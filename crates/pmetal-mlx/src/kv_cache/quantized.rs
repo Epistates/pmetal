@@ -1,6 +1,6 @@
 //! Quantized KV cache.
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
+use pmetal_runtime::compat::{Array, Dtype, Exception, ops};
 
 /// Quantized representation of cached K/V tensors.
 #[derive(Debug, Clone)]

@@ -3,7 +3,7 @@
 use super::*;
 use crate::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 use crate::test_utils::{max_abs_diff, to_f32_vec_eval};
-use pmetal_bridge::compat::{Array, Dtype, ops};
+use pmetal_runtime::compat::{Array, Dtype, ops};
 
 fn seq_tensor(start: f32, len: usize) -> Array {
     let data: Vec<f32> = (0..len).map(|idx| start + idx as f32).collect();

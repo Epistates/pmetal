@@ -57,7 +57,7 @@ section "bun"
 )
 
 section "MLX"
-pin=$(sed -nE 's/^const BUNDLED_MLX_GIT_TAG: &str = "([^"]+)";/\1/p' crates/pmetal-bridge/build.rs)
+pin=$(sed -nE 's/^const BUNDLED_MLX_GIT_TAG: &str = "([^"]+)";/\1/p' crates/pmetal-runtime/build.rs)
 refs=$(git ls-remote https://github.com/ml-explore/mlx.git refs/heads/main 'refs/tags/v*')
 main_sha=$(awk '$2 == "refs/heads/main" { print $1 }' <<<"$refs")
 latest_tag=$(awk '$2 !~ /\^\{\}$/ && $2 ~ /^refs\/tags\/v[0-9.]+$/ { sub("refs/tags/", "", $2); print $2 }' <<<"$refs" |

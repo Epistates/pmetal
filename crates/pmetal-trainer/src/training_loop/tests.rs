@@ -1,10 +1,10 @@
 use super::*;
-use pmetal_bridge::compat::module::ModuleParameters;
 use pmetal_core::{LoraConfig, LrSchedulerType, StepMetrics, TrainingCallback, TrainingConfig};
 use pmetal_data::{DataLoaderConfig, PackedTrainingBatch, Sample, TrainingDataset};
 use pmetal_lora::AdaptedModel;
 use pmetal_models::architectures::llama::LlamaConfig;
 use pmetal_models::dispatcher::DynamicModel;
+use pmetal_runtime::compat::module::ModuleParameters;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -236,7 +236,7 @@ fn test_run_packed_does_not_pack_models_with_recurrent_layers() {
     training_loop
         .run_packed(hybrid, dataset(), None, None)
         .unwrap();
-    pmetal_bridge::check_unobserved_error().unwrap();
+    pmetal_runtime::check_unobserved_error().unwrap();
     assert_eq!(
         training_loop.current_step(),
         6,
@@ -319,7 +319,7 @@ fn test_gradient_accumulation_flag() {
 
 #[test]
 fn test_single_train_step() {
-    use pmetal_bridge::compat::optimizers::Sgd;
+    use pmetal_runtime::compat::optimizers::Sgd;
 
     let config = TrainingLoopConfig {
         use_metal_flash_attention: false, // Disable for simpler test
@@ -353,7 +353,7 @@ fn test_single_train_step() {
 #[test]
 fn test_jit_training_step() {
     // Test the JIT-compiled training step function directly
-    use pmetal_bridge::compat::optimizers::AdamW;
+    use pmetal_runtime::compat::optimizers::AdamW;
 
     let model = small_model();
     let optimizer = AdamW::new(1e-4, 0.0);
@@ -381,7 +381,7 @@ fn test_jit_training_step() {
 fn test_jit_training_step_multiple_steps() {
     // Test that jit_training_step works correctly over multiple steps
     // This verifies the training step function itself works, independent of compile_with_state
-    use pmetal_bridge::compat::optimizers::AdamW;
+    use pmetal_runtime::compat::optimizers::AdamW;
 
     let model = small_model();
     let optimizer = AdamW::new(1e-4, 0.0);
@@ -519,7 +519,7 @@ fn test_run_compiled_enables_gradient_checkpointing_the_model_supports() {
 
 #[test]
 fn test_single_sequence_packed_step_matches_standard_step() {
-    use pmetal_bridge::compat::{optimizers::AdamW, random};
+    use pmetal_runtime::compat::{optimizers::AdamW, random};
 
     let tokens = [1_i32, 2, 3, 4, 5, 6];
     let labels = [2_i64, 3, 4, 5, 6, 7];
@@ -558,7 +558,7 @@ fn test_single_sequence_packed_step_matches_standard_step() {
 
 #[test]
 fn test_single_sequence_packed_cce_step_is_finite() {
-    use pmetal_bridge::compat::{optimizers::AdamW, random};
+    use pmetal_runtime::compat::{optimizers::AdamW, random};
 
     let tokens = [1_i32, 2, 3, 4, 5, 6];
     let labels = [2_i64, 3, 4, 5, 6, 7];
@@ -586,8 +586,8 @@ fn test_single_sequence_packed_cce_step_is_finite() {
 fn test_jit_training_step_with_warmup() {
     // Test the jit_training_step function with proper warmup to initialize
     // optimizer state. This verifies state stability and correct loss reduction.
-    use pmetal_bridge::compat::optimizers::AdamW;
-    use pmetal_bridge::compat::optimizers::Updatable;
+    use pmetal_runtime::compat::optimizers::AdamW;
+    use pmetal_runtime::compat::optimizers::Updatable;
 
     let model = small_model();
     let optimizer = AdamW::new(1e-4, 0.0);
@@ -700,7 +700,7 @@ fn test_eager_evaluation_config() {
 
 #[test]
 fn test_gpu_gradient_clipping() {
-    use pmetal_bridge::compat::Array;
+    use pmetal_runtime::compat::Array;
     use std::rc::Rc;
 
     let config = TrainingLoopConfig {
@@ -893,7 +893,7 @@ fn max_abs_diff(a: &LoraWeights, b: &LoraWeights) -> f32 {
         .map(|(k, x)| {
             let d = x.subtract(&b[k]).abs().max(None);
             d.eval();
-            pmetal_bridge::check_unobserved_error().unwrap();
+            pmetal_runtime::check_unobserved_error().unwrap();
             d.item_f32()
         })
         .fold(0.0, f32::max)
@@ -907,7 +907,7 @@ fn l2_diff(a: &LoraWeights, b: &LoraWeights) -> f32 {
             let d = x.subtract(&b[k]);
             let sq = d.multiply(&d).sum(None);
             sq.eval();
-            pmetal_bridge::check_unobserved_error().unwrap();
+            pmetal_runtime::check_unobserved_error().unwrap();
             sq.item_f32()
         })
         .sum::<f32>()
@@ -1051,7 +1051,7 @@ enum Fault {
     NanLoss,
     /// A bridge op throws inside the gradient trace. The bridge records it and
     /// hands back an empty array, and nothing unwinds.
-    BridgeError,
+    RuntimeError,
 }
 
 /// The small model, broken on the `on`-th forward pass.
@@ -1077,13 +1077,13 @@ impl ModuleParameters for Breaking {
     fn num_parameters(&self) -> usize {
         self.inner.num_parameters()
     }
-    fn parameters(&self) -> pmetal_bridge::compat::ModuleParamRef<'_> {
+    fn parameters(&self) -> pmetal_runtime::compat::ModuleParamRef<'_> {
         self.inner.parameters()
     }
-    fn parameters_mut(&mut self) -> pmetal_bridge::compat::ModuleParamMut<'_> {
+    fn parameters_mut(&mut self) -> pmetal_runtime::compat::ModuleParamMut<'_> {
         self.inner.parameters_mut()
     }
-    fn trainable_parameters(&self) -> pmetal_bridge::compat::ModuleParamRef<'_> {
+    fn trainable_parameters(&self) -> pmetal_runtime::compat::ModuleParamRef<'_> {
         self.inner.trainable_parameters()
     }
 }
@@ -1101,9 +1101,9 @@ impl TrainableModel for Breaking {
         }
         Ok(match self.fault {
             Fault::NanLoss => logits.multiply(&Array::from_f32(f32::NAN)),
-            Fault::BridgeError => {
+            Fault::RuntimeError => {
                 // Inner dimensions that don't match: MLX throws.
-                let bad = pmetal_bridge::compat::ops::matmul(&logits, &Array::ones_f32(&[3, 5]));
+                let bad = pmetal_runtime::compat::ops::matmul(&logits, &Array::ones_f32(&[3, 5]));
                 logits.add(&bad.sum(None))
             }
         })
@@ -1167,11 +1167,11 @@ fn short_run_config() -> TrainingLoopConfig {
 fn a_failed_step_stops_the_run_and_names_the_step() {
     for (fault, expect) in [
         (Fault::NanLoss, "loss of NaN"),
-        (Fault::BridgeError, "matmul"),
+        (Fault::RuntimeError, "matmul"),
     ] {
         let mut model = Breaking::new(3, fault);
         let mut training_loop = TrainingLoop::new(short_run_config());
-        let err = pmetal_bridge::expect_bridge_errors(|| {
+        let err = pmetal_runtime::expect_runtime_errors(|| {
             training_loop.run(&mut model, create_dummy_dataset(8, 12), None, None)
         })
         .expect_err("the run should stop at the broken step");
@@ -1183,7 +1183,7 @@ fn a_failed_step_stops_the_run_and_names_the_step() {
             2,
             "steps after the failure ran"
         );
-        pmetal_bridge::check_unobserved_error().expect("the failure was drained");
+        pmetal_runtime::check_unobserved_error().expect("the failure was drained");
     }
 }
 
@@ -1205,7 +1205,7 @@ fn a_failed_step_stops_the_packed_run() {
 /// its update was zero, and the loss left its contribution out.
 #[test]
 fn cut_cross_entropy_trains_an_adapter_on_the_lm_head() {
-    use pmetal_bridge::compat::optimizers::Sgd;
+    use pmetal_runtime::compat::optimizers::Sgd;
 
     let build = || {
         let config = LlamaConfig {
@@ -1216,7 +1216,7 @@ fn cut_cross_entropy_trains_an_adapter_on_the_lm_head() {
             target_modules: vec!["q_proj".to_string(), "lm_head".to_string()],
             ..small_lora_config()
         };
-        pmetal_bridge::compat::random::seed(5);
+        pmetal_runtime::compat::random::seed(5);
         let base = DynamicModel::from_config(&serde_json::to_string(&config).unwrap()).unwrap();
         (AdaptedModel::attach(base, lora).unwrap(), Sgd::new(1.0))
     };
@@ -1228,7 +1228,7 @@ fn cut_cross_entropy_trains_an_adapter_on_the_lm_head() {
     let before = full.0.lora_parameters();
     jit_training_step_inner(&mut full, (&input_ids, &labels), None).unwrap();
     jit_training_step_cce(&mut cut, (&input_ids, &labels)).unwrap();
-    pmetal_bridge::check_unobserved_error().expect("a bridge op threw");
+    pmetal_runtime::check_unobserved_error().expect("a bridge op threw");
 
     let (full, cut) = (full.0.lora_parameters(), cut.0.lora_parameters());
     for name in ["lm_head.lora_b", "layers.0.self_attn.q_proj.lora_b"] {
@@ -1275,10 +1275,10 @@ fn two_sequence_packed_batch() -> PackedTrainingBatch {
 /// fell back to the full logits.
 #[test]
 fn a_packed_cut_cross_entropy_step_matches_the_full_logits_step() {
-    use pmetal_bridge::compat::optimizers::Sgd;
+    use pmetal_runtime::compat::optimizers::Sgd;
 
     let build = || {
-        pmetal_bridge::compat::random::seed(9);
+        pmetal_runtime::compat::random::seed(9);
         let mut model = small_model();
         // Nonzero `B`, so every adapter has a gradient.
         let params = model
@@ -1304,7 +1304,7 @@ fn a_packed_cut_cross_entropy_step_matches_the_full_logits_step() {
 
     let want = jit_training_step_packed(&mut full, &batch, 0.0).unwrap();
     let got = jit_training_step_packed_cce(&mut cut, &batch, 0.0).unwrap();
-    pmetal_bridge::check_unobserved_error().expect("a bridge op threw");
+    pmetal_runtime::check_unobserved_error().expect("a bridge op threw");
     let (want, got) = (want.item_f32(), got.item_f32());
     assert!(
         (want - got).abs() <= 1e-5 * want.abs(),
@@ -1356,7 +1356,7 @@ fn cut_cross_entropy_says_when_it_does_not_apply() {
 /// step instead of training on the full logits behind its back.
 #[test]
 fn a_cut_cross_entropy_step_without_hidden_states_fails() {
-    use pmetal_bridge::compat::optimizers::Sgd;
+    use pmetal_runtime::compat::optimizers::Sgd;
 
     // `Breaking` delegates everything but the hidden-state forwards, which
     // it leaves at the trait's "not implemented".
@@ -1367,7 +1367,7 @@ fn a_cut_cross_entropy_step_without_hidden_states_fails() {
     let err = jit_training_step_packed_cce(&mut state, &two_sequence_packed_batch(), 0.0)
         .expect_err("no fallback");
     assert!(err.to_string().contains("hidden-state forward"), "{err}");
-    pmetal_bridge::clear_last_error();
+    pmetal_runtime::clear_last_error();
 }
 
 /// The fused Metal AdamW loop and the standard loop train the same adapters
@@ -1376,7 +1376,7 @@ fn a_cut_cross_entropy_step_without_hidden_states_fails() {
 /// decay on the rest, and the frozen base left alone by both.
 #[test]
 fn the_fused_and_standard_loops_train_the_same_parameter_groups() {
-    use pmetal_bridge::compat::{ModuleParametersExt, random};
+    use pmetal_runtime::compat::{ModuleParametersExt, random};
     use std::collections::HashMap;
 
     let config = || {
@@ -1414,7 +1414,7 @@ fn the_fused_and_standard_loops_train_the_same_parameter_groups() {
         params
             .iter()
             .map(|(k, v)| {
-                let v = v.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
+                let v = v.as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32());
                 v.eval();
                 (k.to_string(), v.as_slice::<f32>().to_vec())
             })
@@ -1502,6 +1502,6 @@ fn the_fused_and_standard_loops_train_the_same_parameter_groups() {
         trainable,
         "the fused optimizer holds state for the trainable parameters only"
     );
-    pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+    pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
     println!("fused vs standard loop over 4 steps: {diff:.2e} (adapters moved {moved:.2e})");
 }

@@ -16,7 +16,6 @@
 #![allow(unsafe_code)]
 
 use half::f16;
-use pmetal_bridge::compat::{Array, Dtype};
 use pmetal_metal::{
     bridge::{MetalBufferView, metal_buffer_from_ptr},
     buffer::{BufferUsage, MetalBuffer},
@@ -24,6 +23,7 @@ use pmetal_metal::{
     error::{MetalError, Result as MetalResult},
     kernels::dequant::DequantKernels,
 };
+use pmetal_runtime::compat::{Array, Dtype};
 
 /// High-level bridge for MLX ↔ Metal data transfer.
 ///

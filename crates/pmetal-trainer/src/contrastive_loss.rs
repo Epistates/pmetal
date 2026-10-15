@@ -9,7 +9,7 @@
 //! All losses operate on L2-normalised embeddings `[batch, dim]`.
 //! Normalisation should be applied by the caller (use `pool::normalize_embeddings`).
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
+use pmetal_runtime::compat::{Array, Dtype, Exception, ops};
 
 // ---------------------------------------------------------------------------
 // Public loss functions
@@ -38,7 +38,7 @@ pub fn info_nce_loss(
     let labels: Vec<i32> = (0..batch_size).collect();
     let labels_arr = Array::from_slice(&labels, &[batch_size]);
 
-    Ok(pmetal_bridge::training::cross_entropy_loss_dense(
+    Ok(pmetal_runtime::training::cross_entropy_loss_dense(
         &sim_scaled,
         &labels_arr,
     ))
@@ -250,7 +250,7 @@ mod tests {
         let labels = Array::from_slice(&[1.0f32, 1.0, 0.0], &[3]);
         let loss = cosent_loss(&a, &b, &labels, 0.01).unwrap();
         loss.eval();
-        pmetal_bridge::check_unobserved_error().unwrap();
+        pmetal_runtime::check_unobserved_error().unwrap();
         let val = loss.item_f32();
         assert!((val - 200.0).abs() < 1e-3, "cosent loss: {val}");
     }
@@ -285,7 +285,7 @@ mod tests {
         let labels = Array::from_slice(labels, &[labels.len() as i32]);
         let loss = cosent_loss(&a, &b, &labels, 0.05).unwrap();
         loss.eval();
-        pmetal_bridge::check_unobserved_error().unwrap();
+        pmetal_runtime::check_unobserved_error().unwrap();
         loss.item_f32()
     }
 

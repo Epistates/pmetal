@@ -6,8 +6,8 @@
 //! Weights are gathered into per-layer `InlineArray` structs once at the first
 //! decode call (cold path). All subsequent decode calls use them directly.
 
-use pmetal_bridge::InlineArray;
-use pmetal_bridge::compat::{Array, Dtype, Exception};
+use pmetal_runtime::InlineArray;
+use pmetal_runtime::compat::{Array, Dtype, Exception};
 
 use super::qwen3_next::Qwen3NextForCausalLM;
 use pmetal_mlx::kv_cache::{KVCache, MambaCache};
@@ -64,7 +64,7 @@ pub struct InlineLayerWeights {
     attn_rope_dims: i32,
     attn_rope_base: f32,
     attn_rope_scale: f32,
-    attn_scaled_rope: Option<pmetal_bridge::rope::RotaryEmbedding>,
+    attn_scaled_rope: Option<pmetal_runtime::rope::RotaryEmbedding>,
 
     // GDN-specific (only if is_linear)
     gdn_qkv_w: Option<InlineArray>, // in_proj_qkv, pre-transposed [hidden, conv_dim]
@@ -550,7 +550,7 @@ fn inline_gdn_forward_pure(
             ck,
             kd,
             lw.gdn_norm_eps,
-            pmetal_bridge::qwen3_native::family::gdn_qk_rms_norm_eps(dk),
+            pmetal_runtime::qwen3_native::family::gdn_qk_rms_norm_eps(dk),
             // `from_model` admits only SiLU-gated checkpoints onto this path.
             false,
         );
@@ -593,7 +593,7 @@ fn inline_gdn_forward_pure(
         .reshape(&[b, s, nv, dv]);
 
     // Q/K normalization
-    let qk_eps = pmetal_bridge::qwen3_native::family::gdn_qk_rms_norm_eps(lw.gdn_dk);
+    let qk_eps = pmetal_runtime::qwen3_native::family::gdn_qk_rms_norm_eps(lw.gdn_dk);
     let q = q.rms_norm(lw.gdn_q_nw.as_ref(), qk_eps);
     let k = k.rms_norm(lw.gdn_k_nw.as_ref(), qk_eps);
 

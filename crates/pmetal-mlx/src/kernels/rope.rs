@@ -2,14 +2,14 @@
 //! positions.
 //!
 //! What a config's RoPE scaling means (linear, dynamic NTK, YaRN, LongRoPE,
-//! Llama 3 bands, proportional) lives in one place, [`pmetal_bridge::rope`];
+//! Llama 3 bands, proportional) lives in one place, [`pmetal_runtime::rope`];
 //! an architecture holds a [`RotaryEmbedding`] from there and rotates with
 //! [`rope_embedding`]. The helpers here thread [`RopePositions`] (a cache
 //! offset, or one position per token for packed batches) through the fused
 //! kernel and the explicit cos/sin tables.
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, fast, ops};
-use pmetal_bridge::rope::{RotaryEmbedding, rotate_with_cos_sin};
+use pmetal_runtime::compat::{Array, Dtype, Exception, fast, ops};
+use pmetal_runtime::rope::{RotaryEmbedding, rotate_with_cos_sin};
 
 /// Where a rotary embedding takes its positions from.
 ///
@@ -348,7 +348,7 @@ pub fn apply_rope_with_per_batch_positions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::{Array, Dtype, random};
+    use pmetal_runtime::compat::{Array, Dtype, random};
 
     #[test]
     fn test_rope_functional() {
@@ -459,9 +459,9 @@ mod tests {
     fn contiguous_and_explicit_positions_agree_with_a_period_table() {
         let (seq_len, dims) = (5, 64);
         let x = ramp(&[1, 2, seq_len, dims]);
-        let periods = pmetal_bridge::rope::Rotary::from_config(
+        let periods = pmetal_runtime::rope::Rotary::from_config(
             dims,
-            pmetal_bridge::rope::RopeConfig::from_json(&serde_json::json!({
+            pmetal_runtime::rope::RopeConfig::from_json(&serde_json::json!({
                 "rope_scaling": {"rope_type": "llama3", "factor": 32.0, "low_freq_factor": 1.0,
                     "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}
             })),

@@ -58,7 +58,7 @@ pub(crate) async fn run_train_draft(args: TrainDraftArgs) -> Result<()> {
             .with_context(|| format!("read DFlash config {config_path}"))?;
         let config: DFlashDraftConfig = serde_json::from_slice(&config_bytes)
             .with_context(|| format!("parse DFlash config {config_path}"))?;
-        pmetal_bridge::compat::random::seed(args.seed);
+        pmetal_runtime::compat::random::seed(args.seed);
         DFlashDraftModel::new(config).map_err(|e| anyhow::anyhow!("create DFlash draft: {e}"))?
     };
 
@@ -109,7 +109,7 @@ fn shard_batches(
     seq_len: usize,
     batch_size: usize,
     eos_token_id: u32,
-) -> Result<impl Iterator<Item = pmetal_bridge::compat::Array>> {
+) -> Result<impl Iterator<Item = pmetal_runtime::compat::Array>> {
     anyhow::ensure!(!shards.is_empty(), "--shards must not be empty");
     anyhow::ensure!(seq_len >= 2, "--seq-len must be >= 2");
     let reader = StreamingShardReader::new(StreamConfig {

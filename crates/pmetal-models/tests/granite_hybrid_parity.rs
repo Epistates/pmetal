@@ -36,9 +36,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use common::{fixture_path, load_shard, ref_tensor};
-use pmetal_bridge::compat::{Array, Module, ops::slice_axis};
 use pmetal_mlx::test_utils::{ParityReport, Tolerance, argmax_last_axis, print_report_table};
 use pmetal_models::DynamicModel;
+use pmetal_runtime::compat::{Array, Module, ops::slice_axis};
 use serial_test::serial;
 
 /// Tokens fed as one prefill before the cached decode takes over.
@@ -101,7 +101,7 @@ fn rows(a: &Array, start: i32, end: i32) -> Array {
 }
 
 fn drain_bridge(op: &str) {
-    pmetal_bridge::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
+    pmetal_runtime::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
 }
 
 fn assert_all_pass(title: &str, reports: &[ParityReport]) {

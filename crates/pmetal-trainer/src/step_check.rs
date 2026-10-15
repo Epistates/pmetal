@@ -8,7 +8,7 @@
 //! back through [`check_step`] instead, which ends the run there, naming the
 //! step and the op.
 
-use pmetal_bridge::compat::Exception;
+use pmetal_runtime::compat::Exception;
 
 /// The step's loss, or why the run has to stop at it.
 ///
@@ -19,7 +19,7 @@ use pmetal_bridge::compat::Exception;
 /// last, and every op that succeeds clears the last-op error slot, so this
 /// reads the one that holds the first unobserved error instead.
 pub fn check_step(step: usize, loss: f32) -> Result<f32, Exception> {
-    if let Err(e) = pmetal_bridge::check_unobserved_error() {
+    if let Err(e) = pmetal_runtime::check_unobserved_error() {
         return Err(Exception::custom(format!(
             "training step {step} failed: {e}"
         )));
@@ -48,7 +48,7 @@ pub fn check_grad_norm(step: usize, norm: f32) -> Result<f32, Exception> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::{Array, ops};
+    use pmetal_runtime::compat::{Array, ops};
 
     #[test]
     fn a_finite_loss_passes() {
@@ -71,7 +71,7 @@ mod tests {
     #[test]
     fn a_recorded_bridge_error_fails_the_step() {
         // Mismatched inner dimensions: the bridge records the exception.
-        let _ = pmetal_bridge::expect_bridge_errors(|| {
+        let _ = pmetal_runtime::expect_runtime_errors(|| {
             ops::matmul(&Array::ones_f32(&[2, 3]), &Array::ones_f32(&[4, 5]))
         });
         let err = check_step(4, 0.5).unwrap_err().to_string();

@@ -11,7 +11,7 @@ categories.workspace = true
 
 [dependencies]
 pmetal-core = { workspace = true }
-pmetal-bridge = { workspace = true }
+pmetal-runtime = { workspace = true }
 pmetal-gguf = { workspace = true }
 serde = { workspace = true }
 # `preserve_order`: chat-template inputs (tool schemas, template kwargs) render
@@ -34,8 +34,8 @@ image = { workspace = true }
 base64 = { workspace = true }
 
 [dev-dependencies]
-# Fail every test at the bridge op that throws (pmetal-bridge `strict-errors`).
-pmetal-bridge = { workspace = true, features = ["strict-errors"] }
+# Fail every test at the bridge op that throws (pmetal-runtime `strict-errors`).
+pmetal-runtime = { workspace = true, features = ["strict-errors"] }
 tempfile = { workspace = true }
 # Pull in pmetal-mlx's `test-utils` feature so the parity integration tests can
 # reach the shared helpers (`test_utils::*`). The feature is empty in production

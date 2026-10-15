@@ -45,9 +45,9 @@ jobs:
           meta=$(
             cargo build --release -p pmetal-py --message-format=json \
               | jq -r 'select(.reason == "build-script-executed")
-                  | select(.package_id | test("pmetal-bridge"))
+                  | select(.package_id | test("pmetal-runtime"))
                   | .env | map({(.[0]): .[1]}) | add
-                  | "\(.PMETAL_BRIDGE_MLX_METALLIB) \(.PMETAL_BRIDGE_MLX_METALLIB_SHA256)"' \
+                  | "\(.PMETAL_RUNTIME_MLX_METALLIB) \(.PMETAL_RUNTIME_MLX_METALLIB_SHA256)"' \
               | tail -n 1)
           read -r path sha <<< "$meta"
           if [ ! -f "$path" ]; then

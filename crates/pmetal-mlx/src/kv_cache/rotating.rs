@@ -1,6 +1,6 @@
 //! Rotating KV cache.
 
-use pmetal_bridge::compat::{Array, Exception, ops};
+use pmetal_runtime::compat::{Array, Exception, ops};
 
 /// Rotating KV cache that acts as a circular buffer.
 ///
@@ -199,7 +199,7 @@ impl RotatingKVCache {
             || (self.offset >= self.keys.as_ref().unwrap().dim(2) as usize
                 && (self.keys.as_ref().unwrap().dim(2) as usize) < self.max_size);
         if needs_growth {
-            use pmetal_bridge::compat::Dtype;
+            use pmetal_runtime::compat::Dtype;
             let new_size = self.step.min(self.max_size - self.offset);
             let k_shape = [
                 batch as i32,

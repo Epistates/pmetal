@@ -10,7 +10,7 @@
 //! cost beyond the f32 materialization that the writer already performs.
 
 use crate::{MergeError, Result};
-use pmetal_bridge::compat::Array;
+use pmetal_runtime::compat::Array;
 use serde::{Deserialize, Serialize};
 
 /// How aggressively to validate each merged tensor before writing it.
@@ -148,7 +148,7 @@ pub fn check_tensor(
     if matches!(level, SanityLevel::Off) {
         return Ok(None);
     }
-    let mut copy = tensor.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
+    let mut copy = tensor.as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32());
     let shape = copy.shape().to_vec();
     let n: usize = shape.iter().map(|&s| s as usize).product();
     let data: Vec<f32> = copy.to_f32_vec(n).unwrap_or_default();

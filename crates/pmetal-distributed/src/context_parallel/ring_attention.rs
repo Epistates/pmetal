@@ -25,7 +25,7 @@
 
 use crate::mlx_dist::group::DistributedGroup;
 use crate::mlx_dist::ops;
-use pmetal_bridge::compat::{Array, Exception, ops as mlx_ops};
+use pmetal_runtime::compat::{Array, Exception, ops as mlx_ops};
 
 /// Context parallelism communication mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

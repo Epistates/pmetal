@@ -6,9 +6,9 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use pmetal_bridge::compat::Array;
-use pmetal_bridge::compat::ModuleParameters;
 use pmetal_mlx::kv_cache::KVCache;
+use pmetal_runtime::compat::Array;
+use pmetal_runtime::compat::ModuleParameters;
 
 use crate::LoraError;
 

@@ -7,7 +7,7 @@ use thiserror::Error;
 pub enum MlxError {
     /// MLX exception.
     #[error("MLX error: {0}")]
-    Mlx(#[from] pmetal_bridge::compat::Exception),
+    Mlx(#[from] pmetal_runtime::compat::Exception),
 
     /// Metal kernel error.
     #[error("Metal error: {0}")]

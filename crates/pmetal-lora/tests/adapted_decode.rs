@@ -19,9 +19,9 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use common::{cases, every_projection_lora};
-use pmetal_bridge::compat::{Array, Dtype, random};
 use pmetal_lora::{AdaptedModel, QLoraConfig, quantize_base};
 use pmetal_models::dispatcher::DynamicModel;
+use pmetal_runtime::compat::{Array, Dtype, random};
 
 const PROMPT: [i32; 6] = [3, 11, 7, 2, 9, 5];
 const STEPS: usize = 3;
@@ -102,7 +102,7 @@ fn worst_disagreement(
     let mut worst = 0.0f32;
     for n in 0..STEPS {
         let fresh = last_row(&model.forward(&ids(&prefix), None).expect("forward"));
-        pmetal_bridge::check_unobserved_error().map_err(|e| format!("{name}: {e}"))?;
+        pmetal_runtime::check_unobserved_error().map_err(|e| format!("{name}: {e}"))?;
         let scale = fresh.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
         let diff = cached
             .iter()

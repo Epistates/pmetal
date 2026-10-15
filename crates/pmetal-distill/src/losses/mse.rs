@@ -5,7 +5,7 @@
 
 use super::DistillLoss;
 use crate::Result;
-use pmetal_bridge::compat::{Array, ops};
+use pmetal_runtime::compat::{Array, ops};
 
 /// Mean Squared Error loss on logits.
 ///
@@ -146,7 +146,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_mse_gradient_flow() {
-        use pmetal_bridge::compat::nn::value_and_grad_explicit;
+        use pmetal_runtime::compat::nn::value_and_grad_explicit;
 
         let teacher = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
 

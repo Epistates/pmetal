@@ -34,7 +34,7 @@
 
 use std::path::Path;
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, Module, ops};
+use pmetal_runtime::compat::{Array, Dtype, Exception, Module, ops};
 
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig, MambaCache};
 use pmetal_mlx::speculative::SpecCapture;
@@ -529,7 +529,7 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
                 &mut capture,
             )?;
             let token = sample_token_argmax(&slice_last_time_step(&logits)?)?;
-            pmetal_bridge::check_unobserved_error()
+            pmetal_runtime::check_unobserved_error()
                 .map_err(|e| Exception::custom(format!("greedy decode: {e}")))?;
             output_tokens.push(token);
             metrics.acceptance_lengths.push(1);
@@ -562,7 +562,7 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
         )?;
         let last = slice_last_time_step(&logits)?.as_dtype(Dtype::Float32.as_i32());
         let _ = last.eval();
-        pmetal_bridge::check_unobserved_error()
+        pmetal_runtime::check_unobserved_error()
             .map_err(|e| Exception::custom(format!("top two: {e}")))?;
         let values = last.as_slice::<f32>();
         let mut best = [(0, f32::NEG_INFINITY); 2];
@@ -885,7 +885,7 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
     /// difference vs the linear-causal path comes from the explicit-
     /// mask SDPA kernel, not the mask itself.
     fn target_dtype_hint(&self) -> i32 {
-        pmetal_bridge::compat::Dtype::Bfloat16.as_i32()
+        pmetal_runtime::compat::Dtype::Bfloat16.as_i32()
     }
 }
 
@@ -964,7 +964,7 @@ fn argmax_last_axis(logits: &Array) -> Result<Vec<i32>, Exception> {
 fn token_ids(ids: &Array) -> Result<Vec<i32>, Exception> {
     let ids = ids.as_dtype(Dtype::Int32.as_i32());
     let _ = ids.eval();
-    pmetal_bridge::check_unobserved_error()
+    pmetal_runtime::check_unobserved_error()
         .map_err(|e| Exception::custom(format!("DFlash draft: {e}")))?;
     Ok(ids.as_slice::<i32>().to_vec())
 }
@@ -1153,7 +1153,7 @@ fn apply_logit_softcap(logits: &Array, cap: Option<f32>) -> Array {
             // forward op, but the rule applies everywhere.
             let c_arr = Array::from_f32(c).as_dtype(logits.dtype().as_i32());
             let scaled = logits.divide(&c_arr);
-            let tanh = pmetal_bridge::compat::ops::tanh(&scaled);
+            let tanh = pmetal_runtime::compat::ops::tanh(&scaled);
             tanh.multiply(&c_arr)
         }
         None => logits.clone(),

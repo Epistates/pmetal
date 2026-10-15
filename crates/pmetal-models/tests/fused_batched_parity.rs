@@ -13,8 +13,8 @@
 //! cache write/read, mask construction, or projection reshape would
 //! surface as a divergence on the very first decode token.
 
-use pmetal_bridge::compat::Array;
 use pmetal_mlx::kv_cache::{FusedBatchKVCache, KVCache, KVCacheConfig};
+use pmetal_runtime::compat::Array;
 
 use pmetal_models::architectures::cohere::{CohereConfig, CohereForCausalLM};
 use pmetal_models::architectures::gemma::{GemmaConfig, GemmaForCausalLM};
@@ -107,14 +107,14 @@ fn q_proj_stable_across_calls() {
     let config = tiny_config();
     let mut model = LlamaForCausalLM::new(config.clone()).unwrap();
     let x = Array::from_i32_slice(&[7_i32]).reshape(&[1, 1]);
-    let emb1 = pmetal_bridge::compat::Module::forward(&mut model.model.embed_tokens, &x).unwrap();
+    let emb1 = pmetal_runtime::compat::Module::forward(&mut model.model.embed_tokens, &x).unwrap();
     let out1 =
-        pmetal_bridge::compat::Module::forward(&mut model.model.layers[0].self_attn.q_proj, &emb1)
+        pmetal_runtime::compat::Module::forward(&mut model.model.layers[0].self_attn.q_proj, &emb1)
             .unwrap();
     out1.eval();
-    let emb2 = pmetal_bridge::compat::Module::forward(&mut model.model.embed_tokens, &x).unwrap();
+    let emb2 = pmetal_runtime::compat::Module::forward(&mut model.model.embed_tokens, &x).unwrap();
     let out2 =
-        pmetal_bridge::compat::Module::forward(&mut model.model.layers[0].self_attn.q_proj, &emb2)
+        pmetal_runtime::compat::Module::forward(&mut model.model.layers[0].self_attn.q_proj, &emb2)
             .unwrap();
     out2.eval();
     let v1 = out1.as_slice::<f32>();
@@ -129,9 +129,9 @@ fn q_proj_stable_across_calls() {
 
 #[test]
 fn attn_layer0_matches_at_position_zero() {
-    use pmetal_bridge::compat::Module;
     use pmetal_mlx::kv_cache::FusedBatchKVCache as FBC;
     use pmetal_models::common::{BatchedGqaAttnCfg, batched_gqa_attn};
+    use pmetal_runtime::compat::Module;
 
     let config = tiny_config();
     let mut model = LlamaForCausalLM::new(config.clone()).unwrap();

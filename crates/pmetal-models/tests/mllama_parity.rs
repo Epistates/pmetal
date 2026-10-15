@@ -242,7 +242,7 @@ fn real_checkpoint_loads_and_runs() {
     // which is exactly what happened before the mask-dtype fix. Drain the
     // channel after every stage.
     fn assert_no_bridge_error(stage: &str) {
-        if let Err(e) = pmetal_bridge::check_unobserved_error() {
+        if let Err(e) = pmetal_runtime::check_unobserved_error() {
             panic!("{stage} raised a bridge exception: {e}");
         }
     }
@@ -261,7 +261,7 @@ fn real_checkpoint_loads_and_runs() {
     // A short text-only prompt. Degenerate weights (a silently-skipped tensor
     // left at random init) show up here as non-finite or absurd logits.
     let input_ids =
-        pmetal_bridge::compat::Array::from_slice(&[128_000_i32, 9906, 11, 1917, 0], &[1, 5]);
+        pmetal_runtime::compat::Array::from_slice(&[128_000_i32, 9906, 11, 1917, 0], &[1, 5]);
     let mut logits = model.forward(&input_ids, None).expect("text forward runs");
     logits.eval();
     assert_no_bridge_error("the text forward");
@@ -285,13 +285,13 @@ fn real_checkpoint_loads_and_runs() {
     assert_eq!(vc.image_size, 560, "released checkpoints use 560px tiles");
     assert_eq!(vc.vision_output_dim, 7680);
 
-    let pixels = pmetal_bridge::compat::random::normal(
+    let pixels = pmetal_runtime::compat::random::normal(
         &[1, 1, vc.max_num_tiles, 3, vc.image_size, vc.image_size],
-        pmetal_bridge::compat::Dtype::Float32,
+        pmetal_runtime::compat::Dtype::Float32,
     );
-    let ids = pmetal_bridge::compat::Array::from_slice(&[2_i32], &[1, 1]);
+    let ids = pmetal_runtime::compat::Array::from_slice(&[2_i32], &[1, 1]);
     let mask =
-        pmetal_bridge::compat::Array::from_slice(&[1_i32, 1, 0, 0], &[1, 1, vc.max_num_tiles]);
+        pmetal_runtime::compat::Array::from_slice(&[1_i32, 1, 0, 0], &[1, 1, vc.max_num_tiles]);
     let mut features = mllama
         .vision_model
         .forward(&pixels, &ids, &mask)

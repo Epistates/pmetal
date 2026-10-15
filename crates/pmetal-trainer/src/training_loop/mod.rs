@@ -45,7 +45,7 @@
 //!
 //! Note: Fused training requires `gradient_accumulation_steps=1`.
 
-use pmetal_bridge::compat::{
+use pmetal_runtime::compat::{
     Array, Exception,
     indexing::argmax_axis,
     module::FlattenedModuleParam,
@@ -936,7 +936,7 @@ impl TrainingLoop {
 
     /// Compute loss for a batch.
     fn compute_loss(logits: &Array, labels: &Array) -> Result<Array> {
-        Ok(pmetal_bridge::training::causal_lm_loss(
+        Ok(pmetal_runtime::training::causal_lm_loss(
             logits, labels, -100,
         ))
     }
@@ -959,7 +959,7 @@ impl TrainingLoop {
             return Ok(None);
         }
 
-        let norm = pmetal_bridge::training::clip_grad_norm_map(grads, max_norm);
+        let norm = pmetal_runtime::training::clip_grad_norm_map(grads, max_norm);
 
         // Return lazy norm - caller can eval() for logging if needed
         Ok(Some(norm))
@@ -1113,7 +1113,7 @@ impl TrainingLoop {
                     // model. Evaluating all 600M+ params of a frozen model every step
                     // is wasteful and can spike memory via unnecessary GPU->CPU sync.
                     // Equivalent to mx.eval(state, losses, ...).
-                    let _ = pmetal_bridge::compat::eval_params(model.trainable_parameters());
+                    let _ = pmetal_runtime::compat::eval_params(model.trainable_parameters());
                     // Optimizer state (momentum/variance for Adam)
                     let opt_states: Vec<&Array> =
                         optimizer.updatable_states().into_iter().collect();

@@ -1,7 +1,7 @@
 //! Core sharding abstractions for tensor parallelism.
 
 use crate::expert_shard::expert_range;
-use pmetal_bridge::compat::{Array, Exception};
+use pmetal_runtime::compat::{Array, Exception};
 use std::collections::HashMap;
 
 /// Slice a contiguous range along `axis` using `take_axis`.

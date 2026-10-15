@@ -34,7 +34,7 @@
 //!
 //! For a well-matched draft (high acceptance rate), each step returns 2–N+1
 //! tokens at roughly the cost of one full forward pass (the verify pass dominates).
-use pmetal_bridge::compat::{Array, Exception};
+use pmetal_runtime::compat::{Array, Exception};
 
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 
@@ -355,7 +355,7 @@ fn accept_reject(verify_logits: &Array, draft_tokens: &[u32]) -> Result<Vec<u32>
     // Verify each draft token against the verifier's argmax at that position.
     for (i, &draft_tok) in draft_tokens.iter().enumerate() {
         let pos = (verify_start + i) as i32;
-        let logit_row = pmetal_bridge::compat::ops::slice_axis(verify_logits, 1, pos, pos + 1)
+        let logit_row = pmetal_runtime::compat::ops::slice_axis(verify_logits, 1, pos, pos + 1)
             .squeeze_axes(&[0, 1]);
         logit_row
             .try_eval()
@@ -373,7 +373,7 @@ fn accept_reject(verify_logits: &Array, draft_tokens: &[u32]) -> Result<Vec<u32>
     // prediction at the position after the last draft token.
     let bonus_pos = (verify_start + n) as i32;
     let bonus_row =
-        pmetal_bridge::compat::ops::slice_axis(verify_logits, 1, bonus_pos, bonus_pos + 1)
+        pmetal_runtime::compat::ops::slice_axis(verify_logits, 1, bonus_pos, bonus_pos + 1)
             .squeeze_axes(&[0, 1]);
     bonus_row
         .try_eval()
@@ -396,7 +396,7 @@ fn build_verify_input(input_ids: &Array, draft_tokens: &[u32]) -> Result<Array, 
     }
     let draft_i32: Vec<i32> = draft_tokens.iter().map(|&t| t as i32).collect();
     let draft_arr = Array::from_slice(&draft_i32, &[1, draft_tokens.len() as i32]);
-    Ok(pmetal_bridge::compat::ops::concatenate_axis(
+    Ok(pmetal_runtime::compat::ops::concatenate_axis(
         &[input_ids, &draft_arr],
         1,
     ))
@@ -407,7 +407,7 @@ fn build_verify_input(input_ids: &Array, draft_tokens: &[u32]) -> Result<Array, 
 /// `hidden`: `[batch, seq_len, hidden_dim]` → `[batch, 1, hidden_dim]`
 fn last_token_hidden(hidden: &Array) -> Result<Array, Exception> {
     let seq_len = hidden.dim(1);
-    Ok(pmetal_bridge::compat::ops::slice_axis(
+    Ok(pmetal_runtime::compat::ops::slice_axis(
         hidden,
         1,
         seq_len - 1,
@@ -420,14 +420,14 @@ fn last_token_hidden(hidden: &Array) -> Result<Array, Exception> {
 fn argmax_last(logits: &Array) -> Result<u32, Exception> {
     // logits: [batch=1, seq_len, vocab_size]
     let seq_len = logits.dim(1);
-    let row = pmetal_bridge::compat::ops::slice_axis(logits, 1, seq_len - 1, seq_len)
+    let row = pmetal_runtime::compat::ops::slice_axis(logits, 1, seq_len - 1, seq_len)
         .squeeze_axes(&[0, 1]);
     argmax_1d(&row)
 }
 
 /// Greedy argmax for a 1-D logits vector `[vocab_size]`.
 fn argmax_1d(row: &Array) -> Result<u32, Exception> {
-    use pmetal_bridge::compat::indexing::argmax;
+    use pmetal_runtime::compat::indexing::argmax;
     let idx = argmax(row);
     idx.try_eval()
         .map_err(|e| Exception::custom(e.to_string()))?;

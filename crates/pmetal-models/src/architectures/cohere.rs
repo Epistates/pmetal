@@ -9,15 +9,15 @@
 //! - **Command R**: 35B parameters
 //! - **Command R+**: 104B parameters
 //! - **Command A**: 111B parameters (2025)
-use pmetal_bridge::compat::{Array, Exception, Module, nn};
-use pmetal_bridge::impl_module_params;
+use pmetal_runtime::compat::{Array, Exception, Module, nn};
+use pmetal_runtime::impl_module_params;
 
-use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     rope::{RopePositions, rope_embedding},
 };
 use pmetal_mlx::kv_cache::KVCache;
+use pmetal_runtime::rope::{RopeConfig, RotaryEmbedding};
 
 use serde::{Deserialize, Serialize};
 
@@ -55,7 +55,7 @@ pub struct CohereConfig {
     /// Pattern: every 4th layer uses global attention.
     #[serde(default)]
     pub global_attention_layers: Option<Vec<i32>>,
-    /// RoPE scaling, read by [`pmetal_bridge::rope`]; the Command-R
+    /// RoPE scaling, read by [`pmetal_runtime::rope`]; the Command-R
     /// releases ship none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rope_scaling: Option<serde_json::Value>,
@@ -712,7 +712,7 @@ impl CohereForCausalLM {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::ModuleParametersExt;
+    use pmetal_runtime::compat::ModuleParametersExt;
     use serial_test::serial;
 
     #[test]
@@ -734,9 +734,9 @@ mod tests {
     #[serial]
     fn test_cohere_mlp() {
         let mlp = CohereMLP::new(64, 256).unwrap();
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 10, 64],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
 
         let mut mlp = mlp;

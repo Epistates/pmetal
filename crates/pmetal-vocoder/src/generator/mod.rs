@@ -6,7 +6,7 @@
 use crate::config::BigVGANConfig;
 use crate::error::{Result, VocoderError};
 use crate::nn::{AMPBlock, Activation1d, SnakeBeta, WeightNormConv1d, WeightNormConvTranspose1d};
-use pmetal_bridge::compat::Array;
+use pmetal_runtime::compat::Array;
 use std::path::Path;
 use zerocopy::FromBytes;
 

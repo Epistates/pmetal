@@ -25,13 +25,13 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use pmetal_bridge::compat::{
+use pmetal_core::OptimizerType;
+use pmetal_metal::kernels::AdamWConfig;
+use pmetal_runtime::compat::{
     Array, FlattenedModuleParam, ModuleParametersExt,
     optimizers::{AdamWBuilder, Optimizer},
 };
-use pmetal_bridge::optimizer::{AdamW as BridgeAdamW, ParamClass, ParamSet};
-use pmetal_core::OptimizerType;
-use pmetal_metal::kernels::AdamWConfig;
+use pmetal_runtime::optimizer::{AdamW as RuntimeAdamW, ParamClass, ParamSet};
 use pmetal_trainer::{MlxMetalOptimizerBuilder, ParamGroupOptimizerBuilder, TrainOptimizer};
 use serde::Deserialize;
 
@@ -87,7 +87,7 @@ struct Weights {
     w1: Array,
     w2: Array,
 }
-pmetal_bridge::impl_module_params!(Weights; w0, w1, w2);
+pmetal_runtime::impl_module_params!(Weights; w0, w1, w2);
 
 impl Fixture {
     fn shape(&self, name: &str) -> &[i32] {
@@ -167,7 +167,7 @@ fn check(
         );
         max_err = max_err.max(err);
     }
-    pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+    pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
     println!("{label}: max error {max_err:.2e} over {} steps", fx.steps);
 }
 
@@ -234,7 +234,7 @@ fn bridge_adamw_matches_torch() {
     for case in ["adamw", "adamw_beta2_095"] {
         let c = &fx.optimizers[case];
         let (b1, b2) = c.betas();
-        let mut opt = BridgeAdamW::new(fx.lr[0], c.f32("weight_decay"))
+        let mut opt = RuntimeAdamW::new(fx.lr[0], c.f32("weight_decay"))
             .with_betas(b1, b2)
             .with_eps(c.f32("eps"))
             .with_classifier(|_| ParamClass::Regular);
@@ -297,7 +297,7 @@ struct Grouped {
     q_proj_lora_b: Array,
     down_proj: Array,
 }
-pmetal_bridge::impl_module_params!(
+pmetal_runtime::impl_module_params!(
     Grouped;
     embed_tokens,
     input_layernorm,
@@ -348,7 +348,7 @@ fn largest_difference(a: &HashMap<String, Vec<f32>>, b: &HashMap<String, Vec<f32
 /// without a gradient included.
 #[test]
 fn fused_adamw_trains_the_parameter_groups_the_standard_loop_does() {
-    use pmetal_bridge::compat::random;
+    use pmetal_runtime::compat::random;
     use pmetal_trainer::{TrainingLoop, TrainingLoopConfig};
 
     let mut config = TrainingLoopConfig::default();
@@ -362,7 +362,7 @@ fn fused_adamw_trains_the_parameter_groups_the_standard_loop_does() {
     random::seed(11);
     let init: Vec<Array> = GROUPED
         .iter()
-        .map(|&(_, shape, _)| random::normal(shape, pmetal_bridge::compat::Dtype::Float32))
+        .map(|&(_, shape, _)| random::normal(shape, pmetal_runtime::compat::Dtype::Float32))
         .collect();
     let model = || Grouped {
         embed_tokens: init[0].clone(),
@@ -381,7 +381,7 @@ fn fused_adamw_trains_the_parameter_groups_the_standard_loop_does() {
                 // Step 5 has no gradient for two parameters.
                 .filter(|(name, _, _)| step != 4 || !matches!(*name, "down_proj" | "q_proj_lora_b"))
                 .map(|&(name, shape, scale)| {
-                    let g = random::normal(shape, pmetal_bridge::compat::Dtype::Float32)
+                    let g = random::normal(shape, pmetal_runtime::compat::Dtype::Float32)
                         .multiply(&Array::from_f32(scale));
                     g.eval();
                     (Rc::from(name), g)
@@ -426,7 +426,7 @@ fn fused_adamw_trains_the_parameter_groups_the_standard_loop_does() {
     // Without the groups the two paths part: the test sees them.
     let apart = largest_difference(&grouped_snapshot(&a), &grouped_snapshot(&c));
     assert!(apart > 1e-3, "ungrouped fused AdamW only {apart:.3e} off");
-    pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+    pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
     println!(
         "fused vs standard, grouped: max error {max_err:.2e} over {} steps (ungrouped: {apart:.2e})",
         lrs.len()

@@ -49,15 +49,15 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use pmetal_bridge::compat::ops::{slice_axis, slice_axis_from, slice_last_from, slice_last_to};
-use pmetal_bridge::compat::{
-    Array, Dtype, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, ModuleParametersExt,
-    Param, Parameter, VisitLinears, child_path, fast, nn, ops,
-};
-use pmetal_bridge::impl_module_params;
 use pmetal_mlx::kernels::rope::{RopePositions, rope};
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig, MambaCache, MambaCacheEntry};
 use pmetal_mlx::speculative::SpecCapture;
+use pmetal_runtime::compat::ops::{slice_axis, slice_axis_from, slice_last_from, slice_last_to};
+use pmetal_runtime::compat::{
+    Array, Dtype, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, ModuleParametersExt,
+    Param, Parameter, VisitLinears, child_path, fast, nn, ops,
+};
+use pmetal_runtime::impl_module_params;
 use serde::{Deserialize, Serialize};
 
 use super::qwen3_next::{
@@ -68,7 +68,7 @@ use super::qwen3_next::{
 use super::utils::LoadReport;
 use crate::loader::LoadError;
 use crate::traits::ModelConfig;
-use pmetal_bridge::native_weight::LayerWeight;
+use pmetal_runtime::native_weight::LayerWeight;
 
 // ============================================================================
 // Configuration
@@ -1302,7 +1302,7 @@ impl Qwen4ExpPle {
         let dim = embed / config.ngram_heads();
         let weight = resident_table.then(|| {
             let scale = (1.0 / dim as f32).sqrt();
-            pmetal_bridge::compat::random::uniform_range(
+            pmetal_runtime::compat::random::uniform_range(
                 -scale,
                 scale,
                 &[hash.rows as i32, dim],
@@ -2284,8 +2284,8 @@ fn take_packed_experts(
     weights: &mut HashMap<String, Array>,
     config: &Qwen4ExpConfig,
 ) -> Result<HashMap<usize, PackedRoutedExperts>, LoadError> {
-    use pmetal_bridge::native_loader::take_modelopt_weights;
-    use pmetal_bridge::native_weight::detect_model_dtype;
+    use pmetal_runtime::native_loader::take_modelopt_weights;
+    use pmetal_runtime::native_weight::detect_model_dtype;
 
     if !weights
         .keys()

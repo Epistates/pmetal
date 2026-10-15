@@ -327,7 +327,7 @@ pub fn plan_deepseek_moe(
 ///
 /// # Reference
 ///
-/// `pmetal-bridge/src/qwen3_native/load.rs` — ground-truth weight
+/// `pmetal-runtime/src/qwen3_native/load.rs` — ground-truth weight
 /// stacking. The loader rewrites per-expert HF keys into
 /// `switch_mlp.{proj}.weight` so the expert dimension is axis 0.
 pub fn plan_qwen_moe(prefix: &str, total_experts: usize) -> Vec<(String, ShardingDirective)> {
@@ -383,7 +383,7 @@ pub fn plan_qwen_moe(prefix: &str, total_experts: usize) -> Vec<(String, Shardin
 ///
 /// # Reference
 ///
-/// `pmetal-bridge/src/llama4_native/weights.rs`.
+/// `pmetal-runtime/src/llama4_native/weights.rs`.
 pub fn plan_llama4_moe(prefix: &str, total_experts: usize) -> Vec<(String, ShardingDirective)> {
     let mut directives = Vec::new();
 
@@ -430,7 +430,7 @@ pub fn plan_llama4_moe(prefix: &str, total_experts: usize) -> Vec<(String, Shard
 ///
 /// # Reference
 ///
-/// `pmetal-bridge/src/gpt_oss_native/weights.rs`.
+/// `pmetal-runtime/src/gpt_oss_native/weights.rs`.
 pub fn plan_gpt_oss_moe(prefix: &str, total_experts: usize) -> Vec<(String, ShardingDirective)> {
     let mut directives = Vec::new();
 

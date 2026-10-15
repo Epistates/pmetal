@@ -1,0 +1,65 @@
+[package]
+name = "pmetal-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "PMetal's tensor runtime for Apple Silicon: arrays, ops, compiled graphs, native inference engines and custom Metal kernels"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+links = "pmetal_runtime"
+
+[features]
+default = ["accelerate", "metal"]
+accelerate = []
+metal = []
+# Tests only: a bridge op whose C++ side throws panics the calling thread at
+# that op, naming it, instead of handing back a placeholder array for the
+# caller to check. Every workspace crate turns it on through its
+# `[dev-dependencies]`, so it reaches test, bench and example builds and
+# never a library or binary build. Code that expects an op to fail runs it
+# inside `expect_runtime_errors`.
+strict-errors = []
+
+[dependencies]
+half = { workspace = true }
+memmap2 = { workspace = true }
+safetensors = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+# This crate's own tests fail at the op that throws (`strict-errors`). No
+# version, so publishing drops it instead of resolving the crate against
+# itself on the registry.
+pmetal-runtime = { path = ".", features = ["strict-errors"] }
+
+[build-dependencies]
+cc = { workspace = true }
+cmake = { workspace = true }
+sha2 = { workspace = true }
+
+# This crate is the C++ FFI boundary to MLX and must use `unsafe` pervasively
+# (`inline_array` wraps mlx::core::array via extern "C" calls; ~280 unsafe blocks).
+# We declare an explicit `[lints.rust]` section so the `unsafe_code = "allow"`
+# exemption is documented rather than relying on the implicit bypass that
+# occurs when a crate omits `workspace = true`. The workspace-level
+# `unsafe_code = "deny"` still applies to every other crate.
+[lints.rust]
+unsafe_code = "allow"
+# The rest mirrors [workspace.lints.rust].
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+rust_2018_idioms = { level = "warn", priority = -1 }
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unit_bindings = "warn"
+unused_import_braces = "warn"
+unused_lifetimes = "warn"
+
+[lints.clippy]
+collapsible_if = "allow"
+manual_is_multiple_of = "allow"

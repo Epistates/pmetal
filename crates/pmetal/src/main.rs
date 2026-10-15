@@ -1082,7 +1082,7 @@ const EMBEDDED_METALLIB_SHA256: Option<&str> = option_env!("PMETAL_EMBEDDED_META
 #[cfg(target_os = "macos")]
 fn extract_embedded_metallib(sha256: &str) -> Option<PathBuf> {
     use flate2::read::GzDecoder;
-    use pmetal_bridge::metallib::Cache;
+    use pmetal_runtime::metallib::Cache;
     use std::io::Read;
 
     if MLX_METALLIB_GZ.is_empty() {
@@ -1119,14 +1119,14 @@ fn extract_embedded_metallib(_sha256: &str) -> Option<PathBuf> {
 /// Point MLX at the `mlx.metallib` built with the MLX this binary links,
 /// before anything builds its Metal device.
 ///
-/// In order (`pmetal_bridge::metallib::locate`): `PMETAL_METALLIB_PATH`; the
+/// In order (`pmetal_runtime::metallib::locate`): `PMETAL_METALLIB_PATH`; the
 /// metallib cache's entry for the embedded copy; the file the build produced,
 /// while it exists; an `mlx.metallib` next to the executable, as the release
 /// tarball ships it. Failing those, the embedded copy is written into the
 /// cache. Each binary's copy is keyed by MLX revision and content hash, so
 /// installed pmetal versions don't overwrite each other's.
 fn ensure_metallib() {
-    use pmetal_bridge::metallib;
+    use pmetal_runtime::metallib;
 
     let colocated: Vec<PathBuf> = std::env::current_exe()
         .ok()
@@ -1143,7 +1143,7 @@ fn ensure_metallib() {
     match found {
         Some(path) => {
             tracing::debug!(path = %path.display(), "Using mlx.metallib");
-            pmetal_bridge::inline_array::set_metallib_path(&path.to_string_lossy());
+            pmetal_runtime::inline_array::set_metallib_path(&path.to_string_lossy());
         }
         None => eprintln!(
             "\x1b[1;33mwarning:\x1b[0m no mlx.metallib for this build's MLX ({revision}) was \
@@ -1177,7 +1177,7 @@ fn main() -> anyhow::Result<()> {
         ensure_metallib();
         // Load the library now: if MLX can't, the command would otherwise fail
         // later, possibly by aborting from a bridge call with no error guard.
-        pmetal_bridge::inline_array::init_device().map_err(|e| {
+        pmetal_runtime::inline_array::init_device().map_err(|e| {
             anyhow::anyhow!(
                 "MLX could not load its Metal library: {e}\n\
                  Remove that file, or set PMETAL_METALLIB_PATH to a working mlx.metallib."
@@ -2452,8 +2452,8 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 eval_batches,
                 seed,
             } = args;
-            use pmetal_bridge::compat::random;
             use pmetal_data::streaming::{StreamConfig, StreamingShardReader};
+            use pmetal_runtime::compat::random;
             use pmetal_trainer::pretrain::{self, PretrainConfig};
 
             random::seed(seed);
@@ -2478,7 +2478,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             };
 
             // Build model via factory (supports llama, qwen2, qwen3, gemma, gemma4, mistral, phi, gpt-oss)
-            use pmetal_bridge::compat::module::ModuleParameters;
+            use pmetal_runtime::compat::module::ModuleParameters;
             let config_path = _model_config.as_deref().map(std::path::Path::new);
             let mut model = pretrain::create_model(&arch, config_path)?;
             let n_layers = pretrain::n_layers(&model);
@@ -2517,11 +2517,12 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 eval_batches,
             };
 
-            let mut optimizer = pmetal_bridge::compat::optimizers::AdamWBuilder::new(learning_rate)
-                .weight_decay(weight_decay)
-                .betas((0.9, 0.95))
-                .eps(1e-8)
-                .build()?;
+            let mut optimizer =
+                pmetal_runtime::compat::optimizers::AdamWBuilder::new(learning_rate)
+                    .weight_decay(weight_decay)
+                    .betas((0.9, 0.95))
+                    .eps(1e-8)
+                    .build()?;
             let mut start_step = 0usize;
             let mut resume_position = None;
 
@@ -2561,7 +2562,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                     .iter()
                     .flat_map(|seq| seq.iter().map(|&t| t as i32))
                     .collect();
-                let array = pmetal_bridge::InlineArray::from_i32_slice_shaped(
+                let array = pmetal_runtime::InlineArray::from_i32_slice_shaped(
                     &flat,
                     &[batch.len() as i32, seq_len as i32],
                 );
@@ -2583,7 +2584,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                         .iter()
                         .flat_map(|seq| seq.iter().map(|&t| t as i32))
                         .collect();
-                    pmetal_bridge::InlineArray::from_i32_slice_shaped(
+                    pmetal_runtime::InlineArray::from_i32_slice_shaped(
                         &flat,
                         &[batch.len() as i32, seq_len as i32],
                     )

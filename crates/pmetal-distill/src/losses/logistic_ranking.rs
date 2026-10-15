@@ -9,7 +9,7 @@
 //! Provides smoother gradients than hinge for more stable training.
 
 use crate::Result;
-use pmetal_bridge::compat::{Array, Dtype, ops};
+use pmetal_runtime::compat::{Array, Dtype, ops};
 
 use super::DistillLoss;
 

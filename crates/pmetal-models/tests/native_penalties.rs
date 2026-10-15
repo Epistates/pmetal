@@ -18,11 +18,11 @@
 
 use std::path::PathBuf;
 
-use pmetal_bridge::decode::SamplingParams;
 use pmetal_models::DynamicModel;
 use pmetal_models::generation::{
     GenerationConfig, generate_cached, generate_cached_async_streaming,
 };
+use pmetal_runtime::decode::SamplingParams;
 
 const PROMPT: [u32; 6] = [3, 11, 7, 2, 9, 40];
 const NEW_TOKENS: usize = 24;
@@ -62,7 +62,7 @@ const NONE: Penalties = Penalties {
 };
 
 fn native(penalties: Penalties) -> Vec<u32> {
-    use pmetal_bridge::qwen3_native::{
+    use pmetal_runtime::qwen3_native::{
         NativeCache, generate, load_config, load_model, prefill_first_token,
     };
     let dir = checkpoint();
@@ -79,7 +79,7 @@ fn native(penalties: Penalties) -> Vec<u32> {
     let (rest, _) = generate(&weights, &mut cache, first, NEW_TOKENS - 1, sampler, |_| {
         true
     });
-    pmetal_bridge::check_unobserved_error().expect("native decode: no bridge op failed");
+    pmetal_runtime::check_unobserved_error().expect("native decode: no bridge op failed");
     std::iter::once(first).chain(rest).collect()
 }
 
@@ -104,7 +104,7 @@ fn dynamic(penalties: Penalties) -> Vec<u32> {
         &mut cache,
     )
     .expect("generate");
-    pmetal_bridge::check_unobserved_error().expect("dynamic decode: no bridge op failed");
+    pmetal_runtime::check_unobserved_error().expect("dynamic decode: no bridge op failed");
     out.token_ids[PROMPT.len()..].to_vec()
 }
 
@@ -122,7 +122,7 @@ fn dynamic_pipelined(penalties: Penalties) -> Vec<u32> {
         |_| true,
     )
     .expect("generate");
-    pmetal_bridge::check_unobserved_error().expect("pipelined decode: no bridge op failed");
+    pmetal_runtime::check_unobserved_error().expect("pipelined decode: no bridge op failed");
     out.token_ids[PROMPT.len()..].to_vec()
 }
 
@@ -133,7 +133,7 @@ fn cpu_hybrid(penalties: Penalties) -> Vec<u32> {
     let out =
         pmetal_models::generate_cached_hybrid_cpu(dir.path(), &PROMPT, &greedy_config(penalties))
             .expect("generate");
-    pmetal_bridge::check_unobserved_error().expect("CPU hybrid decode: no bridge op failed");
+    pmetal_runtime::check_unobserved_error().expect("CPU hybrid decode: no bridge op failed");
     out.token_ids[PROMPT.len()..].to_vec()
 }
 
@@ -222,6 +222,6 @@ fn seeded_sampling_matches_on_the_cpu_hybrid_engine() {
     let got = pmetal_models::generate_cached_hybrid_cpu(dir.path(), &PROMPT, &config)
         .expect("generate")
         .token_ids;
-    pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+    pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
     assert_eq!(got, want);
 }

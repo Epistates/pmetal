@@ -28,15 +28,15 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use pmetal_bridge::compat::nn::value_and_grad_explicit;
-use pmetal_bridge::compat::{Array, Dtype, Exception, eval, ops, random};
-use pmetal_bridge::decode::{draw_bits, draw_key};
-use pmetal_bridge::optimizer::{AdamW, ParamClass};
-use pmetal_bridge::training::per_token_cross_entropy_loss;
 use pmetal_lora::{AdaptedModel, PackedBase, QLoraConfig, QLoraScheme, quantize_base};
 #[cfg(doc)]
 use pmetal_models::architectures::diffusion_gemma::DiffusionGemmaForBlockDiffusion;
 use pmetal_models::dispatcher::DynamicModel;
+use pmetal_runtime::compat::nn::value_and_grad_explicit;
+use pmetal_runtime::compat::{Array, Dtype, Exception, eval, ops, random};
+use pmetal_runtime::decode::{draw_bits, draw_key};
+use pmetal_runtime::optimizer::{AdamW, ParamClass};
+use pmetal_runtime::training::per_token_cross_entropy_loss;
 use rand::{RngExt as _, SeedableRng, rngs::StdRng};
 
 /// Corrupt a clean canvas with the uniform-categorical forward kernel.
@@ -474,7 +474,7 @@ mod tests {
         let b = corrupt(43);
         assert_ne!(a.0, b.0, "another seed drew the same tokens");
         assert_ne!(a.1, b.1, "another seed kept the same positions");
-        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+        pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
     }
 
     /// Each step's noise is a function of the config's seed and the step:
@@ -511,7 +511,7 @@ mod tests {
         let other =
             DiffusionGemmaTrainer::new(DiffusionGemmaTrainConfig { seed: 8, ..config }, vocab);
         assert_ne!(noise(&other), a0, "seeds 7 and 8 drew the same noise");
-        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+        pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
     }
 
     #[test]
@@ -542,11 +542,11 @@ mod tests {
         );
     }
 
-    use pmetal_bridge::compat::ModuleParametersExt;
     use pmetal_core::LoraConfig;
     use pmetal_models::architectures::diffusion_gemma::{
         DiffusionGemmaForBlockDiffusion, DiffusionGemmaTextConfig,
     };
+    use pmetal_runtime::compat::ModuleParametersExt;
 
     fn lora_config() -> LoraConfig {
         LoraConfig {
@@ -653,7 +653,7 @@ mod tests {
             }
             last = stats.loss;
         }
-        pmetal_bridge::check_unobserved_error().expect("a bridge op threw");
+        pmetal_runtime::check_unobserved_error().expect("a bridge op threw");
         (first, last)
     }
 

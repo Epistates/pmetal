@@ -19,9 +19,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use pmetal_bridge::compat::{Array, Exception, Module, ModuleParametersExt, Param, nn, ops};
-use pmetal_bridge::impl_module_params;
 use pmetal_mlx::kv_cache::MambaCacheEntry;
+use pmetal_runtime::compat::{Array, Exception, Module, ModuleParametersExt, Param, nn, ops};
+use pmetal_runtime::impl_module_params;
 
 use super::granite::{GraniteConfig, GraniteForCausalLM};
 use super::nemotron_h::{ssm_attention, ssm_update_single};
@@ -316,8 +316,11 @@ impl GraniteMoe {
     ) -> Result<Self, Exception> {
         let bank = |shape: &[i32]| GraniteExpertBank {
             weight: Param::new(
-                pmetal_bridge::compat::random::normal(shape, pmetal_bridge::compat::Dtype::Float32)
-                    .multiply(&Array::from_f32(0.02)),
+                pmetal_runtime::compat::random::normal(
+                    shape,
+                    pmetal_runtime::compat::Dtype::Float32,
+                )
+                .multiply(&Array::from_f32(0.02)),
             ),
         };
         Ok(Self {

@@ -1,6 +1,6 @@
 //! Running a decoder layer under gradient checkpointing.
 //!
-//! The mechanism is [`pmetal_bridge::compat::checkpointed`], which is `unsafe`
+//! The mechanism is [`pmetal_runtime::compat::checkpointed`], which is `unsafe`
 //! for a specific reason: `mlx::core::checkpoint` re-invokes the forward
 //! function during the backward pass, so MLX keeps the closure (and everything
 //! it borrows) alive for as long as any array still references the graph. The
@@ -21,7 +21,7 @@
 // `pub(crate)` bound is what discharges it.
 #![allow(unsafe_code)]
 
-use pmetal_bridge::compat::{Array, Exception, ModuleParametersExt};
+use pmetal_runtime::compat::{Array, Exception, ModuleParametersExt};
 
 /// Run one decoder layer under gradient checkpointing.
 ///
@@ -63,7 +63,7 @@ where
     // SAFETY: `layer` is borrowed from the model running this forward pass, so
     // it outlives the graph being built. See the module docs.
     unsafe {
-        pmetal_bridge::compat::checkpointed(layer, &inputs, move |layer, inputs| {
+        pmetal_runtime::compat::checkpointed(layer, &inputs, move |layer, inputs| {
             forward(
                 layer,
                 &inputs[0],

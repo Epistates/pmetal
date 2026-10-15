@@ -1,15 +1,15 @@
-//! Native inference — all models through the pmetal-bridge native engines.
+//! Native inference — all models through the pmetal-runtime native engines.
 //!
 //! Each architecture has its own `run_{arch}` function that owns the full
 //! pipeline: load config → load weights → prefill → decode.  The module is
 //! intentionally self-contained; the only external dependencies are
-//! `pmetal_bridge` and `serde_json`.
+//! `pmetal_runtime` and `serde_json`.
 
 use std::path::Path;
 
-use pmetal_bridge::turboquant::TurboQuantConfig;
+use pmetal_runtime::turboquant::TurboQuantConfig;
 
-pub(crate) fn ensure_native_bridge_metal_available() -> Result<(), String> {
+pub(crate) fn ensure_native_runtime_metal_available() -> Result<(), String> {
     if pmetal_metal::context::MetalContext::device_available() {
         Ok(())
     } else {
@@ -63,7 +63,7 @@ impl NativeArch {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NativeBridgeInfo {
+pub struct NativeRuntimeInfo {
     pub arch: NativeArch,
     pub num_layers: usize,
     pub num_kv_heads: usize,
@@ -115,15 +115,15 @@ pub fn detect_arch(model_path: &Path) -> Option<NativeArch> {
     }
 }
 
-pub fn load_native_bridge_info(model_path: &Path) -> Result<Option<NativeBridgeInfo>, String> {
+pub fn load_native_runtime_info(model_path: &Path) -> Result<Option<NativeRuntimeInfo>, String> {
     let Some(arch) = detect_arch(model_path) else {
         return Ok(None);
     };
 
     let info = match arch {
         NativeArch::Qwen3 | NativeArch::Qwen3_5 => {
-            let config = pmetal_bridge::qwen3_native::load_config(model_path)?;
-            NativeBridgeInfo {
+            let config = pmetal_runtime::qwen3_native::load_config(model_path)?;
+            NativeRuntimeInfo {
                 arch,
                 num_layers: config.num_hidden_layers as usize,
                 num_kv_heads: config.get_num_kv_heads() as usize,
@@ -133,8 +133,8 @@ pub fn load_native_bridge_info(model_path: &Path) -> Result<Option<NativeBridgeI
             }
         }
         NativeArch::Llama4 => {
-            let config = pmetal_bridge::llama4_native::load_config(model_path)?;
-            NativeBridgeInfo {
+            let config = pmetal_runtime::llama4_native::load_config(model_path)?;
+            NativeRuntimeInfo {
                 arch,
                 num_layers: config.text().num_hidden_layers as usize,
                 num_kv_heads: config.num_kv_heads() as usize,
@@ -144,8 +144,8 @@ pub fn load_native_bridge_info(model_path: &Path) -> Result<Option<NativeBridgeI
             }
         }
         NativeArch::DeepSeek => {
-            let config = pmetal_bridge::deepseek_native::load_config(model_path)?;
-            NativeBridgeInfo {
+            let config = pmetal_runtime::deepseek_native::load_config(model_path)?;
+            NativeRuntimeInfo {
                 arch,
                 num_layers: config.num_hidden_layers as usize,
                 num_kv_heads: config.num_attention_heads as usize,
@@ -155,8 +155,8 @@ pub fn load_native_bridge_info(model_path: &Path) -> Result<Option<NativeBridgeI
             }
         }
         NativeArch::GptOss => {
-            let config = pmetal_bridge::gpt_oss_native::load_config(model_path)?;
-            NativeBridgeInfo {
+            let config = pmetal_runtime::gpt_oss_native::load_config(model_path)?;
+            NativeRuntimeInfo {
                 arch,
                 num_layers: config.num_hidden_layers as usize,
                 num_kv_heads: config.num_key_value_heads as usize,
@@ -167,7 +167,7 @@ pub fn load_native_bridge_info(model_path: &Path) -> Result<Option<NativeBridgeI
             }
         }
         NativeArch::Gemma4 => {
-            let config = pmetal_bridge::gemma4_native::load_config(model_path)?;
+            let config = pmetal_runtime::gemma4_native::load_config(model_path)?;
             // Use the full-attention KV-head count since it's the smaller of
             // the two per-layer-type dimensions — callers only use this to
             // estimate KV-cache memory budgets.
@@ -175,7 +175,7 @@ pub fn load_native_bridge_info(model_path: &Path) -> Result<Option<NativeBridgeI
                 .num_global_key_value_heads
                 .unwrap_or(config.num_key_value_heads);
             let head_dim_full = config.global_head_dim.unwrap_or(config.head_dim);
-            NativeBridgeInfo {
+            NativeRuntimeInfo {
                 arch,
                 num_layers: config.num_hidden_layers as usize,
                 num_kv_heads: n_kv_full.max(config.num_key_value_heads) as usize,
@@ -191,7 +191,7 @@ pub fn load_native_bridge_info(model_path: &Path) -> Result<Option<NativeBridgeI
 
 #[cfg(test)]
 mod tests {
-    use super::{NativeArch, detect_arch, load_native_bridge_info};
+    use super::{NativeArch, detect_arch, load_native_runtime_info};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -314,7 +314,7 @@ mod tests {
                 }
             }"#,
         );
-        let info = load_native_bridge_info(&dir).unwrap().unwrap();
+        let info = load_native_runtime_info(&dir).unwrap().unwrap();
         assert_eq!(info.arch, NativeArch::Qwen3_5);
         assert_eq!(info.num_layers, 28);
         assert_eq!(info.num_kv_heads, 2);
@@ -341,7 +341,7 @@ mod tests {
                 }
             }"#,
         );
-        let info = load_native_bridge_info(&dir).unwrap().unwrap();
+        let info = load_native_runtime_info(&dir).unwrap().unwrap();
         assert_eq!(info.arch, NativeArch::Qwen3_5);
         assert_eq!(info.num_layers, 40);
         assert_eq!(info.num_kv_heads, 2);
@@ -368,7 +368,7 @@ mod tests {
                 "intermediate_size":2880
             }"#,
         );
-        let info = load_native_bridge_info(&dir).unwrap().unwrap();
+        let info = load_native_runtime_info(&dir).unwrap().unwrap();
         assert_eq!(info.arch, NativeArch::GptOss);
         // Its attention sinks have no place in TurboQuant's kernels.
         assert!(!info.supports_turboquant);
@@ -396,7 +396,7 @@ mod tests {
                 "use_qk_norm":true
             }"#,
         );
-        let info = load_native_bridge_info(&dir).unwrap().unwrap();
+        let info = load_native_runtime_info(&dir).unwrap().unwrap();
         assert_eq!(info.arch, NativeArch::Llama4);
         assert!(info.supports_turboquant);
         let _ = fs::remove_dir_all(dir);
@@ -418,7 +418,7 @@ mod tests {
                 "qk_nope_head_dim":128
             }"#,
         );
-        let info = load_native_bridge_info(&dir).unwrap().unwrap();
+        let info = load_native_runtime_info(&dir).unwrap().unwrap();
         assert_eq!(info.arch, NativeArch::DeepSeek);
         assert_eq!(info.num_layers, 61);
         assert_eq!(info.num_kv_heads, 128);
@@ -446,7 +446,7 @@ pub struct NativeGenerationOutput {
     pub stopped_by_length: bool,
     /// Decode throughput metrics from the bridge generate loop.
     /// `None` when fewer than 20 decode steps were measured.
-    pub decode_metrics: Option<pmetal_bridge::decode::DecodeMetrics>,
+    pub decode_metrics: Option<pmetal_runtime::decode::DecodeMetrics>,
 }
 
 #[derive(Debug, Clone)]
@@ -478,7 +478,7 @@ pub fn run_native_inference(
         model_path,
         input_ids,
         max_tokens,
-        pmetal_bridge::decode::SamplingParams::new(temperature),
+        pmetal_runtime::decode::SamplingParams::new(temperature),
         turboquant,
         None,
         &mut on_token,
@@ -490,15 +490,15 @@ pub fn run_native_inference_ext(
     model_path: &Path,
     input_ids: &[u32],
     max_tokens: usize,
-    params: pmetal_bridge::decode::SamplingParams,
+    params: pmetal_runtime::decode::SamplingParams,
     turboquant: Option<TurboQuantConfig>,
-    quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
+    quant_config: Option<pmetal_runtime::qwen3_native::QuantCacheConfig>,
     mut on_token: impl FnMut(u32) -> bool,
 ) -> Result<NativeGenerationOutput, String> {
     let arch = detect_arch(model_path)
         .ok_or_else(|| "unsupported architecture for native inference".to_string())?;
 
-    ensure_native_bridge_metal_available()?;
+    ensure_native_runtime_metal_available()?;
 
     if turboquant.is_some() && !arch.supports_turboquant() {
         return Err(format!(
@@ -516,7 +516,7 @@ pub fn run_native_inference_ext(
             turboquant,
             quant_config,
             &mut on_token,
-            pmetal_bridge::qwen3_native::prefill_first_token,
+            pmetal_runtime::qwen3_native::prefill_first_token,
         ),
         NativeArch::Llama4 => run_llama4(
             model_path,
@@ -562,18 +562,18 @@ pub fn run_native_multimodal_inference_ext(
     images: &[pmetal_data::qwen_vl_processing::ProcessedMedia],
     videos: &[pmetal_data::qwen_vl_processing::ProcessedMedia],
     max_tokens: usize,
-    params: pmetal_bridge::decode::SamplingParams,
+    params: pmetal_runtime::decode::SamplingParams,
     turboquant: Option<TurboQuantConfig>,
-    quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
+    quant_config: Option<pmetal_runtime::qwen3_native::QuantCacheConfig>,
     mut on_token: impl FnMut(u32) -> bool,
 ) -> Result<NativeGenerationOutput, String> {
-    use pmetal_bridge::qwen3_native;
     use pmetal_models::architectures::qwen3_5_vision::Qwen3_5Vision;
+    use pmetal_runtime::qwen3_native;
 
     if detect_arch(model_path) != Some(NativeArch::Qwen3_5) {
         return Err("images need a Qwen3.5-family model".into());
     }
-    ensure_native_bridge_metal_available()?;
+    ensure_native_runtime_metal_available()?;
     let started = std::time::Instant::now();
     let vision = Qwen3_5Vision::load(model_path).map_err(|e| e.to_string())?;
     let encoded = vision
@@ -601,7 +601,7 @@ pub fn run_native_multimodal_inference_ext(
         move |weights, cache, ids, params| {
             // One pass: the merged embeddings and their 3-D positions cover the
             // whole prompt, so it is not split into chunks.
-            pmetal_bridge::decode::prefill_first_token_chunked(
+            pmetal_runtime::decode::prefill_first_token_chunked(
                 weights,
                 cache,
                 ids,
@@ -636,7 +636,7 @@ fn finish_with_bridge_generate(
     on_token: &mut dyn FnMut(u32) -> bool,
     generate_tail: impl FnOnce(
         &mut dyn FnMut(u32) -> bool,
-    ) -> (Vec<u32>, Option<pmetal_bridge::decode::DecodeMetrics>),
+    ) -> (Vec<u32>, Option<pmetal_runtime::decode::DecodeMetrics>),
 ) -> NativeGenerationOutput {
     let prompt_len = prompt.len();
     let mut all_tokens = prompt.to_vec();
@@ -672,7 +672,7 @@ fn run_bridge_inference<Config, Weights, Cache>(
     model_path: &Path,
     input_ids: &[u32],
     max_tokens: usize,
-    params: pmetal_bridge::decode::SamplingParams,
+    params: pmetal_runtime::decode::SamplingParams,
     on_token: &mut dyn FnMut(u32) -> bool,
     load_config: impl Fn(&Path) -> Result<Config, String>,
     describe_config: impl Fn(&Config) -> String,
@@ -682,17 +682,17 @@ fn run_bridge_inference<Config, Weights, Cache>(
         &Weights,
         &mut Cache,
         &[u32],
-        pmetal_bridge::decode::SamplingParams,
-    ) -> (u32, pmetal_bridge::decode::DecodeSampler),
+        pmetal_runtime::decode::SamplingParams,
+    ) -> (u32, pmetal_runtime::decode::DecodeSampler),
     generate: impl Fn(
         &Weights,
         &Config,
         &mut Cache,
         u32,
         usize,
-        pmetal_bridge::decode::DecodeSampler,
+        pmetal_runtime::decode::DecodeSampler,
         &mut dyn FnMut(u32) -> bool,
-    ) -> (Vec<u32>, Option<pmetal_bridge::decode::DecodeMetrics>),
+    ) -> (Vec<u32>, Option<pmetal_runtime::decode::DecodeMetrics>),
 ) -> Result<NativeGenerationOutput, String> {
     let config = load_config(model_path)?;
     tracing::debug!("{}", describe_config(&config));
@@ -703,7 +703,7 @@ fn run_bridge_inference<Config, Weights, Cache>(
         elapsed_s = format!("{:.1}", t0.elapsed().as_secs_f64()),
         active_mb = format!(
             "{:.0}",
-            pmetal_bridge::inline_array::get_active_memory() as f64 / 1e6
+            pmetal_runtime::inline_array::get_active_memory() as f64 / 1e6
         ),
         "Model loaded",
     );
@@ -731,7 +731,7 @@ fn run_bridge_inference<Config, Weights, Cache>(
 }
 
 fn trial_metrics(
-    trial: pmetal_bridge::decode::BenchmarkTrial,
+    trial: pmetal_runtime::decode::BenchmarkTrial,
     prompt_tokens: usize,
     generation_tokens: usize,
 ) -> BenchmarkTrialMetrics {
@@ -746,7 +746,7 @@ fn run_benchmark_trials(
     prompt_tokens: usize,
     generation_tokens: usize,
     num_trials: usize,
-    mut run_once: impl FnMut() -> pmetal_bridge::decode::BenchmarkTrial,
+    mut run_once: impl FnMut() -> pmetal_runtime::decode::BenchmarkTrial,
 ) -> Vec<BenchmarkTrialMetrics> {
     let _warmup = run_once();
 
@@ -766,18 +766,18 @@ fn run_qwen3(
     model_path: &Path,
     input_ids: &[u32],
     max_tokens: usize,
-    params: pmetal_bridge::decode::SamplingParams,
+    params: pmetal_runtime::decode::SamplingParams,
     turboquant: Option<TurboQuantConfig>,
-    quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
+    quant_config: Option<pmetal_runtime::qwen3_native::QuantCacheConfig>,
     on_token: &mut dyn FnMut(u32) -> bool,
     prefill_first_token: impl Fn(
-        &pmetal_bridge::qwen3_native::NativeWeights,
-        &mut pmetal_bridge::qwen3_native::NativeCache,
+        &pmetal_runtime::qwen3_native::NativeWeights,
+        &mut pmetal_runtime::qwen3_native::NativeCache,
         &[u32],
-        pmetal_bridge::decode::SamplingParams,
-    ) -> (u32, pmetal_bridge::decode::DecodeSampler),
+        pmetal_runtime::decode::SamplingParams,
+    ) -> (u32, pmetal_runtime::decode::DecodeSampler),
 ) -> Result<NativeGenerationOutput, String> {
-    use pmetal_bridge::qwen3_native;
+    use pmetal_runtime::qwen3_native;
 
     run_bridge_inference(
         model_path,
@@ -831,15 +831,15 @@ fn run_qwen3(
 }
 
 fn build_qwen3_cache_with_quant(
-    weights: &pmetal_bridge::qwen3_native::NativeWeights,
+    weights: &pmetal_runtime::qwen3_native::NativeWeights,
     turboquant: Option<TurboQuantConfig>,
-    quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
-) -> pmetal_bridge::qwen3_native::NativeCache {
+    quant_config: Option<pmetal_runtime::qwen3_native::QuantCacheConfig>,
+) -> pmetal_runtime::qwen3_native::NativeCache {
     let mut cache = match turboquant {
         Some(config) => {
-            pmetal_bridge::qwen3_native::NativeCache::new_with_turboquant(weights, Some(config))
+            pmetal_runtime::qwen3_native::NativeCache::new_with_turboquant(weights, Some(config))
         }
-        None => pmetal_bridge::qwen3_native::NativeCache::new_empty(weights),
+        None => pmetal_runtime::qwen3_native::NativeCache::new_empty(weights),
     };
     // Apply zero-overhead affine quantization config to all KV layers
     if let Some(qcfg) = quant_config {
@@ -858,10 +858,10 @@ fn run_gemma4(
     model_path: &Path,
     input_ids: &[u32],
     max_tokens: usize,
-    params: pmetal_bridge::decode::SamplingParams,
+    params: pmetal_runtime::decode::SamplingParams,
     on_token: &mut dyn FnMut(u32) -> bool,
 ) -> Result<NativeGenerationOutput, String> {
-    use pmetal_bridge::gemma4_native;
+    use pmetal_runtime::gemma4_native;
 
     run_bridge_inference(
         model_path,
@@ -900,7 +900,7 @@ pub fn benchmark_native(
     turboquant: Option<TurboQuantConfig>,
     num_trials: usize,
 ) -> Result<Vec<BenchmarkTrialMetrics>, String> {
-    use pmetal_bridge::qwen3_native;
+    use pmetal_runtime::qwen3_native;
 
     if prompt_ids.is_empty() {
         return Err("Inference benchmark requires prompt_tokens > 0".to_string());
@@ -909,7 +909,7 @@ pub fn benchmark_native(
         return Err("Inference benchmark requires generation_tokens > 0".to_string());
     }
 
-    ensure_native_bridge_metal_available()?;
+    ensure_native_runtime_metal_available()?;
 
     let arch = detect_arch(model_path)
         .ok_or_else(|| "unsupported architecture for native inference".to_string())?;
@@ -939,7 +939,7 @@ pub fn benchmark_native(
                 })
             }
             NativeArch::Llama4 => {
-                use pmetal_bridge::llama4_native;
+                use pmetal_runtime::llama4_native;
                 let config = llama4_native::load_config(model_path)?;
                 let weights = llama4_native::load_model(model_path, &config)?;
                 run_benchmark_trials(prompt_ids.len(), generation_tokens, num_trials, || {
@@ -947,7 +947,7 @@ pub fn benchmark_native(
                 })
             }
             NativeArch::DeepSeek => {
-                use pmetal_bridge::deepseek_native;
+                use pmetal_runtime::deepseek_native;
                 let config = deepseek_native::load_config(model_path)?;
                 let weights = deepseek_native::load_model(model_path, &config)?;
                 run_benchmark_trials(prompt_ids.len(), generation_tokens, num_trials, || {
@@ -955,7 +955,7 @@ pub fn benchmark_native(
                 })
             }
             NativeArch::GptOss => {
-                use pmetal_bridge::gpt_oss_native;
+                use pmetal_runtime::gpt_oss_native;
                 let config = gpt_oss_native::load_config(model_path)?;
                 let weights = gpt_oss_native::load_model(model_path, &config)?;
                 run_benchmark_trials(prompt_ids.len(), generation_tokens, num_trials, || {
@@ -968,8 +968,8 @@ pub fn benchmark_native(
         }
     };
 
-    pmetal_bridge::inline_array::synchronize();
-    pmetal_bridge::inline_array::clear_cache();
+    pmetal_runtime::inline_array::synchronize();
+    pmetal_runtime::inline_array::clear_cache();
 
     Ok(trials)
 }
@@ -982,12 +982,12 @@ fn run_llama4(
     model_path: &Path,
     input_ids: &[u32],
     max_tokens: usize,
-    params: pmetal_bridge::decode::SamplingParams,
+    params: pmetal_runtime::decode::SamplingParams,
     turboquant: Option<TurboQuantConfig>,
-    quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
+    quant_config: Option<pmetal_runtime::qwen3_native::QuantCacheConfig>,
     on_token: &mut dyn FnMut(u32) -> bool,
 ) -> Result<NativeGenerationOutput, String> {
-    use pmetal_bridge::llama4_native;
+    use pmetal_runtime::llama4_native;
 
     run_bridge_inference(
         model_path,
@@ -1013,11 +1013,11 @@ fn run_llama4(
 }
 
 fn build_llama4_cache(
-    weights: &pmetal_bridge::llama4_native::NativeWeights,
+    weights: &pmetal_runtime::llama4_native::NativeWeights,
     turboquant: Option<TurboQuantConfig>,
-    quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
-) -> pmetal_bridge::llama4_native::NativeCache {
-    use pmetal_bridge::llama4_native;
+    quant_config: Option<pmetal_runtime::qwen3_native::QuantCacheConfig>,
+) -> pmetal_runtime::llama4_native::NativeCache {
+    use pmetal_runtime::llama4_native;
     let mut cache = match turboquant {
         Some(cfg) => llama4_native::NativeCache::new_with_turboquant(weights, Some(cfg)),
         None => llama4_native::NativeCache::new_empty(weights),
@@ -1038,11 +1038,11 @@ fn run_deepseek(
     model_path: &Path,
     input_ids: &[u32],
     max_tokens: usize,
-    params: pmetal_bridge::decode::SamplingParams,
-    quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
+    params: pmetal_runtime::decode::SamplingParams,
+    quant_config: Option<pmetal_runtime::qwen3_native::QuantCacheConfig>,
     on_token: &mut dyn FnMut(u32) -> bool,
 ) -> Result<NativeGenerationOutput, String> {
-    use pmetal_bridge::deepseek_native;
+    use pmetal_runtime::deepseek_native;
 
     run_bridge_inference(
         model_path,
@@ -1077,11 +1077,11 @@ fn run_gpt_oss(
     model_path: &Path,
     input_ids: &[u32],
     max_tokens: usize,
-    params: pmetal_bridge::decode::SamplingParams,
-    quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
+    params: pmetal_runtime::decode::SamplingParams,
+    quant_config: Option<pmetal_runtime::qwen3_native::QuantCacheConfig>,
     on_token: &mut dyn FnMut(u32) -> bool,
 ) -> Result<NativeGenerationOutput, String> {
-    use pmetal_bridge::gpt_oss_native;
+    use pmetal_runtime::gpt_oss_native;
 
     run_bridge_inference(
         model_path,

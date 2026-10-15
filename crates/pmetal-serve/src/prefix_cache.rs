@@ -103,7 +103,7 @@ impl ServePrefixCache {
         &mut self,
         incoming: &[u32],
         kv_config: KVCacheConfig,
-    ) -> Result<Option<PrefixHit>, pmetal_bridge::compat::Exception> {
+    ) -> Result<Option<PrefixHit>, pmetal_runtime::compat::Exception> {
         // Scan everything — the cache is small (typically <=32 entries)
         // so O(n * prefix_len) is fine.
         let mut best: Option<(usize, usize)> = None; // (index, prefix_len)
@@ -133,7 +133,7 @@ impl ServePrefixCache {
                 self.entries[idx].last_used = now;
                 let restored = self.entries[idx].cache.fork();
                 if restored.config() != &kv_config {
-                    return Err(pmetal_bridge::compat::Exception::custom(
+                    return Err(pmetal_runtime::compat::Exception::custom(
                         "prefix-cache hit had a mismatched KVCacheConfig",
                     ));
                 }
@@ -281,7 +281,7 @@ mod tests {
     use super::*;
 
     fn make_cache_with_len(seq_len: usize) -> (KVCache, KVCacheConfig) {
-        use pmetal_bridge::compat::Array;
+        use pmetal_runtime::compat::Array;
         let cfg = KVCacheConfig::new(2, 128, 4, 64);
         let mut cache = KVCache::new(cfg.clone());
         if seq_len > 0 {
@@ -425,7 +425,7 @@ mod tests {
 
     #[test]
     fn restored_fork_can_diverge_without_mutating_cached_prefix() {
-        use pmetal_bridge::compat::Array;
+        use pmetal_runtime::compat::Array;
 
         let mut pc = ServePrefixCache::new(8, 0);
         let (cache, cfg) = make_cache_with_len(2);
@@ -454,8 +454,8 @@ mod tests {
         // TurboQuant state lives in compressed per-layer stores. Serving
         // prefix cache must preserve that state with KVCache::fork() instead
         // of falling back to a dense snapshot.
-        use pmetal_bridge::compat::Array;
         use pmetal_mlx::kv_cache::{CacheMode, TurboQuantConfig};
+        use pmetal_runtime::compat::Array;
 
         let cfg = KVCacheConfig::new(2, 128, 4, 64).with_mode(CacheMode::TurboQuant {
             // Disable the hot window — we want eager compression so the test

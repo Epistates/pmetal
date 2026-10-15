@@ -33,8 +33,8 @@
 
 use std::collections::HashMap;
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, Param, nn, ops};
-use pmetal_bridge::impl_module_params;
+use pmetal_runtime::compat::{Array, Dtype, Exception, Param, nn, ops};
+use pmetal_runtime::impl_module_params;
 use serde::{Deserialize, Serialize};
 
 use super::gemma4::{Gemma4RmsNorm, LoadReport, rms_norm_noscale};
@@ -905,7 +905,7 @@ mod tests {
         let grid = 4; // 16 patches → k²=4 → output_length = 4
         let n = grid * grid;
         let patch_dim = 3 * config.patch_size * config.patch_size;
-        let pixel_values = pmetal_bridge::compat::random::uniform_f32(&[1, n, patch_dim]);
+        let pixel_values = pmetal_runtime::compat::random::uniform_f32(&[1, n, patch_dim]);
         let position_ids = grid_positions(grid);
 
         let out = model.forward(&pixel_values, &position_ids).unwrap();

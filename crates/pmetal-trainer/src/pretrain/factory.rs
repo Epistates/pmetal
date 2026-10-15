@@ -4,11 +4,11 @@
 
 use std::path::Path;
 
-use pmetal_bridge::compat::{
+use pmetal_models::architectures;
+use pmetal_runtime::compat::{
     Array, Exception,
     module::{ModuleParamMut, ModuleParamRef, ModuleParameters},
 };
-use pmetal_models::architectures;
 
 use super::CausalLm;
 

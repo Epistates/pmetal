@@ -38,7 +38,7 @@ use std::sync::Mutex;
 use super::MergeMethod;
 use crate::loader::SafetensorsLoader;
 use crate::{MergeError, MergeParameters, Result, TensorLoader};
-use pmetal_bridge::compat::{Array, ops};
+use pmetal_runtime::compat::{Array, ops};
 
 /// Fisher-weighted average merge.
 pub struct FisherMerge {

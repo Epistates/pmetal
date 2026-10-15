@@ -17,8 +17,8 @@
 mod common;
 
 use common::{fixture_path, load_shard, ref_tensor};
-use pmetal_bridge::compat::{Array, ops};
 use pmetal_mlx::test_utils::{ParityReport, Tolerance, print_report_table};
+use pmetal_runtime::compat::{Array, ops};
 
 use pmetal_models::architectures::gemma4_vision::{
     Gemma4VisionConfig, Gemma4VisionModel, load_gemma4_vision_weights,

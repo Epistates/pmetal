@@ -21,8 +21,6 @@
 //! attention layers, a bundled `mtp.*` predictor), on both the dynamic model
 //! and the native engine. Gemma 4 runs on a tiny random target and assistant.
 
-use pmetal_bridge::compat::{Array, Exception, ops::concatenate_axis, random};
-use pmetal_bridge::decode::{greedy_token, last_token_hidden, last_token_logits};
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig, MambaCache};
 use pmetal_mlx::test_utils::max_abs_diff;
 use pmetal_models::architectures::{
@@ -35,6 +33,8 @@ use pmetal_models::{
     DynamicModel, Gemma4MtpDrafter, Gemma4MtpVerifier, NativeQwen3MtpVerifier, Qwen3NextMtpDrafter,
     Qwen3NextMtpVerifier,
 };
+use pmetal_runtime::compat::{Array, Exception, ops::concatenate_axis, random};
+use pmetal_runtime::decode::{greedy_token, last_token_hidden, last_token_logits};
 use serial_test::serial;
 
 const NEW_TOKENS: usize = 24;
@@ -45,7 +45,7 @@ const PROMPT: [u32; 5] = [3, 17, 42, 8, 61];
 const HIDDEN_TOL: f32 = 1e-3;
 
 fn drain(what: &str) {
-    pmetal_bridge::check_unobserved_error().unwrap_or_else(|e| panic!("{what}: {e}"));
+    pmetal_runtime::check_unobserved_error().unwrap_or_else(|e| panic!("{what}: {e}"));
 }
 
 /// Greedy decoding with no penalties: the bare argmax.
@@ -336,7 +336,7 @@ impl FromScratchQwenHead {
         let (hidden, _) = from_scratch(&mut self.caches.verifier(&mut self.target), committed);
         let mut tokens = committed[1..].to_vec();
         tokens.push(pending);
-        let input = pmetal_bridge::decode::prompt_tokens_to_input(&tokens);
+        let input = pmetal_runtime::decode::prompt_tokens_to_input(&tokens);
         let (_, logits) = self
             .mtp
             .forward_logits(&input, &hidden, None, None, 0)
@@ -756,7 +756,7 @@ impl CheckedGemmaHead<'_> {
             sliding_attention: self.reference_cache.get(0),
             full_attention: self.reference_cache.get(1),
         };
-        let input = pmetal_bridge::decode::prompt_tokens_to_input(&[pending]);
+        let input = pmetal_runtime::decode::prompt_tokens_to_input(&[pending]);
         let embedding = self
             .reference_model
             .model

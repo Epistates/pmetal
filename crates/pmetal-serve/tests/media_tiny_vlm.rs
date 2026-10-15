@@ -24,12 +24,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use base64::Engine as _;
-use pmetal_bridge::compat::{Array, Module};
 use pmetal_data::qwen_vl_processing::{QwenVlProcessor, RgbImage, VideoFrames};
 use pmetal_models::DynamicModel;
 use pmetal_models::architectures::qwen3_5_vision::{
     Qwen3_5MultimodalConfig, Qwen3_5VisionModel, merge_media_features, rope_index,
 };
+use pmetal_runtime::compat::{Array, Module};
 use pmetal_serve::engine::{SamplingParams, TokenEvent};
 use pmetal_serve::{BatcherConfig, InferenceEngine, PreparedPrompt};
 use serde_json::{Value, json};
@@ -201,7 +201,7 @@ fn greedy(max_tokens: usize) -> SamplingParams {
 }
 
 fn drain(op: &str) {
-    pmetal_bridge::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
+    pmetal_runtime::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
 }
 
 /// Greedy decoding with no cache at all: at every step the whole sequence,
@@ -261,7 +261,7 @@ fn recompute_greedy(
         let (_, logits) = qwen
             .forward_embeddings(&embeddings, &positions.array(), None, None)
             .unwrap();
-        let last = pmetal_bridge::compat::ops::slice_axis(
+        let last = pmetal_runtime::compat::ops::slice_axis(
             &logits,
             1,
             ids.len() as i32 - 1,

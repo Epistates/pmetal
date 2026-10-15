@@ -8,8 +8,8 @@
 //! - No bias in attention projections
 //! - Per-layer sliding window configuration via `layer_types`
 
-use pmetal_bridge::compat::{Array, Exception, Module, ModuleParametersExt, Param, nn};
-use pmetal_bridge::impl_module_params;
+use pmetal_runtime::compat::{Array, Exception, Module, ModuleParametersExt, Param, nn};
+use pmetal_runtime::impl_module_params;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -17,12 +17,12 @@ use serde::{Deserialize, Serialize};
 use crate::checkpointing::checkpointed_layer;
 use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
 use crate::traits::ModelConfig;
-use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     rope::{RopePositions, rope_embedding},
 };
 use pmetal_mlx::kv_cache::KVCache;
+use pmetal_runtime::rope::{RopeConfig, RotaryEmbedding};
 
 fn zero_linear(out_dims: i32, in_dims: i32, bias: bool) -> nn::Linear {
     nn::Linear {
@@ -106,7 +106,7 @@ pub struct Qwen3Config {
     #[serde(default = "default_hidden_act")]
     pub hidden_act: String,
     /// RoPE scaling (YaRN, `factor` 4 over 32768, on the Qwen3 card), read
-    /// by [`pmetal_bridge::rope`].
+    /// by [`pmetal_runtime::rope`].
     #[serde(default)]
     pub rope_scaling: Option<serde_json::Value>,
     /// transformers v5's spelling of the same, with `rope_theta` inside.
@@ -1012,13 +1012,13 @@ impl crate::traits::CausalLMModel for Qwen3ForCausalLM {
         for (name, weight) in weights {
             if name == "model.embed_tokens.weight" {
                 self.model.embed_tokens.weight =
-                    pmetal_bridge::compat::module::Param::new(weight.clone());
+                    pmetal_runtime::compat::module::Param::new(weight.clone());
             } else if name == "lm_head.weight" {
                 if let Some(ref mut lm_head) = self.lm_head {
-                    lm_head.weight = pmetal_bridge::compat::module::Param::new(weight.clone());
+                    lm_head.weight = pmetal_runtime::compat::module::Param::new(weight.clone());
                 }
             } else if name == "model.norm.weight" {
-                self.model.norm.weight = pmetal_bridge::compat::module::Param::new(weight.clone());
+                self.model.norm.weight = pmetal_runtime::compat::module::Param::new(weight.clone());
             } else if name.starts_with("model.layers.") {
                 let parts: Vec<&str> = name.split('.').collect();
                 let i: usize = parts[2].parse().map_err(|_| {
@@ -1032,47 +1032,47 @@ impl crate::traits::CausalLMModel for Qwen3ForCausalLM {
                 match suffix.as_str() {
                     "input_layernorm.weight" => {
                         layer.input_layernorm.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone())
+                            pmetal_runtime::compat::module::Param::new(weight.clone())
                     }
                     "post_attention_layernorm.weight" => {
                         layer.post_attention_layernorm.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone())
+                            pmetal_runtime::compat::module::Param::new(weight.clone())
                     }
                     "self_attn.q_proj.weight" => {
                         layer.self_attn.q_proj.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone())
+                            pmetal_runtime::compat::module::Param::new(weight.clone())
                     }
                     "self_attn.k_proj.weight" => {
                         layer.self_attn.k_proj.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone())
+                            pmetal_runtime::compat::module::Param::new(weight.clone())
                     }
                     "self_attn.v_proj.weight" => {
                         layer.self_attn.v_proj.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone())
+                            pmetal_runtime::compat::module::Param::new(weight.clone())
                     }
                     "self_attn.o_proj.weight" => {
                         layer.self_attn.o_proj.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone())
+                            pmetal_runtime::compat::module::Param::new(weight.clone())
                     }
                     "self_attn.q_norm.weight" => {
                         layer.self_attn.q_norm.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone())
+                            pmetal_runtime::compat::module::Param::new(weight.clone())
                     }
                     "self_attn.k_norm.weight" => {
                         layer.self_attn.k_norm.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone())
+                            pmetal_runtime::compat::module::Param::new(weight.clone())
                     }
                     "mlp.gate_proj.weight" => {
                         layer.mlp.gate_proj.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone())
+                            pmetal_runtime::compat::module::Param::new(weight.clone())
                     }
                     "mlp.up_proj.weight" => {
                         layer.mlp.up_proj.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone())
+                            pmetal_runtime::compat::module::Param::new(weight.clone())
                     }
                     "mlp.down_proj.weight" => {
                         layer.mlp.down_proj.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone())
+                            pmetal_runtime::compat::module::Param::new(weight.clone())
                     }
                     _ => {}
                 }
@@ -1171,9 +1171,9 @@ mod tests {
         let config = tiny_config();
         let mut mlp = Qwen3MLP::new(&config).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 4, 32],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let output = Module::forward(&mut mlp, x).unwrap();
 
@@ -1186,9 +1186,9 @@ mod tests {
         let config = tiny_config();
         let mut attn = Qwen3Attention::new(&config, false).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 4, 32],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let output = attn.forward(&x, None, None, None).unwrap();
 
@@ -1201,9 +1201,9 @@ mod tests {
         let config = tiny_config();
         let mut layer = Qwen3Layer::new(&config, false).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 4, 32],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let output = layer.forward(&x, None, None, None).unwrap();
 

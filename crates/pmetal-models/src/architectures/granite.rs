@@ -20,8 +20,8 @@
 //! the four families that sets something this does not compute is refused by
 //! [`GraniteConfig::validate`].
 
-use pmetal_bridge::compat::{Array, Exception, Module, ModuleParameters, ModuleParametersExt, nn};
-use pmetal_bridge::impl_module_params;
+use pmetal_runtime::compat::{Array, Exception, Module, ModuleParameters, ModuleParametersExt, nn};
+use pmetal_runtime::impl_module_params;
 
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
@@ -1314,7 +1314,7 @@ impl GraniteForCausalLM {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::random;
+    use pmetal_runtime::compat::random;
     use serial_test::serial;
 
     fn hybrid_config() -> GraniteConfig {
@@ -1524,9 +1524,9 @@ mod tests {
             );
         }
         let refs: Vec<&Array> = rows.iter().collect();
-        let cached = pmetal_bridge::compat::ops::concatenate_axis(&refs, 1);
+        let cached = pmetal_runtime::compat::ops::concatenate_axis(&refs, 1);
         let diff = cached.subtract(&full).abs().max(None).item::<f32>();
-        pmetal_bridge::check_unobserved_error().unwrap();
+        pmetal_runtime::check_unobserved_error().unwrap();
         assert!(
             diff < 1e-4,
             "cached decode drifted from the full forward by {diff}"
@@ -1549,9 +1549,9 @@ mod tests {
     #[serial]
     fn test_granite_mlp() {
         let mlp = GraniteMLP::new(64, 256).unwrap();
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 10, 64],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
 
         let mut mlp = mlp;
@@ -1617,7 +1617,7 @@ mod tests {
     #[test]
     #[serial]
     fn granite_applies_embedding_residual_and_logits_scalars() {
-        use pmetal_bridge::compat::transforms;
+        use pmetal_runtime::compat::transforms;
 
         let scaled = multiplier_config();
         let neutral = GraniteConfig {

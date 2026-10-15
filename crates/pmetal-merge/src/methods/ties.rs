@@ -15,7 +15,7 @@
 
 use super::MergeMethod;
 use crate::{MergeError, MergeParameters, Result, sign_consensus, sparsify_by_magnitude};
-use pmetal_bridge::compat::Array;
+use pmetal_runtime::compat::Array;
 
 /// TIES merge implementation.
 #[derive(Debug, Clone, Default)]

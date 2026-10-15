@@ -4,7 +4,7 @@
 //! `t+1`, then computes sparse softmax cross-entropy with integer targets.
 //! Optionally adds z-loss for MoE router stability.
 
-use pmetal_bridge::compat::{Array, Exception};
+use pmetal_runtime::compat::{Array, Exception};
 
 /// Compute causal-LM loss from `[B, T, V]` logits and `[B, T]` int32 target
 /// token ids.
@@ -35,9 +35,9 @@ pub fn causal_lm_loss(
     let shifted_targets = targets.slice(&[0, 1], &[shape[0], seq_len]);
 
     let ce_loss = if let Some(ignore) = ignore_index {
-        pmetal_bridge::training::cross_entropy_loss(&shifted_logits, &shifted_targets, ignore)
+        pmetal_runtime::training::cross_entropy_loss(&shifted_logits, &shifted_targets, ignore)
     } else {
-        pmetal_bridge::training::cross_entropy_loss_dense(&shifted_logits, &shifted_targets)
+        pmetal_runtime::training::cross_entropy_loss_dense(&shifted_logits, &shifted_targets)
     };
 
     // Optional z-loss: penalises large logits to prevent router instability.

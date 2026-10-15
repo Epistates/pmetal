@@ -1,4 +1,4 @@
-//! The native DeepSeek engine (`pmetal_bridge::deepseek_native`) against the
+//! The native DeepSeek engine (`pmetal_runtime::deepseek_native`) against the
 //! authoritative Hugging Face `transformers` `DeepseekV3ForCausalLM` and
 //! `DeepseekV2ForCausalLM`.
 //!
@@ -25,12 +25,12 @@ mod common;
 use std::collections::HashMap;
 
 use common::{fixture_path, load_shard, ref_tensor};
-use pmetal_bridge::InlineArray;
-use pmetal_bridge::compat::{Array, ops::slice_axis};
-use pmetal_bridge::deepseek_native::{
+use pmetal_mlx::test_utils::{ParityReport, Tolerance, argmax_last_axis, print_report_table};
+use pmetal_runtime::InlineArray;
+use pmetal_runtime::compat::{Array, ops::slice_axis};
+use pmetal_runtime::deepseek_native::{
     NativeCache, NativeWeights, forward_step, load_config, load_model,
 };
-use pmetal_mlx::test_utils::{ParityReport, Tolerance, argmax_last_axis, print_report_table};
 use serial_test::serial;
 
 /// fp32 against fp32. The reference's own fp32-vs-fp64 noise on these logits
@@ -79,7 +79,7 @@ fn rows(a: &Array, start: i32, end: i32) -> Array {
 }
 
 fn drain_bridge(op: &str) {
-    pmetal_bridge::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
+    pmetal_runtime::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
 }
 
 fn assert_all_pass(title: &str, reports: &[ParityReport]) {
@@ -211,7 +211,7 @@ fn native_deepseek_runs_an_mlx_quantized_checkpoint() {
     }
     for ((layer, proj), mut parts) in experts {
         parts.sort_by_key(|(e, _)| *e);
-        let stack = pmetal_bridge::compat::ops::stack_axis(
+        let stack = pmetal_runtime::compat::ops::stack_axis(
             &parts.iter().map(|(_, w)| w.clone()).collect::<Vec<_>>(),
             0,
         );

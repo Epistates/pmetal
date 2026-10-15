@@ -1,8 +1,8 @@
 //! Each update rule against its paper's formula, worked by hand.
 
 use super::*;
-use pmetal_bridge::compat::optimizers::AdamWBuilder;
-use pmetal_bridge::expect_bridge_errors;
+use pmetal_runtime::compat::optimizers::AdamWBuilder;
+use pmetal_runtime::expect_runtime_errors;
 
 fn arr(v: &[f32], shape: &[i32]) -> Array {
     Array::from_slice(v, shape)
@@ -10,7 +10,7 @@ fn arr(v: &[f32], shape: &[i32]) -> Array {
 
 fn values(a: &Array) -> Vec<f32> {
     a.eval();
-    pmetal_bridge::check_unobserved_error().expect("bridge op failed");
+    pmetal_runtime::check_unobserved_error().expect("bridge op failed");
     a.as_slice::<f32>().to_vec()
 }
 
@@ -273,13 +273,13 @@ fn plain_adamw_trains_embeddings_at_the_rate_it_was_given() {
 
 /// One weight, for driving [`Optimizer::update`] through a model.
 struct OneWeight {
-    w: pmetal_bridge::compat::Param<Array>,
+    w: pmetal_runtime::compat::Param<Array>,
 }
-pmetal_bridge::impl_module_params!(OneWeight; w);
+pmetal_runtime::impl_module_params!(OneWeight; w);
 
 fn one_weight() -> OneWeight {
     OneWeight {
-        w: pmetal_bridge::compat::Param::new(arr(&[1.0, 1.0], &[2])),
+        w: pmetal_runtime::compat::Param::new(arr(&[1.0, 1.0], &[2])),
     }
 }
 
@@ -300,11 +300,11 @@ fn an_update_that_fails_on_the_gpu_stops_the_step_and_names_the_parameter() {
     ];
     for kind in kinds {
         let mut opt = TrainOptimizer::new(kind, 0.1, 0.0);
-        let err = expect_bridge_errors(|| opt.update(&mut one_weight(), misfit_gradient()))
+        let err = expect_runtime_errors(|| opt.update(&mut one_weight(), misfit_gradient()))
             .expect_err("a gradient that doesn't fit its weight must fail the update");
         assert!(err.what().contains("`w`"), "{kind:?}: {}", err.what());
         // The failure was reported; nothing is left pending for the next kind.
-        let _ = pmetal_bridge::check_unobserved_error();
+        let _ = pmetal_runtime::check_unobserved_error();
     }
 }
 
@@ -312,8 +312,8 @@ fn an_update_that_fails_on_the_gpu_stops_the_step_and_names_the_parameter() {
 fn the_plain_adamw_update_reports_a_failed_parameter_too() {
     let mut model = one_weight();
     let mut opt = AdamWBuilder::new(0.1).weight_decay(0.0).build().unwrap();
-    assert!(expect_bridge_errors(|| opt.update(&mut model, misfit_gradient())).is_err());
-    let _ = pmetal_bridge::check_unobserved_error();
+    assert!(expect_runtime_errors(|| opt.update(&mut model, misfit_gradient())).is_err());
+    let _ = pmetal_runtime::check_unobserved_error();
 
     // A gradient that fits still trains.
     let mut model = one_weight();
@@ -321,5 +321,5 @@ fn the_plain_adamw_update_reports_a_failed_parameter_too() {
     let grads: FlattenedModuleParam = [(key("w"), arr(&[1.0, -1.0], &[2]))].into();
     opt.update(&mut model, grads).unwrap();
     assert_close(&values(&model.w), &[0.9, 1.1], 1e-5);
-    pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+    pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
 }

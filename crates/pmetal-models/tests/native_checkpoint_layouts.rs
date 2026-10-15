@@ -22,10 +22,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use common::{fixture_path, load_shard, ref_tensor};
-use pmetal_bridge::compat::{Array, ops};
-use pmetal_bridge::qwen3_native::{NativeCache, forward_step, load_config, load_model};
-use pmetal_bridge::{InlineArray, QuantizedMode};
 use pmetal_mlx::test_utils::max_abs_diff;
+use pmetal_runtime::compat::{Array, ops};
+use pmetal_runtime::qwen3_native::{NativeCache, forward_step, load_config, load_model};
+use pmetal_runtime::{InlineArray, QuantizedMode};
 use serde_json::{Value, json};
 
 type Tensors = Vec<(String, Array)>;
@@ -34,7 +34,7 @@ const EXPERTS: i32 = 8;
 const GROUP_SIZE: i32 = 32;
 
 fn drain(op: &str) {
-    pmetal_bridge::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
+    pmetal_runtime::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
 }
 
 fn base_tensors() -> HashMap<String, Array> {
@@ -312,8 +312,8 @@ fn assert_same_logits(what: &str, got: &Array, want: &Array, tolerance: f32) {
 /// recurrent state, which carries its own dtype), for the hybrid routed model.
 #[test]
 fn a_bf16_checkpoint_stays_bf16_through_prefill_and_decode() {
-    use pmetal_bridge::compat::Dtype;
-    use pmetal_bridge::decode::prompt_tokens_to_input;
+    use pmetal_runtime::compat::Dtype;
+    use pmetal_runtime::decode::prompt_tokens_to_input;
 
     let bf16 = Dtype::Bfloat16.as_i32();
     let tensors: Tensors = base_tensors()

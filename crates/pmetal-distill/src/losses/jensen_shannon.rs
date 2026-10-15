@@ -12,7 +12,7 @@ use super::{
     DistillLoss, SPARSE_TOPK_DEFAULT, align_vocab_with_k, reduce_per_token, tempered_log_probs,
 };
 use crate::Result;
-use pmetal_bridge::compat::{Array, ops};
+use pmetal_runtime::compat::{Array, ops};
 
 /// Numerically stable `log(exp(a) + exp(b))` = `m + log(exp(a - m) + exp(b - m))`
 /// with `m = max(a, b)`.

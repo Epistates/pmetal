@@ -40,7 +40,7 @@
 //! - "Distilling Reasoning Capabilities into Smaller Language Models" (2025)
 
 use crate::{DistillLoss, Result};
-use pmetal_bridge::compat::{Array, Dtype, ops};
+use pmetal_runtime::compat::{Array, Dtype, ops};
 
 /// Rationale-Based Knowledge Distillation Loss.
 ///

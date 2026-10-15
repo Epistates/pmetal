@@ -22,7 +22,7 @@ fn run(loss_type: &str) {
         eprintln!("PMETAL_GRPO_MODEL is not set; skipping");
         return;
     };
-    pmetal_bridge::compat::random::seed(7);
+    pmetal_runtime::compat::random::seed(7);
     let tokenizer = Tokenizer::from_model_dir(&dir).unwrap();
     let lora = LoraConfig {
         r: 8,
@@ -94,7 +94,7 @@ fn run(loss_type: &str) {
                     &mut set_lr,
                 )
                 .unwrap();
-            pmetal_bridge::check_unobserved_error().unwrap();
+            pmetal_runtime::check_unobserved_error().unwrap();
             println!(
                 "epoch {epoch} step {:2}: loss {:+.5} policy {:+.5} reward {:.4} clip {:.3} \
                  ({} updates, lr before {:.2e} after {:.2e})",

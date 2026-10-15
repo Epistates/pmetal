@@ -9,13 +9,13 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
-use pmetal_bridge::InlineArray;
-use pmetal_bridge::compat::{
+use pmetal_data::streaming::StreamPosition;
+use pmetal_runtime::InlineArray;
+use pmetal_runtime::compat::{
     Array, ModuleParametersExt,
     module::ModuleParameters,
     optimizers::{AdamW, Optimizer, State},
 };
-use pmetal_data::streaming::StreamPosition;
 
 use super::PretrainError;
 
@@ -92,10 +92,11 @@ pub fn load_checkpoint<M: ModuleParameters>(
 
     // Model weights
     let model_path = dir.join("model.safetensors");
-    let loaded = pmetal_bridge::inline_array::load_safetensors_shard(&model_path.to_string_lossy())
-        .ok_or_else(|| {
-            PretrainError::Checkpoint(format!("load model: {}", model_path.display()))
-        })?;
+    let loaded =
+        pmetal_runtime::inline_array::load_safetensors_shard(&model_path.to_string_lossy())
+            .ok_or_else(|| {
+                PretrainError::Checkpoint(format!("load model: {}", model_path.display()))
+            })?;
 
     {
         let mut flat = model.flatten_params_mut();
@@ -109,7 +110,7 @@ pub fn load_checkpoint<M: ModuleParameters>(
     // Optimizer state
     let opt_path = dir.join("optimizer.safetensors");
     let opt_loaded =
-        pmetal_bridge::inline_array::load_safetensors_shard(&opt_path.to_string_lossy())
+        pmetal_runtime::inline_array::load_safetensors_shard(&opt_path.to_string_lossy())
             .ok_or_else(|| {
                 PretrainError::Checkpoint(format!("load optimizer: {}", opt_path.display()))
             })?;

@@ -14,13 +14,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use pmetal_bridge::compat::optimizers::{AdamW, Optimizer};
-use pmetal_bridge::compat::{Array, Dtype, ModuleParametersExt, eval, random};
-use pmetal_bridge::inline_array::value_and_grad;
 use pmetal_core::LoraConfig;
 use pmetal_lora::{AdaptedModel, TrainableModel, save_safetensors_map};
 use pmetal_mlx::test_utils::max_abs_diff;
 use pmetal_models::dispatcher::DynamicModel;
+use pmetal_runtime::compat::optimizers::{AdamW, Optimizer};
+use pmetal_runtime::compat::{Array, Dtype, ModuleParametersExt, eval, random};
+use pmetal_runtime::inline_array::value_and_grad;
 
 /// One architecture under test.
 pub struct ArchCase {
@@ -627,7 +627,7 @@ pub fn checkpoint_key(param_path: &str, is_moe_layer: impl Fn(&str) -> bool) -> 
 /// As `target_modules` this adapts all of them; an empty list leaves the
 /// output layer out.
 pub fn every_projection(model: &mut DynamicModel) -> Vec<String> {
-    use pmetal_bridge::compat::VisitLinears;
+    use pmetal_runtime::compat::VisitLinears;
     let mut names = std::collections::BTreeSet::new();
     model.visit_linears_mut("", &mut |path, _| {
         names.insert(path.rsplit('.').next().unwrap_or(path).to_string());
@@ -670,7 +670,7 @@ pub fn silent_adapters(prepare: impl Fn(&mut DynamicModel)) -> Vec<String> {
         let Ok(Ok(before)) =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| model.forward(&ids, None)))
         else {
-            pmetal_bridge::clear_last_error();
+            pmetal_runtime::clear_last_error();
             silent.push(format!("{}: the model doesn't run", case.name));
             continue;
         };
@@ -688,7 +688,7 @@ pub fn silent_adapters(prepare: impl Fn(&mut DynamicModel)) -> Vec<String> {
             )]);
             model.set_lora_parameters(&nudged);
             let after = model.forward(&ids, None).expect("forward");
-            pmetal_bridge::check_unobserved_error().expect("no bridge error");
+            pmetal_runtime::check_unobserved_error().expect("no bridge error");
             let moved = max_abs_diff(&before, &after);
             // NaN compares unequal to everything, so a broken forward would
             // pass for one the adapter reached.
@@ -722,7 +722,7 @@ pub fn train_step(model: &mut AdaptedModel, optimizer: &mut AdamW, ids: &Array) 
             model.set_lora_parameters(&restored);
             let input = &arrays[names.len()];
             let logits = TrainableModel::forward(model, input, None).unwrap();
-            pmetal_bridge::training::causal_lm_loss(&logits, input, -100)
+            pmetal_runtime::training::causal_lm_loss(&logits, input, -100)
         },
         &params,
         std::slice::from_ref(ids),

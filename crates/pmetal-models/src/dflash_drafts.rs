@@ -12,9 +12,9 @@
 
 use std::path::Path;
 
-use pmetal_bridge::compat::{Array, Exception, ModuleParametersExt, ops};
-use pmetal_bridge::native_weight::QuantParams;
 use pmetal_mlx::kv_cache::KVCache;
+use pmetal_runtime::compat::{Array, Exception, ModuleParametersExt, ops};
+use pmetal_runtime::native_weight::QuantParams;
 
 use crate::architectures::dflash_draft::{
     DFlashDraftConfig, DFlashDraftModel, LoadReport, make_context_cache,

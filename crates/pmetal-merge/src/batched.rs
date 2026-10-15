@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 
-use pmetal_bridge::compat::Array;
+use pmetal_runtime::compat::Array;
 use tracing::{debug, info, trace};
 
 use crate::{MergeConfig, MergeMethod, MergeParameters, Result, SafetensorsLoader, TensorLoader};

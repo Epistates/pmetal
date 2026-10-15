@@ -24,9 +24,9 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 
-use pmetal_bridge::compat::Array;
 use pmetal_mlx::kv_cache::{FusedBatchKVCache, KVCache, KVCacheConfig};
 use pmetal_models::architectures::llama::{LlamaConfig, LlamaForCausalLM};
+use pmetal_runtime::compat::Array;
 
 /// Tiny synthetic Llama config: enough layers to surface the per-layer
 /// dispatch tax, small enough to bench fast on Apple Silicon.

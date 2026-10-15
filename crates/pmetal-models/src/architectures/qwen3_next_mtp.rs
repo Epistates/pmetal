@@ -11,10 +11,10 @@ use std::{
     path::Path,
 };
 
-use pmetal_bridge::compat::{Array, Exception, Module, ModuleParametersExt, nn, ops, transforms};
-use pmetal_bridge::impl_module_params;
-use pmetal_bridge::qwen3_native::family::canonical_checkpoint_key;
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
+use pmetal_runtime::compat::{Array, Exception, Module, ModuleParametersExt, nn, ops, transforms};
+use pmetal_runtime::impl_module_params;
+use pmetal_runtime::qwen3_native::family::canonical_checkpoint_key;
 
 use super::qwen3_next::{Qwen3NextConfig, Qwen3NextDecoderLayer, Qwen3NextRoutedExpertMode};
 

@@ -29,13 +29,13 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use pmetal_bridge::compat::{Array, Dtype};
 use pmetal_models::architectures::qwen3_next::Qwen3NextRoutedExpertMode;
 use pmetal_models::architectures::qwen4_exp::{
     CheckpointKeyRole, NgramHash, Qwen4ExpConfig, Qwen4ExpForCausalLM, Qwen4ExpLoadOptions,
     assign_qwen4_exp_tensors, checkpoint_key_role, ngram_shard_encoding,
 };
 use pmetal_models::dispatcher::ModelArchitecture;
+use pmetal_runtime::compat::{Array, Dtype};
 use serial_test::serial;
 
 const VARIANTS: [&str; 3] = [

@@ -196,8 +196,8 @@ fn run_qwen3_next_layer_profile(
                 "prefill",
             )?;
 
-            let last_logits = pmetal_bridge::compat::ops::select_axis(&prefill_logits, -1, 1);
-            let next_token = pmetal_bridge::compat::ops::argmax(&last_logits, -1);
+            let last_logits = pmetal_runtime::compat::ops::select_axis(&prefill_logits, -1, 1);
+            let next_token = pmetal_runtime::compat::ops::argmax(&last_logits, -1);
             let next_token = next_token;
             next_token.eval();
             let decode_token_id = next_token.item::<u32>();

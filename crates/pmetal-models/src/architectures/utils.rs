@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, Param, nn, ops};
+use pmetal_runtime::compat::{Array, Dtype, Exception, Param, nn, ops};
 
 /// Outcome of a hand-written weight loader.
 ///

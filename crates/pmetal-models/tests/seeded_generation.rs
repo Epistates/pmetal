@@ -12,10 +12,10 @@
 
 use std::path::PathBuf;
 
-use pmetal_bridge::compat::random;
-use pmetal_bridge::decode::SamplingParams;
 use pmetal_models::DynamicModel;
 use pmetal_models::generation::{GenerationConfig, generate_cached_async_streaming};
+use pmetal_runtime::compat::random;
+use pmetal_runtime::decode::SamplingParams;
 
 const PROMPT: [u32; 6] = [3, 11, 7, 2, 9, 40];
 const NEW_TOKENS: usize = 24;
@@ -43,7 +43,7 @@ fn checkpoint() -> tempfile::TempDir {
 
 /// Move the calling thread's MLX key the way unrelated work would.
 fn draw_unseeded() {
-    let _ = random::normal(&[64], pmetal_bridge::compat::Dtype::Float32).as_slice::<f32>()[0];
+    let _ = random::normal(&[64], pmetal_runtime::compat::Dtype::Float32).as_slice::<f32>()[0];
 }
 
 /// Each case undisturbed, then on a fresh thread with unseeded draws
@@ -63,11 +63,11 @@ fn here_and_elsewhere(run: fn(Option<u64>, bool) -> Vec<u32>) {
         run(Some(6), false),
         "seeds 5 and 6 drew the same tokens"
     );
-    pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+    pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
 }
 
 fn native(seed: Option<u64>, disturb: bool) -> Vec<u32> {
-    use pmetal_bridge::qwen3_native::{NativeCache, generate, load_config, load_model};
+    use pmetal_runtime::qwen3_native::{NativeCache, generate, load_config, load_model};
     let dir = checkpoint();
     let config = load_config(dir.path()).expect("config");
     let weights = load_model(dir.path(), &config).expect("weights");
@@ -77,7 +77,7 @@ fn native(seed: Option<u64>, disturb: bool) -> Vec<u32> {
     };
     let mut cache = NativeCache::new_empty(&weights);
     let (first, sampler) =
-        pmetal_bridge::qwen3_native::prefill_first_token(&weights, &mut cache, &PROMPT, params);
+        pmetal_runtime::qwen3_native::prefill_first_token(&weights, &mut cache, &PROMPT, params);
     if disturb {
         draw_unseeded();
     }

@@ -12,11 +12,11 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-use pmetal_bridge::compat::Array;
 use pmetal_core::LoraConfig;
 use pmetal_data::Tokenizer;
 use pmetal_lora::{AdaptedModel, QLoraConfig, QLoraScheme};
 use pmetal_models::DynamicModel;
+use pmetal_runtime::compat::Array;
 use pmetal_trainer::orchestrator::save_adapter_config;
 use pmetal_trainer::{
     DiffusionGemmaTrainConfig, DiffusionGemmaTrainer, quantize_diffusion_gemma_base,
@@ -82,7 +82,7 @@ pub(crate) async fn run_train_diffusion(args: TrainDiffusionArgs) -> Result<()> 
         ..Default::default()
     };
     // Seeded here so the adapters' initialisation is reproducible too.
-    pmetal_bridge::compat::random::seed(args.seed);
+    pmetal_runtime::compat::random::seed(args.seed);
     let mut model = AdaptedModel::attach(base, lora_cfg.clone()).map_err(|e| {
         anyhow::anyhow!("attach LoRA (--lora-targets {:?}): {e}", args.lora_targets)
     })?;

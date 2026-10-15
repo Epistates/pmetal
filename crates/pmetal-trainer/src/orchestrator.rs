@@ -449,7 +449,7 @@ pub async fn run_training(
     // MLX draws LoRA's A matrices (and dropout masks) from its own random key,
     // separate from the data pipeline's seed. Seed it before anything builds
     // the model, or runs with the same seed start from different weights.
-    pmetal_bridge::compat::random::seed(config.seed);
+    pmetal_runtime::compat::random::seed(config.seed);
 
     if has_config_file {
         let dispatch_defaults = DispatchConfig::default();

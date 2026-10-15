@@ -3,9 +3,9 @@
 //! Implementation of CLIP (Contrastive Language-Image Pre-training) text encoder.
 //! Based on the architecture from OpenAI and used in Flux.1.
 
-use pmetal_bridge::compat::ops::{argmax_axis, slice_axis, take_along_axis, tri};
-use pmetal_bridge::compat::{Array, Dtype, Exception, Param, nn};
-use pmetal_bridge::impl_module_params;
+use pmetal_runtime::compat::ops::{argmax_axis, slice_axis, take_along_axis, tri};
+use pmetal_runtime::compat::{Array, Dtype, Exception, Param, nn};
+use pmetal_runtime::impl_module_params;
 use serde::{Deserialize, Serialize};
 
 use crate::architectures::utils::{Activation, resolve_activation};
@@ -100,7 +100,7 @@ impl CLIPAttention {
             .reshape(&[b, l, self.num_heads as i32, self.head_dim as i32])
             .transpose_axes(&[0, 2, 1, 3]);
 
-        let out = pmetal_bridge::compat::fast::scaled_dot_product_attention_masked(
+        let out = pmetal_runtime::compat::fast::scaled_dot_product_attention_masked(
             &q, &k, &v, self.scale, mask,
         );
         let out = out.transpose_axes(&[0, 2, 1, 3]).reshape(&[b, l, -1]);
@@ -195,7 +195,7 @@ impl CLIPTextModel {
     pub fn new(config: CLIPConfig) -> Self {
         let token_embedding =
             nn::Embedding::new(config.vocab_size as i32, config.embed_dim as i32).unwrap();
-        let position_embedding = Param::new(pmetal_bridge::compat::ops::zeros(
+        let position_embedding = Param::new(pmetal_runtime::compat::ops::zeros(
             &[
                 1,
                 config.max_position_embeddings as i32,
@@ -223,7 +223,7 @@ impl CLIPTextModel {
         let mask = tri(l, l, 0, Dtype::Float32);
         let neg_inf = Array::from_f32(f32::NEG_INFINITY);
         let zero = Array::from_f32(0.0);
-        Ok(pmetal_bridge::compat::ops::where_fn(
+        Ok(pmetal_runtime::compat::ops::where_fn(
             &mask.equal(&zero),
             &neg_inf,
             &zero,
@@ -258,7 +258,7 @@ impl CLIPTextModel {
         let b = x.dim(0);
         let eos_positions = argmax_axis(input_ids, -1);
         let eos_idx = eos_positions.reshape(&[b, 1, 1]);
-        let eos_idx = pmetal_bridge::compat::ops::broadcast_to(&eos_idx, &[b, 1, x.dim(2)]);
+        let eos_idx = pmetal_runtime::compat::ops::broadcast_to(&eos_idx, &[b, 1, x.dim(2)]);
         let pooled_output = take_along_axis(&x, &eos_idx, 1).squeeze(1);
 
         Ok((pooled_output, hidden_state))

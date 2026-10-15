@@ -3,8 +3,8 @@
 //! Implementation of T5 (Text-to-Text Transfer Transformer) encoder.
 //! Based on the architecture from Google and used in Flux.1 (T5-XXL).
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, nn};
-use pmetal_bridge::impl_module_params;
+use pmetal_runtime::compat::{Array, Dtype, Exception, nn};
+use pmetal_runtime::impl_module_params;
 use serde::{Deserialize, Serialize};
 
 use crate::architectures::utils::{Activation, resolve_activation};
@@ -97,21 +97,21 @@ impl T5RelativePositionBias {
         num_buckets: i32,
         max_distance: i32,
     ) -> Result<Array, Exception> {
-        let mut ret = pmetal_bridge::compat::ops::zeros_like(relative_position);
+        let mut ret = pmetal_runtime::compat::ops::zeros_like(relative_position);
         let mut num_buckets = num_buckets;
-        let rel_pos_f = relative_position.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
+        let rel_pos_f = relative_position.as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32());
 
         let n = if bidirectional {
             num_buckets /= 2;
             // Offset positive relative positions by num_buckets
             let is_positive = relative_position
                 .gt(&Array::from_int(0))
-                .as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32());
+                .as_dtype(pmetal_runtime::compat::Dtype::Int32.as_i32());
             ret = is_positive.multiply(&Array::from_int(num_buckets));
             rel_pos_f.abs()
         } else {
             // Clamp to non-positive, then negate
-            pmetal_bridge::compat::ops::maximum(&rel_pos_f.negative(), &Array::from_f32(0.0))
+            pmetal_runtime::compat::ops::maximum(&rel_pos_f.negative(), &Array::from_f32(0.0))
         };
 
         // Half buckets for exact (linear) positions, half for log-spaced
@@ -128,20 +128,20 @@ impl T5RelativePositionBias {
         let large_val = log_ratio
             .multiply(&Array::from_f32((num_buckets - max_exact) as f32))
             .add(&Array::from_f32(max_exact as f32));
-        let large_val = pmetal_bridge::compat::ops::minimum(
+        let large_val = pmetal_runtime::compat::ops::minimum(
             &large_val,
             &Array::from_f32((num_buckets - 1) as f32),
         );
 
-        let buckets = pmetal_bridge::compat::ops::where_fn(&is_small, &n, &large_val);
-        let buckets = ret.add(&buckets.as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32()));
+        let buckets = pmetal_runtime::compat::ops::where_fn(&is_small, &n, &large_val);
+        let buckets = ret.add(&buckets.as_dtype(pmetal_runtime::compat::Dtype::Int32.as_i32()));
         Ok(buckets)
     }
 
     pub fn forward(&mut self, query_length: usize, key_length: usize) -> Result<Array, Exception> {
         let context_position =
-            pmetal_bridge::compat::ops::arange(query_length as i32, Dtype::Int32);
-        let memory_position = pmetal_bridge::compat::ops::arange(key_length as i32, Dtype::Int32);
+            pmetal_runtime::compat::ops::arange(query_length as i32, Dtype::Int32);
+        let memory_position = pmetal_runtime::compat::ops::arange(key_length as i32, Dtype::Int32);
 
         let relative_position = memory_position
             .expand_dims_axes(&[0])
@@ -162,14 +162,14 @@ impl T5RelativePositionBias {
 /// T5 Layer Norm (RMSNorm style, but often called T5LayerNorm).
 #[derive(Debug)]
 pub struct T5LayerNorm {
-    pub weight: pmetal_bridge::compat::module::Param<Array>,
+    pub weight: pmetal_runtime::compat::module::Param<Array>,
     pub variance_epsilon: f32,
 }
 impl_module_params!(T5LayerNorm; weight);
 
 impl T5LayerNorm {
     pub fn new(dim: usize, eps: f32) -> Self {
-        let weight = pmetal_bridge::compat::module::Param::new(pmetal_bridge::compat::ops::ones(
+        let weight = pmetal_runtime::compat::module::Param::new(pmetal_runtime::compat::ops::ones(
             &[dim as i32],
             Dtype::Float32,
         ));
@@ -181,7 +181,7 @@ impl T5LayerNorm {
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let variance = x.power(&Array::from_f32(2.0)).mean_axes(&[-1], true);
-        let x = x.multiply(&pmetal_bridge::compat::ops::rsqrt(
+        let x = x.multiply(&pmetal_runtime::compat::ops::rsqrt(
             &variance.add(&Array::from_f32(self.variance_epsilon)),
         ));
         Ok(x.multiply(&self.weight))
@@ -336,7 +336,7 @@ impl T5Attention {
             }
         }
 
-        let out = pmetal_bridge::compat::fast::scaled_dot_product_attention_masked(
+        let out = pmetal_runtime::compat::fast::scaled_dot_product_attention_masked(
             &q,
             &k,
             &v,
@@ -349,7 +349,10 @@ impl T5Attention {
         Ok((
             out,
             bias.unwrap_or_else(|| {
-                pmetal_bridge::compat::ops::zeros(&[1, 1, 1], pmetal_bridge::compat::Dtype::Float32)
+                pmetal_runtime::compat::ops::zeros(
+                    &[1, 1, 1],
+                    pmetal_runtime::compat::Dtype::Float32,
+                )
             }),
         )) // Return bias for next layers
     }

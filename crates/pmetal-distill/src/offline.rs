@@ -16,7 +16,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read as _, Write};
 use std::path::{Path, PathBuf};
 
-use pmetal_bridge::compat::Array;
+use pmetal_runtime::compat::Array;
 use serde::{Deserialize, Serialize};
 
 use crate::{CompressionMethod, DistillError, Result};

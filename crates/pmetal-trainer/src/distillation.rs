@@ -3,11 +3,11 @@
 //! Implements the training loop for distilling knowledge from a teacher model
 //! to a student model. Supports Online, Offline, and Progressive distillation.
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, nn, optimizers::Optimizer};
 use pmetal_data::{DataLoader, TrainingBatch, TrainingDataset};
 use pmetal_distill::{DistillLossOutput, Distiller, LogitCache};
 use pmetal_lora::TrainableModel;
 use pmetal_mlx::kernels::with_training_mode;
+use pmetal_runtime::compat::{Array, Dtype, Exception, nn, optimizers::Optimizer};
 
 use crate::{
     AdaptiveAction, CheckpointManager, CheckpointMetadata, Result, SftError, StepStats,
@@ -833,9 +833,9 @@ mod tests {
     /// `pmetal distill` loads it, and a step moves the student's adapters.
     #[test]
     fn frozen_teacher_trains_the_student() {
-        use pmetal_bridge::compat::optimizers::AdamW;
         use pmetal_lora::AdaptedModel;
         use pmetal_models::DynamicModel;
+        use pmetal_runtime::compat::optimizers::AdamW;
 
         let config = r#"{
             "model_type": "llama", "vocab_size": 64, "hidden_size": 32,
@@ -870,7 +870,7 @@ mod tests {
         let stats = test_trainer()
             .train_step(&mut student, &mut teacher, &batch, &mut optimizer, 1)
             .unwrap();
-        pmetal_bridge::check_unobserved_error().unwrap();
+        pmetal_runtime::check_unobserved_error().unwrap();
         assert!(stats.loss.is_finite(), "loss {}", stats.loss);
 
         let after = adapter_values(&student);

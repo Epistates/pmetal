@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeMap, BinaryHeap};
 
-use pmetal_bridge::compat::{Array, Dtype, ops};
+use pmetal_runtime::compat::{Array, Dtype, ops};
 
 /// Hand-computed log-prob budget tree for each tapped draft step. The
 /// entry type is optimised for the heap — we cache `-log_w` as the
@@ -387,7 +387,7 @@ pub fn follow_verified_tree(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::Array;
+    use pmetal_runtime::compat::Array;
 
     fn make_logits(rows: &[&[f32]]) -> Array {
         let rows_count = rows.len() as i32;

@@ -26,7 +26,7 @@
 //! )?;
 //! ```
 
-use pmetal_bridge::compat::{Array, Dtype, ops};
+use pmetal_runtime::compat::{Array, Dtype, ops};
 
 use crate::{MergeError, Result, sparsify_by_magnitude};
 
@@ -197,7 +197,7 @@ impl GpuMerger {
         let agreement = signs
             .multiply(&maj_sign)
             .greater(&zero)
-            .as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
+            .as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32());
 
         // 5e. Compute weighted, agreement-masked contributions and reduce over models.
         // stacked_sparse * weights_bcast * agreement -> [M, ...] -> sum over axis 0 -> [...]

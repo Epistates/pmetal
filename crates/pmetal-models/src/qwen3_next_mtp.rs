@@ -6,16 +6,16 @@
 
 use std::path::Path;
 
-use pmetal_bridge::compat::{
-    Array, Exception,
-    ops::{concatenate_axis, slice_axis},
-};
-use pmetal_bridge::decode::{last_token_hidden, last_token_logits, prompt_tokens_to_input};
-use pmetal_bridge::qwen3_native::{self, GdnReplay, NativeCache, NativeWeights};
 use pmetal_mlx::{
     kv_cache::{GdnVerifyInputs, KVCache, MambaCache, MambaSnapshot},
     speculative::SpecCapture,
 };
+use pmetal_runtime::compat::{
+    Array, Exception,
+    ops::{concatenate_axis, slice_axis},
+};
+use pmetal_runtime::decode::{last_token_hidden, last_token_logits, prompt_tokens_to_input};
+use pmetal_runtime::qwen3_native::{self, GdnReplay, NativeCache, NativeWeights};
 
 use crate::{
     architectures::{Qwen3NextConfig, Qwen3NextForCausalLM, Qwen3NextMtpForCausalLM},
@@ -416,8 +416,8 @@ mod tests {
     /// predictor. With `disturb`, every emitted token also draws from the
     /// thread's MLX key, as another stream sharing the thread would.
     fn sampled_mtp_tokens(seed: Option<u64>, disturb: bool) -> Vec<u32> {
-        use pmetal_bridge::compat::{Dtype, random};
         use pmetal_mlx::kv_cache::KVCacheConfig;
+        use pmetal_runtime::compat::{Dtype, random};
 
         let config = crate::architectures::Qwen3NextConfig {
             hidden_size: 16,
@@ -464,7 +464,7 @@ mod tests {
             },
         )
         .expect("generate");
-        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+        pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
         out.token_ids
     }
 

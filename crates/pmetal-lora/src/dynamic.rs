@@ -29,12 +29,12 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
-use pmetal_bridge::compat::Array;
-use pmetal_bridge::compat::Exception;
 use pmetal_core::LoraConfig;
 use pmetal_mlx::kv_cache::KVCache;
 use pmetal_models::dispatcher::{DynamicModel, DynamicModelLoadOptions};
 use pmetal_models::{ModelArchitecture, WeightFormatError};
+use pmetal_runtime::compat::Array;
+use pmetal_runtime::compat::Exception;
 
 use crate::{AdaptedModel, LoraError, PackedBase, QLoraConfig, TrainableModel, quantize_base};
 
@@ -221,20 +221,20 @@ impl DynamicLoraModel {
     }
 }
 
-impl pmetal_bridge::compat::ModuleParameters for DynamicLoraModel {
+impl pmetal_runtime::compat::ModuleParameters for DynamicLoraModel {
     fn num_parameters(&self) -> usize {
         self.inner.num_parameters()
     }
 
-    fn parameters(&self) -> pmetal_bridge::compat::ModuleParamRef<'_> {
+    fn parameters(&self) -> pmetal_runtime::compat::ModuleParamRef<'_> {
         self.inner.parameters()
     }
 
-    fn parameters_mut(&mut self) -> pmetal_bridge::compat::ModuleParamMut<'_> {
+    fn parameters_mut(&mut self) -> pmetal_runtime::compat::ModuleParamMut<'_> {
         self.inner.parameters_mut()
     }
 
-    fn trainable_parameters(&self) -> pmetal_bridge::compat::ModuleParamRef<'_> {
+    fn trainable_parameters(&self) -> pmetal_runtime::compat::ModuleParamRef<'_> {
         self.inner.trainable_parameters()
     }
 
@@ -405,7 +405,7 @@ pub enum DynamicLoraError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::ModuleParameters;
+    use pmetal_runtime::compat::ModuleParameters;
 
     /// Every architecture the dispatcher builds is now trainable, where the
     /// enum covered fourteen of twenty.

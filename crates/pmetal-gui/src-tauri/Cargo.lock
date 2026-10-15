@@ -6095,7 +6095,6 @@ dependencies = [
  "indicatif",
  "libc",
  "parquet",
- "pmetal-bridge",
  "pmetal-core",
  "pmetal-data",
  "pmetal-distill",
@@ -6108,6 +6107,7 @@ dependencies = [
  "pmetal-mhc",
  "pmetal-mlx",
  "pmetal-models",
+ "pmetal-runtime",
  "pmetal-trainer",
  "pmetal-vocoder",
  "rand 0.10.3",
@@ -6125,22 +6125,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "walkdir",
-]
-
-[[package]]
-name = "pmetal-bridge"
-version = "0.6.0"
-dependencies = [
- "cc",
- "cmake",
- "half",
- "memmap2",
- "rand 0.10.3",
- "safetensors",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tempfile",
 ]
 
 [[package]]
@@ -6176,9 +6160,9 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "parquet",
- "pmetal-bridge",
  "pmetal-core",
  "pmetal-gguf",
+ "pmetal-runtime",
  "rand 0.10.3",
  "rayon",
  "serde",
@@ -6193,7 +6177,7 @@ name = "pmetal-distill"
 version = "0.6.0"
 dependencies = [
  "bitcode",
- "pmetal-bridge",
+ "pmetal-runtime",
  "safetensors",
  "serde",
  "serde-saphyr",
@@ -6247,7 +6231,7 @@ dependencies = [
  "dirs 7.0.0",
  "futures",
  "pmetal",
- "pmetal-bridge",
+ "pmetal-runtime",
  "reqwest",
  "serde",
  "serde_json",
@@ -6282,10 +6266,10 @@ dependencies = [
 name = "pmetal-lora"
 version = "0.6.0"
 dependencies = [
- "pmetal-bridge",
  "pmetal-core",
  "pmetal-mlx",
  "pmetal-models",
+ "pmetal-runtime",
  "serde_json",
  "thiserror 2.0.21",
  "tracing",
@@ -6299,7 +6283,7 @@ dependencies = [
  "hf-hub",
  "memmap2",
  "ndarray",
- "pmetal-bridge",
+ "pmetal-runtime",
  "rand 0.10.3",
  "regex",
  "safetensors",
@@ -6349,9 +6333,9 @@ version = "0.6.0"
 dependencies = [
  "dirs 7.0.0",
  "half",
- "pmetal-bridge",
  "pmetal-core",
  "pmetal-metal",
+ "pmetal-runtime",
  "rand 0.10.3",
  "serde",
  "serde_json",
@@ -6366,17 +6350,33 @@ dependencies = [
  "json5",
  "objc2",
  "objc2-metal",
- "pmetal-bridge",
  "pmetal-core",
  "pmetal-data",
  "pmetal-gguf",
  "pmetal-metal",
  "pmetal-mlx",
+ "pmetal-runtime",
  "safetensors",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tracing",
+]
+
+[[package]]
+name = "pmetal-runtime"
+version = "0.6.0"
+dependencies = [
+ "cc",
+ "cmake",
+ "half",
+ "memmap2",
+ "rand 0.10.3",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
 ]
 
 [[package]]
@@ -6391,7 +6391,6 @@ dependencies = [
  "image",
  "indicatif",
  "parquet",
- "pmetal-bridge",
  "pmetal-core",
  "pmetal-data",
  "pmetal-distill",
@@ -6402,6 +6401,7 @@ dependencies = [
  "pmetal-metal",
  "pmetal-mlx",
  "pmetal-models",
+ "pmetal-runtime",
  "prost",
  "rand 0.10.3",
  "safetensors",
@@ -6419,7 +6419,7 @@ version = "0.6.0"
 dependencies = [
  "half",
  "hf-hub",
- "pmetal-bridge",
+ "pmetal-runtime",
  "safetensors",
  "serde",
  "serde_json",

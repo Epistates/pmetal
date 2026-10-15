@@ -6,12 +6,12 @@
 //! - Optional Metal FlashAttention for forward pass
 //! - Checkpoint saving/loading
 
-use pmetal_bridge::compat::optimizers::Sgd;
 use pmetal_core::{LoraConfig, TrainingConfig};
 use pmetal_data::{DataLoaderConfig, Sample, TrainingDataset};
 use pmetal_lora::AdaptedModel;
 use pmetal_models::architectures::llama::LlamaConfig;
 use pmetal_models::dispatcher::DynamicModel;
+use pmetal_runtime::compat::optimizers::Sgd;
 use pmetal_trainer::{TrainingLoop, TrainingLoopConfig};
 
 fn small_llama_config() -> LlamaConfig {
@@ -455,7 +455,7 @@ fn test_qlora_training_step() {
     let stats = training_loop
         .train_step(&mut model, &batch, &mut optimizer)
         .expect("QLoRA training step should succeed");
-    pmetal_bridge::check_unobserved_error().expect("no bridge error");
+    pmetal_runtime::check_unobserved_error().expect("no bridge error");
 
     assert!(stats.loss > 0.0, "QLoRA loss should be positive");
     assert_eq!(stats.step, 1, "Step should be 1");
@@ -484,7 +484,7 @@ fn test_qlora_loss_decreases_for_every_scheme() {
             None,
         );
         let batch = dataloader.next_batch().expect("a batch");
-        let mut optimizer = pmetal_bridge::compat::optimizers::AdamW::new(1e-2, 0.0);
+        let mut optimizer = pmetal_runtime::compat::optimizers::AdamW::new(1e-2, 0.0);
 
         let mut losses = Vec::new();
         for _ in 0..10 {
@@ -493,7 +493,7 @@ fn test_qlora_loss_decreases_for_every_scheme() {
                 .expect("step");
             losses.push(stats.loss);
         }
-        pmetal_bridge::check_unobserved_error().expect("no bridge error");
+        pmetal_runtime::check_unobserved_error().expect("no bridge error");
         assert!(losses.iter().all(|l| l.is_finite()), "{scheme}: {losses:?}");
         assert!(
             losses[9] < losses[0] - 0.1,

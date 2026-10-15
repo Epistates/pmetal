@@ -38,11 +38,11 @@
 //! A full `pmetal train-draft` CLI command can be implemented on top of
 //! [`dflash_train_step`] without touching any other module.
 
-use pmetal_bridge::compat::{Array, Exception, ops};
 use pmetal_mlx::speculative::SpecCapture;
 use pmetal_models::architectures::dflash_draft::DFlashDraftModel;
 use pmetal_models::architectures::qwen3::Qwen3ForCausalLM;
 use pmetal_models::dflash_decoder::DFlashTarget;
+use pmetal_runtime::compat::{Array, Exception, ops};
 
 /// Configuration for a single [`dflash_train_step`] call.
 #[derive(Debug, Clone)]
@@ -191,7 +191,7 @@ fn masked_cross_entropy(logits: &Array, labels: &Array) -> Result<Array, Excepti
             shape
         )));
     }
-    Ok(pmetal_bridge::training::cross_entropy_loss(
+    Ok(pmetal_runtime::training::cross_entropy_loss(
         logits, labels, -100,
     ))
 }

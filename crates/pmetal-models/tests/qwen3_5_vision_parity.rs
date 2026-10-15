@@ -32,7 +32,6 @@ use std::path::Path;
 
 use common::{fixture_path, load_shard, ref_tensor};
 use image::RgbImage;
-use pmetal_bridge::compat::{Array, Module, ops::slice_axis};
 use pmetal_data::qwen_vl_processing::{
     ProcessedMedia, QwenVlProcessor, QwenVlProcessorConfig, VideoFrames,
 };
@@ -43,6 +42,7 @@ use pmetal_models::DynamicModel;
 use pmetal_models::architectures::qwen3_5_vision::{
     MropePositions, Qwen3_5MultimodalConfig, Qwen3_5VisionModel, merge_media_features, rope_index,
 };
+use pmetal_runtime::compat::{Array, Module, ops::slice_axis};
 use serial_test::serial;
 
 /// fp32 against fp32; the reference's own fp32-vs-fp64 noise on the logits is
@@ -129,7 +129,7 @@ impl Fixture {
 }
 
 fn drain(op: &str) {
-    pmetal_bridge::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
+    pmetal_runtime::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
 }
 
 fn rows(a: &Array, start: i32, end: i32) -> Array {
@@ -379,7 +379,7 @@ fn dynamic_engine_matches_transformers() {
 #[test]
 #[serial]
 fn native_engine_matches_transformers() {
-    use pmetal_bridge::qwen3_native::{
+    use pmetal_runtime::qwen3_native::{
         NativeCache, embed_tokens, forward_embeddings_hidden, forward_step_hidden, load_config,
         load_model,
     };

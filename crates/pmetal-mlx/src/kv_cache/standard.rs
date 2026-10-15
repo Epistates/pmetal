@@ -1,6 +1,6 @@
 //! Standard KV cache implementation with lazy and eager allocation.
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
+use pmetal_runtime::compat::{Array, Dtype, Exception, ops};
 
 use crate::kernels::FusedAttentionConfig;
 

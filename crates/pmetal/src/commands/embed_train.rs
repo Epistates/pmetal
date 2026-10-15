@@ -17,16 +17,16 @@ pub(crate) async fn run_embed_train(
     log_every: usize,
     seed: u64,
 ) -> anyhow::Result<()> {
-    use pmetal_bridge::compat::optimizers::{AdamWBuilder, Optimizer};
     use pmetal_data::EmbeddingDataset;
     use pmetal_models::architectures::bert::BertForEmbedding;
     use pmetal_models::pooling::PoolingMode;
+    use pmetal_runtime::compat::optimizers::{AdamWBuilder, Optimizer};
     use pmetal_trainer::embedding_trainer::{
         EmbeddingLossType, EmbeddingTrainer, EmbeddingTrainerConfig,
     };
 
     // `seed` also orders the batches below; this covers MLX's own key.
-    pmetal_bridge::compat::random::seed(seed);
+    pmetal_runtime::compat::random::seed(seed);
 
     // Parse loss type
     let loss_type = match loss_str {
@@ -138,8 +138,8 @@ pub(crate) async fn run_embed_train(
 
     // Manual training loop using the encode_and_loss helpers exposed by the trainer
     // until BertForEmbedding implements TrainableModel.
-    use pmetal_bridge::compat::{eval_params, module::ModuleParameters, nn};
     use pmetal_models::pooling::{normalize_embeddings, pool};
+    use pmetal_runtime::compat::{eval_params, module::ModuleParameters, nn};
     use pmetal_trainer::contrastive_loss;
 
     let actual_batch_size = trainer.config.training.batch_size;
@@ -214,38 +214,38 @@ pub(crate) async fn run_embed_train(
                             mask_b[i * actual_max_b + j] = 1;
                         }
                     }
-                    let ids_a = pmetal_bridge::compat::Array::from_slice(
+                    let ids_a = pmetal_runtime::compat::Array::from_slice(
                         &flat_a,
                         &[bs as i32, actual_max_a as i32],
                     );
-                    let m_a = pmetal_bridge::compat::Array::from_slice(
+                    let m_a = pmetal_runtime::compat::Array::from_slice(
                         &mask_a,
                         &[bs as i32, actual_max_a as i32],
                     );
-                    let ids_b = pmetal_bridge::compat::Array::from_slice(
+                    let ids_b = pmetal_runtime::compat::Array::from_slice(
                         &flat_b,
                         &[bs as i32, actual_max_b as i32],
                     );
-                    let m_b = pmetal_bridge::compat::Array::from_slice(
+                    let m_b = pmetal_runtime::compat::Array::from_slice(
                         &mask_b,
                         &[bs as i32, actual_max_b as i32],
                     );
                     let labels_data: Vec<f32> =
                         batch.iter().map(|p| p.label.unwrap_or(1.0)).collect();
                     let labels =
-                        pmetal_bridge::compat::Array::from_slice(&labels_data, &[bs as i32]);
+                        pmetal_runtime::compat::Array::from_slice(&labels_data, &[bs as i32]);
 
                     let loss_fn = |m: &mut BertForEmbedding,
                                    (ia, ma, ib, mb, lbl): (
-                        &pmetal_bridge::compat::Array,
-                        &pmetal_bridge::compat::Array,
-                        &pmetal_bridge::compat::Array,
-                        &pmetal_bridge::compat::Array,
-                        &pmetal_bridge::compat::Array,
+                        &pmetal_runtime::compat::Array,
+                        &pmetal_runtime::compat::Array,
+                        &pmetal_runtime::compat::Array,
+                        &pmetal_runtime::compat::Array,
+                        &pmetal_runtime::compat::Array,
                     )|
                      -> Result<
-                        pmetal_bridge::compat::Array,
-                        pmetal_bridge::compat::Exception,
+                        pmetal_runtime::compat::Array,
+                        pmetal_runtime::compat::Exception,
                     > {
                         let ha = m.forward(ia, Some(ma))?;
                         let hb = m.forward(ib, Some(mb))?;
@@ -341,11 +341,11 @@ pub(crate) async fn run_embed_train(
                                     msk[i * mlen + j] = 1;
                                 }
                             }
-                            let ids_arr = pmetal_bridge::compat::Array::from_slice(
+                            let ids_arr = pmetal_runtime::compat::Array::from_slice(
                                 &flat,
                                 &[bs2 as i32, mlen as i32],
                             );
-                            let msk_arr = pmetal_bridge::compat::Array::from_slice(
+                            let msk_arr = pmetal_runtime::compat::Array::from_slice(
                                 &msk,
                                 &[bs2 as i32, mlen as i32],
                             );
@@ -362,16 +362,16 @@ pub(crate) async fn run_embed_train(
 
                     let loss_fn = |m: &mut BertForEmbedding,
                                    (ia, ma, ip, mp, i_n, mn): (
-                        &pmetal_bridge::compat::Array,
-                        &pmetal_bridge::compat::Array,
-                        &pmetal_bridge::compat::Array,
-                        &pmetal_bridge::compat::Array,
-                        &pmetal_bridge::compat::Array,
-                        &pmetal_bridge::compat::Array,
+                        &pmetal_runtime::compat::Array,
+                        &pmetal_runtime::compat::Array,
+                        &pmetal_runtime::compat::Array,
+                        &pmetal_runtime::compat::Array,
+                        &pmetal_runtime::compat::Array,
+                        &pmetal_runtime::compat::Array,
                     )|
                      -> Result<
-                        pmetal_bridge::compat::Array,
-                        pmetal_bridge::compat::Exception,
+                        pmetal_runtime::compat::Array,
+                        pmetal_runtime::compat::Exception,
                     > {
                         let ha = m.forward(ia, Some(ma))?;
                         let hp = m.forward(ip, Some(mp))?;
@@ -428,16 +428,16 @@ pub(crate) async fn run_embed_train(
     std::fs::create_dir_all(output_dir)
         .map_err(|e| anyhow::anyhow!("Failed to create output dir: {}", e))?;
     let output_path = std::path::Path::new(output_dir).join("model.safetensors");
-    use pmetal_bridge::compat::module::ModuleParametersExt;
+    use pmetal_runtime::compat::module::ModuleParametersExt;
     let output_path_str = output_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Non-UTF-8 output path: {}", output_path.display()))?;
     let flattened = model.flatten_params();
-    let entries: Vec<(&str, &pmetal_bridge::compat::Array)> = flattened
+    let entries: Vec<(&str, &pmetal_runtime::compat::Array)> = flattened
         .iter()
         .map(|(name, value)| (name.as_ref(), value))
         .collect();
-    pmetal_bridge::compat::Array::save_safetensors(output_path_str, &entries)?;
+    pmetal_runtime::compat::Array::save_safetensors(output_path_str, &entries)?;
 
     // Copy config.json and tokenizer files so the output is a complete model directory
     for file in &[

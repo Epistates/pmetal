@@ -30,7 +30,7 @@ pmetal-merge = { workspace = true, optional = true }
 safetensors = { workspace = true, optional = true }
 pmetal-distributed = { workspace = true, optional = true }
 pmetal-hub = { workspace = true, optional = true }
-pmetal-bridge = { workspace = true }
+pmetal-runtime = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -51,8 +51,8 @@ prost = { workspace = true }
 crc = { workspace = true }
 
 [dev-dependencies]
-# Fail every test at the bridge op that throws (pmetal-bridge `strict-errors`).
-pmetal-bridge = { workspace = true, features = ["strict-errors"] }
+# Fail every test at the bridge op that throws (pmetal-runtime `strict-errors`).
+pmetal-runtime = { workspace = true, features = ["strict-errors"] }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
 

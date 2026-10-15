@@ -26,11 +26,11 @@
 //! path relies on (`apply_rope(Q, ..., offset)` matched by
 //! `apply_rope(K, ..., offset)` before the cache write).
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, Module, nn, ops};
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope_with_per_batch_positions,
 };
 use pmetal_mlx::kv_cache::FusedBatchKVCache;
+use pmetal_runtime::compat::{Array, Dtype, Exception, Module, nn, ops};
 
 use crate::decoder_layer::{MlpModule, NormModule};
 
@@ -99,12 +99,12 @@ impl BatchedGqaAttnCfg {
     /// architecture's `supports_fused_batched` keeps those on the serial
     /// path, and this refuses rather than rotate them as plain RoPE.
     ///
-    /// [`RotaryEmbedding`]: pmetal_bridge::rope::RotaryEmbedding
+    /// [`RotaryEmbedding`]: pmetal_runtime::rope::RotaryEmbedding
     pub fn for_rotary(
         n_heads: i32,
         n_kv_heads: i32,
         head_dim: i32,
-        rotary: &pmetal_bridge::rope::RotaryEmbedding,
+        rotary: &pmetal_runtime::rope::RotaryEmbedding,
     ) -> Result<Self, Exception> {
         let (base, scale) = rotary.scalar().ok_or_else(|| {
             Exception::custom(format!(

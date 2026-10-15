@@ -15,7 +15,7 @@
 //! length-averaged log-probs; the SimPO authors' trainer for SimPO; TRL's
 //! `ORPOTrainer` for ORPO.
 
-use pmetal_bridge::compat::{Array, Exception, ops};
+use pmetal_runtime::compat::{Array, Exception, ops};
 
 /// A paired preference objective and its hyperparameters.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -243,13 +243,13 @@ mod tests {
 
     fn values(a: &Array) -> Vec<f32> {
         a.eval();
-        pmetal_bridge::check_unobserved_error().expect("bridge error");
+        pmetal_runtime::check_unobserved_error().expect("bridge error");
         a.as_slice::<f32>().to_vec()
     }
 
     fn scalar(a: &Array) -> f32 {
         a.eval();
-        pmetal_bridge::check_unobserved_error().expect("bridge error");
+        pmetal_runtime::check_unobserved_error().expect("bridge error");
         a.item_f32()
     }
 
@@ -387,7 +387,7 @@ mod tests {
     #[test]
     fn softplus_gradient_is_sigmoid_including_at_zero() {
         let x = arr(&[-3.0, 0.0, 2.0]);
-        let (_, grads) = pmetal_bridge::compat::nn::value_and_grad_explicit(
+        let (_, grads) = pmetal_runtime::compat::nn::value_and_grad_explicit(
             |p: &[Array]| softplus(&p[0]).sum(None),
             &[x],
             &[],

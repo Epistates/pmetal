@@ -3,8 +3,8 @@
 //! Implementation of Flux.1 DiT (Diffusion Transformer) optimized for Apple Silicon.
 //! Based on the architecture from Black Forest Labs and DiffSynth-Studio.
 
-use pmetal_bridge::compat::{Array, Exception, nn, ops};
-use pmetal_bridge::impl_module_params;
+use pmetal_runtime::compat::{Array, Exception, nn, ops};
+use pmetal_runtime::impl_module_params;
 use serde::{Deserialize, Serialize};
 
 /// Flux model configuration.
@@ -101,7 +101,7 @@ impl AdaLayerNorm {
         let emb = self.linear.forward(&nn::silu(emb));
         // Reshape emb to [batch, 1, 6 * dim] for broadcasting
         let emb = emb.expand_dims_axes(&[1]);
-        let chunks = pmetal_bridge::compat::ops::split(&emb, 6, -1);
+        let chunks = pmetal_runtime::compat::ops::split(&emb, 6, -1);
 
         let shift_msa = &chunks[0];
         let scale_msa = &chunks[1];
@@ -149,7 +149,7 @@ impl AdaLayerNormSingle {
     pub fn forward(&mut self, x: &Array, emb: &Array) -> Result<(Array, Array), Exception> {
         let emb = self.linear.forward(&nn::silu(emb));
         let emb = emb.expand_dims_axes(&[1]);
-        let chunks = pmetal_bridge::compat::ops::split(&emb, 3, -1);
+        let chunks = pmetal_runtime::compat::ops::split(&emb, 3, -1);
 
         let shift_msa = &chunks[0];
         let scale_msa = &chunks[1];
@@ -188,7 +188,7 @@ impl AdaLayerNormContinuous {
     pub fn forward(&mut self, x: &Array, conditioning: &Array) -> Result<Array, Exception> {
         let emb = self.linear.forward(&nn::silu(conditioning));
         let emb = emb.expand_dims_axes(&[1]);
-        let chunks = pmetal_bridge::compat::ops::split(&emb, 2, -1);
+        let chunks = pmetal_runtime::compat::ops::split(&emb, 2, -1);
 
         let shift = &chunks[0];
         let scale = &chunks[1];
@@ -233,18 +233,18 @@ pub fn get_timestep_embedding(
     max_period: f32,
 ) -> Result<Array, Exception> {
     let half_dim = (embedding_dim / 2) as i32;
-    let exponent = pmetal_bridge::compat::ops::arange_from(0, half_dim)
+    let exponent = pmetal_runtime::compat::ops::arange_from(0, half_dim)
         .multiply(&Array::from_f32(-(max_period.ln()) / (half_dim as f32)));
-    let emb = pmetal_bridge::compat::ops::exp(&exponent);
+    let emb = pmetal_runtime::compat::ops::exp(&exponent);
 
     // timesteps: [batch]
-    let timesteps = timesteps.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
+    let timesteps = timesteps.as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32());
     let emb = timesteps
         .expand_dims_axes(&[1])
         .matmul(&emb.expand_dims_axes(&[0]));
 
-    let sin_emb = pmetal_bridge::compat::ops::sin(&emb);
-    let cos_emb = pmetal_bridge::compat::ops::cos(&emb);
+    let sin_emb = pmetal_runtime::compat::ops::sin(&emb);
+    let cos_emb = pmetal_runtime::compat::ops::cos(&emb);
 
     Ok(ops::concatenate_axis(&[&cos_emb, &sin_emb], -1))
 }
@@ -268,7 +268,7 @@ impl FluxRoPE {
 
     fn rope(&self, pos: &Array, dim: usize, theta: f32) -> Result<Array, Exception> {
         let half_dim = (dim / 2) as i32;
-        let scale = pmetal_bridge::compat::ops::arange_from(0, half_dim)
+        let scale = pmetal_runtime::compat::ops::arange_from(0, half_dim)
             .divide(&Array::from_f32(half_dim as f32));
         let omega = Array::from_f32(1.0).divide(&Array::from_f32(theta).pow(&scale));
 
@@ -276,8 +276,8 @@ impl FluxRoPE {
             .expand_dims_axes(&[-1])
             .matmul(&omega.expand_dims_axes(&[0]));
 
-        let cos_out = pmetal_bridge::compat::ops::cos(&out);
-        let sin_out = pmetal_bridge::compat::ops::sin(&out);
+        let cos_out = pmetal_runtime::compat::ops::cos(&out);
+        let sin_out = pmetal_runtime::compat::ops::sin(&out);
 
         let freqs_cis = ops::concatenate_axis(
             &[
@@ -293,7 +293,7 @@ impl FluxRoPE {
         let n_axes = ids.dim(-1);
         let mut embs = Vec::new();
         for i in 0..n_axes {
-            let axis_ids = pmetal_bridge::compat::ops::select_axis(ids, i, -1);
+            let axis_ids = pmetal_runtime::compat::ops::select_axis(ids, i, -1);
             embs.push(self.rope(&axis_ids, self.axes_dim[i as usize], self.theta)?);
         }
 
@@ -360,11 +360,11 @@ impl FluxJointAttention {
         let shape = x.shape();
         let x_complex = x.reshape(&[shape[0], shape[1], shape[2], -1, 2]);
 
-        let cos = pmetal_bridge::compat::ops::select_axis(&x_complex, 0, -1);
-        let sin = pmetal_bridge::compat::ops::select_axis(&x_complex, 1, -1);
+        let cos = pmetal_runtime::compat::ops::select_axis(&x_complex, 0, -1);
+        let sin = pmetal_runtime::compat::ops::select_axis(&x_complex, 1, -1);
 
-        let freq_cos = pmetal_bridge::compat::ops::select_axis(freqs_cis, 0, -1);
-        let freq_sin = pmetal_bridge::compat::ops::select_axis(freqs_cis, 1, -1);
+        let freq_cos = pmetal_runtime::compat::ops::select_axis(freqs_cis, 0, -1);
+        let freq_sin = pmetal_runtime::compat::ops::select_axis(freqs_cis, 1, -1);
 
         let out_real = cos.multiply(&freq_cos).subtract(&sin.multiply(&freq_sin));
         let out_imag = cos.multiply(&freq_sin).add(&sin.multiply(&freq_cos));
@@ -397,9 +397,9 @@ impl FluxJointAttention {
                 self.head_dim as i32,
             ])
             .transpose_axes(&[0, 3, 1, 2, 4]);
-        let q_a = pmetal_bridge::compat::ops::select_axis(&qkv_a, 0, 3);
-        let k_a = pmetal_bridge::compat::ops::select_axis(&qkv_a, 1, 3);
-        let v_a = pmetal_bridge::compat::ops::select_axis(&qkv_a, 2, 3);
+        let q_a = pmetal_runtime::compat::ops::select_axis(&qkv_a, 0, 3);
+        let k_a = pmetal_runtime::compat::ops::select_axis(&qkv_a, 1, 3);
+        let v_a = pmetal_runtime::compat::ops::select_axis(&qkv_a, 2, 3);
         let q_a = self.norm_q_a.forward(&q_a);
         let k_a = self.norm_k_a.forward(&k_a);
 
@@ -413,9 +413,9 @@ impl FluxJointAttention {
                 self.head_dim as i32,
             ])
             .transpose_axes(&[0, 3, 1, 2, 4]);
-        let q_b = pmetal_bridge::compat::ops::select_axis(&qkv_b, 0, 3);
-        let k_b = pmetal_bridge::compat::ops::select_axis(&qkv_b, 1, 3);
-        let v_b = pmetal_bridge::compat::ops::select_axis(&qkv_b, 2, 3);
+        let q_b = pmetal_runtime::compat::ops::select_axis(&qkv_b, 0, 3);
+        let k_b = pmetal_runtime::compat::ops::select_axis(&qkv_b, 1, 3);
+        let v_b = pmetal_runtime::compat::ops::select_axis(&qkv_b, 2, 3);
         let q_b = self.norm_q_b.forward(&q_b);
         let k_b = self.norm_k_b.forward(&k_b);
 
@@ -427,7 +427,7 @@ impl FluxJointAttention {
         let k = self.apply_rope(&k, image_rotary_emb)?;
 
         let scale = 1.0 / (self.head_dim as f32).sqrt();
-        let attn_out = pmetal_bridge::compat::fast::scaled_dot_product_attention_masked(
+        let attn_out = pmetal_runtime::compat::fast::scaled_dot_product_attention_masked(
             &q, &k, &v, scale, None,
         );
 
@@ -439,9 +439,9 @@ impl FluxJointAttention {
 
         let split_idx = hidden_states_b.dim(1);
         let hidden_states_b_out =
-            pmetal_bridge::compat::ops::slice_axis(&attn_out, 1, 0, split_idx);
+            pmetal_runtime::compat::ops::slice_axis(&attn_out, 1, 0, split_idx);
         let hidden_states_a_out =
-            pmetal_bridge::compat::ops::slice_axis_from(&attn_out, 1, split_idx);
+            pmetal_runtime::compat::ops::slice_axis_from(&attn_out, 1, split_idx);
 
         let hidden_states_a_out = self.a_to_out.forward(&hidden_states_a_out);
         let hidden_states_b_out = self.b_to_out.forward(&hidden_states_b_out);
@@ -589,11 +589,11 @@ impl FluxSingleTransformerBlock {
         let shape = x.shape();
         let x_complex = x.reshape(&[shape[0], shape[1], shape[2], -1, 2]);
 
-        let cos = pmetal_bridge::compat::ops::select_axis(&x_complex, 0, -1);
-        let sin = pmetal_bridge::compat::ops::select_axis(&x_complex, 1, -1);
+        let cos = pmetal_runtime::compat::ops::select_axis(&x_complex, 0, -1);
+        let sin = pmetal_runtime::compat::ops::select_axis(&x_complex, 1, -1);
 
-        let freq_cos = pmetal_bridge::compat::ops::select_axis(freqs_cis, 0, -1);
-        let freq_sin = pmetal_bridge::compat::ops::select_axis(freqs_cis, 1, -1);
+        let freq_cos = pmetal_runtime::compat::ops::select_axis(freqs_cis, 0, -1);
+        let freq_sin = pmetal_runtime::compat::ops::select_axis(freqs_cis, 1, -1);
 
         let out_real = cos.multiply(&freq_cos).subtract(&sin.multiply(&freq_sin));
         let out_imag = cos.multiply(&freq_sin).add(&sin.multiply(&freq_cos));
@@ -620,8 +620,8 @@ impl FluxSingleTransformerBlock {
 
         let batch_size = hidden_states.dim(0);
         let dim3 = (self.dim * 3) as i32;
-        let qkv = pmetal_bridge::compat::ops::slice_last_to(&qkv_mlp, dim3);
-        let mlp_hidden = pmetal_bridge::compat::ops::slice_last_from(&qkv_mlp, dim3);
+        let qkv = pmetal_runtime::compat::ops::slice_last_to(&qkv_mlp, dim3);
+        let mlp_hidden = pmetal_runtime::compat::ops::slice_last_from(&qkv_mlp, dim3);
 
         let qkv = qkv
             .reshape(&[
@@ -632,9 +632,9 @@ impl FluxSingleTransformerBlock {
                 self.head_dim as i32,
             ])
             .transpose_axes(&[0, 3, 1, 2, 4]);
-        let q = pmetal_bridge::compat::ops::select_axis(&qkv, 0, 3);
-        let k = pmetal_bridge::compat::ops::select_axis(&qkv, 1, 3);
-        let v = pmetal_bridge::compat::ops::select_axis(&qkv, 2, 3);
+        let q = pmetal_runtime::compat::ops::select_axis(&qkv, 0, 3);
+        let k = pmetal_runtime::compat::ops::select_axis(&qkv, 1, 3);
+        let v = pmetal_runtime::compat::ops::select_axis(&qkv, 2, 3);
 
         let q = self.norm_q_a.forward(&q);
         let k = self.norm_k_a.forward(&k);
@@ -643,7 +643,7 @@ impl FluxSingleTransformerBlock {
         let k = self.apply_rope(&k, image_rotary_emb)?;
 
         let scale = 1.0 / (self.head_dim as f32).sqrt();
-        let attn_out = pmetal_bridge::compat::fast::scaled_dot_product_attention_masked(
+        let attn_out = pmetal_runtime::compat::fast::scaled_dot_product_attention_masked(
             &q, &k, &v, scale, None,
         );
 
@@ -785,7 +785,7 @@ impl FluxDiT {
 
         // Final output
         let split_idx = hidden_states_b.dim(1);
-        let hidden_states_a = pmetal_bridge::compat::ops::slice_axis_from(&combined, 1, split_idx);
+        let hidden_states_a = pmetal_runtime::compat::ops::slice_axis_from(&combined, 1, split_idx);
 
         let out = self.final_norm_out.forward(&hidden_states_a, &temb)?;
         let out = self.final_proj_out.forward(&out);
@@ -806,7 +806,7 @@ impl FluxDiT {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::Dtype;
+    use pmetal_runtime::compat::Dtype;
 
     #[test]
     #[ignore] // Flux DiT RoPE embedding concat shape mismatch at tiny dims — needs arch-specific fix
@@ -828,22 +828,22 @@ mod tests {
 
         let batch = 1;
         let seq_len = 4i32; // tiny image patch count
-        let hidden_states = pmetal_bridge::compat::random::normal(
+        let hidden_states = pmetal_runtime::compat::random::normal(
             &[batch, seq_len, 32],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let timestep = Array::from_slice(&[1.0f32], &[1]);
-        let prompt_emb = pmetal_bridge::compat::random::normal(
+        let prompt_emb = pmetal_runtime::compat::random::normal(
             &[batch, 4, 64],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
-        let pooled_prompt_emb = pmetal_bridge::compat::random::normal(
+        let pooled_prompt_emb = pmetal_runtime::compat::random::normal(
             &[batch, 64],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
-        let text_ids = pmetal_bridge::compat::ops::zeros(&[batch, 4, 3], Dtype::Float32).unwrap();
+        let text_ids = pmetal_runtime::compat::ops::zeros(&[batch, 4, 3], Dtype::Float32).unwrap();
         let image_ids =
-            pmetal_bridge::compat::ops::zeros(&[batch, seq_len, 3], Dtype::Float32).unwrap();
+            pmetal_runtime::compat::ops::zeros(&[batch, seq_len, 3], Dtype::Float32).unwrap();
 
         let out = model
             .forward(

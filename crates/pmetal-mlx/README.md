@@ -30,7 +30,7 @@ fn setup() {
 |--------|-------------|
 | `kernels` | Custom MLX kernels (fused attention, cut cross entropy, RMS norm, GDN, etc.) |
 | `kernels/gated_delta` | Gated Delta Network (GDN) recurrence with fused Metal shader |
-| `gradient_checkpoint` | Gradient-checkpointing config (the mechanism lives in `pmetal-bridge`) |
+| `gradient_checkpoint` | Gradient-checkpointing config (the mechanism lives in `pmetal-runtime`) |
 | `kv_cache` | Key-value cache for efficient inference |
 | `moe` | Mixture of Experts support |
 | `speculative` | `SpecCapture`, the state a target's forward pass records for speculative decoding |

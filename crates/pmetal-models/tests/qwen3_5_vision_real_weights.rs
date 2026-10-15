@@ -19,11 +19,11 @@
 
 use std::path::{Path, PathBuf};
 
-use pmetal_bridge::compat::{Array, Module, ops::slice_axis};
 use pmetal_data::qwen_vl_processing::load_image_source;
 use pmetal_mlx::test_utils::{load_shard, to_f32_vec_eval};
 use pmetal_models::DynamicModel;
 use pmetal_models::architectures::qwen3_5_vision::Qwen3_5Vision;
+use pmetal_runtime::compat::{Array, Module, ops::slice_axis};
 use serial_test::serial;
 
 fn env_dir(key: &str) -> Option<PathBuf> {
@@ -54,7 +54,7 @@ fn top_k(values: &[f32], k: usize) -> Vec<usize> {
 }
 
 fn drain(op: &str) {
-    pmetal_bridge::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
+    pmetal_runtime::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
 }
 
 fn last_row(logits: &Array) -> Vec<f32> {
@@ -120,7 +120,7 @@ fn real_checkpoint_matches_transformers() {
         let mut vision32 = Qwen3_5Vision::load(&model_dir).unwrap();
         vision32
             .tower
-            .set_dtype(pmetal_bridge::compat::Dtype::Float32);
+            .set_dtype(pmetal_runtime::compat::Dtype::Float32);
         let image = vision32
             .processor
             .preprocess_image(
@@ -172,7 +172,7 @@ fn real_checkpoint_matches_transformers() {
 
     // Native engine: prefill, then greedy decode.
     {
-        use pmetal_bridge::qwen3_native::{
+        use pmetal_runtime::qwen3_native::{
             NativeCache, embed_tokens, forward_embeddings_hidden, forward_step_hidden, load_config,
             load_model,
         };

@@ -42,7 +42,7 @@
 
 use super::MergeMethod;
 use crate::{MergeError, MergeParameters, Result};
-use pmetal_bridge::compat::Array;
+use pmetal_runtime::compat::Array;
 use std::path::PathBuf;
 
 /// Souper-Model merge implementation.

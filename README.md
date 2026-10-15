@@ -355,7 +355,7 @@ PMetal is organized as a Rust workspace with 20 specialized crates:
 
 ```text
 pmetal/
-├── pmetal-bridge       # Zero-allocation MLX C++ bridge (inline array FFI)
+├── pmetal-runtime       # Zero-allocation MLX C++ bridge (inline array FFI)
 ├── pmetal-core         # Foundation: configs, traits, types, error handling
 ├── pmetal-core-derive  # Derive macros for the core traits
 ├── pmetal-metal        # Custom Metal GPU kernels + ANE runtime
@@ -693,7 +693,7 @@ Defaults are `cli`, `dashboard`, `trainer`, `lora`, `merge`, `ane` and `distribu
 | `distributed` | Yes | `pmetal-distributed` | Distributed training and the `cluster` subcommand |
 | `ane` | Yes | — | Apple Neural Engine |
 | `dashboard` | Yes | — | TUI control center |
-| `native-only` | No | `pmetal-bridge` | Bridge-only build, without `pmetal-mlx` or `pmetal-models` |
+| `native-only` | No | `pmetal-runtime` | Bridge-only build, without `pmetal-mlx` or `pmetal-models` |
 | `vocoder` | No | `pmetal-vocoder` | BigVGAN neural vocoder |
 | `mhc` | No | `pmetal-mhc` | Manifold-Constrained Hyper-Connections |
 | `serve` | No | `pmetal-serve` | OpenAI- and Anthropic-compatible inference server |
@@ -734,6 +734,6 @@ Licensed under either of MIT or Apache-2.0.
 ## Acknowledgments
 
 - [MLX](https://github.com/ml-explore/mlx) - Apple's machine learning framework
-- `pmetal-bridge` - PMetal's Rust bridge for MLX, Metal, and runtime dispatch
+- `pmetal-runtime` - PMetal's Rust bridge for MLX, Metal, and runtime dispatch
 - Fused kernel techniques — see THIRD_PARTY_NOTICES for attributions
 - [Tauri](https://tauri.app) - Desktop application framework

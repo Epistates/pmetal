@@ -38,8 +38,8 @@ pub use prefix_cache::*;
 pub use speculative::*;
 
 // Re-export bridge types for convenience
-pub use pmetal_bridge::compat::builder::Builder;
-pub use pmetal_bridge::compat::{Array, Dtype, Exception, Module, ModuleParameters, Param};
+pub use pmetal_runtime::compat::builder::Builder;
+pub use pmetal_runtime::compat::{Array, Dtype, Exception, Module, ModuleParameters, Param};
 /// Crate-level result type alias using [`Exception`] as the error.
 pub type Result<T> = std::result::Result<T, Exception>;
 
@@ -54,7 +54,7 @@ pub mod prelude {
     pub use crate::moe::*;
     pub use crate::prefix_cache::*;
     pub use crate::speculative::*;
-    pub use pmetal_bridge::compat::{Array, Dtype, Exception, Module, ModuleParameters, Param};
+    pub use pmetal_runtime::compat::{Array, Dtype, Exception, Module, ModuleParameters, Param};
 }
 
 /// Compiles the code blocks in `README.md` as doctests, so the crate's front

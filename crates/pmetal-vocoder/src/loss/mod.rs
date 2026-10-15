@@ -8,7 +8,7 @@
 use crate::audio::{MelConfig, StftConfig, mel_spectrogram};
 use crate::discriminator::DiscriminatorOutput;
 use crate::error::Result;
-use pmetal_bridge::compat::Array;
+use pmetal_runtime::compat::Array;
 
 /// Generator adversarial loss.
 ///

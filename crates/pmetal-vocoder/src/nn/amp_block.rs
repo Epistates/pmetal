@@ -6,7 +6,7 @@
 
 use crate::error::Result;
 use crate::nn::{Activation1d, Snake, SnakeBeta, WeightNormConv1d};
-use pmetal_bridge::compat::Array;
+use pmetal_runtime::compat::Array;
 
 /// Anti-aliased Multi-Periodicity (AMP) block.
 ///

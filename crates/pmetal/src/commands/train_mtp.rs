@@ -42,7 +42,7 @@ pub(crate) async fn run_train_mtp(args: TrainMtpArgs) -> Result<()> {
                     other.architecture()
                 ),
             };
-            pmetal_bridge::compat::random::seed(args.seed);
+            pmetal_runtime::compat::random::seed(args.seed);
             let mut mtp = if let Some(init) = args.init_mtp.as_deref() {
                 let init_path = pmetal_hub::resolve_model_path(init, None, None)
                     .await
@@ -74,7 +74,7 @@ pub(crate) async fn run_train_mtp(args: TrainMtpArgs) -> Result<()> {
                     other.architecture()
                 ),
             };
-            pmetal_bridge::compat::random::seed(args.seed);
+            pmetal_runtime::compat::random::seed(args.seed);
             let mut assistant = if let Some(init) = args.init_mtp.as_deref() {
                 let init_path = pmetal_hub::resolve_model_path(init, None, None)
                     .await
@@ -155,7 +155,7 @@ fn shard_batches(
     seq_len: usize,
     batch_size: usize,
     eos_token_id: u32,
-) -> Result<impl Iterator<Item = pmetal_bridge::compat::Array>> {
+) -> Result<impl Iterator<Item = pmetal_runtime::compat::Array>> {
     anyhow::ensure!(!shards.is_empty(), "--shards must not be empty");
     anyhow::ensure!(seq_len >= 2, "--seq-len must be >= 2");
     let reader = StreamingShardReader::new(StreamConfig {

@@ -9,8 +9,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use pmetal_bridge::compat::{Array, Exception};
-use pmetal_bridge::inline_array;
+use pmetal_runtime::compat::{Array, Exception};
+use pmetal_runtime::inline_array;
 use serde::{Deserialize, Serialize};
 
 use crate::{Result, SftError};

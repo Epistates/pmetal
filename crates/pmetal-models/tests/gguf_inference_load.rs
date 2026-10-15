@@ -5,9 +5,9 @@
 //! This exercises the full path: format detection → GGUF metadata → arch config
 //! → dequantized weight assignment → logits — with no external download.
 
-use pmetal_bridge::compat::{Array, Dtype};
 use pmetal_gguf::GgufBuilder;
 use pmetal_models::{DynamicModel, ModelArchitecture};
+use pmetal_runtime::compat::{Array, Dtype};
 
 // Tiny dimensions: keep the fixture sub-kilobyte while still exercising GQA
 // (kv_heads < heads), multi-layer stacking, and a non-tied LM head.

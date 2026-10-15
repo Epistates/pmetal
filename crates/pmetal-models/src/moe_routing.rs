@@ -30,7 +30,7 @@
 //! argpartition → take → normalize pattern. After: one helper + 1-line
 //! call sites.
 
-use pmetal_bridge::compat::{Array, Exception, ops};
+use pmetal_runtime::compat::{Array, Exception, ops};
 
 /// Numerical floor for the `sum(top_weights)` denominator when
 /// `norm_topk_prob` is true. Matches the value used in-line across pmetal
@@ -194,7 +194,7 @@ pub fn noaux_tc_topk(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::Array;
+    use pmetal_runtime::compat::Array;
 
     #[test]
     fn topk_picks_largest_and_preserves_shape() {
@@ -264,7 +264,7 @@ mod tests {
         // This test exists to guard against accidentally reintroducing the
         // buggy combination — if argpartition semantics ever changed such
         // that the bug became a correct form, this test would flag it.
-        use pmetal_bridge::compat::ops;
+        use pmetal_runtime::compat::ops;
 
         let scores = Array::from_slice(&[0.2f32, 0.3, 0.1, 0.4], &[1, 4]);
         let neg_k = -2_i32;

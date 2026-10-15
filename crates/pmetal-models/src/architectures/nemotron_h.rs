@@ -14,8 +14,8 @@
 //!
 //! Reference: <https://arxiv.org/abs/2504.03624>
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, Module, Param, nn};
-use pmetal_bridge::impl_module_params;
+use pmetal_runtime::compat::{Array, Dtype, Exception, Module, Param, nn};
+use pmetal_runtime::impl_module_params;
 use std::collections::HashMap;
 
 use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
@@ -27,7 +27,7 @@ fn materialize_linear_weight(
     weight_scale: Option<&Array>,
 ) -> Result<Array, Exception> {
     let weight = if weight.dtype() == Dtype::Uint8 {
-        pmetal_bridge::compat::ops::from_fp8(weight, Dtype::Bfloat16)?
+        pmetal_runtime::compat::ops::from_fp8(weight, Dtype::Bfloat16)?
     } else {
         weight.clone()
     };
@@ -92,7 +92,7 @@ fn linear_module_forward(linear: &mut nn::Linear, x: &Array) -> Result<Array, Ex
 }
 
 fn quantize_linear_weights_fp8(linear: &mut nn::Linear) -> Result<(), Exception> {
-    let quantized = pmetal_bridge::compat::ops::to_fp8(linear.weight.as_ref())?;
+    let quantized = pmetal_runtime::compat::ops::to_fp8(linear.weight.as_ref())?;
     linear.weight = Param::new(quantized);
     Ok(())
 }
@@ -242,7 +242,7 @@ impl MambaRMSNormGated {
 fn compute_dt(dt: &Array, dt_bias: &Array, time_step_min: f32) -> Result<Array, Exception> {
     let dt_biased = dt.add(dt_bias);
     let dt_soft = nn::softplus(&dt_biased);
-    Ok(pmetal_bridge::compat::ops::clip(
+    Ok(pmetal_runtime::compat::ops::clip(
         &dt_soft,
         Some(&Array::from_f32(time_step_min)),
         None,
@@ -256,14 +256,14 @@ fn segsum(x: &Array) -> Result<Array, Exception> {
     let l = x.shape()[ndim - 1];
 
     // Repeat x along new axis: [B, H, L] -> [B, H, L, L]
-    let x_expanded = pmetal_bridge::compat::ops::expand_dims(x, -1);
-    let x_repeated = pmetal_bridge::compat::ops::tile(&x_expanded, &[1, 1, 1, l]);
+    let x_expanded = pmetal_runtime::compat::ops::expand_dims(x, -1);
+    let x_repeated = pmetal_runtime::compat::ops::tile(&x_expanded, &[1, 1, 1, l]);
 
     // Create lower triangular mask (shifted by -1)
-    let x_tril = pmetal_bridge::compat::ops::tril(&x_repeated, -1);
+    let x_tril = pmetal_runtime::compat::ops::tril(&x_repeated, -1);
 
     // Cumsum along axis -2
-    Ok(pmetal_bridge::compat::ops::cumsum(&x_tril, -2))
+    Ok(pmetal_runtime::compat::ops::cumsum(&x_tril, -2))
 }
 
 /// Optimized SSM update for single-token decode (seq_len=1).
@@ -318,18 +318,18 @@ pub fn ssm_update_single(
     let dt_full = compute_dt(&dt_squeezed, dt_bias, time_step_min)?;
 
     // Compute A = -exp(A_log): [H]
-    let a = pmetal_bridge::compat::ops::negative(&pmetal_bridge::compat::ops::exp(a_log));
+    let a = pmetal_runtime::compat::ops::negative(&pmetal_runtime::compat::ops::exp(a_log));
     let a = a.as_dtype(dt_full.dtype().as_i32());
 
     // dA = exp(A * dt): [B, H] - decay factor
     let dt_a = dt_full.multiply(&a.reshape(&[1, num_heads]));
-    let d_a = pmetal_bridge::compat::ops::exp(&dt_a);
+    let d_a = pmetal_runtime::compat::ops::exp(&dt_a);
 
     // x squeezed: [B, 1, H, D] -> [B, H, D]
     let x_squeezed = x.squeeze_axes(&[1]);
 
     // dt expanded for multiplication: [B, H] -> [B, H, 1]
-    let dt_expanded = pmetal_bridge::compat::ops::expand_dims(&dt_full, -1);
+    let dt_expanded = pmetal_runtime::compat::ops::expand_dims(&dt_full, -1);
 
     // dtx = x * dt: [B, H, D]
     let dtx = x_squeezed.multiply(&dt_expanded);
@@ -338,19 +338,19 @@ pub fn ssm_update_single(
     let b_squeezed = b.squeeze_axes(&[1]);
 
     // Repeat B to all heads: [B, G, N] -> [B, H, N]
-    let b_expanded = pmetal_bridge::compat::ops::expand_dims(&b_squeezed, 2); // [B, G, 1, N]
-    let b_tiled = pmetal_bridge::compat::ops::tile(&b_expanded, &[1, 1, repeats, 1]); // [B, G, repeats, N]
+    let b_expanded = pmetal_runtime::compat::ops::expand_dims(&b_squeezed, 2); // [B, G, 1, N]
+    let b_tiled = pmetal_runtime::compat::ops::tile(&b_expanded, &[1, 1, repeats, 1]); // [B, G, repeats, N]
     let b_heads = b_tiled.reshape(&[batch, num_heads, state_dim]); // [B, H, N]
 
     // dB_by_x = dtx * B: [B, H, D, 1] @ [B, H, 1, N] -> [B, H, D, N]
     // Using outer product: dtx[:,:,:,None] * B[:,:,None,:]
-    let dtx_expanded = pmetal_bridge::compat::ops::expand_dims(&dtx, -1); // [B, H, D, 1]
-    let b_expanded2 = pmetal_bridge::compat::ops::expand_dims(&b_heads, 2); // [B, H, 1, N]
+    let dtx_expanded = pmetal_runtime::compat::ops::expand_dims(&dtx, -1); // [B, H, D, 1]
+    let b_expanded2 = pmetal_runtime::compat::ops::expand_dims(&b_heads, 2); // [B, H, 1, N]
     let db_by_x = dtx_expanded.multiply(&b_expanded2); // [B, H, D, N]
 
     // dA expanded for state: [B, H] -> [B, H, 1, 1]
-    let d_a_expanded = pmetal_bridge::compat::ops::expand_dims(&d_a, -1);
-    let d_a_expanded = pmetal_bridge::compat::ops::expand_dims(&d_a_expanded, -1);
+    let d_a_expanded = pmetal_runtime::compat::ops::expand_dims(&d_a, -1);
+    let d_a_expanded = pmetal_runtime::compat::ops::expand_dims(&d_a_expanded, -1);
 
     // New state = dA * old_state + dB_by_x: [B, H, D, N]
     let new_state = state.multiply(&d_a_expanded).add(&db_by_x);
@@ -359,13 +359,13 @@ pub fn ssm_update_single(
     let c_squeezed = c.squeeze_axes(&[1]);
 
     // Repeat C to all heads: [B, G, N] -> [B, H, N]
-    let c_expanded = pmetal_bridge::compat::ops::expand_dims(&c_squeezed, 2);
-    let c_tiled = pmetal_bridge::compat::ops::tile(&c_expanded, &[1, 1, repeats, 1]);
+    let c_expanded = pmetal_runtime::compat::ops::expand_dims(&c_squeezed, 2);
+    let c_tiled = pmetal_runtime::compat::ops::tile(&c_expanded, &[1, 1, repeats, 1]);
     let c_heads = c_tiled.reshape(&[batch, num_heads, state_dim]);
 
     // Output = state @ C: [B, H, D, N] @ [B, H, N, 1] -> [B, H, D, 1] -> [B, H, D]
     // Or using einsum-like: sum over N: state * C
-    let c_expanded2 = pmetal_bridge::compat::ops::expand_dims(&c_heads, 2); // [B, H, 1, N]
+    let c_expanded2 = pmetal_runtime::compat::ops::expand_dims(&c_heads, 2); // [B, H, 1, N]
     let state_c = new_state.multiply(&c_expanded2); // [B, H, D, N]
     let y = state_c.sum_axis(-1, false); // [B, H, D]
 
@@ -375,7 +375,7 @@ pub fn ssm_update_single(
     let y = y.add(&skip);
 
     // Expand output to [B, 1, H, D]
-    let y = pmetal_bridge::compat::ops::expand_dims(&y, 1);
+    let y = pmetal_runtime::compat::ops::expand_dims(&y, 1);
 
     Ok((y, new_state))
 }
@@ -429,7 +429,7 @@ pub fn ssm_attention(
     let dt_full = compute_dt(dt, dt_bias, time_step_min)?;
 
     // Compute A = -exp(A_log) and cast to dt dtype
-    let a = pmetal_bridge::compat::ops::negative(&pmetal_bridge::compat::ops::exp(a_log));
+    let a = pmetal_runtime::compat::ops::negative(&pmetal_runtime::compat::ops::exp(a_log));
     let a = a.as_dtype(dt_full.dtype().as_i32());
 
     // Compute dtA = dt * A: [B, L, H]
@@ -447,18 +447,18 @@ pub fn ssm_attention(
     let cb = c_t.matmul(&b_t);
 
     // Repeat CB to all heads: [B, G, L, L] -> [B, H, L, L]
-    let cb_expanded = pmetal_bridge::compat::ops::expand_dims(&cb, 2);
-    let cb_tiled = pmetal_bridge::compat::ops::tile(&cb_expanded, &[1, 1, repeats, 1, 1]);
+    let cb_expanded = pmetal_runtime::compat::ops::expand_dims(&cb, 2);
+    let cb_tiled = pmetal_runtime::compat::ops::tile(&cb_expanded, &[1, 1, repeats, 1, 1]);
     let cb_heads = cb_tiled.reshape(&[batch, num_heads, seq_len, seq_len]);
 
     // Compute decay = exp(segsum(dtA.swapaxes(1,2))): [B, H, L, L]
     let dt_a_t = dt_a.transpose_axes(&[0, 2, 1]);
     let segsum_result = segsum(&dt_a_t)?;
-    let decay = pmetal_bridge::compat::ops::exp(&segsum_result);
+    let decay = pmetal_runtime::compat::ops::exp(&segsum_result);
 
     // Surrogate attention = tril(CB * decay)
     let attn_weights = cb_heads.multiply(&decay);
-    let attn_weights = pmetal_bridge::compat::ops::tril(&attn_weights, 0);
+    let attn_weights = pmetal_runtime::compat::ops::tril(&attn_weights, 0);
 
     // y = attn @ dtx.swapaxes(1,2): [B, H, L, L] @ [B, H, L, D] = [B, H, L, D]
     let dtx_t = dtx.transpose_axes(&[0, 2, 1, 3]);
@@ -466,12 +466,12 @@ pub fn ssm_attention(
 
     // Compute new state for caching
     // decay_last: [B, H, 1, L] -> [B, L, H, 1]
-    let decay_last = pmetal_bridge::compat::ops::slice_axis(&decay, 2, seq_len - 1, seq_len);
+    let decay_last = pmetal_runtime::compat::ops::slice_axis(&decay, 2, seq_len - 1, seq_len);
     let decay_last = decay_last.transpose_axes(&[0, 3, 1, 2]);
 
     // B_expanded: [B, G, N, L] -> repeat to [B, H, N, L] -> [B, H, L, N]
-    let b_expanded = pmetal_bridge::compat::ops::expand_dims(&b_t, 2);
-    let b_tiled = pmetal_bridge::compat::ops::tile(&b_expanded, &[1, 1, repeats, 1, 1]);
+    let b_expanded = pmetal_runtime::compat::ops::expand_dims(&b_t, 2);
+    let b_tiled = pmetal_runtime::compat::ops::tile(&b_expanded, &[1, 1, repeats, 1, 1]);
     let b_heads = b_tiled.reshape(&[batch, num_heads, state_dim, seq_len]);
     let b_heads = b_heads.transpose_axes(&[0, 1, 3, 2]); // [B, H, L, N]
 
@@ -488,13 +488,13 @@ pub fn ssm_attention(
     if let Some(prev_state) = state {
         // exp_dtA_cumsum = exp(cumsum(dtA, axis=-2)): [B, L, H]
         let exp_dta_cumsum =
-            pmetal_bridge::compat::ops::exp(&pmetal_bridge::compat::ops::cumsum(&dt_a, -2));
+            pmetal_runtime::compat::ops::exp(&pmetal_runtime::compat::ops::cumsum(&dt_a, -2));
 
         // exp_dta_last: [B, 1, H] -> [B, H, 1, 1]
         let exp_dta_last =
-            pmetal_bridge::compat::ops::slice_axis(&exp_dta_cumsum, 1, seq_len - 1, seq_len);
+            pmetal_runtime::compat::ops::slice_axis(&exp_dta_cumsum, 1, seq_len - 1, seq_len);
         let exp_dta_last = exp_dta_last.transpose_axes(&[0, 2, 1]);
-        let exp_dta_last = pmetal_bridge::compat::ops::expand_dims(&exp_dta_last, -1);
+        let exp_dta_last = pmetal_runtime::compat::ops::expand_dims(&exp_dta_last, -1);
 
         // next_state += exp_dta_last * prev_state
         let state_decay = prev_state.multiply(&exp_dta_last);
@@ -505,7 +505,7 @@ pub fn ssm_attention(
         // Reshape for group-wise processing:
         // state_grouped: [B, G, repeats, D, N] -> [B, 1, G, repeats, D, N]
         let state_grouped = prev_state.reshape(&[batch, n_groups, repeats, head_dim, state_dim]);
-        let state_grouped = pmetal_bridge::compat::ops::expand_dims(&state_grouped, 1);
+        let state_grouped = pmetal_runtime::compat::ops::expand_dims(&state_grouped, 1);
 
         // C_grouped: [B, L, G, N] -> [B, L, G, 1, N, 1]
         let c_grouped = c.reshape(&[batch, seq_len, n_groups, 1, state_dim, 1]);
@@ -518,7 +518,7 @@ pub fn ssm_attention(
             .reshape(&[batch, seq_len, num_heads, head_dim]);
 
         // exp_dta_cumsum: [B, L, H] -> [B, L, H, 1]
-        let exp_dta_expanded = pmetal_bridge::compat::ops::expand_dims(&exp_dta_cumsum, -1);
+        let exp_dta_expanded = pmetal_runtime::compat::ops::expand_dims(&exp_dta_cumsum, -1);
 
         // y_prev contribution: y += exp_dta_cumsum * y_prev
         let y_prev_t = y_prev.transpose_axes(&[0, 2, 1, 3]); // [B, H, L, D]
@@ -666,7 +666,7 @@ impl MoERouter {
 
         // Apply sigmoid (not softmax) for scoring
         let logits_f32 = logits.as_dtype(Dtype::Float32.as_i32());
-        let orig_scores = pmetal_bridge::compat::ops::sigmoid(&logits_f32);
+        let orig_scores = pmetal_runtime::compat::ops::sigmoid(&logits_f32);
 
         // Add bias for selection (but use original scores for final weights)
         let scores_for_selection = orig_scores.add(&self.e_score_correction_bias);
@@ -678,18 +678,19 @@ impl MoERouter {
             let grouped = scores_for_selection.reshape(&[-1, self.n_group, experts_per_group]);
 
             // Get top-2 scores per group and sum them to get group scores
-            let top2_scores = pmetal_bridge::compat::indexing::topk_axis(&grouped, 2, -1);
+            let top2_scores = pmetal_runtime::compat::indexing::topk_axis(&grouped, 2, -1);
             let group_scores = top2_scores.sum_axis(-1, true);
 
             // Zero out non-selected groups (keep top topk_group groups)
             let k = self.n_group - self.topk_group;
-            let group_idx = pmetal_bridge::compat::ops::argpartition_axis(&group_scores, k - 1, -2);
-            let group_idx = pmetal_bridge::compat::ops::slice_axis(&group_idx, 1, 0, k);
+            let group_idx =
+                pmetal_runtime::compat::ops::argpartition_axis(&group_scores, k - 1, -2);
+            let group_idx = pmetal_runtime::compat::ops::slice_axis(&group_idx, 1, 0, k);
 
             // Zero out bottom groups using put_along_axis
             let zeros = Array::from_f32(0.0);
-            let group_idx_sg = pmetal_bridge::compat::stop_gradient(&group_idx)?;
-            let grouped = pmetal_bridge::compat::indexing::put_along_axis(
+            let group_idx_sg = pmetal_runtime::compat::stop_gradient(&group_idx)?;
+            let grouped = pmetal_runtime::compat::indexing::put_along_axis(
                 &grouped,
                 &group_idx_sg,
                 &zeros,
@@ -705,11 +706,11 @@ impl MoERouter {
         // Get top-k indices (negate for argpartition which returns smallest)
         let neg_scores = scores_for_selection.negative();
         let k = self.top_k - 1;
-        let inds = pmetal_bridge::compat::ops::argpartition_axis(&neg_scores, k, -1);
+        let inds = pmetal_runtime::compat::ops::argpartition_axis(&neg_scores, k, -1);
         // Indices carry no gradient, and MLX refuses to differentiate a gather
         // with respect to them.
-        let inds = pmetal_bridge::compat::ops::stop_gradient(
-            &pmetal_bridge::compat::ops::slice_last_to(&inds, self.top_k),
+        let inds = pmetal_runtime::compat::ops::stop_gradient(
+            &pmetal_runtime::compat::ops::slice_last_to(&inds, self.top_k),
         );
 
         // Get original scores for selected experts (not bias-corrected)
@@ -814,7 +815,7 @@ impl MoELayer {
         let (weights, indices) = self.router.forward(&x_flat)?;
 
         // Initialize output with zeros
-        let mut output = pmetal_bridge::compat::ops::zeros_like(&x_flat);
+        let mut output = pmetal_runtime::compat::ops::zeros_like(&x_flat);
 
         // For decode (single token), we can sync once and call only selected experts
         // This reduces from 128 to 4 expert calls (32x reduction)
@@ -828,7 +829,7 @@ impl MoELayer {
                 let expert_idx = expert_idx_u32 as usize;
                 let ki = k as i32;
                 let expert_weight =
-                    pmetal_bridge::compat::ops::slice_axis(&weights, -1, ki, ki + 1);
+                    pmetal_runtime::compat::ops::slice_axis(&weights, -1, ki, ki + 1);
 
                 // Call only the selected expert
                 let expert_out = self.experts[expert_idx].forward(&x_flat)?;
@@ -839,8 +840,9 @@ impl MoELayer {
             // For larger batches, use lazy evaluation with masking
             // Build the entire computation graph first, then let MLX optimize
             for k in 0..self.top_k {
-                let expert_indices = pmetal_bridge::compat::ops::select_axis(&indices, k, -1);
-                let expert_weights = pmetal_bridge::compat::ops::slice_axis(&weights, -1, k, k + 1);
+                let expert_indices = pmetal_runtime::compat::ops::select_axis(&indices, k, -1);
+                let expert_weights =
+                    pmetal_runtime::compat::ops::slice_axis(&weights, -1, k, k + 1);
 
                 // Process each expert with masking
                 for expert_idx in 0..self.num_experts {
@@ -852,10 +854,10 @@ impl MoELayer {
 
                     // Weight and mask the output using where (lazy)
                     let weighted = expert_out.multiply(&expert_weights);
-                    let zeros = pmetal_bridge::compat::ops::zeros_like(&weighted);
+                    let zeros = pmetal_runtime::compat::ops::zeros_like(&weighted);
                     let mask_expanded = mask.reshape(&[-1, 1]);
                     let masked_weighted =
-                        pmetal_bridge::compat::ops::where_fn(&mask_expanded, &weighted, &zeros);
+                        pmetal_runtime::compat::ops::where_fn(&mask_expanded, &weighted, &zeros);
                     output = output.add(&masked_weighted);
                 }
             }
@@ -890,7 +892,7 @@ impl MoELayer {
 
         // Stack along new first dimension: [num_experts, intermediate, hidden]
         // Note: Linear weights are stored transposed as [out_features, in_features]
-        let stacked_up = pmetal_bridge::compat::ops::stack_axis(&up_weights, 0);
+        let stacked_up = pmetal_runtime::compat::ops::stack_axis(&up_weights, 0);
 
         // Collect all down_proj weights: [intermediate, hidden] for each expert
         let down_weights: Vec<Array> = self
@@ -904,7 +906,7 @@ impl MoELayer {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let stacked_down = pmetal_bridge::compat::ops::stack_axis(&down_weights, 0);
+        let stacked_down = pmetal_runtime::compat::ops::stack_axis(&down_weights, 0);
 
         tracing::debug!(
             "Stacked MoE weights: up={:?}, down={:?}, num_experts={}",
@@ -970,7 +972,7 @@ impl MoELayer {
         let up_out = gather_mm(&x_expanded, &up_t, None, Some(&indices), false)?;
 
         // Apply relu2 activation (relu squared)
-        let activated = pmetal_bridge::compat::nn::relu(&up_out).square();
+        let activated = pmetal_runtime::compat::nn::relu(&up_out).square();
 
         // Use gather_mm for down projection
         // activated: [B*L, top_k, intermediate]
@@ -1624,7 +1626,7 @@ impl NemotronHMixer {
         // Use split_sections for efficient splitting (optimization #1)
         // Split at: [intermediate_size, intermediate_size + conv_dim]
         let split_indices = &[intermediate_size, intermediate_size + conv_dim];
-        let parts = pmetal_bridge::compat::ops::split_sections(&projected, split_indices, -1);
+        let parts = pmetal_runtime::compat::ops::split_sections(&projected, split_indices, -1);
         let gate = &parts[0]; // [B, L, intermediate_size]
         let conv_input = &parts[1]; // [B, L, conv_dim]
         let dt = &parts[2]; // [B, L, num_heads]
@@ -1639,14 +1641,14 @@ impl NemotronHMixer {
             let out_len = conv_out.dim(1);
 
             let conv_out =
-                pmetal_bridge::compat::ops::slice_axis_from(&conv_out, 1, out_len - seq_len);
+                pmetal_runtime::compat::ops::slice_axis_from(&conv_out, 1, out_len - seq_len);
             nn::silu(&conv_out)
         } else {
             // No cache: use CAUSAL PADDING for full sequence
             // Pad (kernel_size - 1) zeros on the left of the sequence
             // This matches reference: mx.pad(conv_input, [(0, 0), (kernel_size - 1, 0), (0, 0)])
             let pad_amount = conv_kernel - 1;
-            let padded_input = pmetal_bridge::compat::ops::pad(
+            let padded_input = pmetal_runtime::compat::ops::pad(
                 conv_input,
                 &[(0i32, 0i32), (pad_amount, 0), (0, 0)],
                 None,      // mode = Constant (default)
@@ -1662,7 +1664,7 @@ impl NemotronHMixer {
         let bc_size = n_groups * ssm_state_size;
         let conv_split_indices = &[intermediate_size, intermediate_size + bc_size];
         let conv_parts =
-            pmetal_bridge::compat::ops::split_sections(&conv_activated, conv_split_indices, -1);
+            pmetal_runtime::compat::ops::split_sections(&conv_activated, conv_split_indices, -1);
         let hidden_states = &conv_parts[0]; // [B, L, intermediate_size]
         let b_proj = &conv_parts[1]; // [B, L, n_groups * ssm_state_size]
         let c_proj = &conv_parts[2]; // [B, L, n_groups * ssm_state_size]
@@ -2127,7 +2129,7 @@ impl NemotronHForCausalLM {
 
     /// Evaluate all parameters to materialize them on device.
     pub fn eval(&self) -> Result<(), Exception> {
-        pmetal_bridge::compat::ModuleParametersExt::eval(self)
+        pmetal_runtime::compat::ModuleParametersExt::eval(self)
     }
 
     pub fn quantize_fp8_weights(&mut self) -> Result<(), Exception> {
@@ -2433,7 +2435,7 @@ fn load_moe_weights(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::ops;
+    use pmetal_runtime::compat::ops;
 
     fn small_config() -> NemotronHConfig {
         NemotronHConfig {
@@ -2562,8 +2564,8 @@ mod tests {
     /// `d/dB sum(s · (x·Aᵀ)·Bᵀ)` is `s` times the column sums of `x·Aᵀ`.
     #[test]
     fn an_adapter_on_an_fp8_scaled_projection_applies_and_trains() {
-        use pmetal_bridge::compat::random;
-        use pmetal_bridge::inline_array::value_and_grad;
+        use pmetal_runtime::compat::random;
+        use pmetal_runtime::inline_array::value_and_grad;
 
         random::seed(5);
         let (inputs, outputs, rank) = (32, 16, 4);
@@ -2605,7 +2607,7 @@ mod tests {
             std::slice::from_ref(&b),
             &[],
         );
-        pmetal_bridge::check_unobserved_error().expect("a bridge op threw");
+        pmetal_runtime::check_unobserved_error().expect("a bridge op threw");
         let want = xa
             .as_dtype(Dtype::Float32.as_i32())
             .sum_axis(0, true)

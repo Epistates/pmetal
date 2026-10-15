@@ -43,8 +43,8 @@ pub(crate) async fn run_fuse(
     let lora_file_str = lora_file
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("non-UTF-8 LoRA path: {}", lora_file.display()))?;
-    let lora_weights: HashMap<String, pmetal_bridge::compat::Array> =
-        pmetal_bridge::inline_array::load_safetensors_shard(lora_file_str)
+    let lora_weights: HashMap<String, pmetal_runtime::compat::Array> =
+        pmetal_runtime::inline_array::load_safetensors_shard(lora_file_str)
             .map(|pairs| pairs.into_iter().collect())
             .ok_or_else(|| {
                 anyhow::anyhow!("failed to load safetensors: {}", lora_file.display())
@@ -97,8 +97,8 @@ pub(crate) async fn run_fuse(
     let mut fused_count = 0usize;
 
     // Group LoRA weights by layer: find matching (lora_a, lora_b) pairs
-    let mut lora_a_map: HashMap<String, &pmetal_bridge::compat::Array> = HashMap::new();
-    let mut lora_b_map: HashMap<String, &pmetal_bridge::compat::Array> = HashMap::new();
+    let mut lora_a_map: HashMap<String, &pmetal_runtime::compat::Array> = HashMap::new();
+    let mut lora_b_map: HashMap<String, &pmetal_runtime::compat::Array> = HashMap::new();
 
     for (name, array) in &lora_weights {
         if let Some(base_name) = name.strip_suffix(".lora_a") {
@@ -131,10 +131,10 @@ pub(crate) async fn run_fuse(
         // lora_a: [r, in_features], lora_b: [out_features, r]
         // delta: [out_features, in_features]
         let base_dtype = base_weight.dtype_raw();
-        let delta = pmetal_bridge::compat::ops::matmul(lora_b, lora_a);
+        let delta = pmetal_runtime::compat::ops::matmul(lora_b, lora_a);
         let scaled_delta =
-            pmetal_bridge::compat::ops::multiply(&delta, &pmetal_bridge::array!(scale));
-        let fused = pmetal_bridge::compat::ops::add(base_weight, &scaled_delta);
+            pmetal_runtime::compat::ops::multiply(&delta, &pmetal_runtime::array!(scale));
+        let fused = pmetal_runtime::compat::ops::add(base_weight, &scaled_delta);
         // Cast back to base dtype (LoRA is f32, base is typically bf16/f16)
         let fused = if fused.dtype_raw() != base_dtype {
             fused.as_dtype(base_dtype)
@@ -178,11 +178,11 @@ pub(crate) async fn run_fuse(
     let output_file_str = output_file
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("non-UTF-8 output path: {}", output_file.display()))?;
-    let entries: Vec<(&str, &pmetal_bridge::compat::Array)> = base_weights
+    let entries: Vec<(&str, &pmetal_runtime::compat::Array)> = base_weights
         .iter()
         .map(|(key, value)| (key.as_str(), value))
         .collect();
-    pmetal_bridge::compat::Array::save_safetensors(output_file_str, &entries)?;
+    pmetal_runtime::compat::Array::save_safetensors(output_file_str, &entries)?;
 
     // Generate model.safetensors.index.json (required by many model loaders)
     let mut weight_map = serde_json::Map::new();

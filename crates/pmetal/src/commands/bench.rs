@@ -2,8 +2,6 @@ use crate::{GdnBenchmarkStage, WorkloadBenchmarkPreset, WorkloadInferenceContext
 use anyhow::Context;
 use half::f16;
 use pmetal::inference_runner::{CacheModeRequest, select_cache_mode_for_model};
-use pmetal_bridge::compat::module::ModuleParameters as _;
-use pmetal_bridge::compat::{Array, ops};
 use pmetal_core::{
     DatasetConfig, LoraConfig, ModelConfig, StepMetrics, TrainingCallback, TrainingConfig,
 };
@@ -27,6 +25,8 @@ use pmetal_models::architectures::llama4::{Llama4MoE, Llama4TextConfig};
 use pmetal_models::architectures::qwen3_moe::{Qwen3MoEBlock, Qwen3MoEConfig};
 use pmetal_models::architectures::qwen3_next::Qwen3NextGatedDeltaNet;
 use pmetal_models::dispatcher::{DynamicModel, DynamicModelLoadOptions};
+use pmetal_runtime::compat::module::ModuleParameters as _;
+use pmetal_runtime::compat::{Array, ops};
 use pmetal_trainer::orchestrator::{FullTrainingConfig, run_training};
 use pmetal_trainer::{DispatchConfig, TrainingJobConfig};
 use serde::{Deserialize, Serialize};
@@ -81,16 +81,16 @@ pub(crate) async fn run_benchmark(
     let mut model_inst = AdaptedModel::attach(base, lora_config)?;
 
     // Create dummy data
-    let input_ids = pmetal_bridge::compat::ops::zeros(
+    let input_ids = pmetal_runtime::compat::ops::zeros(
         &[batch_size as i32, seq_len as i32],
-        pmetal_bridge::compat::Dtype::Int32,
+        pmetal_runtime::compat::Dtype::Int32,
     );
 
     // Warmup
     println!("Warming up...");
     for _ in 0..3 {
         let output = model_inst.forward(&input_ids, None)?;
-        pmetal_bridge::compat::transforms::eval([&output])?;
+        pmetal_runtime::compat::transforms::eval([&output])?;
     }
 
     // Benchmark
@@ -99,7 +99,7 @@ pub(crate) async fn run_benchmark(
 
     for _ in 0..iterations {
         let output = model_inst.forward(&input_ids, None)?;
-        pmetal_bridge::compat::transforms::eval([&output])?;
+        pmetal_runtime::compat::transforms::eval([&output])?;
     }
 
     let elapsed = start.elapsed();
@@ -702,10 +702,10 @@ pub(crate) async fn run_gdn_decode_benchmark(
                     let z = mlx_linear_projection(&setup.input, &setup.z_weight)?;
                     let b_val = mlx_linear_projection(&setup.input, &setup.b_weight)?;
                     let a = mlx_linear_projection(&setup.input, &setup.a_weight)?;
-                    pmetal_bridge::compat::transforms::eval([&qkv])?;
-                    pmetal_bridge::compat::transforms::eval([&z])?;
-                    pmetal_bridge::compat::transforms::eval([&b_val])?;
-                    pmetal_bridge::compat::transforms::eval([&a])?;
+                    pmetal_runtime::compat::transforms::eval([&qkv])?;
+                    pmetal_runtime::compat::transforms::eval([&z])?;
+                    pmetal_runtime::compat::transforms::eval([&b_val])?;
+                    pmetal_runtime::compat::transforms::eval([&a])?;
                     Ok(())
                 },
             )?;
@@ -721,7 +721,7 @@ pub(crate) async fn run_gdn_decode_benchmark(
                         &setup.b_weight_t,
                         &setup.a_weight_t,
                     )?;
-                    pmetal_bridge::compat::transforms::eval([&projected])?;
+                    pmetal_runtime::compat::transforms::eval([&projected])?;
                     Ok(())
                 },
             )?;
@@ -731,7 +731,7 @@ pub(crate) async fn run_gdn_decode_benchmark(
                 benchmark_iterations,
                 || -> anyhow::Result<()> {
                     let projected = mlx_linear_projection(&setup.input, &setup.combined_weight)?;
-                    pmetal_bridge::compat::transforms::eval([&projected])?;
+                    pmetal_runtime::compat::transforms::eval([&projected])?;
                     Ok(())
                 },
             )?;
@@ -744,7 +744,7 @@ pub(crate) async fn run_gdn_decode_benchmark(
                         &setup.input,
                         &setup.combined_weight_t,
                     )?;
-                    pmetal_bridge::compat::transforms::eval([&projected])?;
+                    pmetal_runtime::compat::transforms::eval([&projected])?;
                     Ok(())
                 },
             )?;
@@ -763,10 +763,10 @@ pub(crate) async fn run_gdn_decode_benchmark(
                         setup.num_v_heads,
                         setup.head_v_dim,
                     )?;
-                    pmetal_bridge::compat::transforms::eval([&qkv])?;
-                    pmetal_bridge::compat::transforms::eval([&z])?;
-                    pmetal_bridge::compat::transforms::eval([&b_val])?;
-                    pmetal_bridge::compat::transforms::eval([&a])?;
+                    pmetal_runtime::compat::transforms::eval([&qkv])?;
+                    pmetal_runtime::compat::transforms::eval([&z])?;
+                    pmetal_runtime::compat::transforms::eval([&b_val])?;
+                    pmetal_runtime::compat::transforms::eval([&a])?;
                     Ok(())
                 },
             )?;
@@ -785,10 +785,10 @@ pub(crate) async fn run_gdn_decode_benchmark(
                         setup.num_v_heads,
                         setup.head_v_dim,
                     )?;
-                    pmetal_bridge::compat::transforms::eval([&qkv])?;
-                    pmetal_bridge::compat::transforms::eval([&z])?;
-                    pmetal_bridge::compat::transforms::eval([&b_val])?;
-                    pmetal_bridge::compat::transforms::eval([&a])?;
+                    pmetal_runtime::compat::transforms::eval([&qkv])?;
+                    pmetal_runtime::compat::transforms::eval([&z])?;
+                    pmetal_runtime::compat::transforms::eval([&b_val])?;
+                    pmetal_runtime::compat::transforms::eval([&a])?;
                     Ok(())
                 },
             )?;
@@ -809,10 +809,10 @@ pub(crate) async fn run_gdn_decode_benchmark(
                         setup.num_v_heads,
                         setup.head_v_dim,
                     )?;
-                    pmetal_bridge::compat::transforms::eval([&qkv])?;
-                    pmetal_bridge::compat::transforms::eval([&z])?;
-                    pmetal_bridge::compat::transforms::eval([&b_val])?;
-                    pmetal_bridge::compat::transforms::eval([&a])?;
+                    pmetal_runtime::compat::transforms::eval([&qkv])?;
+                    pmetal_runtime::compat::transforms::eval([&z])?;
+                    pmetal_runtime::compat::transforms::eval([&b_val])?;
+                    pmetal_runtime::compat::transforms::eval([&a])?;
                     Ok(())
                 },
             )?;
@@ -833,10 +833,10 @@ pub(crate) async fn run_gdn_decode_benchmark(
                         setup.num_v_heads,
                         setup.head_v_dim,
                     )?;
-                    pmetal_bridge::compat::transforms::eval([&qkv])?;
-                    pmetal_bridge::compat::transforms::eval([&z])?;
-                    pmetal_bridge::compat::transforms::eval([&b_val])?;
-                    pmetal_bridge::compat::transforms::eval([&a])?;
+                    pmetal_runtime::compat::transforms::eval([&qkv])?;
+                    pmetal_runtime::compat::transforms::eval([&z])?;
+                    pmetal_runtime::compat::transforms::eval([&b_val])?;
+                    pmetal_runtime::compat::transforms::eval([&a])?;
                     Ok(())
                 },
             )?;
@@ -872,16 +872,16 @@ pub(crate) async fn run_gdn_decode_benchmark(
                         setup.num_v_heads,
                         setup.head_v_dim,
                     )?;
-                    pmetal_bridge::compat::transforms::eval([&qkv])?;
-                    pmetal_bridge::compat::transforms::eval([&z])?;
-                    pmetal_bridge::compat::transforms::eval([&b_val])?;
-                    pmetal_bridge::compat::transforms::eval([&a])?;
+                    pmetal_runtime::compat::transforms::eval([&qkv])?;
+                    pmetal_runtime::compat::transforms::eval([&z])?;
+                    pmetal_runtime::compat::transforms::eval([&b_val])?;
+                    pmetal_runtime::compat::transforms::eval([&a])?;
                     Ok(())
                 },
             )?;
 
             let combined_output = mlx_linear_projection(&setup.input, &setup.combined_weight)?;
-            pmetal_bridge::compat::transforms::eval([&combined_output])?;
+            pmetal_runtime::compat::transforms::eval([&combined_output])?;
             let combined_output_data = combined_output.as_slice::<f32>().to_vec();
             let (qkv_qz, z_qz, b_qz, a_qz) = mlx_qkv_z_combined_split_projection(
                 &setup.input,
@@ -908,7 +908,7 @@ pub(crate) async fn run_gdn_decode_benchmark(
                 ],
                 -1,
             );
-            pmetal_bridge::compat::transforms::eval([&qkv_z_combined_output])?;
+            pmetal_runtime::compat::transforms::eval([&qkv_z_combined_output])?;
             let qkv_z_combined_output_data = qkv_z_combined_output.as_slice::<f32>().to_vec();
             let accelerate_output = accelerate_combined_projection(
                 &setup.input_data,
@@ -1020,7 +1020,7 @@ pub(crate) async fn run_gdn_decode_benchmark(
                 benchmark_iterations,
                 || -> anyhow::Result<()> {
                     let projected = mlx_linear_projection(&setup.input, &setup.weight)?;
-                    pmetal_bridge::compat::transforms::eval([&projected])?;
+                    pmetal_runtime::compat::transforms::eval([&projected])?;
                     Ok(())
                 },
             )?;
@@ -1031,7 +1031,7 @@ pub(crate) async fn run_gdn_decode_benchmark(
                 || -> anyhow::Result<()> {
                     let projected =
                         mlx_linear_projection_rhs_transposed(&setup.input, &setup.weight_t)?;
-                    pmetal_bridge::compat::transforms::eval([&projected])?;
+                    pmetal_runtime::compat::transforms::eval([&projected])?;
                     Ok(())
                 },
             )?;
@@ -1063,7 +1063,7 @@ pub(crate) async fn run_gdn_decode_benchmark(
                         setup.input_dim,
                         setup.output_dim,
                     )?;
-                    pmetal_bridge::compat::transforms::eval([&projected])?;
+                    pmetal_runtime::compat::transforms::eval([&projected])?;
                     Ok(())
                 },
             )?;
@@ -1235,8 +1235,8 @@ fn run_gdn_prefill_backend(
             false,
             chunk_size_override,
         )?;
-        pmetal_bridge::compat::transforms::eval([&y])?;
-        pmetal_bridge::compat::transforms::eval([&state])?;
+        pmetal_runtime::compat::transforms::eval([&y])?;
+        pmetal_runtime::compat::transforms::eval([&state])?;
         Ok(())
     })?;
 
@@ -1253,7 +1253,7 @@ fn run_gdn_prefill_backend(
         false,
         chunk_size_override,
     )?;
-    pmetal_bridge::compat::transforms::eval([&output])?;
+    pmetal_runtime::compat::transforms::eval([&output])?;
 
     Ok(GdnDecodeBackendResult {
         name: name.to_string(),
@@ -1561,27 +1561,27 @@ fn build_gdn_decode_benchmark_setup(
             let z_weight_t = z_weight.t();
             let b_weight_t = b_weight.t();
             let a_weight_t = a_weight.t();
-            pmetal_bridge::compat::transforms::eval([&qkv_weight])?;
-            pmetal_bridge::compat::transforms::eval([&z_weight])?;
-            pmetal_bridge::compat::transforms::eval([&b_weight])?;
-            pmetal_bridge::compat::transforms::eval([&a_weight])?;
-            pmetal_bridge::compat::transforms::eval([&qkv_weight_t])?;
-            pmetal_bridge::compat::transforms::eval([&z_weight_t])?;
-            pmetal_bridge::compat::transforms::eval([&b_weight_t])?;
-            pmetal_bridge::compat::transforms::eval([&a_weight_t])?;
+            pmetal_runtime::compat::transforms::eval([&qkv_weight])?;
+            pmetal_runtime::compat::transforms::eval([&z_weight])?;
+            pmetal_runtime::compat::transforms::eval([&b_weight])?;
+            pmetal_runtime::compat::transforms::eval([&a_weight])?;
+            pmetal_runtime::compat::transforms::eval([&qkv_weight_t])?;
+            pmetal_runtime::compat::transforms::eval([&z_weight_t])?;
+            pmetal_runtime::compat::transforms::eval([&b_weight_t])?;
+            pmetal_runtime::compat::transforms::eval([&a_weight_t])?;
 
             let combined_weight = build_combined_input_projection_weight(gdn)?;
             let qkv_z_combined_weight = build_qkv_z_combined_projection_weight(gdn)?;
             let combined_weight_t = combined_weight.t();
             let qkv_z_combined_weight_t = qkv_z_combined_weight.t();
-            pmetal_bridge::compat::transforms::eval([&combined_weight])?;
-            pmetal_bridge::compat::transforms::eval([&qkv_z_combined_weight])?;
-            pmetal_bridge::compat::transforms::eval([&combined_weight_t])?;
-            pmetal_bridge::compat::transforms::eval([&qkv_z_combined_weight_t])?;
+            pmetal_runtime::compat::transforms::eval([&combined_weight])?;
+            pmetal_runtime::compat::transforms::eval([&qkv_z_combined_weight])?;
+            pmetal_runtime::compat::transforms::eval([&combined_weight_t])?;
+            pmetal_runtime::compat::transforms::eval([&qkv_z_combined_weight_t])?;
             let combined_weight_data = combined_weight.as_slice::<f32>().to_vec();
             let reference_output =
                 mlx_split_projection(&input, &qkv_weight, &z_weight, &b_weight, &a_weight)?;
-            pmetal_bridge::compat::transforms::eval([&reference_output])?;
+            pmetal_runtime::compat::transforms::eval([&reference_output])?;
 
             Ok(GdnBenchmarkSetup::InputProj(
                 GdnInputProjectionBenchmarkSetup {
@@ -1626,11 +1626,11 @@ fn build_gdn_decode_benchmark_setup(
             );
             let weight = gdn.out_proj.weight.as_ref().as_type::<f32>();
             let weight_t = weight.t();
-            pmetal_bridge::compat::transforms::eval([&weight])?;
-            pmetal_bridge::compat::transforms::eval([&weight_t])?;
+            pmetal_runtime::compat::transforms::eval([&weight])?;
+            pmetal_runtime::compat::transforms::eval([&weight_t])?;
             let weight_data = weight.as_slice::<f32>().to_vec();
             let reference_output = mlx_linear_projection(&input, &weight)?;
-            pmetal_bridge::compat::transforms::eval([&reference_output])?;
+            pmetal_runtime::compat::transforms::eval([&reference_output])?;
 
             Ok(GdnBenchmarkSetup::OutProj(
                 GdnLinearProjectionBenchmarkSetup {
@@ -1711,13 +1711,13 @@ fn build_gdn_decode_benchmark_setup(
             let k = l2norm_last_dim(&k_raw, 1e-6)?;
             let a_log = gdn.a_log.as_ref().as_type::<f32>();
             let dt_bias = gdn.dt_bias.as_ref().as_type::<f32>();
-            pmetal_bridge::compat::transforms::eval([&q])?;
-            pmetal_bridge::compat::transforms::eval([&k])?;
-            pmetal_bridge::compat::transforms::eval([&v])?;
-            pmetal_bridge::compat::transforms::eval([&a])?;
-            pmetal_bridge::compat::transforms::eval([&b])?;
-            pmetal_bridge::compat::transforms::eval([&a_log])?;
-            pmetal_bridge::compat::transforms::eval([&dt_bias])?;
+            pmetal_runtime::compat::transforms::eval([&q])?;
+            pmetal_runtime::compat::transforms::eval([&k])?;
+            pmetal_runtime::compat::transforms::eval([&v])?;
+            pmetal_runtime::compat::transforms::eval([&a])?;
+            pmetal_runtime::compat::transforms::eval([&b])?;
+            pmetal_runtime::compat::transforms::eval([&a_log])?;
+            pmetal_runtime::compat::transforms::eval([&dt_bias])?;
             let (reference_output, _): (Array, Array) =
                 gated_delta_update_with_chunk_size_override(
                     &q,
@@ -1732,7 +1732,7 @@ fn build_gdn_decode_benchmark_setup(
                     false,
                     Some(0),
                 )?;
-            pmetal_bridge::compat::transforms::eval([&reference_output])?;
+            pmetal_runtime::compat::transforms::eval([&reference_output])?;
 
             Ok(GdnBenchmarkSetup::Prefill(GdnPrefillBenchmarkSetup {
                 model_path: model_path.to_path_buf(),
@@ -2537,7 +2537,7 @@ fn run_prefill_decode_pass(
     decode_steps: usize,
     cache_mode: CacheMode,
 ) -> anyhow::Result<PrefillDecodePassResult> {
-    use pmetal_bridge::compat::Array;
+    use pmetal_runtime::compat::Array;
     let prompt_tokens: Vec<i32> = prompt_ids.iter().map(|&id| id as i32).collect();
     let prompt = Array::from_slice(&prompt_tokens, &[1, prompt_tokens.len() as i32]);
     let mut cache = model.create_cache_with_mode(
@@ -2552,10 +2552,11 @@ fn run_prefill_decode_pass(
     let prefill_start = Instant::now();
     let logits =
         model.forward_with_hybrid_cache(&prompt, None, Some(&mut cache), mamba_cache.as_mut())?;
-    pmetal_bridge::compat::transforms::eval([&logits])?;
+    pmetal_runtime::compat::transforms::eval([&logits])?;
     let prefill_elapsed = prefill_start.elapsed();
 
-    let first_generated_token = pmetal_bridge::compat::ops::argmax(&logits.index((.., -1, ..)), -1);
+    let first_generated_token =
+        pmetal_runtime::compat::ops::argmax(&logits.index((.., -1, ..)), -1);
     let first_generated_token_id = first_generated_token.item::<u32>();
     let mut next_token = first_generated_token_id as i32;
     let decode_start = Instant::now();
@@ -2568,7 +2569,7 @@ fn run_prefill_decode_pass(
             mamba_cache.as_mut(),
         )?;
         let next_token_array =
-            pmetal_bridge::compat::ops::argmax(&decode_logits.index((.., -1, ..)), -1);
+            pmetal_runtime::compat::ops::argmax(&decode_logits.index((.., -1, ..)), -1);
         next_token = next_token_array.item::<u32>() as i32;
     }
     let decode_elapsed = decode_start.elapsed();
@@ -3495,13 +3496,13 @@ fn run_kernel_benchmark_case(
             ]);
 
             let outcome = (|| -> anyhow::Result<KernelBenchmarkOutcome> {
-                let input = pmetal_bridge::compat::random::normal(
+                let input = pmetal_runtime::compat::random::normal(
                     &[
                         case.batch_size as i32,
                         case.seq_len as i32,
                         case.hidden_size as i32,
                     ],
-                    pmetal_bridge::compat::Dtype::Float32,
+                    pmetal_runtime::compat::Dtype::Float32,
                 );
 
                 match case.family {
@@ -3517,7 +3518,7 @@ fn run_kernel_benchmark_case(
                         let mut moe = Llama4MoE::new(&config)?;
                         benchmark_operation(warmup_iterations, benchmark_iterations, || {
                             let output = moe.forward(&input)?;
-                            pmetal_bridge::compat::transforms::eval([&output])?;
+                            pmetal_runtime::compat::transforms::eval([&output])?;
                             std::hint::black_box(output);
                             Ok(())
                         })
@@ -3538,7 +3539,7 @@ fn run_kernel_benchmark_case(
                         let mut moe = Qwen3MoEBlock::new(&config)?;
                         benchmark_operation(warmup_iterations, benchmark_iterations, || {
                             let output = moe.forward(&input)?;
-                            pmetal_bridge::compat::transforms::eval([&output])?;
+                            pmetal_runtime::compat::transforms::eval([&output])?;
                             std::hint::black_box(output);
                             Ok(())
                         })
@@ -3555,7 +3556,7 @@ fn run_kernel_benchmark_case(
                         let mut moe = DeepSeekMoE::new(&config)?;
                         benchmark_operation(warmup_iterations, benchmark_iterations, || {
                             let output = moe.forward(&input)?;
-                            pmetal_bridge::compat::transforms::eval([&output])?;
+                            pmetal_runtime::compat::transforms::eval([&output])?;
                             std::hint::black_box(output);
                             Ok(())
                         })
@@ -4185,7 +4186,7 @@ pub(crate) fn generate_sample_config(output: &str) -> anyhow::Result<()> {
 ///
 /// Python baseline: ~7420 argmax ops/sec (~0.135ms per op) on Qwen3 vocab size.
 pub(crate) fn run_ffi_benchmark() -> anyhow::Result<()> {
-    use pmetal_bridge::compat::{
+    use pmetal_runtime::compat::{
         Array,
         indexing::{argmax, argmax_axis},
         transforms::eval,
@@ -4259,8 +4260,8 @@ pub(crate) fn run_ffi_benchmark() -> anyhow::Result<()> {
 ///
 /// This profiles each step of the generation loop.
 pub(crate) async fn run_gen_benchmark(model_id: &str) -> anyhow::Result<()> {
-    use pmetal_bridge::compat::{Array, indexing::argmax, ops::async_eval, transforms::eval};
     use pmetal_models::DynamicModel;
+    use pmetal_runtime::compat::{Array, indexing::argmax, ops::async_eval, transforms::eval};
     use std::time::Instant;
 
     println!("=== Generation Loop Benchmark ===");

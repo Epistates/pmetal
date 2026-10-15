@@ -21,11 +21,11 @@ mod common;
 
 use common::{fixture_path, load_shard, ref_tensor};
 
-use pmetal_bridge::compat::Array;
 use pmetal_mlx::speculative::SpecCapture;
 use pmetal_mlx::test_utils::{
     ParityReport, Tolerance, argmax_last_axis, print_report_table, to_f32_vec_eval,
 };
+use pmetal_runtime::compat::Array;
 use serial_test::serial;
 
 use pmetal_models::architectures::gpt_oss::{GptOssConfig, GptOssForCausalLM};

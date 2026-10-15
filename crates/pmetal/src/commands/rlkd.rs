@@ -40,7 +40,7 @@ pub(crate) async fn run_rlkd_cli(
     use pmetal_lora::{DynamicLoraModel, TrainableModel};
     use pmetal_models::DynamicModel;
 
-    pmetal_bridge::compat::random::seed(seed);
+    pmetal_runtime::compat::random::seed(seed);
 
     let column_cfg = crate::commands::build_column_config(
         text_column,
@@ -182,7 +182,7 @@ pub(crate) async fn run_rlkd_cli(
                 &self,
                 _prompts: &[String],
                 completions: &[String],
-                _images: Option<&[Vec<pmetal_bridge::compat::Array>]>,
+                _images: Option<&[Vec<pmetal_runtime::compat::Array>]>,
             ) -> pmetal_trainer::GrpoResult<Vec<f64>> {
                 Ok(completions
                     .iter()
@@ -208,7 +208,7 @@ pub(crate) async fn run_rlkd_cli(
                 &self,
                 _prompts: &[String],
                 completions: &[String],
-                _images: Option<&[Vec<pmetal_bridge::compat::Array>]>,
+                _images: Option<&[Vec<pmetal_runtime::compat::Array>]>,
             ) -> pmetal_trainer::GrpoResult<Vec<f64>> {
                 Ok(completions
                     .iter()
@@ -239,7 +239,7 @@ pub(crate) async fn run_rlkd_cli(
                 &self,
                 _p: &[String],
                 completions: &[String],
-                _i: Option<&[Vec<pmetal_bridge::compat::Array>]>,
+                _i: Option<&[Vec<pmetal_runtime::compat::Array>]>,
             ) -> pmetal_trainer::GrpoResult<Vec<f64>> {
                 Ok(vec![0.1; completions.len()])
             }

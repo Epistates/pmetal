@@ -15,7 +15,7 @@ use super::{
     DistillLoss, SPARSE_TOPK_DEFAULT, align_vocab_with_k, reduce_per_token, tempered_log_probs,
 };
 use crate::Result;
-use pmetal_bridge::compat::Array;
+use pmetal_runtime::compat::Array;
 
 /// KL Divergence loss for knowledge distillation.
 ///

@@ -9,11 +9,11 @@
 
 use std::path::PathBuf;
 
-use pmetal_bridge::QuantizedMode;
-use pmetal_bridge::native_weight::QuantParams;
 use pmetal_metal::ane::lm::{AneLm, AneLmOptions, GenerateOptions, Greedy, NoDraft};
 use pmetal_models::dflash_drafter::DFlashDrafter;
 use pmetal_models::generation::{GenerationConfig, HostLogitsSampler};
+use pmetal_runtime::QuantizedMode;
+use pmetal_runtime::native_weight::QuantParams;
 
 /// Chat prompts (thinking off).
 const PROMPTS: [(&str, &[u32]); 3] = [

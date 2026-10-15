@@ -1,19 +1,19 @@
-use pmetal_bridge::compat::{
+use pmetal_data::PackedTrainingBatch;
+use pmetal_lora::TrainableModel;
+use pmetal_runtime::compat::{
     Array, Exception, FlattenedModuleParam,
     module::{ModuleParameters, ModuleParametersExt},
     nn,
     optimizers::{Optimizer, Updatable},
     transforms,
 };
-use pmetal_data::PackedTrainingBatch;
-use pmetal_lora::TrainableModel;
 
 /// Clip gradients by global L2 norm (GPU-based, lazy).
 ///
 /// Same algorithm as `TrainingLoop::clip_gradients_gpu` but usable from
 /// standalone step functions.
 fn clip_grads(grads: &mut FlattenedModuleParam, max_norm: f32) {
-    pmetal_bridge::training::clip_grad_norm_map(grads, max_norm);
+    pmetal_runtime::training::clip_grad_norm_map(grads, max_norm);
 }
 
 /// Training step shared by the JIT step variants.
@@ -57,7 +57,7 @@ pub(crate) fn jit_training_step_inner_clipped<M: TrainableModel, O: Optimizer>(
                 .map_err(|e| Exception::custom(e.to_string()))?
         };
 
-        Ok(pmetal_bridge::training::causal_lm_loss(
+        Ok(pmetal_runtime::training::causal_lm_loss(
             &logits, labels, -100,
         ))
     };
@@ -120,7 +120,7 @@ pub(crate) fn jit_training_step_packed<M: TrainableModel, O: Optimizer>(
             .forward_with_positions(input_ids, attn_mask_4d.as_ref(), &position_ids)
             .map_err(|e| Exception::custom(e.to_string()))?;
 
-        Ok(pmetal_bridge::training::causal_lm_loss(
+        Ok(pmetal_runtime::training::causal_lm_loss(
             &logits, labels, -100,
         ))
     };

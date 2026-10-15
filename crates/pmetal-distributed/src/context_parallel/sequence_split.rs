@@ -2,7 +2,7 @@
 
 use crate::mlx_dist::group::DistributedGroup;
 use crate::mlx_dist::ops;
-use pmetal_bridge::compat::{Array, Exception};
+use pmetal_runtime::compat::{Array, Exception};
 
 /// Extract a contiguous slice along `axis` using `take_axis`.
 ///

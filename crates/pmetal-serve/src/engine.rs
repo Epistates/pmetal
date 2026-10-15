@@ -656,11 +656,11 @@ fn mllama(
     model: &mut DynamicModel,
 ) -> Result<
     &mut pmetal_models::architectures::mllama::MllamaForConditionalGeneration,
-    pmetal_bridge::compat::Exception,
+    pmetal_runtime::compat::Exception,
 > {
     model
         .as_mllama_mut()
-        .ok_or_else(|| pmetal_bridge::compat::Exception::custom("not a Llama 3.2 Vision model"))
+        .ok_or_else(|| pmetal_runtime::compat::Exception::custom("not a Llama 3.2 Vision model"))
 }
 
 /// One continuous-batching step, run by the model thread between jobs: a
@@ -681,7 +681,7 @@ fn continuous_step(state: &mut EngineState) -> Background {
     let mut forward = |tokens: &[u32],
                        cache: &mut KVCache,
                        recurrent: Option<&mut MambaCache>|
-     -> Result<Array, pmetal_bridge::compat::Exception> {
+     -> Result<Array, pmetal_runtime::compat::Exception> {
         let input = Array::from_u32_slice(tokens, &[1, tokens.len() as i32])
             .as_dtype(Dtype::Int32.as_i32());
         model.forward_with_hybrid_cache(&input, None, Some(cache), recurrent)
@@ -1693,7 +1693,7 @@ impl InferenceEngine {
                 let ids: Vec<i32> = input_ids.iter().map(|&id| id as i32).collect();
                 let ids = Array::from_i32_slice_shaped(&ids, &[1, ids.len() as i32]);
                 let text =
-                    pmetal_bridge::compat::Module::forward(&mut qwen.model.embed_tokens, &ids)?;
+                    pmetal_runtime::compat::Module::forward(&mut qwen.model.embed_tokens, &ids)?;
                 Ok(MediaForward::Qwen3_5 {
                     embeddings: encoded.merge(&text, input_ids, &vision.config)?,
                     positions: encoded.positions.array(),
@@ -1705,7 +1705,7 @@ impl InferenceEngine {
                 images,
                 cross_attention_mask,
             } => {
-                use pmetal_bridge::compat::ops::slice_axis;
+                use pmetal_runtime::compat::ops::slice_axis;
 
                 let images: Vec<image::DynamicImage> = images
                     .iter()
@@ -1733,7 +1733,7 @@ impl InferenceEngine {
                     .states
                     .try_eval()
                     .map_err(|e| ServeError::Internal(format!("vision tower: {e}")))?;
-                pmetal_bridge::check_unobserved_error()
+                pmetal_runtime::check_unobserved_error()
                     .map_err(|e| ServeError::Internal(format!("vision tower: {e}")))?;
                 let last_row = |array: &Option<Array>, axis: i32| {
                     array.as_ref().map(|a| slice_axis(a, axis, len - 1, len))
@@ -1760,7 +1760,7 @@ impl InferenceEngine {
         media: &MediaForward,
         cache: &mut KVCache,
         mamba_cache: Option<&mut MambaCache>,
-    ) -> Result<Array, pmetal_bridge::compat::Exception> {
+    ) -> Result<Array, pmetal_runtime::compat::Exception> {
         match media {
             MediaForward::Qwen3_5 {
                 embeddings,
@@ -1768,7 +1768,7 @@ impl InferenceEngine {
                 ..
             } => {
                 let qwen = model.as_qwen3_next_mut().ok_or_else(|| {
-                    pmetal_bridge::compat::Exception::custom("not a Qwen 3.5-family model")
+                    pmetal_runtime::compat::Exception::custom("not a Qwen 3.5-family model")
                 })?;
                 let (_hidden, logits) =
                     qwen.forward_embeddings(embeddings, positions, Some(cache), mamba_cache)?;
@@ -1790,12 +1790,12 @@ impl InferenceEngine {
         step: usize,
         cache: &mut KVCache,
         mamba_cache: Option<&mut MambaCache>,
-    ) -> Result<Array, pmetal_bridge::compat::Exception> {
+    ) -> Result<Array, pmetal_runtime::compat::Exception> {
         match media {
             None => model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache),
             Some(MediaForward::Qwen3_5 { next_position, .. }) => {
                 let qwen = model.as_qwen3_next_mut().ok_or_else(|| {
-                    pmetal_bridge::compat::Exception::custom("not a Qwen 3.5-family model")
+                    pmetal_runtime::compat::Exception::custom("not a Qwen 3.5-family model")
                 })?;
                 let at = Array::from_i32_slice(&[next_position + step as i32]);
                 qwen.forward_with_cache_at(input, &at, Some(cache), mamba_cache)
@@ -1853,11 +1853,11 @@ impl InferenceEngine {
     where
         E: FnMut(u32, Option<TokenLogprobEntry>) -> StepOutcome,
     {
-        use pmetal_bridge::compat::ops::async_eval;
         use pmetal_models::generation::{
             WiredLimitGuard, clear_generation_caches, run_cached_prefill_chunks_at, token_logprobs,
             use_generation_stream,
         };
+        use pmetal_runtime::compat::ops::async_eval;
 
         let _wired_guard = WiredLimitGuard::new();
 
@@ -1972,7 +1972,7 @@ impl InferenceEngine {
                 let pair = {
                     use_generation_stream();
                     let next_input = current_y
-                        .as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32())
+                        .as_dtype(pmetal_runtime::compat::Dtype::Int32.as_i32())
                         .reshape(&[1, -1]);
                     let next_full = Self::decode_step(
                         model,
@@ -1999,7 +1999,7 @@ impl InferenceEngine {
             //    gets data (the n==0 special case).
             if i == 0 {
                 current_y.try_eval().map_err(|e| {
-                    ServeError::Model(pmetal_bridge::compat::Exception::custom(e.to_string()))
+                    ServeError::Model(pmetal_runtime::compat::Exception::custom(e.to_string()))
                 })?;
             }
 
@@ -2372,7 +2372,7 @@ impl InferenceEngine {
                         .map_err(ServeError::Model)?
                         .as_type::<f32>();
                     pooled.try_eval().map_err(|e| {
-                        ServeError::Model(pmetal_bridge::compat::Exception::custom(e.to_string()))
+                        ServeError::Model(pmetal_runtime::compat::Exception::custom(e.to_string()))
                     })?;
                     let hidden_dim = pooled.dim(1) as usize;
                     let flat: Vec<f32> = pooled.as_slice::<f32>().to_vec();

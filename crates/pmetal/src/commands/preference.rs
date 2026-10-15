@@ -66,7 +66,7 @@ pub(crate) async fn run_preference(
     extra_callbacks: Vec<Box<dyn TrainingCallback>>,
 ) -> anyhow::Result<()> {
     let objective = objective(&spec)?;
-    pmetal_bridge::compat::random::seed(spec.seed);
+    pmetal_runtime::compat::random::seed(spec.seed);
 
     let model_path = pmetal_hub::resolve_model_path(&spec.model, None, None).await?;
     let dataset_path = pmetal_trainer::resolve_dataset_path(&spec.dataset).await?;

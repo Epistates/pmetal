@@ -98,7 +98,7 @@ fn serve_returns_reasoning_apart_from_the_answer() {
             .await
             .unwrap();
         let (tokens, _, finish, _) = engine.generate_prompt(&prompt, greedy()).await.unwrap();
-        pmetal_bridge::check_unobserved_error().unwrap();
+        pmetal_runtime::check_unobserved_error().unwrap();
         assert_eq!(finish, "stop", "the model finished its answer");
         let split = SplitOutput::split(&tokenizer, &prompt.input_ids, &tokens);
         let reasoning = split

@@ -35,7 +35,7 @@
 
 use crate::Result;
 use crate::losses::softmax;
-use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
+use pmetal_runtime::compat::{Array, Dtype, Exception, ops};
 
 /// Log-softmax along specified axis.
 fn log_softmax(x: &Array, axis: i32) -> Result<Array> {

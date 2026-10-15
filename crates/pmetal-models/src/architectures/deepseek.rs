@@ -11,17 +11,17 @@
 use crate::checkpointing::checkpointed_layer;
 use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
 use crate::fp8_utils::dequantize_fp8_weight_for_compute;
-use pmetal_bridge::compat::{
-    Array, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, VisitLinears, nn, ops,
-};
-use pmetal_bridge::impl_module_params;
-use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     rope::{RopePositions, rope_embedding},
 };
 use pmetal_mlx::kv_cache::KVCache;
 use pmetal_mlx::moe::Expert;
+use pmetal_runtime::compat::{
+    Array, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, VisitLinears, nn, ops,
+};
+use pmetal_runtime::impl_module_params;
+use pmetal_runtime::rope::{RopeConfig, RotaryEmbedding};
 use serde::{Deserialize, Serialize};
 
 /// Result type for DeepSeek operations.
@@ -344,12 +344,12 @@ impl DeepSeekAttention {
         // with YaRN's frequencies and attention factor when configured.
         let q_pe = rope_embedding(q_pe, rope_positions, &self.rotary);
         let k_pe = rope_embedding(k_pe, rope_positions, &self.rotary);
-        let k_pe_repeated = pmetal_bridge::compat::ops::broadcast_to(
+        let k_pe_repeated = pmetal_runtime::compat::ops::broadcast_to(
             &k_pe,
             &[batch, self.n_heads, seq_len, self.config.qk_rope_head_dim],
         );
-        let keys = pmetal_bridge::compat::ops::concatenate_axis(&[k_nope, &k_pe_repeated], -1);
-        let queries = pmetal_bridge::compat::ops::concatenate_axis(&[q_nope, &q_pe], -1);
+        let keys = pmetal_runtime::compat::ops::concatenate_axis(&[k_nope, &k_pe_repeated], -1);
+        let queries = pmetal_runtime::compat::ops::concatenate_axis(&[q_nope, &q_pe], -1);
         Ok((queries, keys, values.clone()))
     }
 
@@ -520,9 +520,9 @@ impl TokenSelector {
         let neg_k = -self.top_k;
         // Indices carry no gradient, and MLX refuses to differentiate a gather
         // with respect to them.
-        Ok(pmetal_bridge::compat::ops::stop_gradient(
-            &pmetal_bridge::compat::ops::slice_axis_from(
-                &pmetal_bridge::compat::ops::argpartition_axis(&masked_scores, neg_k, -1),
+        Ok(pmetal_runtime::compat::ops::stop_gradient(
+            &pmetal_runtime::compat::ops::slice_axis_from(
+                &pmetal_runtime::compat::ops::argpartition_axis(&masked_scores, neg_k, -1),
                 -1,
                 neg_k,
             ),
@@ -578,29 +578,29 @@ impl DeepSeekSparseAttention {
         let top_k = self.selector.top_k;
         let idx = selected_indices.reshape(&[batch, 1, query_len, top_k]);
         let idx =
-            pmetal_bridge::compat::ops::broadcast_to(&idx, &[batch, n_heads, query_len, top_k]);
+            pmetal_runtime::compat::ops::broadcast_to(&idx, &[batch, n_heads, query_len, top_k]);
         let idx_for_keys = idx.reshape(&[batch, n_heads, query_len * top_k, 1]);
-        let idx_for_keys = pmetal_bridge::compat::ops::broadcast_to(
+        let idx_for_keys = pmetal_runtime::compat::ops::broadcast_to(
             &idx_for_keys,
             &[batch, n_heads, query_len * top_k, key_dim],
         );
         let gathered_keys =
-            pmetal_bridge::compat::indexing::take_along_axis(&keys, &idx_for_keys, 2)
+            pmetal_runtime::compat::indexing::take_along_axis(&keys, &idx_for_keys, 2)
                 .reshape(&[batch, n_heads, query_len, top_k, key_dim]);
         let idx_for_vals = idx.reshape(&[batch, n_heads, query_len * top_k, 1]);
-        let idx_for_vals = pmetal_bridge::compat::ops::broadcast_to(
+        let idx_for_vals = pmetal_runtime::compat::ops::broadcast_to(
             &idx_for_vals,
             &[batch, n_heads, query_len * top_k, val_dim],
         );
         let gathered_values =
-            pmetal_bridge::compat::indexing::take_along_axis(&values, &idx_for_vals, 2)
+            pmetal_runtime::compat::indexing::take_along_axis(&values, &idx_for_vals, 2)
                 .reshape(&[batch, n_heads, query_len, top_k, val_dim]);
         let q_expanded = queries.reshape(&[batch, n_heads, query_len, 1, key_dim]);
         let attn_scores = q_expanded
             .matmul(&gathered_keys.transpose_axes(&[0, 1, 2, 4, 3]))
             .squeeze_axes(&[3])
             .multiply(&Array::from_f32(self.base_attention.scale));
-        let attn_weights = pmetal_bridge::compat::ops::softmax_axis(&attn_scores, -1)
+        let attn_weights = pmetal_runtime::compat::ops::softmax_axis(&attn_scores, -1)
             .reshape(&[batch, n_heads, query_len, 1, top_k]);
         let output = attn_weights
             .matmul(&gathered_values)
@@ -684,11 +684,11 @@ impl DeepSeekMoEGate {
         // an unnormalised score, which changes both which experts win and how
         // much weight each carries. The cast keeps the reduction in f32 for
         // numerical stability on bf16 models.
-        let logits = gates.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
+        let logits = gates.as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32());
         let scores = if self.scoring_func == "softmax" {
-            pmetal_bridge::compat::ops::softmax_axis(&logits, -1)
+            pmetal_runtime::compat::ops::softmax_axis(&logits, -1)
         } else {
-            pmetal_bridge::compat::ops::sigmoid(&logits)
+            pmetal_runtime::compat::ops::sigmoid(&logits)
         };
 
         // Shared top-k + noaux_tc bias-corrected selection —
@@ -871,9 +871,9 @@ impl DeepSeekMoE {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok((
-            pmetal_bridge::compat::ops::stack_axis(&gate_weights, 0),
-            pmetal_bridge::compat::ops::stack_axis(&up_weights, 0),
-            pmetal_bridge::compat::ops::stack_axis(&down_weights, 0),
+            pmetal_runtime::compat::ops::stack_axis(&gate_weights, 0),
+            pmetal_runtime::compat::ops::stack_axis(&up_weights, 0),
+            pmetal_runtime::compat::ops::stack_axis(&down_weights, 0),
         ))
     }
 
@@ -911,7 +911,7 @@ impl DeepSeekMoE {
 
     fn batched_matmul(&self, x: &Array, w: &Array) -> Result<Array> {
         let x_expanded = x.reshape(&[x.dim(0), 1, x.dim(1)]);
-        let result = pmetal_bridge::compat::ops::matmul(&x_expanded, w);
+        let result = pmetal_runtime::compat::ops::matmul(&x_expanded, w);
         Ok(result.squeeze_axes(&[1]))
     }
 
@@ -925,7 +925,7 @@ impl DeepSeekMoE {
         let flat = x.reshape(&[-1, hidden]);
         let (expert_indices, expert_weights) = self.gate.forward(&flat)?;
         let mut routed =
-            pmetal_bridge::compat::ops::zeros_dtype(&[flat.dim(0), hidden], flat.dtype());
+            pmetal_runtime::compat::ops::zeros_dtype(&[flat.dim(0), hidden], flat.dtype());
         for (e, expert) in self.moe.experts.iter().enumerate() {
             let picked = expert_indices
                 .equal(&Array::from_int(e as i32))
@@ -953,15 +953,17 @@ impl DeepSeekMoE {
         let hidden_size = hidden_flat.dim(1);
         let (expert_indices, expert_weights) = self.gate.forward(&hidden_flat)?;
         let top_k = self.gate.top_k;
-        let mut output =
-            pmetal_bridge::compat::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype());
+        let mut output = pmetal_runtime::compat::ops::zeros_dtype(
+            &[batch_seq, hidden_size],
+            hidden_flat.dtype(),
+        );
 
         for slot in 0..top_k {
             let slot_experts =
-                pmetal_bridge::compat::ops::slice_axis(&expert_indices, 1, slot, slot + 1)
+                pmetal_runtime::compat::ops::slice_axis(&expert_indices, 1, slot, slot + 1)
                     .reshape(&[expert_indices.dim(0)]);
             let slot_weights =
-                pmetal_bridge::compat::ops::slice_axis(&expert_weights, 1, slot, slot + 1);
+                pmetal_runtime::compat::ops::slice_axis(&expert_weights, 1, slot, slot + 1);
 
             let gate_weights = self
                 .stacked_gate_proj
@@ -1316,7 +1318,7 @@ impl DeepSeekMTPModule {
     ) -> Result<Array> {
         let hn = self.hnorm.forward(h_prev);
         let en = self.enorm.forward(e_curr);
-        let cat = pmetal_bridge::compat::ops::concatenate_axis(&[&hn, &en], -1);
+        let cat = pmetal_runtime::compat::ops::concatenate_axis(&[&hn, &en], -1);
         self.layer
             .forward(&self.eh_proj.forward(&cat), mask, None, None)
     }
@@ -1362,8 +1364,8 @@ impl DeepSeek {
         let mut h_prev = hidden_final;
         let embeddings = self.model.embed_tokens.forward(input_ids);
         for mtp_module in &mut self.mtp_modules {
-            let e_curr = pmetal_bridge::compat::ops::slice_axis_from(&embeddings, 1, 1);
-            let e_curr_padded = pmetal_bridge::compat::ops::concatenate_axis(
+            let e_curr = pmetal_runtime::compat::ops::slice_axis_from(&embeddings, 1, 1);
+            let e_curr_padded = pmetal_runtime::compat::ops::concatenate_axis(
                 &[
                     &e_curr,
                     &Array::zeros_f32(&[embeddings.dim(0), 1, self.config.hidden_size]),
@@ -1478,11 +1480,11 @@ mod tests {
     fn test_deepseek_moe_stacked_matches_reference() {
         let config = tiny_deepseek_moe_config();
         let mut moe = DeepSeekMoE::new(&config).unwrap();
-        let x = pmetal_bridge::compat::random::uniform_range(
+        let x = pmetal_runtime::compat::random::uniform_range(
             -1.0,
             1.0,
             &[2, 5, config.hidden_size],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
 
         let reference = moe.forward_reference(&x).unwrap();
@@ -1511,11 +1513,11 @@ mod tests {
     fn test_deepseek_moe_cache_refreshes_after_weight_change() {
         let config = tiny_deepseek_moe_config();
         let mut moe = DeepSeekMoE::new(&config).unwrap();
-        let x = pmetal_bridge::compat::random::uniform_range(
+        let x = pmetal_runtime::compat::random::uniform_range(
             -1.0,
             1.0,
             &[1, 4, config.hidden_size],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
 
         let _ = moe.forward(&x).unwrap();

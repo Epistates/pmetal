@@ -9,9 +9,9 @@
 //!
 //! Tiny random-init model through `DynamicModel`, the path serving takes.
 
-use pmetal_bridge::compat::Array;
 use pmetal_mlx::kv_cache::{KVCache, MambaCache};
 use pmetal_models::dispatcher::DynamicModel;
+use pmetal_runtime::compat::Array;
 
 const QWEN3_NEXT: &str = r#"{
     "model_type": "qwen3_next",
@@ -128,7 +128,7 @@ fn second_sequence_decodes_against_its_own_state() {
                 &format!("{name}: second sequence, step {step}"),
             );
         }
-        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+        pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
     }
 }
 
@@ -147,7 +147,7 @@ fn interleaved_sequences_keep_their_own_state() {
             a.assert_matches_recompute(&mut model, &format!("{name}: sequence a, step {step}"));
             b.assert_matches_recompute(&mut model, &format!("{name}: sequence b, step {step}"));
         }
-        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+        pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
     }
 }
 

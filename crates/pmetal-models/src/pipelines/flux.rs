@@ -2,7 +2,7 @@
 //!
 //! Coordinates CLIP/T5 text encoders, Flux DiT, and VAE for end-to-end
 //! high-quality image generation on Apple Silicon.
-use pmetal_bridge::compat::{Array, ModuleParametersExt};
+use pmetal_runtime::compat::{Array, ModuleParametersExt};
 
 use pmetal_core::Result;
 use serde_json::Value;
@@ -142,9 +142,9 @@ impl FluxPipeline {
         // 3. Prepare IDs for RoPE
         // Text IDs are [B, text_seq, 3] - usually zeros or indices for Flux.
         let text_seq = prompt_emb.dim(1);
-        let text_ids = pmetal_bridge::compat::ops::zeros(
+        let text_ids = pmetal_runtime::compat::ops::zeros(
             &[batch_size, text_seq, 3],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
 
         // Image IDs: grid indices for positional encoding
@@ -156,18 +156,18 @@ impl FluxPipeline {
         }
         let image_ids_flat: Vec<f32> = image_ids_vec.into_iter().flatten().collect();
         let image_ids_base = Array::from_f32_slice(&image_ids_flat, &[1, latents_seq as i32, 3]);
-        let image_ids = pmetal_bridge::compat::ops::repeat_axis(image_ids_base, batch_size, 0);
+        let image_ids = pmetal_runtime::compat::ops::repeat_axis(image_ids_base, batch_size, 0);
 
         // 4. Denoising loop
         let scheduler = FlowMatchScheduler::new_flux(num_steps, 1.0, Some(3.0))?;
         let guidance_arr = Array::from_f32(guidance).expand_dims(0);
-        let guidance_arr = pmetal_bridge::compat::ops::repeat_axis(guidance_arr, batch_size, 0);
+        let guidance_arr = pmetal_runtime::compat::ops::repeat_axis(guidance_arr, batch_size, 0);
 
         // Scheduler timesteps are already in descending order (high noise → low noise)
         let timesteps = scheduler.timesteps.as_slice::<f32>().to_vec();
         for timestep in timesteps.iter() {
             let t = Array::from_f32(*timestep).expand_dims(0);
-            let t_repeated = pmetal_bridge::compat::ops::repeat_axis(t, batch_size, 0);
+            let t_repeated = pmetal_runtime::compat::ops::repeat_axis(t, batch_size, 0);
 
             let model_output = self
                 .dit
@@ -210,15 +210,15 @@ impl FluxPipeline {
 /// The noise a generation starts from, standard normal latents of `shape`.
 ///
 /// With a `seed` they are drawn with the key
-/// [`draw_key`](pmetal_bridge::decode::draw_key)`(seed, 0)`, as a seeded
+/// [`draw_key`](pmetal_runtime::decode::draw_key)`(seed, 0)`, as a seeded
 /// sampler's first draw is, so a seed gives the same image whatever else
 /// draws random numbers on the thread, and the thread's own key is left
 /// alone. Without one they take the thread's key.
 fn initial_latents(shape: &[i32], seed: Option<u64>) -> Array {
-    let key = seed.map(|seed| pmetal_bridge::decode::draw_key(seed, 0));
-    pmetal_bridge::compat::random::normal_keyed(
+    let key = seed.map(|seed| pmetal_runtime::decode::draw_key(seed, 0));
+    pmetal_runtime::compat::random::normal_keyed(
         shape,
-        pmetal_bridge::compat::Dtype::Float32,
+        pmetal_runtime::compat::Dtype::Float32,
         key.as_ref(),
     )
 }
@@ -433,7 +433,7 @@ fn value_usize_array(raw: &Value, keys: &[&str]) -> Option<Vec<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::ops::zeros;
+    use pmetal_runtime::compat::ops::zeros;
     use serde_json::json;
 
     #[test]
@@ -458,8 +458,8 @@ mod tests {
         let mut pipeline = FluxPipeline::new(clip_config, t5_config, flux_config, vae_config);
 
         let batch = 1;
-        let clip_input = zeros(&[batch, 77], pmetal_bridge::compat::Dtype::Int32);
-        let t5_input = zeros(&[batch, 256], pmetal_bridge::compat::Dtype::Int32);
+        let clip_input = zeros(&[batch, 77], pmetal_runtime::compat::Dtype::Int32);
+        let t5_input = zeros(&[batch, 256], pmetal_runtime::compat::Dtype::Int32);
 
         // Use a very small number of steps for the test
         let out = pipeline.generate(
@@ -477,7 +477,7 @@ mod tests {
         image.eval();
         // A throwing bridge op hands back a placeholder of plausible shape, so
         // the shape alone can't show the pipeline ran.
-        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+        pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
         assert_eq!(image.shape(), &[batch, 3, 64, 64]);
     }
 
@@ -487,7 +487,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn seeded_initial_noise_is_independent_of_the_thread_key() {
-        use pmetal_bridge::compat::{Dtype, random};
+        use pmetal_runtime::compat::{Dtype, random};
 
         let shape = [1, 16, 64];
         let floats = |a: Array| {
@@ -525,7 +525,7 @@ mod tests {
         let unseeded = floats(initial_latents(&shape, None));
         random::seed(5);
         assert_eq!(unseeded, floats(initial_latents(&shape, None)));
-        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+        pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
     }
 
     #[test]

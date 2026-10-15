@@ -11,7 +11,7 @@
 //!   vision tower's 2-D position table and pooler are indexed by.
 
 use image::{DynamicImage, RgbImage};
-use pmetal_bridge::compat::{Array, Exception};
+use pmetal_runtime::compat::{Array, Exception};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -212,7 +212,10 @@ impl FixedSizeImageProcessor {
 
         // Stack along batch dimension
         let batch_refs: Vec<&Array> = batch_data.iter().collect();
-        Ok(pmetal_bridge::compat::ops::concatenate_axis(&batch_refs, 0))
+        Ok(pmetal_runtime::compat::ops::concatenate_axis(
+            &batch_refs,
+            0,
+        ))
     }
 
     /// Process a batch from file paths.

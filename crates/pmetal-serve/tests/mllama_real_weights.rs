@@ -107,7 +107,7 @@ async fn serve_replies_to_an_image_as_transformers_does() {
         )
         .await
         .unwrap();
-    pmetal_bridge::check_unobserved_error().unwrap();
+    pmetal_runtime::check_unobserved_error().unwrap();
     let tokenizer = pmetal_data::Tokenizer::from_model_dir(&dir).unwrap();
     println!("reference: {:?}", reference["reply"]);
     println!("server:    {:?}", tokenizer.decode(&got).unwrap());

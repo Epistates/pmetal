@@ -3,10 +3,10 @@
 //! Run with: cargo bench -p pmetal-distill
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use pmetal_bridge::compat::Array;
 use pmetal_distill::losses::{
     DistillLoss, HiddenStateLoss, JensenShannonLoss, KlDivergenceLoss, SoftCrossEntropyLoss,
 };
+use pmetal_runtime::compat::Array;
 use std::hint::black_box;
 
 /// Generate random logits for benchmarking.

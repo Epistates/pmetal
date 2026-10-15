@@ -1,6 +1,6 @@
 //! Memory management utilities for Apple Silicon.
 //!
-//! Re-exports MLX Metal memory management via pmetal-bridge and adds
+//! Re-exports MLX Metal memory management via pmetal-runtime and adds
 //! pmetal-specific helpers (RSS tracking, system memory queries, estimation
 //! functions, and training-oriented diagnostics).
 
@@ -12,22 +12,22 @@ use std::sync::OnceLock;
 use pmetal_core::MemoryStats;
 
 // ---------------------------------------------------------------------------
-// Re-export MLX Metal memory management via pmetal-bridge
+// Re-export MLX Metal memory management via pmetal-runtime
 // ---------------------------------------------------------------------------
 
-pub use pmetal_bridge::inline_array::{
+pub use pmetal_runtime::inline_array::{
     clear_cache, get_active_memory, get_cache_memory, get_peak_memory, reset_peak_memory,
     set_wired_limit,
 };
 
 /// Get the current memory limit (returns maximum recommended working set size).
 pub fn get_memory_limit() -> usize {
-    pmetal_bridge::inline_array::get_max_recommended_size()
+    pmetal_runtime::inline_array::get_max_recommended_size()
 }
 
 /// Set the memory limit. Maps to set_wired_limit in the bridge.
 pub fn set_memory_limit(limit: usize) -> usize {
-    pmetal_bridge::inline_array::set_wired_limit(limit)
+    pmetal_runtime::inline_array::set_wired_limit(limit)
 }
 
 #[cfg(target_os = "macos")]
@@ -169,7 +169,7 @@ pub fn get_gpu_memory_limit() -> Option<u64> {
     if limit > 0 {
         return Some(limit as u64);
     }
-    match pmetal_bridge::inline_array::get_max_recommended_size() {
+    match pmetal_runtime::inline_array::get_max_recommended_size() {
         0 => None,
         recommended => Some(recommended as u64),
     }

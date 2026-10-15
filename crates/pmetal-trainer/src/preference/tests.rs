@@ -1,9 +1,9 @@
 use super::*;
-use pmetal_bridge::compat::optimizers::{AdamW, AdamWBuilder};
 use pmetal_core::LoraConfig;
 use pmetal_lora::AdaptedModel;
 use pmetal_models::architectures::llama::LlamaConfig;
 use pmetal_models::dispatcher::DynamicModel;
+use pmetal_runtime::compat::optimizers::{AdamW, AdamWBuilder};
 use serial_test::serial;
 
 /// A tiny Llama with adapters attached: what `pmetal preference` trains.
@@ -21,7 +21,7 @@ fn small_model() -> AdaptedModel {
         rope_theta: 10000.0,
         ..Default::default()
     };
-    pmetal_bridge::compat::random::seed(7);
+    pmetal_runtime::compat::random::seed(7);
     let base =
         DynamicModel::from_config(&serde_json::to_string(&config).unwrap()).expect("llama builds");
     AdaptedModel::attach(
@@ -88,7 +88,7 @@ fn sequences_mask_the_prompt_and_pad_to_the_longest() {
     labels.eval();
     assert_eq!(ids.shape(), &[2, 5]);
     assert_eq!(&ids.as_slice::<i32>()[5..], &[9, 8, 0, 0, 0]);
-    let labels = labels.as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32());
+    let labels = labels.as_dtype(pmetal_runtime::compat::Dtype::Int32.as_i32());
     labels.eval();
     assert_eq!(&labels.as_slice::<i32>()[5..], &[-100, 8, -100, -100, -100]);
 }
@@ -114,7 +114,7 @@ fn dpo_starts_at_ln2_and_learns_the_preference() {
     let history = trainer
         .train(&mut model, &data, &mut adamw(lr), set_lr)
         .unwrap();
-    pmetal_bridge::check_unobserved_error().unwrap();
+    pmetal_runtime::check_unobserved_error().unwrap();
 
     assert_eq!(history.len(), 30);
     let first = &history[0];
@@ -153,7 +153,7 @@ fn reference_free_objectives_train() {
         let history = trainer
             .train(&mut model, &pairs(16), &mut adamw(lr), set_lr)
             .unwrap();
-        pmetal_bridge::check_unobserved_error().unwrap();
+        pmetal_runtime::check_unobserved_error().unwrap();
         let (first, last) = (&history[0], history.last().unwrap());
         assert!(
             last.loss < first.loss,
@@ -210,7 +210,7 @@ fn kto_learns_desirable_from_undesirable() {
     let history = trainer
         .train(&mut model, &data, &mut adamw(lr), set_lr)
         .unwrap();
-    pmetal_bridge::check_unobserved_error().unwrap();
+    pmetal_runtime::check_unobserved_error().unwrap();
     let (first, last) = (&history[0], history.last().unwrap());
     // At the start r = 0 and z = 0: every example's loss is 1 − σ(0) = 0.5.
     assert!(

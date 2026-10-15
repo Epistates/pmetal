@@ -28,15 +28,15 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use pmetal_bridge::compat::{
+use pmetal_runtime::compat::{
     Array, Exception, FlattenedModuleParam,
     module::ModuleParameters,
     optimizers::{AdamW, AdamWBuilder, Optimizer, Updatable, apply_updates},
 };
 // The update rules live beside AdamW in the bridge; they are re-exported here
 // where the trainer's callers have always found them.
-pub use pmetal_bridge::compat::optimizers::{Adafactor, Lion, MomentumSgd, SecondMoment};
 use pmetal_core::{OptimizerType, TrainingConfig};
+pub use pmetal_runtime::compat::optimizers::{Adafactor, Lion, MomentumSgd, SecondMoment};
 
 use crate::{ParamClass, ParameterGroupConfig};
 

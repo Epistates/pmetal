@@ -1,8 +1,8 @@
 //! Collective and point-to-point operations using MLX distributed.
 //!
-//! These wrap [`pmetal_bridge::distributed`], which calls MLX's C++
+//! These wrap [`pmetal_runtime::distributed`], which calls MLX's C++
 //! collectives, providing interfaces that work with
-//! `pmetal_bridge::compat::Array`. All operations are lazy — they build the
+//! `pmetal_runtime::compat::Array`. All operations are lazy — they build the
 //! MLX computation graph and execute when `eval()` is called. Passing no
 //! group uses MLX's default one.
 //!
@@ -20,14 +20,14 @@
 //! - [`recv_like`] — Receive tensor matching another tensor's shape/dtype
 
 use super::group::DistributedGroup;
-use pmetal_bridge::compat::{Array, Dtype, Exception};
-use pmetal_bridge::distributed::{self, Group};
+use pmetal_runtime::compat::{Array, Dtype, Exception};
+use pmetal_runtime::distributed::{self, Group};
 
 fn group(group: Option<&DistributedGroup>) -> Option<&Group> {
     group.map(|g| &g.inner)
 }
 
-fn exception(op: &str, e: pmetal_bridge::BridgeError) -> Exception {
+fn exception(op: &str, e: pmetal_runtime::RuntimeError) -> Exception {
     Exception::custom(format!("mlx distributed {op} failed: {e}"))
 }
 

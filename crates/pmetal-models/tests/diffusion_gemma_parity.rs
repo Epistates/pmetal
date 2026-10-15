@@ -16,8 +16,8 @@ mod common;
 
 use common::{fixture_path, load_shard, ref_tensor};
 
-use pmetal_bridge::compat::Array;
 use pmetal_mlx::test_utils::{ParityReport, Tolerance, print_report_table};
+use pmetal_runtime::compat::Array;
 
 use pmetal_models::architectures::diffusion_gemma::{
     DiffusionGemmaEncoderModel, DiffusionGemmaTextConfig, load_diffusion_gemma_encoder_weights,

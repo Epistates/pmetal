@@ -3,7 +3,7 @@
 use super::placement::ExpertPlacement;
 use crate::mlx_dist::group::DistributedGroup;
 use crate::mlx_dist::ops;
-use pmetal_bridge::compat::{Array, Dtype, Exception, ops as mlx_ops};
+use pmetal_runtime::compat::{Array, Dtype, Exception, ops as mlx_ops};
 
 /// Slice a contiguous range along `axis` using `take_axis`.
 ///

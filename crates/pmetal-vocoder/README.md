@@ -46,7 +46,7 @@ Mel Spectrogram → Conv1d → [AMP Blocks × N] → Conv1d → Audio Waveform
 ## Usage
 
 ```rust,no_run
-use pmetal_bridge::compat::Array;
+use pmetal_runtime::compat::Array;
 use pmetal_vocoder::{BigVGAN, BigVGANConfig, Result};
 
 /// `mel` is `[batch, mel_bins, frames]`; the result is `[batch, 1, samples]`.

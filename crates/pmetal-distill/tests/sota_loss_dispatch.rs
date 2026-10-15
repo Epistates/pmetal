@@ -7,10 +7,10 @@
 //! contract test: the new variants are wire-complete from YAML config →
 //! `compute_loss` output.
 
-use pmetal_bridge::compat::Array;
 use pmetal_distill::{
     DistillConfig, DistillMethod, Distiller, LossConfig, LossType, TrainingConfig,
 };
+use pmetal_runtime::compat::Array;
 
 fn make_logits() -> (Array, Array) {
     let teacher = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0, 0.5, 1.5, 2.5, 3.5], &[1, 2, 4]);

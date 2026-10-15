@@ -31,9 +31,9 @@ mhc = ["dep:pmetal-mhc"]
 
 # MLX-dependent crates
 mlx = ["dep:pmetal-mlx", "core", "metal"]
-models = ["dep:pmetal-models", "dep:pmetal-bridge", "core", "gguf", "metal", "mlx"]
-# Native-only: inference through pmetal-bridge alone, without pmetal-mlx or pmetal-models
-native-only = ["dep:pmetal-bridge", "core", "metal"]
+models = ["dep:pmetal-models", "dep:pmetal-runtime", "core", "gguf", "metal", "mlx"]
+# Native-only: inference through pmetal-runtime alone, without pmetal-mlx or pmetal-models
+native-only = ["dep:pmetal-runtime", "core", "metal"]
 lora = ["dep:pmetal-lora", "core", "gguf", "metal", "mlx", "models"]
 data = ["dep:pmetal-data", "core", "mlx"]
 trainer = ["dep:pmetal-trainer", "core", "mlx", "metal", "lora", "models", "data", "distill"]
@@ -81,7 +81,7 @@ pmetal-distributed = { workspace = true, optional = true }
 pmetal-mhc = { workspace = true, optional = true }
 pmetal-mlx = { workspace = true, optional = true }
 pmetal-models = { workspace = true, optional = true }
-pmetal-bridge = { workspace = true, optional = true }
+pmetal-runtime = { workspace = true, optional = true }
 pmetal-lora = { workspace = true, optional = true }
 pmetal-data = { workspace = true, optional = true }
 pmetal-trainer = { workspace = true, optional = true }
@@ -130,8 +130,8 @@ flate2 = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
-# Fail every test at the bridge op that throws (pmetal-bridge `strict-errors`).
-pmetal-bridge = { workspace = true, features = ["strict-errors"] }
+# Fail every test at the bridge op that throws (pmetal-runtime `strict-errors`).
+pmetal-runtime = { workspace = true, features = ["strict-errors"] }
 tracing-subscriber = { workspace = true }
 base64 = { workspace = true }
 image = { workspace = true }

@@ -13,12 +13,12 @@
 //! bar here: both sides run the same kernel on the same input, so any
 //! difference means a different function was chosen.
 
-use pmetal_bridge::compat::{Array, Dtype, Param, nn, ops};
 use pmetal_models::architectures::bert::{BertConfig, BertIntermediate};
 use pmetal_models::architectures::clip::{CLIPConfig, CLIPMLP};
 use pmetal_models::architectures::phi::{PhiActivation, PhiConfig, PhiMLP};
 use pmetal_models::architectures::t5::{T5Config, T5DenseGatedActDense};
 use pmetal_models::architectures::utils::Activation;
+use pmetal_runtime::compat::{Array, Dtype, Param, nn, ops};
 
 /// Width of the square identity projections used throughout.
 const N: usize = 8;

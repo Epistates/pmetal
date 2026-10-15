@@ -21,22 +21,22 @@
 //! - Configurable reasoning effort (low/medium/high)
 //! - Tool use optimization
 //! - Apache 2.0 license
-use pmetal_bridge::compat::{Array, Exception, ModuleParametersExt, Param, nn, ops};
-use pmetal_bridge::impl_module_params;
+use pmetal_runtime::compat::{Array, Exception, ModuleParametersExt, Param, nn, ops};
+use pmetal_runtime::impl_module_params;
 
 use crate::checkpointing::checkpointed_layer;
 use crate::fp8_utils::dequantize_fp8_weight_for_compute;
-use pmetal_bridge::gpt_oss_native::GptOssExperts;
+use pmetal_runtime::gpt_oss_native::GptOssExperts;
 
 /// gpt-oss's GLU slope, `gate · σ(1.702 · gate)`.
 const SWIGLU_ALPHA: f32 = 1.702;
-use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig,
     rope::{RopePositions, rope_embedding},
     sink_sdpa,
 };
 use pmetal_mlx::kv_cache::KVCache;
+use pmetal_runtime::rope::{RopeConfig, RotaryEmbedding};
 use serde::{Deserialize, Serialize};
 
 /// Attention layer type for GPT-OSS.
@@ -270,7 +270,7 @@ impl GptOssConfig {
         let rope_scaling = match &self.rope_scaling {
             Some(rs) => serde_json::to_value(rs)
                 .map_err(|e| Exception::custom(format!("gpt_oss rope_scaling: {e}")))?,
-            None => pmetal_bridge::gpt_oss_native::default_rope_scaling(),
+            None => pmetal_runtime::gpt_oss_native::default_rope_scaling(),
         };
         crate::common::rotary_embedding(
             &self.model_type,
@@ -839,12 +839,12 @@ impl GptOssMoE {
             .collect();
 
         Ok((
-            pmetal_bridge::compat::ops::stack_axis(&gate_weights, 0),
-            pmetal_bridge::compat::ops::stack_axis(&up_weights, 0),
-            pmetal_bridge::compat::ops::stack_axis(&down_weights, 0),
-            pmetal_bridge::compat::ops::stack_axis(&gate_biases, 0),
-            pmetal_bridge::compat::ops::stack_axis(&up_biases, 0),
-            pmetal_bridge::compat::ops::stack_axis(&down_biases, 0),
+            pmetal_runtime::compat::ops::stack_axis(&gate_weights, 0),
+            pmetal_runtime::compat::ops::stack_axis(&up_weights, 0),
+            pmetal_runtime::compat::ops::stack_axis(&down_weights, 0),
+            pmetal_runtime::compat::ops::stack_axis(&gate_biases, 0),
+            pmetal_runtime::compat::ops::stack_axis(&up_biases, 0),
+            pmetal_runtime::compat::ops::stack_axis(&down_biases, 0),
         ))
     }
 
@@ -915,7 +915,7 @@ impl GptOssMoE {
 
     fn batched_matmul(&self, x: &Array, w: &Array) -> Result<Array, Exception> {
         let x_expanded = x.reshape(&[x.dim(0), 1, x.dim(1)]);
-        let result = pmetal_bridge::compat::ops::matmul(&x_expanded, w);
+        let result = pmetal_runtime::compat::ops::matmul(&x_expanded, w);
         Ok(result.squeeze_axes(&[1]))
     }
 
@@ -944,8 +944,10 @@ impl GptOssMoE {
             }
         }
 
-        let mut output =
-            pmetal_bridge::compat::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype());
+        let mut output = pmetal_runtime::compat::ops::zeros_dtype(
+            &[batch_seq, hidden_size],
+            hidden_flat.dtype(),
+        );
         for (expert_idx, expert_assignments) in assignments.iter().enumerate() {
             if expert_assignments.is_empty() {
                 continue;
@@ -965,7 +967,7 @@ impl GptOssMoE {
             let expert_out = self.experts[expert_idx].forward(&expert_input)?;
             let weighted = expert_out.multiply(&weight_array);
             let updates = weighted.reshape(&[token_indices.len() as i32, 1, hidden_size]);
-            output = pmetal_bridge::compat::indexing::scatter_add_single(
+            output = pmetal_runtime::compat::indexing::scatter_add_single(
                 &output, &idx_array, &updates, 0,
             );
         }
@@ -986,15 +988,17 @@ impl GptOssMoE {
         let (batch_seq, hidden_size, top_indices, normalized_weights) =
             self.route_topk(&hidden_flat)?;
         let top_k = self.top_k as i32;
-        let mut output =
-            pmetal_bridge::compat::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype());
+        let mut output = pmetal_runtime::compat::ops::zeros_dtype(
+            &[batch_seq, hidden_size],
+            hidden_flat.dtype(),
+        );
 
         for slot in 0..top_k {
             let slot_experts =
-                pmetal_bridge::compat::ops::slice_axis(&top_indices, -1, slot, slot + 1)
+                pmetal_runtime::compat::ops::slice_axis(&top_indices, -1, slot, slot + 1)
                     .reshape(&[top_indices.dim(0)]);
             let slot_weights =
-                pmetal_bridge::compat::ops::slice_axis(&normalized_weights, -1, slot, slot + 1);
+                pmetal_runtime::compat::ops::slice_axis(&normalized_weights, -1, slot, slot + 1);
             let gate_weights = self
                 .stacked_gate_proj
                 .as_ref()
@@ -1067,7 +1071,7 @@ impl GptOssMoE {
             SWIGLU_ALPHA,
             self.swiglu_limit,
         );
-        pmetal_bridge::check_unobserved_error()
+        pmetal_runtime::check_unobserved_error()
             .map_err(|e| Exception::custom(format!("gpt_oss: fused experts: {e}")))?;
         Ok(out.reshape(&shape))
     }
@@ -1356,7 +1360,7 @@ impl GptOssForCausalLM {
         &mut self,
         model_dir: &std::path::Path,
     ) -> Result<bool, Exception> {
-        use pmetal_bridge::native_loader::{discover_safetensors_shards, load_shards_into_map};
+        use pmetal_runtime::native_loader::{discover_safetensors_shards, load_shards_into_map};
         let shards = discover_safetensors_shards(model_dir).map_err(Exception::custom)?;
         let mut raw = load_shards_into_map(&shards, model_dir).map_err(Exception::custom)?;
         if !raw.keys().any(|k| k.contains(".mlp.experts.gate_up_proj")) {
@@ -1510,7 +1514,7 @@ mod tests {
     /// and a config with no rope dict gets transformers' gpt-oss default.
     #[test]
     fn gpt_oss_yarn_keeps_truncate_false() {
-        use pmetal_bridge::rope::{RopeConfig, RopeScaling, Rotary};
+        use pmetal_runtime::rope::{RopeConfig, RopeScaling, Rotary};
 
         let released = serde_json::json!({
             "head_dim": 64, "rope_theta": 150000, "max_position_embeddings": 131072,
@@ -1589,11 +1593,11 @@ mod tests {
             config.router_aux_loss_coef,
         )
         .unwrap();
-        let x = pmetal_bridge::compat::random::uniform_range(
+        let x = pmetal_runtime::compat::random::uniform_range(
             -1.0,
             1.0,
             &[2, 5, config.hidden_size],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
 
         let reference = moe.forward_reference(&x).unwrap();
@@ -1628,16 +1632,16 @@ mod tests {
             config.router_aux_loss_coef,
         )
         .unwrap();
-        let x = pmetal_bridge::compat::random::uniform_range(
+        let x = pmetal_runtime::compat::random::uniform_range(
             -1.0,
             1.0,
             &[1, 4, config.hidden_size],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
 
         let _ = moe.forward(&x).unwrap();
         moe.experts[0].gate_proj.weight =
-            pmetal_bridge::compat::module::Param::new(Array::zeros_f32(&[
+            pmetal_runtime::compat::module::Param::new(Array::zeros_f32(&[
                 config.intermediate_size,
                 config.hidden_size,
             ]));

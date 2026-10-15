@@ -14,12 +14,12 @@ pub(crate) async fn run_info(json_output: bool) -> anyhow::Result<()> {
             }),
         };
         obj["mlx"] = serde_json::json!({
-            "revision": pmetal_bridge::metallib::MLX_REVISION,
+            "revision": pmetal_runtime::metallib::MLX_REVISION,
             "metallib": metallib_in_use(),
             // The metallib this binary carries; release packaging checks the
             // file it ships against it.
             "metallib_sha256": crate::EMBEDDED_METALLIB_SHA256
-                .or(pmetal_bridge::metallib::BUILT_SHA256),
+                .or(pmetal_runtime::metallib::BUILT_SHA256),
         });
         println!("{}", serde_json::to_string_pretty(&obj)?);
     } else {
@@ -37,7 +37,7 @@ pub(crate) async fn run_info(json_output: bool) -> anyhow::Result<()> {
             }
         }
         println!("PMetal Version: {}", env!("CARGO_PKG_VERSION"));
-        println!("MLX Revision:   {}", pmetal_bridge::metallib::MLX_REVISION);
+        println!("MLX Revision:   {}", pmetal_runtime::metallib::MLX_REVISION);
         println!(
             "MLX Metallib:   {}",
             metallib_in_use().unwrap_or_else(|| "MLX's default search".to_string())
@@ -48,7 +48,7 @@ pub(crate) async fn run_info(json_output: bool) -> anyhow::Result<()> {
 
 /// The `mlx.metallib` MLX loads its kernels from (`main` chose it).
 fn metallib_in_use() -> Option<String> {
-    pmetal_bridge::inline_array::metallib_path().map(|p| p.display().to_string())
+    pmetal_runtime::inline_array::metallib_path().map(|p| p.display().to_string())
 }
 
 const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;

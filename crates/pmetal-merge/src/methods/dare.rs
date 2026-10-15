@@ -19,7 +19,7 @@
 
 use super::MergeMethod;
 use crate::{MergeError, MergeParameters, Result, sign_consensus};
-use pmetal_bridge::compat::{Array, Dtype};
+use pmetal_runtime::compat::{Array, Dtype};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 

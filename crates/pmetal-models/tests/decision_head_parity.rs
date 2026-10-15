@@ -14,11 +14,11 @@
 mod common;
 
 use common::{fixture_path, load_shard, ref_tensor};
-use pmetal_bridge::compat::Dtype;
 use pmetal_mlx::test_utils::{ParityReport, Tolerance, print_report_table};
 use pmetal_models::decision::{
     EncodedQuestion, EncodedRecord, JointHeadConfig, JointSchemaHead, QuestionType,
 };
+use pmetal_runtime::compat::Dtype;
 use serde::Deserialize;
 
 const REFERENCE: &str = "clef_head_reference.safetensors";
@@ -93,7 +93,7 @@ fn joint_schema_head_matches_reference() {
             ref_tensor(&reference, "output_embedding"),
         )
         .expect("head forward");
-    pmetal_bridge::check_unobserved_error().expect("no bridge op threw");
+    pmetal_runtime::check_unobserved_error().expect("no bridge op threw");
 
     let reports: Vec<ParityReport> = logits
         .iter()

@@ -1,7 +1,7 @@
 use std::fs;
 
-use pmetal_bridge::compat::{Dtype, random};
 use pmetal_models::architectures::{Gemma4Config, Gemma4ForCausalLM};
+use pmetal_runtime::compat::{Dtype, random};
 use pmetal_trainer::pretrain::{PretrainConfig, PretrainModel, create_model, run_pretrain};
 use serial_test::serial;
 

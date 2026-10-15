@@ -1,7 +1,7 @@
 //! Mel filterbank and mel spectrogram computation.
 
 use crate::error::Result;
-use pmetal_bridge::compat::{Array, ops};
+use pmetal_runtime::compat::{Array, ops};
 
 /// Mel filterbank configuration.
 #[derive(Debug, Clone)]

@@ -1,6 +1,6 @@
 //! Gradient checkpointing on a real architecture, end to end.
 //!
-//! `pmetal-bridge` proves the primitive gives the same gradients as a retained
+//! `pmetal-runtime` proves the primitive gives the same gradients as a retained
 //! backward, on shapes small enough to reason about. This proves the same thing
 //! through the whole chain a training run uses: `AdaptedModel` ->
 //! `DynamicModel` -> the architecture's own layer loop -> `checkpointed_layer`.
@@ -14,11 +14,11 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use pmetal_bridge::compat::{Array, ModuleParametersExt};
-use pmetal_bridge::inline_array::value_and_grad;
 use pmetal_core::LoraConfig;
 use pmetal_lora::{AdaptedModel, TrainableModel};
 use pmetal_models::dispatcher::DynamicModel;
+use pmetal_runtime::compat::{Array, ModuleParametersExt};
+use pmetal_runtime::inline_array::value_and_grad;
 
 /// Every architecture whose trunk implements checkpointing.
 ///

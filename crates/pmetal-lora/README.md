@@ -23,7 +23,7 @@ This crate provides Low-Rank Adaptation (LoRA) and Quantized LoRA (QLoRA) traini
 `pmetal_hub::download_model` first.
 
 ```rust,no_run
-use pmetal_bridge::compat::Array;
+use pmetal_runtime::compat::Array;
 use pmetal_core::LoraConfig;
 use pmetal_lora::{DynamicLoraModel, TrainableModel};
 
@@ -76,7 +76,7 @@ fn qlora(model_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
 ### Loading Trained Adapters
 
 ```rust,no_run
-use pmetal_bridge::compat::Array;
+use pmetal_runtime::compat::Array;
 use pmetal_core::LoraConfig;
 use pmetal_lora::{DynamicLoraModel, TrainableModel};
 

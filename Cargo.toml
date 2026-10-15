@@ -2,7 +2,7 @@
 resolver = "2"
 exclude = ["fuzz", "crates/pmetal-gui/src-tauri"]
 members = [
-    "crates/pmetal-bridge",
+    "crates/pmetal-runtime",
     "crates/pmetal-core",
     "crates/pmetal-core-derive",
     "crates/pmetal-metal",
@@ -35,7 +35,7 @@ categories = ["science", "algorithms"]
 
 [workspace.dependencies]
 # Internal crates
-pmetal-bridge = { path = "crates/pmetal-bridge", version = "0.6.0" }
+pmetal-runtime = { path = "crates/pmetal-runtime", version = "0.6.0" }
 pmetal-core = { path = "crates/pmetal-core", version = "0.6.0", default-features = false }
 pmetal-core-derive = { path = "crates/pmetal-core-derive", version = "0.6.0" }
 pmetal-metal = { path = "crates/pmetal-metal", version = "0.6.0", default-features = false }

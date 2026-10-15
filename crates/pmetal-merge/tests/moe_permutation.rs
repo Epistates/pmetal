@@ -17,8 +17,8 @@
 //!    observable evidence of the caveat — if a future change makes merge
 //!    expert-aware, this test will flip and should be updated.
 
-use pmetal_bridge::compat::Array;
 use pmetal_merge::{TiesMerge, contains_moe_experts, moe_merge_caveat};
+use pmetal_runtime::compat::Array;
 
 #[test]
 fn detects_moe_expert_names_across_supported_archs() {

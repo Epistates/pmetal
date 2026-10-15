@@ -29,11 +29,11 @@ use crate::model_thread::ModelThread;
 /// good as at bf16 (Qwen3-4B: 7.1, 4.7 and 3.1 tokens per pass on three chat
 /// prompts against 6.9, 4.7 and 3.0) and a draft takes ~2.5 ms less, with
 /// half the GPU memory.
-const DRAFT_QUANT: pmetal_bridge::native_weight::QuantParams =
-    pmetal_bridge::native_weight::QuantParams {
+const DRAFT_QUANT: pmetal_runtime::native_weight::QuantParams =
+    pmetal_runtime::native_weight::QuantParams {
         group_size: 64,
         bits: 8,
-        mode: pmetal_bridge::QuantizedMode::Affine,
+        mode: pmetal_runtime::QuantizedMode::Affine,
     };
 
 /// A model on the ANE, and the DFlash drafter (on the GPU) reading its

@@ -813,7 +813,7 @@ fn run_train_mtp_blocking(opts: MtpTrainOptions) -> Result<MtpTrainingResult, St
                         ));
                     }
                 };
-                pmetal_bridge::compat::random::seed(opts.seed);
+                pmetal_runtime::compat::random::seed(opts.seed);
                 let mut mtp = if let Some(init) = opts.init_mtp.as_deref() {
                     let init_path = pmetal_hub::resolve_model_path(init, None, None)
                         .await
@@ -842,7 +842,7 @@ fn run_train_mtp_blocking(opts: MtpTrainOptions) -> Result<MtpTrainingResult, St
                         ));
                     }
                 };
-                pmetal_bridge::compat::random::seed(opts.seed);
+                pmetal_runtime::compat::random::seed(opts.seed);
                 let mut assistant = if let Some(init) = opts.init_mtp.as_deref() {
                     let init_path = pmetal_hub::resolve_model_path(init, None, None)
                         .await
@@ -918,7 +918,7 @@ fn run_train_draft_blocking(opts: DraftTrainOptions) -> Result<MtpTrainingResult
                 .map_err(|e| format!("read DFlash config {config_path}: {e}"))?;
             let config: DFlashDraftConfig = serde_json::from_slice(&config_bytes)
                 .map_err(|e| format!("parse DFlash config {config_path}: {e}"))?;
-            pmetal_bridge::compat::random::seed(opts.seed);
+            pmetal_runtime::compat::random::seed(opts.seed);
             DFlashDraftModel::new(config).map_err(|e| format!("create DFlash draft: {e}"))?
         };
 
@@ -978,7 +978,7 @@ fn shard_batches(
     seq_len: usize,
     batch_size: usize,
     eos_token_id: u32,
-) -> Result<impl Iterator<Item = pmetal_bridge::compat::Array>, String> {
+) -> Result<impl Iterator<Item = pmetal_runtime::compat::Array>, String> {
     if shards.is_empty() {
         return Err("shards must not be empty".to_string());
     }

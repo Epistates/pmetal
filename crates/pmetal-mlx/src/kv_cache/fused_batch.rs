@@ -49,7 +49,7 @@
 //! arch slated for the fused-batch rollout. TurboQuant/Quantized/Sliding
 //! variants stay on the per-slot fallback.
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
+use pmetal_runtime::compat::{Array, Dtype, Exception, ops};
 
 use super::{CacheMode, KVCacheConfig};
 

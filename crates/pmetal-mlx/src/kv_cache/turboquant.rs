@@ -12,8 +12,8 @@
 
 use std::{f32::consts::PI, sync::Arc};
 
-use pmetal_bridge::compat::{Array, Dtype, Exception};
 use pmetal_metal::{MetalContext, TurboQuantTransform};
+use pmetal_runtime::compat::{Array, Dtype, Exception};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use tracing::debug;
 
@@ -151,7 +151,7 @@ pub const DEFAULT_RECENT_WINDOW: usize = 8192;
 /// matches the typical prefill chunk so most evictions happen in one shot.
 const HOT_EVICTION_CHUNK: usize = 1024;
 
-/// QJL residual mode — mirror of `pmetal_bridge::TurboQuantQjlMode`.
+/// QJL residual mode — mirror of `pmetal_runtime::TurboQuantQjlMode`.
 /// `Standard` uses 1 bit per dim for QJL signs; `NoQjl` drops QJL and
 /// reclaims that bit for the codebook.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -163,7 +163,7 @@ pub enum TurboQuantQjlMode {
     NoQjl,
 }
 
-/// Centroid-index storage mode — mirror of `pmetal_bridge::TurboQuantPackMode`.
+/// Centroid-index storage mode — mirror of `pmetal_runtime::TurboQuantPackMode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TurboQuantPackMode {
     /// Bit-packed indices: `ceil(N · D / 8)` bytes per slot at N bits.
@@ -173,7 +173,7 @@ pub enum TurboQuantPackMode {
     Fullbyte,
 }
 
-/// Per-block outlier mode — mirror of `pmetal_bridge::TurboQuantOutlierMode`.
+/// Per-block outlier mode — mirror of `pmetal_runtime::TurboQuantOutlierMode`.
 /// `None` leaves codebook to absorb heavy-tail values; `PerBlock { k }`
 /// stores the top-K |rotated| coords per slot as `(channel, value)` pairs
 /// that override codebook reconstruction.
@@ -222,7 +222,7 @@ pub struct TurboQuantConfig {
     /// Cold-store length above which the 1-bit Hamming skip-list pre-filter
     /// engages on the bridge side. `None` (default) keeps the full-cold
     /// score path. This crate doesn't itself implement the pre-filter — it
-    /// just propagates the threshold to `pmetal-bridge` via the FFI mirror
+    /// just propagates the threshold to `pmetal-runtime` via the FFI mirror
     /// so a single config object covers both backends.
     pub skiplist_threshold: Option<usize>,
     /// Per-block outlier mode (Variant G). See [`TurboQuantOutlierMode`].
@@ -287,7 +287,7 @@ impl TurboQuantConfig {
     }
 
     /// Enable or disable the 1-bit Hamming skip-list pre-filter (delegated
-    /// to pmetal-bridge). `None` keeps the full-cold score path.
+    /// to pmetal-runtime). `None` keeps the full-cold score path.
     pub const fn with_skiplist_threshold(mut self, threshold: Option<usize>) -> Self {
         self.skiplist_threshold = threshold;
         self
@@ -798,7 +798,7 @@ impl TurboQuantCore {
         let mut codebooks = vec![Vec::new(); usize::from(max_mse_bits) + 1];
         for bits in 1..=max_mse_bits {
             codebooks[usize::from(bits)] =
-                (*pmetal_bridge::turboquant::beta_codebook(dim, bits)).clone();
+                (*pmetal_runtime::turboquant::beta_codebook(dim, bits)).clone();
         }
 
         // Metal-side pre-built rotation matrices are only useful for the
@@ -917,7 +917,7 @@ impl TurboQuantCore {
         let post = post_signs.as_deref()?;
         let mut output = input.to_vec();
         for row in output.chunks_mut(self.dim) {
-            pmetal_bridge::turboquant::signed_fwht_forward(row, post, pre);
+            pmetal_runtime::turboquant::signed_fwht_forward(row, post, pre);
         }
         Some(output)
     }
@@ -1337,7 +1337,7 @@ impl TurboQuantKvCache {
             capacity as i32,
             dim as i32,
         ];
-        Ok(pmetal_bridge::compat::ops::zeros(&shape, self.dtype))
+        Ok(pmetal_runtime::compat::ops::zeros(&shape, self.dtype))
     }
 
     /// Write `[B, H, seq, D]`-shaped `keys`/`values` into the hot ring at
@@ -1793,7 +1793,7 @@ impl TurboQuantKvCache {
         };
 
         match (cold_part, hot_part) {
-            (Some(cold), Some(hot)) => Ok(pmetal_bridge::compat::ops::concatenate_axis(
+            (Some(cold), Some(hot)) => Ok(pmetal_runtime::compat::ops::concatenate_axis(
                 &[&cold, &hot],
                 2,
             )),
@@ -1855,7 +1855,7 @@ impl TurboQuantKvCache {
         };
 
         match (cold_part, hot_part) {
-            (Some(cold), Some(hot)) => Ok(pmetal_bridge::compat::ops::concatenate_axis(
+            (Some(cold), Some(hot)) => Ok(pmetal_runtime::compat::ops::concatenate_axis(
                 &[&cold, &hot],
                 2,
             )),
@@ -2359,7 +2359,7 @@ fn encode_key_component_rows(
 
     if mse_bits > 0 {
         // Per-row slot_scale adapts the fixed Beta codebook to each row's
-        // rotated range. See pmetal-bridge::turboquant::encode for the
+        // rotated range. See pmetal-runtime::turboquant::encode for the
         // reference comment.
         let rotated = core.rotate_rows(&normalized);
         let codebook = core.codebook(mse_bits);
@@ -3111,7 +3111,7 @@ mod tests {
 
     #[test]
     fn beta_codebook_is_sorted() {
-        let codebook = pmetal_bridge::turboquant::beta_codebook(128, 4);
+        let codebook = pmetal_runtime::turboquant::beta_codebook(128, 4);
         assert_eq!(codebook.len(), 16);
         assert!(codebook.windows(2).all(|window| window[0] <= window[1]));
     }
@@ -3119,8 +3119,8 @@ mod tests {
     #[test]
     fn beta_codebook_memoization_is_stable() {
         // Two calls with the same (dim, bits) must return identical centroids.
-        let a = pmetal_bridge::turboquant::beta_codebook(128, 3);
-        let b = pmetal_bridge::turboquant::beta_codebook(128, 3);
+        let a = pmetal_runtime::turboquant::beta_codebook(128, 3);
+        let b = pmetal_runtime::turboquant::beta_codebook(128, 3);
         assert_eq!(*a, *b);
         assert_eq!(a.len(), 1usize << 3);
     }
@@ -3180,7 +3180,7 @@ mod tests {
     /// of magnitude, reconstructs within a single relative-error envelope.
     #[test]
     fn turboquant_slot_scale_roundtrip_adversarial_magnitudes() {
-        use pmetal_bridge::compat::{Array, Dtype, ops};
+        use pmetal_runtime::compat::{Array, Dtype, ops};
 
         // recent_window=None → every token goes straight to cold/compressed.
         let config = super::TurboQuantConfig::uniform(8, 4).with_recent_window(None);
@@ -3239,7 +3239,7 @@ mod tests {
         // budget. NoQjl reclaims the QJL bit for the codebook so reconstruction
         // error should be comparable, not strictly lower (per Phase A's
         // synthetic ablation it's a wash on Gaussian-rotated keys).
-        use pmetal_bridge::compat::Array;
+        use pmetal_runtime::compat::Array;
 
         let n_rows = 16usize;
         let dim = 64usize;
@@ -3324,13 +3324,13 @@ mod tests {
         // With the default `recent_window=8192`, a 64-token append should
         // never touch the cold side — hot_offset == 64, cold_offset == 0.
         let mut cache = super::TurboQuantKvCache::new(4, 3);
-        let keys = pmetal_bridge::compat::ops::ones(
+        let keys = pmetal_runtime::compat::ops::ones(
             &[1, 2, 64, 32],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
-        let values = pmetal_bridge::compat::ops::ones(
+        let values = pmetal_runtime::compat::ops::ones(
             &[1, 2, 64, 32],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         cache.update_and_fetch(&keys, &values).unwrap();
         assert_eq!(cache.cold_len(), 0, "no compression for short context");
@@ -3343,17 +3343,17 @@ mod tests {
         // Set a small recent window; push enough tokens to trigger eviction.
         let config = super::TurboQuantConfig::uniform(4, 3).with_recent_window(Some(64));
         let mut cache = super::TurboQuantKvCache::new_with_config(config);
-        let dtype = pmetal_bridge::compat::Dtype::Float32;
+        let dtype = pmetal_runtime::compat::Dtype::Float32;
         // First push: 50 tokens — under window.
-        let keys_a = pmetal_bridge::compat::ops::ones(&[1, 2, 50, 32], dtype);
-        let values_a = pmetal_bridge::compat::ops::ones(&[1, 2, 50, 32], dtype);
+        let keys_a = pmetal_runtime::compat::ops::ones(&[1, 2, 50, 32], dtype);
+        let values_a = pmetal_runtime::compat::ops::ones(&[1, 2, 50, 32], dtype);
         cache.update_and_fetch(&keys_a, &values_a).unwrap();
         assert_eq!(cache.cold_len(), 0);
         assert_eq!(cache.hot_len(), 50);
         // Second push: bring total to 50+1100 = 1150. Hot capacity = 64+1024.
         // Evicting 1086 leaves hot at 64. Cold gains 1086.
-        let keys_b = pmetal_bridge::compat::ops::ones(&[1, 2, 1100, 32], dtype);
-        let values_b = pmetal_bridge::compat::ops::ones(&[1, 2, 1100, 32], dtype);
+        let keys_b = pmetal_runtime::compat::ops::ones(&[1, 2, 1100, 32], dtype);
+        let values_b = pmetal_runtime::compat::ops::ones(&[1, 2, 1100, 32], dtype);
         cache.update_and_fetch(&keys_b, &values_b).unwrap();
         assert_eq!(cache.len(), 1150);
         assert!(
@@ -3368,10 +3368,10 @@ mod tests {
     fn rollback_drains_hot_before_cold() {
         let config = super::TurboQuantConfig::uniform(4, 3).with_recent_window(Some(8));
         let mut cache = super::TurboQuantKvCache::new_with_config(config);
-        let dtype = pmetal_bridge::compat::Dtype::Float32;
+        let dtype = pmetal_runtime::compat::Dtype::Float32;
         // Push enough to evict — 8 + 1024 + extra = 1100 → hot 8, cold 1092.
-        let keys = pmetal_bridge::compat::ops::ones(&[1, 2, 1100, 32], dtype);
-        let values = pmetal_bridge::compat::ops::ones(&[1, 2, 1100, 32], dtype);
+        let keys = pmetal_runtime::compat::ops::ones(&[1, 2, 1100, 32], dtype);
+        let values = pmetal_runtime::compat::ops::ones(&[1, 2, 1100, 32], dtype);
         cache.update_and_fetch(&keys, &values).unwrap();
         let cold_before = cache.cold_len();
         let hot_before = cache.hot_len();
@@ -3392,9 +3392,9 @@ mod tests {
         // behavior: every appended token goes straight to cold.
         let config = super::TurboQuantConfig::uniform(4, 3).with_recent_window(None);
         let mut cache = super::TurboQuantKvCache::new_with_config(config);
-        let dtype = pmetal_bridge::compat::Dtype::Float32;
-        let keys = pmetal_bridge::compat::ops::ones(&[1, 2, 16, 32], dtype);
-        let values = pmetal_bridge::compat::ops::ones(&[1, 2, 16, 32], dtype);
+        let dtype = pmetal_runtime::compat::Dtype::Float32;
+        let keys = pmetal_runtime::compat::ops::ones(&[1, 2, 16, 32], dtype);
+        let values = pmetal_runtime::compat::ops::ones(&[1, 2, 16, 32], dtype);
         cache.update_and_fetch(&keys, &values).unwrap();
         assert_eq!(cache.hot_len(), 0);
         assert_eq!(cache.cold_len(), 16);

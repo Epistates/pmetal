@@ -26,7 +26,7 @@ pub mod systemone;
 
 use std::path::{Path, PathBuf};
 
-use pmetal_bridge::compat::{Array, Dtype, Exception};
+use pmetal_runtime::compat::{Array, Dtype, Exception};
 
 use backbone::Backbone;
 pub use encode::{
@@ -269,11 +269,11 @@ impl DecisionModel {
         let backbone_ms = started.elapsed().as_secs_f64() * 1e3;
         let logits = self.head.forward(&hidden, record, &self.output_embedding)?;
         let flat =
-            pmetal_bridge::compat::ops::concatenate_axis(&logits.iter().collect::<Vec<_>>(), 0)
+            pmetal_runtime::compat::ops::concatenate_axis(&logits.iter().collect::<Vec<_>>(), 0)
                 .as_dtype(Dtype::Float32.as_i32());
         flat.try_eval()
             .map_err(|e| DecisionError::Model(Exception::custom(e.to_string())))?;
-        pmetal_bridge::check_unobserved_error()
+        pmetal_runtime::check_unobserved_error()
             .map_err(|e| DecisionError::Model(Exception::custom(e.to_string())))?;
         tracing::debug!(
             tokens = record.input_ids.len(),

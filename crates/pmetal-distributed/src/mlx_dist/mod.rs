@@ -4,7 +4,7 @@
 //! - **JACCL**: RDMA over Thunderbolt 5 (~3µs latency, 45 GB/s)
 //! - **Ring**: TCP-based ring communication
 //!
-//! These wrap [`pmetal_bridge::distributed`], which calls MLX's C++
+//! These wrap [`pmetal_runtime::distributed`], which calls MLX's C++
 //! distributed API (`mlx/distributed/`) in the libmlx the bridge links.
 //!
 //! # Environment Variables

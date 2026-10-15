@@ -2,7 +2,7 @@
 //!
 //! Bridges the existing `DistributedBackend` trait (which operates on raw
 //! byte buffers) to MLX's native collective operations (which operate on
-//! `pmetal_bridge::compat::Array`). This enables using JACCL/RDMA over
+//! `pmetal_runtime::compat::Array`). This enables using JACCL/RDMA over
 //! Thunderbolt 5 for gradient synchronization in the training loop.
 
 use super::group::DistributedGroup;
@@ -10,7 +10,7 @@ use super::ops;
 use crate::{DistributedBackend, ReduceOp};
 use anyhow::Result;
 use async_trait::async_trait;
-use pmetal_bridge::compat::Array;
+use pmetal_runtime::compat::Array;
 use tracing::debug;
 
 /// Distributed backend using MLX native collectives (JACCL/Ring).

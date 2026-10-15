@@ -6,16 +6,16 @@
 //! - RMSNorm applied to Q and K before RoPE (q_norm, k_norm)
 //! - SwitchGLU-style expert MLP with gather_mm
 
-use pmetal_bridge::compat::{
-    Array, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, VisitLinears, nn,
-};
-use pmetal_bridge::impl_module_params;
-use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     rope::{RopePositions, rope_embedding},
 };
 use pmetal_mlx::kv_cache::KVCache;
+use pmetal_runtime::compat::{
+    Array, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, VisitLinears, nn,
+};
+use pmetal_runtime::impl_module_params;
+use pmetal_runtime::rope::{RopeConfig, RotaryEmbedding};
 // MoE block uses pmetal_mlx::moe::Expert directly for individual expert MLPs
 use serde::{Deserialize, Serialize};
 
@@ -77,7 +77,7 @@ pub struct Qwen3MoEConfig {
     #[serde(default = "default_norm_topk_prob")]
     pub norm_topk_prob: bool,
     /// RoPE scaling (YaRN on the Qwen3 cards), read by
-    /// [`pmetal_bridge::rope`].
+    /// [`pmetal_runtime::rope`].
     #[serde(default)]
     pub rope_scaling: Option<serde_json::Value>,
     /// transformers v5's spelling of the same, with `rope_theta` inside.
@@ -472,9 +472,9 @@ impl Qwen3MoEBlock {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok((
-            pmetal_bridge::compat::ops::stack_axis(&gate_weights, 0),
-            pmetal_bridge::compat::ops::stack_axis(&up_weights, 0),
-            pmetal_bridge::compat::ops::stack_axis(&down_weights, 0),
+            pmetal_runtime::compat::ops::stack_axis(&gate_weights, 0),
+            pmetal_runtime::compat::ops::stack_axis(&up_weights, 0),
+            pmetal_runtime::compat::ops::stack_axis(&down_weights, 0),
         ))
     }
 
@@ -518,12 +518,12 @@ impl Qwen3MoEBlock {
 
         // Softmax over expert logits, with an f32 cast for numerical stability.
         let gate_logits = self.gate.forward(hidden_flat);
-        let gate_logits_f32 = if gate_logits.dtype() != pmetal_bridge::compat::Dtype::Float32 {
+        let gate_logits_f32 = if gate_logits.dtype() != pmetal_runtime::compat::Dtype::Float32 {
             gate_logits.as_type::<f32>()
         } else {
             gate_logits
         };
-        let routing_probs = pmetal_bridge::compat::ops::softmax_axis(&gate_logits_f32, -1);
+        let routing_probs = pmetal_runtime::compat::ops::softmax_axis(&gate_logits_f32, -1);
 
         // Shared top-k selection + optional renormalisation — see
         // `crate::moe_routing::topk_normalize`.
@@ -564,8 +564,10 @@ impl Qwen3MoEBlock {
             }
         }
 
-        let mut final_output =
-            pmetal_bridge::compat::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype());
+        let mut final_output = pmetal_runtime::compat::ops::zeros_dtype(
+            &[batch_seq, hidden_size],
+            hidden_flat.dtype(),
+        );
         for (expert_idx, assignments) in expert_assignments.iter().enumerate() {
             if assignments.is_empty() {
                 continue;
@@ -580,7 +582,7 @@ impl Qwen3MoEBlock {
             let expert_out = self.experts[expert_idx].forward(&expert_input);
             let weighted_out = expert_out.multiply(&weight_array);
             let updates_3d = weighted_out.reshape(&[token_indices.len() as i32, 1, hidden_size]);
-            final_output = pmetal_bridge::compat::indexing::scatter_add_single(
+            final_output = pmetal_runtime::compat::indexing::scatter_add_single(
                 &final_output,
                 &idx_array,
                 &updates_3d,
@@ -595,7 +597,7 @@ impl Qwen3MoEBlock {
 
     fn batched_matmul(&self, x: &Array, w: &Array) -> Result<Array, Exception> {
         let x_expanded = x.reshape(&[x.dim(0), 1, x.dim(1)]);
-        let result = pmetal_bridge::compat::ops::matmul(&x_expanded, w);
+        let result = pmetal_runtime::compat::ops::matmul(&x_expanded, w);
         Ok(result.squeeze_axes(&[1]))
     }
 
@@ -610,14 +612,16 @@ impl Qwen3MoEBlock {
         let (batch_seq, hidden_size, top_indices, normalized_weights) =
             self.route_topk(&hidden_flat)?;
         let top_k = self.top_k as i32;
-        let mut output =
-            pmetal_bridge::compat::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype());
+        let mut output = pmetal_runtime::compat::ops::zeros_dtype(
+            &[batch_seq, hidden_size],
+            hidden_flat.dtype(),
+        );
         for slot in 0..top_k {
             let slot_experts =
-                pmetal_bridge::compat::ops::slice_axis(&top_indices, -1, slot, slot + 1)
+                pmetal_runtime::compat::ops::slice_axis(&top_indices, -1, slot, slot + 1)
                     .reshape(&[top_indices.dim(0)]);
             let slot_weights =
-                pmetal_bridge::compat::ops::slice_axis(&normalized_weights, -1, slot, slot + 1);
+                pmetal_runtime::compat::ops::slice_axis(&normalized_weights, -1, slot, slot + 1);
 
             let gate_weights = self
                 .stacked_gate_proj
@@ -1119,7 +1123,7 @@ impl Qwen3MoE {
             &self.model.layers[0].self_attn.rotary,
         )?;
         let mut hidden =
-            pmetal_bridge::compat::Module::forward(&mut self.model.embed_tokens, input_ids)?;
+            pmetal_runtime::compat::Module::forward(&mut self.model.embed_tokens, input_ids)?;
         for (layer_idx, layer) in self.model.layers.iter_mut().enumerate() {
             hidden = batched_prenorm_layer(
                 &hidden,
@@ -1138,9 +1142,9 @@ impl Qwen3MoE {
                 layer_idx,
             )?;
         }
-        let hidden = pmetal_bridge::compat::Module::forward(&mut self.model.norm, &hidden)?;
+        let hidden = pmetal_runtime::compat::Module::forward(&mut self.model.norm, &hidden)?;
         if let Some(ref mut head) = self.lm_head {
-            pmetal_bridge::compat::Module::forward(head, &hidden)
+            pmetal_runtime::compat::Module::forward(head, &hidden)
         } else {
             let embed_weight = self.model.embed_tokens.weight.value.as_ref();
             Ok(hidden.matmul(&embed_weight.t()))
@@ -1218,11 +1222,11 @@ mod tests {
         let mut ffn = Qwen3MoEFeedForward::Dense(
             Qwen3MoEDenseMLP::new(config.hidden_size, config.intermediate_size).unwrap(),
         );
-        let x = pmetal_bridge::compat::random::uniform_range(
+        let x = pmetal_runtime::compat::random::uniform_range(
             -1.0,
             1.0,
             &[1, 4, config.hidden_size],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let out = ffn.forward(&x).unwrap();
         assert_eq!(out.shape(), &[1, 4, config.hidden_size]);
@@ -1233,11 +1237,11 @@ mod tests {
     fn test_feed_forward_moe_dispatch() {
         let config = tiny_moe_config();
         let mut ffn = Qwen3MoEFeedForward::MoE(Qwen3MoEBlock::new(&config).unwrap());
-        let x = pmetal_bridge::compat::random::uniform_range(
+        let x = pmetal_runtime::compat::random::uniform_range(
             -1.0,
             1.0,
             &[1, 4, config.hidden_size],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let out = ffn.forward(&x).unwrap();
         assert_eq!(out.shape(), &[1, 4, config.hidden_size]);
@@ -1310,11 +1314,11 @@ mod tests {
     fn test_moe_block_forward_shape() {
         let config = tiny_moe_config();
         let mut block = Qwen3MoEBlock::new(&config).unwrap();
-        let x = pmetal_bridge::compat::random::uniform_range(
+        let x = pmetal_runtime::compat::random::uniform_range(
             -1.0,
             1.0,
             &[2, 5, config.hidden_size],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let out = block.forward(&x).unwrap();
         assert_eq!(out.shape(), &[2, 5, config.hidden_size]);
@@ -1325,11 +1329,11 @@ mod tests {
     fn test_moe_block_stacked_matches_per_expert_path() {
         let config = tiny_moe_config();
         let mut block = Qwen3MoEBlock::new(&config).unwrap();
-        let x = pmetal_bridge::compat::random::uniform_range(
+        let x = pmetal_runtime::compat::random::uniform_range(
             -1.0,
             1.0,
             &[2, 5, config.hidden_size],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
 
         let reference = block.forward_per_expert(&x).unwrap();
@@ -1358,11 +1362,11 @@ mod tests {
     fn test_moe_block_stacked_cache_refreshes_after_weight_change() {
         let config = tiny_moe_config();
         let mut block = Qwen3MoEBlock::new(&config).unwrap();
-        let x = pmetal_bridge::compat::random::uniform_range(
+        let x = pmetal_runtime::compat::random::uniform_range(
             -1.0,
             1.0,
             &[1, 4, config.hidden_size],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
 
         let _ = block.forward(&x).unwrap();

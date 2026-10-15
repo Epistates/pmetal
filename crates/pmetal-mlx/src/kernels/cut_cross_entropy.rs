@@ -10,7 +10,7 @@
 //! # The fused kernels
 //!
 //! On a Metal GPU the loss runs as fused kernels
-//! ([`pmetal_bridge::inline_array::cut_cross_entropy_fused`]): the forward
+//! ([`pmetal_runtime::inline_array::cut_cross_entropy_fused`]): the forward
 //! builds 64×64 tiles of logits in the GEMM's registers and folds them into
 //! each token's logsumexp and target logit as it goes. The backward uses the
 //! softmax's sparsity as the paper does (gradient filtering): where the
@@ -45,8 +45,8 @@
 
 use std::sync::Once;
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
-use pmetal_bridge::inline_array::{FusedCceParams, checkpoint_apply, cut_cross_entropy_fused};
+use pmetal_runtime::compat::{Array, Dtype, Exception, ops};
+use pmetal_runtime::inline_array::{FusedCceParams, checkpoint_apply, cut_cross_entropy_fused};
 
 /// Configuration for [`CutCrossEntropy`].
 #[derive(Debug, Clone)]
@@ -354,7 +354,7 @@ impl CutCrossEntropy {
                 );
                 vec![lse, a[3].add(&picked.multiply(&inside)), h]
             });
-            pmetal_bridge::check_unobserved_error()
+            pmetal_runtime::check_unobserved_error()
                 .map_err(|e| Exception::custom(format!("cut cross-entropy chunk {i}: {e}")))?;
             [lse, target, h] = out.try_into().map_err(|_| {
                 Exception::custom("cut cross-entropy: a chunk returned the wrong outputs")
@@ -388,11 +388,11 @@ impl Transform {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::random;
-    use pmetal_bridge::inline_array::value_and_grad;
+    use pmetal_runtime::compat::random;
+    use pmetal_runtime::inline_array::value_and_grad;
 
     fn drain() {
-        if let Err(e) = pmetal_bridge::check_unobserved_error() {
+        if let Err(e) = pmetal_runtime::check_unobserved_error() {
             panic!("a bridge op threw: {e}");
         }
     }
@@ -495,7 +495,7 @@ mod tests {
     ) -> (f32, Vec<Array>) {
         with_grads(
             |h, w, b| {
-                pmetal_bridge::training::cross_entropy_loss(
+                pmetal_runtime::training::cross_entropy_loss(
                     &full_logits(config, h, w, b),
                     targets,
                     config.ignore_index,
@@ -668,7 +668,7 @@ mod tests {
         let ids: Vec<i32> = (0..n).map(|i| (i * 61) % v).collect();
         let targets = Array::from_i32_slice(&ids);
 
-        let want = pmetal_bridge::training::cross_entropy_loss(
+        let want = pmetal_runtime::training::cross_entropy_loss(
             &f32_(&hidden.matmul(&weight.t())),
             &targets,
             -100,
@@ -827,7 +827,7 @@ mod tests {
         let short = Array::from_i32_slice(&[1, 2, 3]);
         let cce = CutCrossEntropy::new(CutCrossEntropyConfig::new());
 
-        let err = pmetal_bridge::expect_bridge_errors(|| {
+        let err = pmetal_runtime::expect_runtime_errors(|| {
             cce.forward(&hidden, &weight, &short, None).unwrap_err()
         });
         assert!(err.to_string().contains("3 targets for 4 tokens"), "{err}");
@@ -895,7 +895,7 @@ mod tests {
         };
         let got = outer(&|h, w| loss_by(Path::Fused, &cce, h, w, &case.targets, None));
         let want = outer(&|h, w| {
-            pmetal_bridge::training::cross_entropy_loss(
+            pmetal_runtime::training::cross_entropy_loss(
                 &full_logits(&config, h, w, None),
                 &case.targets,
                 -100,

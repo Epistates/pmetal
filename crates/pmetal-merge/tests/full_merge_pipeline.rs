@@ -153,8 +153,8 @@ fn dry_run_does_not_write_weights() {
 
 #[test]
 fn sanity_quick_rejects_nan_tensor() {
-    use pmetal_bridge::compat::Array;
     use pmetal_merge::{MergedTensorReport, SanityLevel, check_tensor};
+    use pmetal_runtime::compat::Array;
 
     // Direct unit-style coverage of the sanity guard — useful when the merge
     // produces a NaN through a numerically degenerate parameter combination.

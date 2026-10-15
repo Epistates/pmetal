@@ -1,6 +1,6 @@
 //! Pooling strategies for converting sequence representations to fixed-size embeddings.
 
-use pmetal_bridge::compat::{Array, Exception};
+use pmetal_runtime::compat::{Array, Exception};
 /// Pooling modes for sentence embeddings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum PoolingMode {
@@ -56,12 +56,12 @@ pub fn pool(
             let masked = hidden_states.multiply(&mask_expanded);
             let sum = masked.sum_axes(&[1], false);
             let count = mask_expanded.sum_axes(&[1], false);
-            let count = pmetal_bridge::compat::ops::maximum(&count, &Array::from_f32(1e-9));
+            let count = pmetal_runtime::compat::ops::maximum(&count, &Array::from_f32(1e-9));
             Ok(sum.divide(&count))
         }
         PoolingMode::Cls => {
             // Take first token embedding [batch, hidden_dim]
-            Ok(pmetal_bridge::compat::ops::slice_axis(hidden_states, 1, 0, 1).squeeze_axes(&[1]))
+            Ok(pmetal_runtime::compat::ops::slice_axis(hidden_states, 1, 0, 1).squeeze_axes(&[1]))
         }
         PoolingMode::Max => {
             // Replace padding positions with -inf then take max over sequence
@@ -81,14 +81,14 @@ pub fn pool(
 
             // lengths [batch] → last index [batch] as Int32
             let last_indices = attention_mask
-                .as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32())
+                .as_dtype(pmetal_runtime::compat::Dtype::Int32.as_i32())
                 .sum_axes(&[1], false) // [batch]
                 .subtract(&Array::from_int(1)); // [batch]
 
             // Reshape to [batch, 1, 1] then broadcast to [batch, 1, hidden_dim]
             // so take_along_axis can gather along the sequence dimension.
             let indices_expanded = last_indices.reshape(&[batch, 1, 1]);
-            let indices_broadcast = pmetal_bridge::compat::ops::broadcast_to(
+            let indices_broadcast = pmetal_runtime::compat::ops::broadcast_to(
                 &indices_expanded,
                 &[batch, 1, hidden_dim],
             );
@@ -111,7 +111,7 @@ pub fn pool(
             let sum = weighted.sum_axes(&[1], false);
             let weight_sum = weights.multiply(&mask_expanded).sum_axes(&[1], false);
             let weight_sum =
-                pmetal_bridge::compat::ops::maximum(&weight_sum, &Array::from_f32(1e-9));
+                pmetal_runtime::compat::ops::maximum(&weight_sum, &Array::from_f32(1e-9));
             Ok(sum.divide(&weight_sum))
         }
     }
@@ -126,7 +126,7 @@ pub fn pool(
 /// Unit-normalized embeddings `[batch, dim]`
 pub fn normalize_embeddings(embeddings: &Array) -> Result<Array, Exception> {
     let norm = embeddings.square().sum_axes(&[-1], true).sqrt();
-    let norm = pmetal_bridge::compat::ops::maximum(&norm, &Array::from_f32(1e-12));
+    let norm = pmetal_runtime::compat::ops::maximum(&norm, &Array::from_f32(1e-12));
     Ok(embeddings.divide(&norm))
 }
 

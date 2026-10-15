@@ -4,7 +4,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use futures::FutureExt;
 use pmetal::prelude::{JobFields, TrainingCallback};
-use pmetal_bridge::compat::ops;
+use pmetal_runtime::compat::ops;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
@@ -3604,7 +3604,7 @@ fn run_fuse_in_process(
         .to_str()
         .ok_or_else(|| AppError(format!("non-UTF-8 LoRA path: {}", lora_file.display())))?;
     let lora_weights: HashMap<String, pmetal::mlx::Array> =
-        pmetal_bridge::inline_array::load_safetensors_shard(lora_file_str)
+        pmetal_runtime::inline_array::load_safetensors_shard(lora_file_str)
             .map(|pairs| pairs.into_iter().collect())
             .ok_or_else(|| {
                 AppError(format!(

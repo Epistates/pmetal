@@ -24,7 +24,6 @@ mod common;
 
 use common::{fixture_path, load_shard, ref_tensor};
 
-use pmetal_bridge::compat::{Array, ops};
 use pmetal_mlx::speculative::SpecCapture;
 use pmetal_mlx::test_utils::{
     ParityReport, Tolerance, argmax_last_axis, print_report_table, to_f32_vec_eval,
@@ -34,6 +33,7 @@ use pmetal_models::architectures::qwen4_exp::{
     Qwen4ExpConfig, Qwen4ExpForCausalLM, Qwen4ExpLoadOptions, load_qwen4_exp_weights,
 };
 use pmetal_models::dispatcher::{DynamicModel, ModelArchitecture};
+use pmetal_runtime::compat::{Array, ops};
 use serial_test::serial;
 
 const TAP_LAYERS: [usize; 4] = [0, 1, 2, 3];
@@ -120,7 +120,7 @@ fn cached_logits(model: &mut DynamicModel, input_ids: &Array) -> Array {
         let logits = model
             .forward_with_hybrid_cache(&chunk, None, Some(&mut kv), mamba.as_mut())
             .expect("cached forward");
-        pmetal_bridge::check_unobserved_error().expect("no bridge error in the cached forward");
+        pmetal_runtime::check_unobserved_error().expect("no bridge error in the cached forward");
         outputs.push(logits);
     }
     let refs: Vec<&Array> = outputs.iter().collect();
@@ -150,7 +150,7 @@ fn qwen4_exp_matches_transformers_full_and_cached() {
         .model
         .forward_with_cache_and_capture(&input_ids, None, None, None, Some(&mut capture))
         .expect("uncached forward");
-    pmetal_bridge::check_unobserved_error().expect("no bridge error in the uncached forward");
+    pmetal_runtime::check_unobserved_error().expect("no bridge error in the uncached forward");
     let logits = model.forward(&input_ids, None).expect("logits");
 
     let mut reports = vec![compare(
@@ -235,7 +235,7 @@ fn qwen4_exp_disk_served_ngram_rows_match_resident() {
 /// `nvidia/Qwen3.8-Flash-Next-NVFP4` release ships: one module per expert, the
 /// e2m1 bytes, an e4m3 scale per 16 values, and a per-expert `weight_scale_2`.
 fn nvfp4_checkpoint_dir() -> tempfile::TempDir {
-    use pmetal_bridge::QuantizedMode;
+    use pmetal_runtime::QuantizedMode;
 
     let dense = load_shard(&fixture_path("qwen4_exp_synth_weights.safetensors"));
     let mut out: Vec<(String, Array)> = Vec::new();
@@ -264,7 +264,7 @@ fn nvfp4_checkpoint_dir() -> tempfile::TempDir {
                 let module = format!("{prefix}.{e}.{name}");
                 out.push((
                     format!("{module}.weight"),
-                    packed.view(pmetal_bridge::dtype::U8),
+                    packed.view(pmetal_runtime::dtype::U8),
                 ));
                 out.push((format!("{module}.weight_scale"), scales));
                 out.push((
@@ -334,7 +334,7 @@ fn qwen4_exp_nvfp4_experts_run_packed() {
         );
         let logits = model.forward(&input_ids, None).expect("forward");
         let cached = cached_logits(&mut model, &input_ids);
-        pmetal_bridge::check_unobserved_error().expect("no bridge error");
+        pmetal_runtime::check_unobserved_error().expect("no bridge error");
         runs.push((logits, cached));
     }
     // Observed 6.6e-7 both ways; swapping a gate and up projection moves the

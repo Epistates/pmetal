@@ -1,6 +1,6 @@
 //! Error types for the vocoder crate.
 
-use pmetal_bridge::compat::Exception;
+use pmetal_runtime::compat::Exception;
 use thiserror::Error;
 
 /// Result type for vocoder operations.

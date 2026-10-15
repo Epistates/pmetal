@@ -30,8 +30,8 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
 
-use pmetal_bridge::compat::{Array, Dtype};
 use pmetal_metal::expert_buffer::{AlignedBuffer, ExpertBufferPool};
+use pmetal_runtime::compat::{Array, Dtype};
 
 use crate::expert_io::ExpertOffloadContext;
 
@@ -569,15 +569,19 @@ impl ExpertPrefetcher {
         &self,
         hidden: &Array,
         gate_w: &[f32],
-    ) -> Result<Vec<usize>, pmetal_bridge::compat::Exception> {
+    ) -> Result<Vec<usize>, pmetal_runtime::compat::Exception> {
         let d = self.hidden_dim as i32;
         let k = self.top_k;
 
         let hidden_rows = hidden.reshape(&[-1, d]);
         let last_row_idx = hidden_rows.dim(0) - 1;
-        let hidden_1d =
-            pmetal_bridge::compat::ops::slice_axis(&hidden_rows, 0, last_row_idx, last_row_idx + 1)
-                .squeeze_axes(&[0]);
+        let hidden_1d = pmetal_runtime::compat::ops::slice_axis(
+            &hidden_rows,
+            0,
+            last_row_idx,
+            last_row_idx + 1,
+        )
+        .squeeze_axes(&[0]);
         let hidden_1d = if hidden_1d.dtype() != Dtype::Float32 {
             hidden_1d.as_type::<f32>()
         } else {
@@ -624,7 +628,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    use pmetal_bridge::compat::nn;
+    use pmetal_runtime::compat::nn;
     use serial_test::serial;
 
     use crate::architectures::qwen3_next::Qwen3NextConfig;
@@ -723,7 +727,7 @@ mod tests {
             .unwrap();
         let gate_logits = gate.forward(&hidden).unwrap();
         let last_row =
-            pmetal_bridge::compat::ops::select_axis(&gate_logits, gate_logits.dim(0) - 1, 0);
+            pmetal_runtime::compat::ops::select_axis(&gate_logits, gate_logits.dim(0) - 1, 0);
         let last_row = last_row.as_type::<f32>().unwrap();
         let mut actual_scores: Vec<(f32, usize)> = (0..config.num_experts as usize)
             .map(|expert_idx| (last_row.index(expert_idx as i32).item::<f32>(), expert_idx))

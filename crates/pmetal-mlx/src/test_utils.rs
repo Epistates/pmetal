@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use pmetal_bridge::compat::{Array, ops};
+use pmetal_runtime::compat::{Array, ops};
 
 /// Load a safetensors shard into a name→tensor map.
 ///
@@ -24,7 +24,7 @@ use pmetal_bridge::compat::{Array, ops};
 /// not a condition a test can meaningfully handle.
 pub fn load_shard(path: &Path) -> HashMap<String, Array> {
     let path_str = path.to_str().expect("utf8 path");
-    let pairs = pmetal_bridge::inline_array::load_safetensors_shard(path_str)
+    let pairs = pmetal_runtime::inline_array::load_safetensors_shard(path_str)
         .unwrap_or_else(|| panic!("failed to load safetensors shard at {path_str:?}"));
     pairs.into_iter().collect()
 }

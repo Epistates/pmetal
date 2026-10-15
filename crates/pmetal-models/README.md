@@ -60,7 +60,7 @@ These are loaded by the Flux pipeline rather than by `DynamicModel`:
 resolve HuggingFace ids with `pmetal_hub::download_model` first.
 
 ```rust,no_run
-use pmetal_bridge::compat::Exception;
+use pmetal_runtime::compat::Exception;
 use pmetal_models::{DynamicModel, GenerationConfig, generate};
 
 fn run(model_dir: &str, input_tokens: &[u32]) -> Result<Vec<u32>, Exception> {
@@ -80,7 +80,7 @@ fn run(model_dir: &str, input_tokens: &[u32]) -> Result<Vec<u32>, Exception> {
 The `DynamicModel` automatically detects model architecture:
 
 ```rust,no_run
-use pmetal_bridge::compat::Exception;
+use pmetal_runtime::compat::Exception;
 use pmetal_models::ModelArchitecture;
 
 fn detect(model_dir: &str) -> Result<ModelArchitecture, Exception> {

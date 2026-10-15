@@ -6,15 +6,15 @@
 //! - GeGLU instead of SwiGLU (uses GELU instead of SiLU)
 //! - Embedding scaling by sqrt(hidden_size)
 //! - Gemma2: Attention logit softcapping, sliding window, extra normalization
-use pmetal_bridge::compat::{Array, Dtype, Exception, Module, Param, nn};
-use pmetal_bridge::impl_module_params;
+use pmetal_runtime::compat::{Array, Dtype, Exception, Module, Param, nn};
+use pmetal_runtime::impl_module_params;
 
-use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     rope::{RopePositions, rope_embedding},
 };
 use pmetal_mlx::kv_cache::KVCache;
+use pmetal_runtime::rope::{RopeConfig, RotaryEmbedding};
 use serde::{Deserialize, Serialize};
 
 use crate::checkpointing::checkpointed_layer;
@@ -100,7 +100,7 @@ pub struct GemmaConfig {
     #[serde(default)]
     pub is_gemma3: bool,
     /// RoPE scaling (Gemma 3's `linear` on its global layers), read by
-    /// [`pmetal_bridge::rope`].
+    /// [`pmetal_runtime::rope`].
     #[serde(default)]
     pub rope_scaling: Option<serde_json::Value>,
     /// transformers v5's spelling: one dict, or Gemma 3's pair keyed
@@ -339,7 +339,7 @@ impl GemmaRmsNorm {
     /// Create a new GemmaRmsNorm layer.
     pub fn new(hidden_size: i32, eps: f32) -> Result<Self, Exception> {
         // Initialize weights to zeros (will become 1 after +1 offset)
-        let weight = pmetal_bridge::compat::ops::zeros(&[hidden_size], Dtype::Float32);
+        let weight = pmetal_runtime::compat::ops::zeros(&[hidden_size], Dtype::Float32);
 
         Ok(Self {
             weight: Param::new(weight),
@@ -654,8 +654,8 @@ impl GemmaMLP {
     fn apply_activation(&self, x: &Array) -> Array {
         match self.hidden_act.as_str() {
             "gelu" | "gelu_pytorch_tanh" | "gelu_tanh" => gelu_tanh(x),
-            "silu" | "swish" => pmetal_bridge::compat::nn::silu(x),
-            "relu" => pmetal_bridge::compat::nn::relu(x),
+            "silu" | "swish" => pmetal_runtime::compat::nn::silu(x),
+            "relu" => pmetal_runtime::compat::nn::relu(x),
             _ => gelu_tanh(x), // Default to gelu_tanh for Gemma
         }
     }
@@ -1073,7 +1073,7 @@ impl GemmaForCausalLM {
         match self.model.config.final_logit_softcapping {
             Some(cap) if cap != 0.0 => {
                 let cap_arr = Array::from_f32(cap);
-                pmetal_bridge::compat::ops::tanh(&logits.divide(&cap_arr)).multiply(&cap_arr)
+                pmetal_runtime::compat::ops::tanh(&logits.divide(&cap_arr)).multiply(&cap_arr)
             }
             _ => logits,
         }
@@ -1320,7 +1320,7 @@ impl CausalLMModel for GemmaForCausalLM {
     }
 
     fn eval(&self) -> Result<(), Exception> {
-        pmetal_bridge::compat::ModuleParametersExt::eval(self)
+        pmetal_runtime::compat::ModuleParametersExt::eval(self)
     }
 }
 
@@ -1413,9 +1413,9 @@ mod tests {
     #[serial]
     fn test_gemma_rms_norm() {
         let norm = GemmaRmsNorm::new(64, 1e-6).unwrap();
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 4, 64],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let output = norm.forward(&x).unwrap();
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -1429,7 +1429,7 @@ mod tests {
         // saturates to the identity there, so these must come back finite and
         // equal to x.
         let xs = [-1.0f32, 0.0, 1.0, 2.0, 10.5, 20.0, 50.0];
-        let x = pmetal_bridge::compat::Array::from_slice(&xs, &[xs.len() as i32]);
+        let x = pmetal_runtime::compat::Array::from_slice(&xs, &[xs.len() as i32]);
         let mut output = gelu_tanh(&x);
         output.eval().unwrap();
         let got = output.to_f32_vec(xs.len()).expect("to_f32_vec");
@@ -1450,9 +1450,9 @@ mod tests {
         let config = small_config();
         let mut attn = GemmaAttention::new(&config, 0).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 4, 64],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let output = attn.forward(&x, None).unwrap();
 
@@ -1465,9 +1465,9 @@ mod tests {
         let config = small_config();
         let mut mlp = GemmaMLP::new(&config).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 4, 64],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let output = mlp.forward(&x).unwrap();
 
@@ -1480,9 +1480,9 @@ mod tests {
         let config = small_config();
         let mut layer = GemmaDecoderLayer::new(&config, 0).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 4, 64],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let output = layer.forward(&x, None).unwrap();
 
@@ -1495,7 +1495,7 @@ mod tests {
         let config = small_config();
         let mut model = GemmaModel::new(config).unwrap();
 
-        let input_ids = pmetal_bridge::compat::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = pmetal_runtime::compat::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
         let output = model.forward(&input_ids, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -1507,7 +1507,7 @@ mod tests {
         let config = small_config();
         let mut model = GemmaForCausalLM::new(config).unwrap();
 
-        let input_ids = pmetal_bridge::compat::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = pmetal_runtime::compat::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
         let logits = model.forward(&input_ids, None).unwrap();
 
         assert_eq!(logits.shape(), &[1, 4, 1000]); // [batch, seq, vocab]
@@ -1523,9 +1523,9 @@ mod tests {
 
         let mut layer = Gemma2DecoderLayer::new(&config, 0).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 4, 64],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let output = layer.forward(&x, None).unwrap();
 
@@ -1539,9 +1539,9 @@ mod tests {
         config.attn_logit_softcapping = Some(50.0);
 
         let mut attn = GemmaAttention::new(&config, 0).unwrap();
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 4, 64],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let output = attn.forward(&x, None).unwrap();
 
@@ -1558,7 +1558,7 @@ mod tests {
         let mut cache = model.create_cache(32);
 
         // First forward (prompt)
-        let input_ids = pmetal_bridge::compat::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = pmetal_runtime::compat::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
         let logits = model
             .forward_with_cache(&input_ids, None, Some(&mut cache))
             .unwrap();
@@ -1567,7 +1567,7 @@ mod tests {
         assert_eq!(logits.shape(), &[1, 4, 1000]);
 
         // Second forward (incremental)
-        let next_token = pmetal_bridge::compat::Array::from_slice(&[5_i32], &[1, 1]);
+        let next_token = pmetal_runtime::compat::Array::from_slice(&[5_i32], &[1, 1]);
         let logits = model
             .forward_with_cache(&next_token, None, Some(&mut cache))
             .unwrap();
@@ -1586,7 +1586,7 @@ mod tests {
 
         let mut model = GemmaForCausalLM::new(config).unwrap();
 
-        let input_ids = pmetal_bridge::compat::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = pmetal_runtime::compat::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
         let logits = model.forward(&input_ids, None).unwrap();
 
         assert_eq!(logits.shape(), &[1, 4, 1000]);

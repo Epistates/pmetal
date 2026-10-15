@@ -10,11 +10,11 @@ use std::{
     path::Path,
 };
 
-use pmetal_bridge::compat::{
+use pmetal_mlx::kernels::rope::RopePositions;
+use pmetal_runtime::compat::{
     Array, Dtype, Exception, ModuleParametersExt, Param, nn, ops, transforms,
 };
-use pmetal_bridge::impl_module_params;
-use pmetal_mlx::kernels::rope::RopePositions;
+use pmetal_runtime::impl_module_params;
 use serde::{Deserialize, Serialize};
 
 use super::gemma4::{Gemma4Config, Gemma4Model, LoadReport};

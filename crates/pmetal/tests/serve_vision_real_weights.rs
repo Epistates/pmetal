@@ -111,7 +111,7 @@ fn data_uri(png: &[u8]) -> String {
 }
 
 fn drain(op: &str) {
-    pmetal_bridge::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
+    pmetal_runtime::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
 }
 
 /// What `pmetal infer --chat --temperature 0` generates for `prompt` with

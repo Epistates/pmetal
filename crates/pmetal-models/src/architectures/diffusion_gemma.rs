@@ -39,9 +39,9 @@
 //! transformers oracle. The discrete-diffusion generation engine (block loop,
 //! entropy-bound sampler, stopping) is built in a later phase.
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, Param, nn, ops};
-use pmetal_bridge::impl_module_params;
 use pmetal_mlx::kernels::rope::RopePositions;
+use pmetal_runtime::compat::{Array, Dtype, Exception, Param, nn, ops};
+use pmetal_runtime::impl_module_params;
 use serde::{Deserialize, Serialize};
 
 use std::collections::HashMap;
@@ -1240,7 +1240,7 @@ impl DiffusionGemmaForBlockDiffusion {
     ///
     /// The trajectory is stochastic (multinomial + uniform renoise). The
     /// `n`-th random draw of a generation (a fresh canvas, a proposal, a
-    /// renoise) takes the key [`pmetal_bridge::decode::draw_key`]`(seed, n)`,
+    /// renoise) takes the key [`pmetal_runtime::decode::draw_key`]`(seed, n)`,
     /// as every sampler's draws do, so a seed picks the same tokens whatever
     /// else draws on the thread, and the thread's own key is left alone. The
     /// per-step *transforms* are the parity-verified deterministic functions
@@ -1251,7 +1251,7 @@ impl DiffusionGemmaForBlockDiffusion {
         config: &DiffusionGemmaGenerationConfig,
         seed: u64,
     ) -> Result<Array, Exception> {
-        use pmetal_bridge::compat::{Dtype, random};
+        use pmetal_runtime::compat::{Dtype, random};
 
         let canvas = self.canvas_length;
         let vocab = self.vocab_size;
@@ -1259,7 +1259,7 @@ impl DiffusionGemmaForBlockDiffusion {
         let mut draws = 0u64;
         let mut next_key = || {
             draws += 1;
-            pmetal_bridge::decode::draw_key(seed, draws - 1)
+            pmetal_runtime::decode::draw_key(seed, draws - 1)
         };
         let uniform_canvas =
             |key: &Array| random::randint(0, vocab, &[1, canvas], Dtype::Int32, Some(key));
@@ -1288,7 +1288,7 @@ impl DiffusionGemmaForBlockDiffusion {
                     config.max_denoising_steps,
                 );
                 argmax_canvas = ops::argmax(&processed, -1)
-                    .as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32());
+                    .as_dtype(pmetal_runtime::compat::Dtype::Int32.as_i32());
 
                 // Multinomial proposal: categorical over processed logits is
                 // equivalent to multinomial over softmax(processed).
@@ -1902,7 +1902,7 @@ mod tests {
         let grid = 4;
         let n = grid * grid;
         let patch_dim = 3 * 2 * 2;
-        let pixel_values = pmetal_bridge::compat::random::uniform_f32(&[1, n, patch_dim]);
+        let pixel_values = pmetal_runtime::compat::random::uniform_f32(&[1, n, patch_dim]);
         let mut coords = Vec::with_capacity((n * 2) as usize);
         for y in 0..grid {
             for x in 0..grid {
@@ -1978,7 +1978,7 @@ mod tests {
 
     /// Adapters on the attention projections, in the encoder and the decoder.
     fn attach_attention_adapters(model: &mut DiffusionGemmaForBlockDiffusion) -> usize {
-        use pmetal_bridge::compat::VisitLinears;
+        use pmetal_runtime::compat::VisitLinears;
         let mut attached = 0;
         model.visit_linears_mut("", &mut |path, linear| {
             if path.contains(".self_attn.") {
@@ -1996,8 +1996,8 @@ mod tests {
     #[test]
     #[serial]
     fn quantized_base_forward_train_finite() {
-        use pmetal_bridge::compat::VisitLinears;
-        use pmetal_bridge::native_weight::QuantParams;
+        use pmetal_runtime::compat::VisitLinears;
+        use pmetal_runtime::native_weight::QuantParams;
         let cfg = DiffusionGemmaTextConfig {
             moe_intermediate_size: 32,
             ..tiny_config()
@@ -2013,7 +2013,7 @@ mod tests {
                     .quantize(QuantParams {
                         group_size: 32,
                         bits: 4,
-                        mode: pmetal_bridge::QuantizedMode::Affine,
+                        mode: pmetal_runtime::QuantizedMode::Affine,
                     })
                     .unwrap();
             }
@@ -2041,7 +2041,7 @@ mod tests {
     #[test]
     #[serial]
     fn lora_attach_is_noop_until_trained() {
-        use pmetal_bridge::compat::ModuleParametersExt;
+        use pmetal_runtime::compat::ModuleParametersExt;
         let cfg = tiny_config();
         let vocab = cfg.vocab_size;
         let canvas = cfg.canvas_length;
@@ -2092,11 +2092,11 @@ mod tests {
             cfg.rms_norm_eps,
         )
         .unwrap();
-        let x = pmetal_bridge::compat::random::uniform_range(
+        let x = pmetal_runtime::compat::random::uniform_range(
             -1.0,
             1.0,
             &[6, cfg.hidden_size],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let (idx, w) = router.route(&x).unwrap();
         assert_eq!(idx.shape(), &[6, cfg.top_k_experts]);
@@ -2117,11 +2117,11 @@ mod tests {
         let mut experts =
             DiffusionGemmaExperts::new(cfg.num_experts, cfg.moe_intermediate_size, cfg.hidden_size)
                 .unwrap();
-        let x = pmetal_bridge::compat::random::uniform_range(
+        let x = pmetal_runtime::compat::random::uniform_range(
             -1.0,
             1.0,
             &[6, cfg.hidden_size],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let (idx, w) = router.route(&x).unwrap();
         let out = experts.forward(&x, &idx, &w).unwrap();
@@ -2158,11 +2158,11 @@ mod tests {
         assert_eq!(out.shape(), &[1, 4, cfg.hidden_size]);
 
         // Step >0: with self-conditioning logits over the vocab.
-        let sc_logits = pmetal_bridge::compat::random::uniform_range(
+        let sc_logits = pmetal_runtime::compat::random::uniform_range(
             -1.0,
             1.0,
             &[1, 4, cfg.vocab_size],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let out2 = decoder
             .forward(&canvas_ids, &kvs, Some(&sc_logits))
@@ -2244,7 +2244,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_seeded_generation_is_independent_of_the_thread_key() {
-        use pmetal_bridge::compat::{Dtype, random};
+        use pmetal_runtime::compat::{Dtype, random};
 
         let cfg = tiny_config();
         let mut model = DiffusionGemmaForBlockDiffusion::new(cfg.clone()).unwrap();
@@ -2276,6 +2276,6 @@ mod tests {
 
         let c = tokens(model.generate(&prompt, &gen_cfg, 43).unwrap());
         assert_ne!(a, c, "another seed generated the same tokens");
-        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+        pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
     }
 }

@@ -19,7 +19,7 @@
 //! let view = unsafe { metal_buffer_from_ptr(&ctx, ptr, len)? };
 //! ```
 
-use pmetal_bridge::compat::Array;
+use pmetal_runtime::compat::Array;
 use safetensors::SafeTensors;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -884,7 +884,7 @@ impl TensorWriter {
     /// in-memory dtype during merging) and then packed into bytes at the
     /// writer's target dtype.
     pub fn write_tensor(&mut self, name: &str, tensor: &Array) -> Result<()> {
-        let mut tensor = tensor.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
+        let mut tensor = tensor.as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32());
         let shape = tensor.shape().to_vec();
         let n = shape.iter().map(|&s| s as usize).product();
         let data: Vec<f32> = tensor.to_f32_vec(n).unwrap_or_default();
@@ -1049,7 +1049,7 @@ mod tests {
     /// back to the original f32 values within each dtype's precision.
     #[test]
     fn dtype_round_trip_f32_f16_bf16() {
-        use pmetal_bridge::compat::Array;
+        use pmetal_runtime::compat::Array;
         use safetensors::Dtype;
 
         let values: Vec<f32> = (0..32).map(|i| (i as f32) * 0.125 - 2.0).collect();

@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use pmetal_bridge::compat::{Array, Exception, ops};
+use pmetal_runtime::compat::{Array, Exception, ops};
 
 use crate::kv_cache::GdnVerifyInputs;
 

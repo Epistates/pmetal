@@ -25,7 +25,7 @@
 //! *stretches* them (`0,2,4,…`), which changes the differences and so must
 //! change the output of any architecture that rotates by them at all.
 
-use pmetal_bridge::compat::{Array, Dtype, Exception};
+use pmetal_runtime::compat::{Array, Dtype, Exception};
 
 use pmetal_models::architectures::cohere::{CohereConfig, CohereForCausalLM};
 use pmetal_models::architectures::gemma::{GemmaConfig, GemmaForCausalLM};

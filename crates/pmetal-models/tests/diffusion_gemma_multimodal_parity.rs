@@ -66,7 +66,7 @@ fn vision_config() -> Gemma4VisionConfig {
 
 /// Build the encoder, attach vision, and load the multimodal fixture weights.
 fn build_loaded_encoder(
-    weights: &std::collections::HashMap<String, pmetal_bridge::compat::Array>,
+    weights: &std::collections::HashMap<String, pmetal_runtime::compat::Array>,
 ) -> DiffusionGemmaEncoderModel {
     let mut enc = DiffusionGemmaEncoderModel::new(text_config()).expect("encoder builds");
     enc.attach_vision(&vision_config(), 500)
@@ -154,10 +154,10 @@ fn diffusion_gemma_multimodal_bidirectional_band_behaviour() {
 
     // input_ids = [2, 10, 500, 500, 500, 500, 11, 3]: positions 0,1 are text
     // before the image; 2..=5 are image tokens.
-    let diff = pmetal_bridge::compat::ops::abs(&causal.subtract(&bidir));
+    let diff = pmetal_runtime::compat::ops::abs(&causal.subtract(&bidir));
     let per_pos: Vec<f32> = (0..8)
         .map(|t| {
-            pmetal_bridge::compat::ops::slice_axis(&diff, 1, t, t + 1)
+            pmetal_runtime::compat::ops::slice_axis(&diff, 1, t, t + 1)
                 .mean_all()
                 .item_f32()
         })

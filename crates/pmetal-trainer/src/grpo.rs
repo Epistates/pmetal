@@ -10,16 +10,16 @@
 //! - **Flexible Rewards**: Pluggable reward functions for reasoning, formatting, and accuracy.
 //! - **Efficient Training**: Implementation optimized for Apple Silicon via MLX.
 
-use pmetal_bridge::compat::{
+use pmetal_core::TrainingConfig;
+use pmetal_lora::TrainableModel;
+use pmetal_models::rl_generation::{BatchedRlConfig, BatchedRlGenerator};
+use pmetal_runtime::compat::{
     Array, Exception,
     module::{Module, ModuleParameters},
     nn, ops,
     optimizers::Optimizer,
     transforms,
 };
-use pmetal_core::TrainingConfig;
-use pmetal_lora::TrainableModel;
-use pmetal_models::rl_generation::{BatchedRlConfig, BatchedRlGenerator};
 use std::time::Instant;
 use tracing::info;
 
@@ -917,7 +917,7 @@ impl GrpoTrainer {
 
         // Where clipping changed the objective (no gradient flows through it).
         let w = ratio.stop_gradient();
-        let f32_dtype = pmetal_bridge::dtype::F32;
+        let f32_dtype = pmetal_runtime::dtype::F32;
         let zero = Array::from_f32(0.0);
         let low = w
             .less(&lo)
@@ -1149,7 +1149,7 @@ impl GrpoTrainer {
                 )?
             };
             if max_grad_norm > 0.0 {
-                pmetal_bridge::training::clip_grad_norm_map(&mut grads, max_grad_norm);
+                pmetal_runtime::training::clip_grad_norm_map(&mut grads, max_grad_norm);
             }
             optimizer.update(policy_model, grads)?;
             let parts = stash
@@ -2205,7 +2205,7 @@ impl RewardFunction for CombinedReward {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::Array;
+    use pmetal_runtime::compat::Array;
     use serial_test::serial;
 
     // ---------------------------------------------------------------------------
@@ -2352,13 +2352,13 @@ mod tests {
 
     fn scalar(a: &Array) -> f32 {
         a.eval();
-        pmetal_bridge::check_unobserved_error().expect("bridge op failed");
+        pmetal_runtime::check_unobserved_error().expect("bridge op failed");
         a.item_f32()
     }
 
     fn values(a: &Array) -> Vec<f32> {
         a.eval();
-        pmetal_bridge::check_unobserved_error().expect("bridge op failed");
+        pmetal_runtime::check_unobserved_error().expect("bridge op failed");
         a.as_slice::<f32>().to_vec()
     }
 

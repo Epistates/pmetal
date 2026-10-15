@@ -49,7 +49,7 @@ pub enum DistillError {
 
     /// MLX operation error.
     #[error("MLX error: {0}")]
-    Mlx(#[from] pmetal_bridge::compat::Exception),
+    Mlx(#[from] pmetal_runtime::compat::Exception),
 
     /// Safetensors error.
     #[error("Safetensors error: {0}")]

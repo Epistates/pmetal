@@ -27,11 +27,11 @@
 //! trainer.run(&mut bert_model, &tokenizer, &dataset, &mut optimizer)?;
 //! ```
 
-use pmetal_bridge::compat::{Array, Exception, eval_params, nn, optimizers::Optimizer};
 use pmetal_core::{EvalMetrics, TrainingCallback, TrainingConfig};
 use pmetal_data::{EmbeddingDataset, EmbeddingPair, EmbeddingTriplet, Tokenizer};
 use pmetal_lora::TrainableModel;
 use pmetal_models::pooling::{PoolingMode, normalize_embeddings, pool};
+use pmetal_runtime::compat::{Array, Exception, eval_params, nn, optimizers::Optimizer};
 
 use crate::contrastive_loss;
 

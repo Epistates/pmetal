@@ -47,8 +47,8 @@
 
 use std::collections::HashMap;
 
-use pmetal_bridge::compat::{Array, Exception, Param, nn, ops};
-use pmetal_bridge::impl_module_params;
+use pmetal_runtime::compat::{Array, Exception, Param, nn, ops};
+use pmetal_runtime::impl_module_params;
 use serde::{Deserialize, Serialize};
 
 use pmetal_mlx::kernels::{
@@ -339,12 +339,12 @@ impl Gemma4Config {
     }
 
     /// Layer `layer_idx`'s rotation, resolved the way the native engine
-    /// resolves it ([`pmetal_bridge::gemma4_native::gemma4_layer_rope`]):
+    /// resolves it ([`pmetal_runtime::gemma4_native::gemma4_layer_rope`]):
     /// an unsupported `rope_type` is an error naming it.
     pub fn layer_rope(
         &self,
         layer_idx: usize,
-    ) -> Result<pmetal_bridge::gemma4_native::Gemma4LayerRope, Exception> {
+    ) -> Result<pmetal_runtime::gemma4_native::Gemma4LayerRope, Exception> {
         let is_full = self.is_full_attention(layer_idx);
         let (default_base, default_frac) = if is_full {
             (default_rope_theta_global(), 0.25)
@@ -358,7 +358,7 @@ impl Gemma4Config {
                 &rp.sliding_attention
             }
         });
-        pmetal_bridge::gemma4_native::gemma4_layer_rope(
+        pmetal_runtime::gemma4_native::gemma4_layer_rope(
             self.layer_head_dim(layer_idx),
             cfg.and_then(|c| c.rope_type.as_deref()),
             cfg.and_then(|c| c.rope_theta).unwrap_or(default_base),
@@ -450,7 +450,7 @@ impl Gemma4RmsNorm {
     }
 
     pub fn forward(&self, x: &Array) -> Array {
-        pmetal_bridge::compat::fast::rms_norm(x, self.weight.as_ref(), self.eps)
+        pmetal_runtime::compat::fast::rms_norm(x, self.weight.as_ref(), self.eps)
     }
 }
 
@@ -460,7 +460,7 @@ impl Gemma4RmsNorm {
 /// materialising an all-ones tensor and doing an identity multiply, which
 /// avoids the tiny rounding drift that the ones path introduces.
 pub(crate) fn rms_norm_noscale(x: &Array, eps: f32) -> Array {
-    pmetal_bridge::compat::fast::rms_norm_opt(x, None, eps)
+    pmetal_runtime::compat::fast::rms_norm_opt(x, None, eps)
 }
 
 fn layer_per_input(per_layer_inputs: &Array, layer_idx: usize) -> Array {
@@ -1434,7 +1434,7 @@ impl Gemma4DecoderLayer {
     ) -> Result<Array, Exception> {
         // Dynamic-path decoder (used by training, parity tests, and
         // generation when the native bridge isn't available). The fused
-        // compiled layer blocks live in `pmetal-bridge::gemma4_native`
+        // compiled layer blocks live in `pmetal-runtime::gemma4_native`
         // and require pre-transposed weights, so we keep this side on
         // the plain per-op path — `cargo test gemma4_synthetic_parity`
         // exercises exactly what's below.
@@ -1746,7 +1746,7 @@ impl Gemma4ForCausalLM {
 ///
 /// Keys arrive in any of the three released layouts and are normalised onto
 /// the bare `model.*` text tower by
-/// [`pmetal_bridge::gemma4_native::normalize_checkpoint_key`]; vision and
+/// [`pmetal_runtime::gemma4_native::normalize_checkpoint_key`]; vision and
 /// audio weights are skipped.
 pub fn load_gemma4_weights(
     model: &mut Gemma4ForCausalLM,
@@ -1755,12 +1755,12 @@ pub fn load_gemma4_weights(
     let mut report = LoadReport::default();
 
     // Strip the multimodal prefix + skip vision / audio tower entries. The
-    // rule lives in `pmetal_bridge::gemma4_native` so the native engine and
+    // rule lives in `pmetal_runtime::gemma4_native` so the native engine and
     // this loader accept exactly the same set of checkpoints.
     let weights: HashMap<String, Array> = raw_weights
         .iter()
         .filter_map(|(key, value)| {
-            pmetal_bridge::gemma4_native::normalize_checkpoint_key(key)
+            pmetal_runtime::gemma4_native::normalize_checkpoint_key(key)
                 .map(|stripped| (stripped, value.clone()))
         })
         .collect();
@@ -2007,7 +2007,7 @@ pub use crate::architectures::utils::LoadReport;
 #[cfg(test)]
 mod moe_tests {
     use super::*;
-    use pmetal_bridge::compat::{Dtype, ModuleParametersExt, random};
+    use pmetal_runtime::compat::{Dtype, ModuleParametersExt, random};
     use serial_test::serial;
 
     const VOCAB: i32 = 64;
@@ -2071,8 +2071,8 @@ mod moe_tests {
     #[test]
     #[serial]
     fn packed_projections_preserve_attention_within_tolerance() {
-        use pmetal_bridge::compat::{Dtype, VisitLinears, random};
-        use pmetal_bridge::native_weight::QuantParams;
+        use pmetal_runtime::compat::{Dtype, VisitLinears, random};
+        use pmetal_runtime::native_weight::QuantParams;
         let rand = |shape: &[i32]| random::uniform_range(-0.5, 0.5, shape, Dtype::Float32);
         let cfg = tiny_config(false);
         let mut attn = Gemma4Attention::new(&cfg, 0).unwrap();
@@ -2093,7 +2093,7 @@ mod moe_tests {
                 .quantize(QuantParams {
                     group_size: 32,
                     bits: 8,
-                    mode: pmetal_bridge::QuantizedMode::Affine,
+                    mode: pmetal_runtime::QuantizedMode::Affine,
                 })
                 .unwrap();
             packed += 1;
@@ -2122,7 +2122,7 @@ mod moe_tests {
     #[test]
     #[serial]
     fn expert_cache_matches_reference_and_refreshes() {
-        use pmetal_bridge::compat::{Dtype, random};
+        use pmetal_runtime::compat::{Dtype, random};
         let n = 6;
         let len = (n * HIDDEN) as usize;
         let rand = |shape: &[i32]| random::uniform_range(-0.5, 0.5, shape, Dtype::Float32);
@@ -2160,7 +2160,7 @@ mod moe_tests {
     #[test]
     #[serial]
     fn quantized_experts_match_dense_within_tolerance() {
-        use pmetal_bridge::compat::{Dtype, random};
+        use pmetal_runtime::compat::{Dtype, random};
         let (h, i, e, k, n) = (64, 32, NUM_EXPERTS, TOP_K, 6);
         let rand = |shape: &[i32]| random::uniform_range(-0.3, 0.3, shape, Dtype::Float32);
 
@@ -2238,7 +2238,7 @@ mod moe_tests {
     #[test]
     #[serial]
     fn packed_experts_backpropagate_to_the_tokens() {
-        use pmetal_bridge::inline_array::value_and_grad;
+        use pmetal_runtime::inline_array::value_and_grad;
         random::seed(21);
         let (h, i, e, k, n) = (64, 32, NUM_EXPERTS, TOP_K, 6);
         let (packed, mut dense) = packed_and_unpacked_experts(e, i, h, 32, 4, Dtype::Float32);
@@ -2258,7 +2258,7 @@ mod moe_tests {
             std::slice::from_ref(&x),
             &[],
         );
-        pmetal_bridge::check_unobserved_error().expect("a bridge op threw");
+        pmetal_runtime::check_unobserved_error().expect("a bridge op threw");
         let g = &fused[0];
         let scale = g.abs().max(None).item_f32();
         let diff = g.subtract(&unpacked[0]).abs().max(None).item_f32();
@@ -2290,7 +2290,7 @@ mod moe_tests {
             !(off(r1) && off(r2)),
             "|g| {norm} vs the loss's slope along g {r1}, {r2}"
         );
-        pmetal_bridge::check_unobserved_error().expect("a bridge op threw");
+        pmetal_runtime::check_unobserved_error().expect("a bridge op threw");
     }
 
     /// The MoE block is built only when `enable_moe_block` is set, and is

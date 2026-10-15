@@ -40,7 +40,7 @@ jobs:
         id: mlx
         run: |
           tag=$(grep -E '^const BUNDLED_MLX_GIT_TAG' \
-            crates/pmetal-bridge/build.rs | sed -E 's/.*"([^"]+)".*/\1/')
+            crates/pmetal-runtime/build.rs | sed -E 's/.*"([^"]+)".*/\1/')
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "Resolved MLX tag: $tag"
 
@@ -50,7 +50,7 @@ jobs:
       - uses: actions/cache@v6
         with:
           path: ${{ env.PMETAL_MLX_PREFIX }}
-          key: mlx-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx.outputs.tag }}-${{ hashFiles('crates/pmetal-bridge/build.rs', 'crates/pmetal-bridge/cmake/**', 'crates/pmetal-bridge/patches/**') }}
+          key: mlx-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx.outputs.tag }}-${{ hashFiles('crates/pmetal-runtime/build.rs', 'crates/pmetal-runtime/cmake/**', 'crates/pmetal-runtime/patches/**') }}
           restore-keys: |
             mlx-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx.outputs.tag }}-
 

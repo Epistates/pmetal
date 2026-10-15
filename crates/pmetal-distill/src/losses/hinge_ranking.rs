@@ -7,7 +7,7 @@
 //!   loss += max(0, margin - (P_student[i] - P_student[j]))
 
 use crate::Result;
-use pmetal_bridge::compat::{Array, Dtype, ops};
+use pmetal_runtime::compat::{Array, Dtype, ops};
 
 use super::DistillLoss;
 

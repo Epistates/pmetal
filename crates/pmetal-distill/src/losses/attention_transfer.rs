@@ -24,7 +24,7 @@
 //! [`super::HiddenStateLoss`] in that regard.
 
 use crate::{AttentionHeadReduction, AttentionLossType, Result};
-use pmetal_bridge::compat::Array;
+use pmetal_runtime::compat::Array;
 
 /// Attention-map transfer loss.
 pub struct AttentionTransferLoss {

@@ -30,7 +30,7 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use pmetal_bridge::compat::{
+use pmetal_runtime::compat::{
     Array, Dtype, Exception,
     module::{FlattenedModuleParam, ModuleParameters, ModuleParametersExt},
     transforms,
@@ -760,7 +760,7 @@ mod tests {
     struct Weights {
         params: Vec<Array>,
     }
-    pmetal_bridge::impl_module_params!(Weights; params);
+    pmetal_runtime::impl_module_params!(Weights; params);
 
     #[test]
     fn the_model_update_runs_the_metal_kernel() {
@@ -811,7 +811,7 @@ mod tests {
         for (a, b) in opt.m_buffer.as_slice()[..5].iter().zip(&m) {
             assert!((a - b).abs() < 1e-6, "m buffer {a} vs {b}");
         }
-        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+        pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
     }
 
     #[test]
@@ -834,10 +834,10 @@ mod tests {
     #[test]
     #[ignore = "benchmark; run it alone (it measures speed)"]
     fn bench_fused_adamw_over_lora_sized_params() {
-        pmetal_bridge::compat::random::seed(1);
+        pmetal_runtime::compat::random::seed(1);
         let mut model = Weights {
             params: (0..392)
-                .map(|_| pmetal_bridge::compat::random::normal(&[16, 1600], Dtype::Float32))
+                .map(|_| pmetal_runtime::compat::random::normal(&[16, 1600], Dtype::Float32))
                 .collect(),
         };
         let grads: FlattenedModuleParam = model

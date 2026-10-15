@@ -2,7 +2,7 @@
 //!
 //! Provides functionality to load model weights from safetensor files,
 //! with support for HuggingFace model formats and weight name mapping.
-use pmetal_bridge::compat::{Array, ModuleParameters, ModuleParametersExt, nn};
+use pmetal_runtime::compat::{Array, ModuleParameters, ModuleParametersExt, nn};
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -43,11 +43,11 @@ pub enum LoadError {
     #[error("MLX error: {0}")]
     Mlx(String),
     #[error("MLX IO error: {0}")]
-    MlxIo(#[from] pmetal_bridge::compat::IoError),
+    MlxIo(#[from] pmetal_runtime::compat::IoError),
 }
 
-impl From<pmetal_bridge::compat::Exception> for LoadError {
-    fn from(e: pmetal_bridge::compat::Exception) -> Self {
+impl From<pmetal_runtime::compat::Exception> for LoadError {
+    fn from(e: pmetal_runtime::compat::Exception) -> Self {
         Self::Mlx(e.to_string())
     }
 }
@@ -64,7 +64,7 @@ pub fn load_safetensors_file(
 
 /// Load a safetensors shard file into a `HashMap<String, Array>`.
 ///
-/// This wraps `pmetal_bridge::inline_array::load_safetensors_shard` which
+/// This wraps `pmetal_runtime::inline_array::load_safetensors_shard` which
 /// returns `Option<Vec<(String, InlineArray)>>` and converts it into the
 /// `HashMap<String, Array>` that the model loaders expect.
 fn load_shard(path: &std::path::Path) -> Result<HashMap<String, Array>, LoadError> {
@@ -74,7 +74,7 @@ fn load_shard(path: &std::path::Path) -> Result<HashMap<String, Array>, LoadErro
             format!("Non-UTF8 path: {:?}", path),
         ))
     })?;
-    pmetal_bridge::inline_array::load_safetensors_shard(path_str)
+    pmetal_runtime::inline_array::load_safetensors_shard(path_str)
         .map(|pairs| pairs.into_iter().collect::<HashMap<_, _>>())
         .ok_or_else(|| LoadError::SafeTensors(format!("Failed to load safetensors: {}", path_str)))
 }
@@ -224,7 +224,7 @@ fn eval_loaded_parameters<M: ModuleParameters + ModuleParametersExt>(
     let params = model.flatten_params();
     let arrays: Vec<Array> = params.into_values().collect();
     for chunk in arrays.chunks(PARAM_EVAL_BATCH_SIZE) {
-        pmetal_bridge::compat::transforms::eval(chunk.iter())
+        pmetal_runtime::compat::transforms::eval(chunk.iter())
             .map_err(|e| LoadError::Mlx(e.to_string()))?;
     }
     Ok(())
@@ -429,7 +429,7 @@ fn dequantize_mlx_quantized_weights(
 pub(crate) fn dequantize_sidecar_weights(
     weights: &mut HashMap<String, Array>,
 ) -> Result<(), LoadError> {
-    use pmetal_bridge::native_loader as nl;
+    use pmetal_runtime::native_loader as nl;
 
     if !weights
         .keys()
@@ -437,7 +437,7 @@ pub(crate) fn dequantize_sidecar_weights(
     {
         return Ok(());
     }
-    let dtype = pmetal_bridge::native_weight::detect_model_dtype(|key| {
+    let dtype = pmetal_runtime::native_weight::detect_model_dtype(|key| {
         weights.get(key).map(|w| w.dtype_raw())
     });
 
@@ -490,7 +490,7 @@ fn index_has_quant_sidecars(index: &WeightIndex) -> bool {
     index
         .weight_map
         .keys()
-        .any(|key| pmetal_bridge::native_loader::quant_sidecar_base(key).is_some())
+        .any(|key| pmetal_runtime::native_loader::quant_sidecar_base(key).is_some())
 }
 
 pub fn load_clip_weights(
@@ -507,18 +507,19 @@ pub fn load_clip_weights(
         match name {
             "embeddings.token_embedding.weight" => {
                 model.token_embedding.weight =
-                    pmetal_bridge::compat::module::Param::new(weight.clone())
+                    pmetal_runtime::compat::module::Param::new(weight.clone())
             }
             "embeddings.position_embedding.weight" => {
-                model.position_embedding = pmetal_bridge::compat::module::Param::new(weight.clone())
+                model.position_embedding =
+                    pmetal_runtime::compat::module::Param::new(weight.clone())
             }
             "final_layer_norm.weight" => {
                 model.final_layer_norm.weight =
-                    pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                    pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
             }
             "final_layer_norm.bias" => {
                 model.final_layer_norm.bias =
-                    pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                    pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
             }
             _ if name.starts_with("encoder.layers.") => {
                 let parts: Vec<&str> = name.split('.').collect();
@@ -532,67 +533,67 @@ pub fn load_clip_weights(
                 match sub_path.as_str() {
                     "self_attn.q_proj.weight" => {
                         model.layers[idx].attn.q_proj.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone())
+                            pmetal_runtime::compat::module::Param::new(weight.clone())
                     }
                     "self_attn.q_proj.bias" => {
                         model.layers[idx].attn.q_proj.bias =
-                            pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                            pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                     }
                     "self_attn.k_proj.weight" => {
                         model.layers[idx].attn.k_proj.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone())
+                            pmetal_runtime::compat::module::Param::new(weight.clone())
                     }
                     "self_attn.k_proj.bias" => {
                         model.layers[idx].attn.k_proj.bias =
-                            pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                            pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                     }
                     "self_attn.v_proj.weight" => {
                         model.layers[idx].attn.v_proj.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone())
+                            pmetal_runtime::compat::module::Param::new(weight.clone())
                     }
                     "self_attn.v_proj.bias" => {
                         model.layers[idx].attn.v_proj.bias =
-                            pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                            pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                     }
                     "self_attn.out_proj.weight" => {
                         model.layers[idx].attn.out_proj.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone())
+                            pmetal_runtime::compat::module::Param::new(weight.clone())
                     }
                     "self_attn.out_proj.bias" => {
                         model.layers[idx].attn.out_proj.bias =
-                            pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                            pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                     }
                     "layer_norm1.weight" => {
                         model.layers[idx].norm1.weight =
-                            pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                            pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                     }
                     "layer_norm1.bias" => {
                         model.layers[idx].norm1.bias =
-                            pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                            pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                     }
                     "layer_norm2.weight" => {
                         model.layers[idx].norm2.weight =
-                            pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                            pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                     }
                     "layer_norm2.bias" => {
                         model.layers[idx].norm2.bias =
-                            pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                            pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                     }
                     "mlp.fc1.weight" => {
                         model.layers[idx].mlp.fc1.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone())
+                            pmetal_runtime::compat::module::Param::new(weight.clone())
                     }
                     "mlp.fc1.bias" => {
                         model.layers[idx].mlp.fc1.bias =
-                            pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                            pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                     }
                     "mlp.fc2.weight" => {
                         model.layers[idx].mlp.fc2.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone())
+                            pmetal_runtime::compat::module::Param::new(weight.clone())
                     }
                     "mlp.fc2.bias" => {
                         model.layers[idx].mlp.fc2.bias =
-                            pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                            pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                     }
                     _ => {}
                 }
@@ -610,11 +611,11 @@ pub fn load_t5_weights(
     for (name, weight) in weights {
         match name.as_str() {
             "shared.weight" => {
-                model.shared.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
+                model.shared.weight = pmetal_runtime::compat::module::Param::new(weight.clone())
             }
             "encoder.final_layer_norm.weight" => {
                 model.final_layer_norm.weight =
-                    pmetal_bridge::compat::module::Param::new(weight.clone())
+                    pmetal_runtime::compat::module::Param::new(weight.clone())
             }
             _ if name.starts_with("encoder.block.") => {
                 let parts: Vec<&str> = name.split('.').collect();
@@ -628,47 +629,47 @@ pub fn load_t5_weights(
                 match sub_path.as_str() {
                     "layer.0.SelfAttention.q.weight" => {
                         model.blocks[idx].layer_0_attn.q.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone())
+                            pmetal_runtime::compat::module::Param::new(weight.clone())
                     }
                     "layer.0.SelfAttention.k.weight" => {
                         model.blocks[idx].layer_0_attn.k.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone())
+                            pmetal_runtime::compat::module::Param::new(weight.clone())
                     }
                     "layer.0.SelfAttention.v.weight" => {
                         model.blocks[idx].layer_0_attn.v.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone())
+                            pmetal_runtime::compat::module::Param::new(weight.clone())
                     }
                     "layer.0.SelfAttention.o.weight" => {
                         model.blocks[idx].layer_0_attn.o.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone())
+                            pmetal_runtime::compat::module::Param::new(weight.clone())
                     }
                     "layer.0.SelfAttention.relative_attention_bias.weight" => {
                         if let Some(ref mut rel_bias) =
                             model.blocks[idx].layer_0_attn.relative_attention_bias
                         {
                             rel_bias.embedding.weight =
-                                pmetal_bridge::compat::module::Param::new(weight.clone());
+                                pmetal_runtime::compat::module::Param::new(weight.clone());
                         }
                     }
                     "layer.0.layer_norm.weight" => {
                         model.blocks[idx].layer_0_norm.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone())
+                            pmetal_runtime::compat::module::Param::new(weight.clone())
                     }
                     "layer.1.DenseReluDense.wi_0.weight" => {
                         model.blocks[idx].layer_1_mlp.wi_0.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone())
+                            pmetal_runtime::compat::module::Param::new(weight.clone())
                     }
                     "layer.1.DenseReluDense.wi_1.weight" => {
                         model.blocks[idx].layer_1_mlp.wi_1.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone())
+                            pmetal_runtime::compat::module::Param::new(weight.clone())
                     }
                     "layer.1.DenseReluDense.wo.weight" => {
                         model.blocks[idx].layer_1_mlp.wo.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone())
+                            pmetal_runtime::compat::module::Param::new(weight.clone())
                     }
                     "layer.1.layer_norm.weight" => {
                         model.blocks[idx].layer_1_norm.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone())
+                            pmetal_runtime::compat::module::Param::new(weight.clone())
                     }
                     _ => {}
                 }
@@ -933,104 +934,104 @@ pub fn load_flux_weights(
             match sub_path.as_str() {
                 "img_mod.lin.weight" => {
                     model.blocks[idx].norm1_a.linear.weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
                 "img_mod.lin.bias" => {
                     model.blocks[idx].norm1_a.linear.bias =
-                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                 }
                 "txt_mod.lin.weight" => {
                     model.blocks[idx].norm1_b.linear.weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
                 "txt_mod.lin.bias" => {
                     model.blocks[idx].norm1_b.linear.bias =
-                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                 }
 
                 "img_attn.qkv.weight" => {
                     model.blocks[idx].attn.a_to_qkv.weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
                 "img_attn.qkv.bias" => {
                     model.blocks[idx].attn.a_to_qkv.bias =
-                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                 }
                 "txt_attn.qkv.weight" => {
                     model.blocks[idx].attn.b_to_qkv.weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
                 "txt_attn.qkv.bias" => {
                     model.blocks[idx].attn.b_to_qkv.bias =
-                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                 }
 
                 "img_attn.norm.query_norm.scale" => {
                     model.blocks[idx].attn.norm_q_a.weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
                 "img_attn.norm.key_norm.scale" => {
                     model.blocks[idx].attn.norm_k_a.weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
                 "txt_attn.norm.query_norm.scale" => {
                     model.blocks[idx].attn.norm_q_b.weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
                 "txt_attn.norm.key_norm.scale" => {
                     model.blocks[idx].attn.norm_k_b.weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
 
                 "img_attn.proj.weight" => {
                     model.blocks[idx].attn.a_to_out.weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
                 "img_attn.proj.bias" => {
                     model.blocks[idx].attn.a_to_out.bias =
-                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                 }
                 "txt_attn.proj.weight" => {
                     model.blocks[idx].attn.b_to_out.weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
                 "txt_attn.proj.bias" => {
                     model.blocks[idx].attn.b_to_out.bias =
-                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                 }
 
                 "img_mlp.0.weight" => {
                     model.blocks[idx].ff_a[0].weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
                 "img_mlp.0.bias" => {
                     model.blocks[idx].ff_a[0].bias =
-                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                 }
                 "img_mlp.2.weight" => {
                     model.blocks[idx].ff_a[1].weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
                 "img_mlp.2.bias" => {
                     model.blocks[idx].ff_a[1].bias =
-                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                 }
 
                 "txt_mlp.0.weight" => {
                     model.blocks[idx].ff_b[0].weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
                 "txt_mlp.0.bias" => {
                     model.blocks[idx].ff_b[0].bias =
-                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                 }
                 "txt_mlp.2.weight" => {
                     model.blocks[idx].ff_b[1].weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
                 "txt_mlp.2.bias" => {
                     model.blocks[idx].ff_b[1].bias =
-                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                 }
                 _ => {}
             }
@@ -1047,35 +1048,35 @@ pub fn load_flux_weights(
             match sub_path.as_str() {
                 "modulation.lin.weight" => {
                     model.single_blocks[idx].norm.linear.weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
                 "modulation.lin.bias" => {
                     model.single_blocks[idx].norm.linear.bias =
-                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                 }
                 "linear1.weight" => {
                     model.single_blocks[idx].to_qkv_mlp.weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
                 "linear1.bias" => {
                     model.single_blocks[idx].to_qkv_mlp.bias =
-                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                 }
                 "linear2.weight" => {
                     model.single_blocks[idx].proj_out.weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
                 "linear2.bias" => {
                     model.single_blocks[idx].proj_out.bias =
-                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                 }
                 "norm.query_norm.scale" => {
                     model.single_blocks[idx].norm_q_a.weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
                 "norm.key_norm.scale" => {
                     model.single_blocks[idx].norm_k_a.weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
                 _ => {}
             }
@@ -1083,96 +1084,96 @@ pub fn load_flux_weights(
             match name {
                 "time_in.in_layer.weight" => {
                     model.time_embedder.linear_1.weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
                 "time_in.in_layer.bias" => {
                     model.time_embedder.linear_1.bias =
-                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                 }
                 "time_in.out_layer.weight" => {
                     model.time_embedder.linear_2.weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
                 "time_in.out_layer.bias" => {
                     model.time_embedder.linear_2.bias =
-                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                 }
 
                 "txt_in.weight" => {
                     model.context_embedder.weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
                 "txt_in.bias" => {
                     model.context_embedder.bias =
-                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                 }
 
                 "vector_in.in_layer.weight" => {
                     model.pooled_text_embedder[0].weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
                 "vector_in.in_layer.bias" => {
                     model.pooled_text_embedder[0].bias =
-                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                 }
                 "vector_in.out_layer.weight" => {
                     model.pooled_text_embedder[1].weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
                 "vector_in.out_layer.bias" => {
                     model.pooled_text_embedder[1].bias =
-                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                 }
 
                 "guidance_in.in_layer.weight" => {
                     if let Some(ref mut ge) = model.guidance_embedder {
                         ge.linear_1.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone());
+                            pmetal_runtime::compat::module::Param::new(weight.clone());
                     }
                 }
                 "guidance_in.in_layer.bias" => {
                     if let Some(ref mut ge) = model.guidance_embedder {
                         ge.linear_1.bias =
-                            pmetal_bridge::compat::module::Param::new(Some(weight.clone()));
+                            pmetal_runtime::compat::module::Param::new(Some(weight.clone()));
                     }
                 }
                 "guidance_in.out_layer.weight" => {
                     if let Some(ref mut ge) = model.guidance_embedder {
                         ge.linear_2.weight =
-                            pmetal_bridge::compat::module::Param::new(weight.clone());
+                            pmetal_runtime::compat::module::Param::new(weight.clone());
                     }
                 }
                 "guidance_in.out_layer.bias" => {
                     if let Some(ref mut ge) = model.guidance_embedder {
                         ge.linear_2.bias =
-                            pmetal_bridge::compat::module::Param::new(Some(weight.clone()));
+                            pmetal_runtime::compat::module::Param::new(Some(weight.clone()));
                     }
                 }
 
                 "img_in.weight" => {
                     model.x_embedder.weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
                 "img_in.bias" => {
                     model.x_embedder.bias =
-                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                 }
 
                 "final_layer.adaLN_modulation.1.weight" => {
                     model.final_norm_out.linear.weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
                 "final_layer.adaLN_modulation.1.bias" => {
                     model.final_norm_out.linear.bias =
-                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                 }
                 "final_layer.linear.weight" => {
                     model.final_proj_out.weight =
-                        pmetal_bridge::compat::module::Param::new(weight.clone())
+                        pmetal_runtime::compat::module::Param::new(weight.clone())
                 }
                 "final_layer.linear.bias" => {
                     model.final_proj_out.bias =
-                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
                 }
                 _ => {}
             }
@@ -1476,7 +1477,7 @@ where
             || quant_config.is_some()
                 && quant_aux_base_key(key)
                     .is_some_and(|base| keep_key(base) || keep_key(&format!("{base}.weight")))
-            || pmetal_bridge::native_loader::quant_sidecar_base(key)
+            || pmetal_runtime::native_loader::quant_sidecar_base(key)
                 .is_some_and(|base| keep_key(&format!("{base}.weight")))
     };
 
@@ -1629,7 +1630,7 @@ pub fn load_llama_weights(
     weights: &HashMap<String, Array>,
 ) -> Result<(), LoadError> {
     if let Some(w) = weights.get("model.embed_tokens.weight") {
-        model.model.embed_tokens.weight = pmetal_bridge::compat::module::Param::new(w.clone());
+        model.model.embed_tokens.weight = pmetal_runtime::compat::module::Param::new(w.clone());
     } else {
         return Err(LoadError::MissingWeight("model.embed_tokens.weight".into()));
     }
@@ -1684,7 +1685,7 @@ pub fn load_llama_weights(
     load_rms_norm_weight(&mut model.model.norm, weights, "model.norm")?;
     if let Some(ref mut lm_head) = model.lm_head {
         if let Some(w) = weights.get("lm_head.weight") {
-            lm_head.weight = pmetal_bridge::compat::module::Param::new(w.clone());
+            lm_head.weight = pmetal_runtime::compat::module::Param::new(w.clone());
         }
     }
     Ok(())
@@ -1695,7 +1696,7 @@ pub fn load_mistral_weights(
     weights: &HashMap<String, Array>,
 ) -> Result<(), LoadError> {
     if let Some(w) = weights.get("model.embed_tokens.weight") {
-        model.model.embed_tokens.weight = pmetal_bridge::compat::module::Param::new(w.clone());
+        model.model.embed_tokens.weight = pmetal_runtime::compat::module::Param::new(w.clone());
     } else {
         return Err(LoadError::MissingWeight("model.embed_tokens.weight".into()));
     }
@@ -1750,7 +1751,7 @@ pub fn load_mistral_weights(
     load_rms_norm_weight(&mut model.model.norm, weights, "model.norm")?;
     if let Some(ref mut lm_head) = model.lm_head {
         if let Some(w) = weights.get("lm_head.weight") {
-            lm_head.weight = pmetal_bridge::compat::module::Param::new(w.clone());
+            lm_head.weight = pmetal_runtime::compat::module::Param::new(w.clone());
         }
     }
     Ok(())
@@ -1761,7 +1762,7 @@ pub fn load_gemma_weights(
     weights: &HashMap<String, Array>,
 ) -> Result<(), LoadError> {
     if let Some(w) = weights.get("model.embed_tokens.weight") {
-        model.model.embed_tokens.weight = pmetal_bridge::compat::module::Param::new(w.clone());
+        model.model.embed_tokens.weight = pmetal_runtime::compat::module::Param::new(w.clone());
     } else {
         return Err(LoadError::MissingWeight("model.embed_tokens.weight".into()));
     }
@@ -1944,7 +1945,7 @@ pub fn load_phi_weights(
     weights: &HashMap<String, Array>,
 ) -> Result<(), LoadError> {
     if let Some(w) = weights.get("model.embed_tokens.weight") {
-        model.model.embed_tokens.weight = pmetal_bridge::compat::module::Param::new(w.clone());
+        model.model.embed_tokens.weight = pmetal_runtime::compat::module::Param::new(w.clone());
     } else {
         return Err(LoadError::MissingWeight("model.embed_tokens.weight".into()));
     }
@@ -2001,31 +2002,31 @@ pub fn load_phi_weights(
 }
 
 fn load_linear_weight(
-    linear: &mut pmetal_bridge::compat::nn::Linear,
+    linear: &mut pmetal_runtime::compat::nn::Linear,
     weights: &HashMap<String, Array>,
     prefix: &str,
 ) -> Result<(), LoadError> {
     let weight_key = format!("{prefix}.weight");
     if let Some(w) = weights.get(&weight_key) {
-        linear.weight = pmetal_bridge::compat::module::Param::new(w.clone());
+        linear.weight = pmetal_runtime::compat::module::Param::new(w.clone());
     } else {
         return Err(LoadError::MissingWeight(weight_key));
     }
     let bias_key = format!("{prefix}.bias");
     if let Some(b) = weights.get(&bias_key) {
-        linear.bias = pmetal_bridge::compat::module::Param::new(Some(b.clone()));
+        linear.bias = pmetal_runtime::compat::module::Param::new(Some(b.clone()));
     }
     Ok(())
 }
 
 fn load_rms_norm_weight(
-    norm: &mut pmetal_bridge::compat::nn::RmsNorm,
+    norm: &mut pmetal_runtime::compat::nn::RmsNorm,
     weights: &HashMap<String, Array>,
     prefix: &str,
 ) -> Result<(), LoadError> {
     let weight_key = format!("{prefix}.weight");
     if let Some(w) = weights.get(&weight_key) {
-        norm.weight = pmetal_bridge::compat::module::Param::new(w.clone());
+        norm.weight = pmetal_runtime::compat::module::Param::new(w.clone());
     } else {
         return Err(LoadError::MissingWeight(weight_key));
     }
@@ -2039,7 +2040,7 @@ fn load_gemma_rms_norm_weight(
 ) -> Result<(), LoadError> {
     let weight_key = format!("{prefix}.weight");
     if let Some(w) = weights.get(&weight_key) {
-        norm.weight = pmetal_bridge::compat::module::Param::new(w.clone());
+        norm.weight = pmetal_runtime::compat::module::Param::new(w.clone());
     } else {
         return Err(LoadError::MissingWeight(weight_key));
     }
@@ -2053,7 +2054,7 @@ fn load_phi_rms_norm_weight(
 ) -> Result<(), LoadError> {
     let weight_key = format!("{prefix}.weight");
     if let Some(w) = weights.get(&weight_key) {
-        norm.weight = pmetal_bridge::compat::module::Param::new(w.clone());
+        norm.weight = pmetal_runtime::compat::module::Param::new(w.clone());
     } else {
         return Err(LoadError::MissingWeight(weight_key));
     }
@@ -2069,13 +2070,13 @@ fn load_conv2d_weight(
     if let Some(w) = weights.get(&weight_key) {
         // HF/PyTorch Conv2d weights are [O, I, H, W], MLX uses [O, H, W, I]
         let w = w.transpose_axes(&[0, 2, 3, 1]);
-        conv.weight = pmetal_bridge::compat::module::Param::new(w);
+        conv.weight = pmetal_runtime::compat::module::Param::new(w);
     } else {
         return Err(LoadError::MissingWeight(weight_key));
     }
     let bias_key = format!("{prefix}.bias");
     if let Some(b) = weights.get(&bias_key) {
-        conv.bias = pmetal_bridge::compat::module::Param::new(Some(b.clone()));
+        conv.bias = pmetal_runtime::compat::module::Param::new(Some(b.clone()));
     }
     Ok(())
 }
@@ -2087,13 +2088,13 @@ fn load_group_norm_weight(
 ) -> Result<(), LoadError> {
     let weight_key = format!("{prefix}.weight");
     if let Some(w) = weights.get(&weight_key) {
-        norm.weight = pmetal_bridge::compat::module::Param::new(Some(w.clone()));
+        norm.weight = pmetal_runtime::compat::module::Param::new(Some(w.clone()));
     } else {
         return Err(LoadError::MissingWeight(weight_key));
     }
     let bias_key = format!("{prefix}.bias");
     if let Some(b) = weights.get(&bias_key) {
-        norm.bias = pmetal_bridge::compat::module::Param::new(Some(b.clone()));
+        norm.bias = pmetal_runtime::compat::module::Param::new(Some(b.clone()));
     }
     Ok(())
 }
@@ -2213,7 +2214,7 @@ mod tests {
 
     fn max_abs_diff(a: &Array, b: &Array) -> f32 {
         let n = a.size();
-        let f32_dtype = pmetal_bridge::dtype::F32;
+        let f32_dtype = pmetal_runtime::dtype::F32;
         let mut a = a.as_dtype(f32_dtype);
         let mut b = b.as_dtype(f32_dtype);
         let va = a.to_f32_vec(n).expect("read lhs");
@@ -2261,7 +2262,7 @@ mod tests {
     /// reporting every weight matched. Training and eval both read this path.
     #[test]
     fn modelopt_checkpoints_unpack_to_dense() {
-        use pmetal_bridge::QuantizedMode;
+        use pmetal_runtime::QuantizedMode;
         let dir = tempdir().unwrap();
         let (out, in_dim) = (4i32, 64i32);
         let values: Vec<f32> = (0..out * in_dim)
@@ -2277,7 +2278,7 @@ mod tests {
         let mut weights = HashMap::new();
         weights.insert(
             format!("{down}.weight"),
-            packed.view(pmetal_bridge::dtype::U8),
+            packed.view(pmetal_runtime::dtype::U8),
         );
         weights.insert(format!("{down}.weight_scale"), scales.clone());
         weights.insert(format!("{down}.weight_scale_2"), scalar(0.37));
@@ -2287,7 +2288,7 @@ mod tests {
         weights.insert(format!("{q}.input_scale"), scalar(0.2));
         weights.insert(
             "model.norm.weight".to_string(),
-            Array::ones(&[in_dim], pmetal_bridge::dtype::F32),
+            Array::ones(&[in_dim], pmetal_runtime::dtype::F32),
         );
         write_safetensors(&dir.path().join("model.safetensors"), &weights).unwrap();
 
@@ -2295,19 +2296,19 @@ mod tests {
 
         let sidecars: Vec<&String> = loaded
             .keys()
-            .filter(|k| pmetal_bridge::native_loader::quant_sidecar_base(k).is_some())
+            .filter(|k| pmetal_runtime::native_loader::quant_sidecar_base(k).is_some())
             .collect();
         assert!(sidecars.is_empty(), "sidecars survived: {sidecars:?}");
 
         let want_down = packed
             .dequantize_mode(&scales, None, 16, 4, QuantizedMode::Nvfp4)
-            .as_dtype(pmetal_bridge::dtype::F32)
+            .as_dtype(pmetal_runtime::dtype::F32)
             .multiply(&scalar(0.37));
         let diff = max_abs_diff(&loaded[&format!("{down}.weight")], &want_down);
         assert!(diff < 1e-6, "nvfp4 unpacked wrongly: max|diff| = {diff}");
 
         let want_q = fp8
-            .from_fp8(pmetal_bridge::dtype::F32)
+            .from_fp8(pmetal_runtime::dtype::F32)
             .multiply(&scalar(0.5));
         let diff = max_abs_diff(&loaded[&format!("{q}.weight")], &want_q);
         assert!(diff < 1e-6, "fp8 unpacked wrongly: max|diff| = {diff}");
@@ -2324,7 +2325,7 @@ mod tests {
         );
         weights.insert(
             "model.norm.weight".to_string(),
-            Array::ones(&[4], pmetal_bridge::dtype::F32),
+            Array::ones(&[4], pmetal_runtime::dtype::F32),
         );
         write_safetensors(&dir.path().join("model.safetensors"), &weights).unwrap();
 
@@ -2335,7 +2336,7 @@ mod tests {
     fn write_safetensors(
         path: &Path,
         weights: &HashMap<String, Array>,
-    ) -> Result<(), pmetal_bridge::compat::IoError> {
+    ) -> Result<(), pmetal_runtime::compat::IoError> {
         let entries: Vec<_> = weights
             .iter()
             .map(|(key, value)| (key.as_str(), value))

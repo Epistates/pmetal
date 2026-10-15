@@ -16,7 +16,7 @@ mod common;
 
 use common::{fixture_path, load_shard, ref_tensor};
 
-use pmetal_bridge::compat::ops;
+use pmetal_runtime::compat::ops;
 
 use pmetal_mlx::test_utils::{ParityReport, Tolerance, print_report_table};
 

@@ -14,7 +14,7 @@
 //! to find the k-th percentile threshold in linear time on average.
 
 use crate::Result;
-use pmetal_bridge::compat::{Array, Dtype};
+use pmetal_runtime::compat::{Array, Dtype};
 
 /// Sparsify a tensor by keeping only the top `density` fraction by magnitude.
 ///
@@ -55,7 +55,7 @@ pub fn sparsify_by_magnitude(tensor: &Array, density: f32) -> Result<Array> {
     // Create mask: 1 where |x| >= threshold, 0 otherwise
     let threshold_array = Array::from_f32(threshold);
     let mask = abs_vals.greater_equal(&threshold_array);
-    let mask_f32 = mask.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
+    let mask_f32 = mask.as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32());
 
     // Apply mask
     let result_flat = flat.multiply(&mask_f32);
@@ -226,7 +226,7 @@ pub fn sparsify_by_magnitude_online(tensor: &Array, density: f32) -> Result<Arra
     // Create mask: 1 where |x| >= threshold, 0 otherwise
     let threshold_array = Array::from_f32(threshold);
     let mask = abs_vals.greater_equal(&threshold_array);
-    let mask_f32 = mask.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
+    let mask_f32 = mask.as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32());
 
     // Apply mask
     let result_flat = flat.multiply(&mask_f32);
@@ -340,7 +340,7 @@ pub fn apply_thresholds(tensors: &[Array], thresholds: &[f32]) -> Result<Vec<Arr
 
         let threshold_array = Array::from_f32(threshold);
         let mask = abs_vals.greater_equal(&threshold_array);
-        let mask_f32 = mask.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
+        let mask_f32 = mask.as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32());
 
         let result_flat = flat.multiply(&mask_f32);
         results.push(result_flat.reshape(&original_shape));

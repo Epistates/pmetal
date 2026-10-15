@@ -5,7 +5,7 @@
 //! normalization-induced artifacts in audio generation.
 
 use crate::error::Result;
-use pmetal_bridge::compat::{Array, Param, ops, random};
+use pmetal_runtime::compat::{Array, Param, ops, random};
 
 /// Weight-normalized 1D convolution.
 ///
@@ -72,7 +72,7 @@ impl WeightNormConv1d {
         // random::uniform produces U(0,1); scale to [-bound, bound]
         let u = random::uniform(
             &[out_channels, in_channels / groups, kernel_size],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let scale = Array::from_f32(2.0 * bound);
         let offset = Array::from_f32(-bound);
@@ -219,7 +219,7 @@ impl WeightNormConvTranspose1d {
         // Weight shape for ConvTranspose1d: [in_channels, out_channels/groups, kernel_size]
         let u = random::uniform(
             &[in_channels, out_channels / groups, kernel_size],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let scale = Array::from_f32(2.0 * bound);
         let offset = Array::from_f32(-bound);

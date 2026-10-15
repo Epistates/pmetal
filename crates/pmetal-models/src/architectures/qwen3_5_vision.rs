@@ -35,8 +35,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, Param, nn, ops};
 use pmetal_data::qwen_vl_processing::{ProcessedMedia, QwenVlProcessor};
+use pmetal_runtime::compat::{Array, Dtype, Exception, Param, nn, ops};
 use serde::Deserialize;
 
 use super::utils::{Activation, resolve_activation};
@@ -969,7 +969,7 @@ impl Qwen3_5Vision {
                 .try_eval()
                 .map_err(|e| Exception::custom(format!("vision tower: {e}")))?;
         }
-        pmetal_bridge::check_unobserved_error()
+        pmetal_runtime::check_unobserved_error()
             .map_err(|e| Exception::custom(format!("vision tower: {e}")))?;
         let encoded = EncodedMedia {
             image_features,

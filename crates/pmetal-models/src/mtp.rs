@@ -28,8 +28,8 @@
 //! penalized for the drafts before it, and only the tokens the round emits
 //! go into the sequence's own.
 
-use pmetal_bridge::compat::{Array, Exception, ops::select_axis, ops::slice_axis};
-use pmetal_bridge::decode::{DecodePenalties, greedy_token, last_token_hidden, last_token_logits};
+use pmetal_runtime::compat::{Array, Exception, ops::select_axis, ops::slice_axis};
+use pmetal_runtime::decode::{DecodePenalties, greedy_token, last_token_hidden, last_token_logits};
 
 use crate::generation::{
     GenerationConfig, GenerationOutput, SpeculativeDecodeMetrics, SpeculativeDraws,

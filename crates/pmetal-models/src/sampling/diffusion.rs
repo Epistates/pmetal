@@ -3,9 +3,9 @@
 //! Provides schedulers for diffusion models (Flow-Matching, DDIM, etc.)
 //! optimized for Apple Silicon.
 
-use pmetal_bridge::compat::ops::argmin_axis;
-use pmetal_bridge::compat::{Array, Dtype, ops};
 use pmetal_core::Result;
+use pmetal_runtime::compat::ops::argmin_axis;
+use pmetal_runtime::compat::{Array, Dtype, ops};
 
 /// Flow-Matching scheduler for models like Flux.1 and Wan.
 #[derive(Debug, Clone)]
@@ -29,7 +29,7 @@ impl FlowMatchScheduler {
 
         let sigma_start = sigma_min + (sigma_max - sigma_min) * denoising_strength;
 
-        let sigmas = pmetal_bridge::compat::ops::linspace(
+        let sigmas = pmetal_runtime::compat::ops::linspace(
             sigma_start,
             sigma_min,
             num_inference_steps as i32,

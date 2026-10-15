@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use pmetal_bridge::compat::Array;
+use pmetal_runtime::compat::Array;
 use regex::Regex;
 use tracing::{debug, info, warn};
 

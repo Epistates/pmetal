@@ -31,7 +31,7 @@ pub fn run() {
             ensure_metallib(app.handle());
             // Load it now, so a library MLX can't load is reported once, here,
             // rather than failing (or aborting) the first GPU job.
-            if let Err(e) = pmetal_bridge::inline_array::init_device() {
+            if let Err(e) = pmetal_runtime::inline_array::init_device() {
                 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
                 tracing::error!("MLX could not load its Metal library: {e}");
                 app.dialog()
@@ -195,12 +195,12 @@ pub fn run() {
 ///
 /// MLX cannot load a single Metal kernel without it. The bundled app carries
 /// one as a Tauri resource; a build from a source checkout uses the one its
-/// build produced. The search is `pmetal_bridge::metallib::locate`'s, as the
+/// build produced. The search is `pmetal_runtime::metallib::locate`'s, as the
 /// CLI's: `PMETAL_METALLIB_PATH`, the per-version metallib cache, the build's
 /// own file, then the bundle resource and a copy next to the executable. The
 /// `pmetal` CLI processes this app spawns run their own search.
 fn ensure_metallib(app: &tauri::AppHandle) {
-    use pmetal_bridge::metallib;
+    use pmetal_runtime::metallib;
     use tauri::path::BaseDirectory;
 
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
@@ -221,7 +221,7 @@ fn ensure_metallib(app: &tauri::AppHandle) {
     match found {
         Some(located) => {
             tracing::info!(path = %located.path.display(), "Found mlx.metallib");
-            pmetal_bridge::inline_array::set_metallib_path(&located.path.to_string_lossy());
+            pmetal_runtime::inline_array::set_metallib_path(&located.path.to_string_lossy());
         }
         None => {
             tracing::error!(

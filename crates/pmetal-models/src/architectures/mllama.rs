@@ -30,8 +30,8 @@
 //! checkpoint (`(448/14)² + 1 = 1025` pads to 1032), and it is plainly not the
 //! intent, so [`aspect_ratio_attention_mask`] builds the mask additively and
 //! leaves nothing masked when there is no padding.
-use pmetal_bridge::compat::{Array, Dtype, Exception, Module, Param, nn, ops, random};
-use pmetal_bridge::impl_module_params;
+use pmetal_runtime::compat::{Array, Dtype, Exception, Module, Param, nn, ops, random};
+use pmetal_runtime::impl_module_params;
 
 use std::collections::HashMap;
 
@@ -1723,7 +1723,7 @@ fn load_text_weights(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::ModuleParametersExt;
+    use pmetal_runtime::compat::ModuleParametersExt;
     use serial_test::serial;
 
     const VOCAB: i32 = 64;

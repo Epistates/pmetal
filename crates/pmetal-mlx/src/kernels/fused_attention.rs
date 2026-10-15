@@ -13,12 +13,12 @@
 
 use std::{sync::OnceLock, time::Instant};
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
 use pmetal_metal::{
     FlashAttention, FlashAttentionConfig as MetalFlashAttentionConfig, KernelDispatch,
     MetalContext, MppFlashAttention, MppFlashAttentionConfig,
     context::{DeviceProperties, DeviceTier},
 };
+use pmetal_runtime::compat::{Array, Dtype, Exception, ops};
 use serde::{Deserialize, Serialize};
 
 use super::persistent_cache::PersistentChoiceCache;
@@ -863,7 +863,7 @@ fn manual_sdpa_with_softcapping(
     // produce NaN. Softcapping exists precisely to tame outlier logits, so it
     // must not itself blow up on them.
     let cap_arr = Array::from_f32(cap);
-    let scores = pmetal_bridge::compat::ops::tanh(&scores.divide(&cap_arr));
+    let scores = pmetal_runtime::compat::ops::tanh(&scores.divide(&cap_arr));
     let scores = scores.multiply(&cap_arr);
 
     // Apply mask
@@ -1151,7 +1151,7 @@ fn create_chunk_causal_mask(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::random;
+    use pmetal_runtime::compat::random;
 
     fn random_tensor(shape: &[i32]) -> Array {
         random::normal(shape, Dtype::Float32)
@@ -1215,7 +1215,7 @@ mod tests {
         let mut out = fused_sdpa(&q, &k, &v, &config, Some(&mask)).expect("fused_sdpa runs");
         out.eval();
 
-        pmetal_bridge::check_unobserved_error()
+        pmetal_runtime::check_unobserved_error()
             .expect("no bridge exception with an f32 mask on bf16");
         assert_eq!(out.shape(), &shape);
         let values = out.to_f32_vec(out.size()).expect("output readable");
@@ -1258,7 +1258,7 @@ mod tests {
         )
         .expect("fused_sdpa runs");
         bf16_out.eval();
-        pmetal_bridge::check_unobserved_error()
+        pmetal_runtime::check_unobserved_error()
             .expect("no bridge exception from a self-built sliding-window mask on bf16");
         assert_eq!(bf16_out.shape(), &shape);
 
@@ -1951,7 +1951,7 @@ mod tests {
 
     #[test]
     fn test_needs_gradient_follows_the_trace() {
-        use pmetal_bridge::compat::nn::value_and_grad_explicit;
+        use pmetal_runtime::compat::nn::value_and_grad_explicit;
 
         let param = random_tensor(&[1, 2, 4, 64]);
         let frozen = random_tensor(&[1, 2, 4, 64]);
@@ -1993,7 +1993,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_attention_under_autograd_keeps_its_gradient() {
-        use pmetal_bridge::compat::nn::value_and_grad_explicit;
+        use pmetal_runtime::compat::nn::value_and_grad_explicit;
 
         clear_cached_attention_backends();
         let (heads, kv_heads, head_dim, len) = (4, 2, 128, 2048);
@@ -2036,7 +2036,7 @@ mod tests {
             g.iter().for_each(|x| {
                 x.eval();
             });
-            pmetal_bridge::check_unobserved_error().unwrap();
+            pmetal_runtime::check_unobserved_error().unwrap();
             g
         };
         let fused = grads(&|a| fused_sdpa(&a[0], &a[1], &a[2], &config, None).unwrap());

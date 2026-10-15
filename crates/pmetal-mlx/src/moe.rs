@@ -6,8 +6,8 @@
 //! is the expert itself: a bias-free SwiGLU MLP whose weights a checkpoint
 //! fills.
 
-use pmetal_bridge::compat::{Array, Dtype, ops};
-use pmetal_bridge::impl_module_params;
+use pmetal_runtime::compat::{Array, Dtype, ops};
+use pmetal_runtime::impl_module_params;
 
 /// Minimal linear layer: weight [out, in], no bias, zero-initialised.
 #[derive(Debug, Clone)]
@@ -67,7 +67,7 @@ impl Expert {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::random;
+    use pmetal_runtime::compat::random;
 
     #[test]
     fn test_expert_forward_shape() {

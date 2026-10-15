@@ -71,7 +71,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use pmetal_bridge::compat::Array;
+use pmetal_runtime::compat::Array;
 // Not via `common`: that module's `fixture_path` keys off `tests/fixtures/`,
 // and every path here comes from `PMETAL_REAL_WEIGHTS` instead.
 use pmetal_mlx::test_utils::{
@@ -244,7 +244,7 @@ fn worst_position_ratio(pmetal: &[f32], floor: &[f32]) -> Option<(usize, f32)> {
 /// that accumulates until the test is SIGKILLed, which is exactly what
 /// happened before this call existed.
 fn release_mlx_memory() {
-    pmetal_bridge::inline_array::clear_cache();
+    pmetal_runtime::inline_array::clear_cache();
 }
 
 /// Cosine similarity per sequence position, over `hidden` values each.
@@ -285,7 +285,7 @@ fn rank_of(row: &[f32], token: i32) -> usize {
 /// and plausibly scaled. Drain after every stage or the whole sweep can pass
 /// while attention computes nothing.
 fn drain(stage: &str) -> Result<(), String> {
-    pmetal_bridge::check_unobserved_error()
+    pmetal_runtime::check_unobserved_error()
         .map_err(|e| format!("{stage} raised a bridge exception: {e}"))
 }
 
@@ -673,7 +673,7 @@ fn load_manifest() -> (PathBuf, BTreeMap<String, RefMeta>) {
 #[test]
 #[ignore = "requires PMETAL_REAL_WEIGHTS and multi-GB checkpoints; see the module docs"]
 fn released_checkpoints_leave_no_parameter_at_random_init() {
-    use pmetal_bridge::compat::random;
+    use pmetal_runtime::compat::random;
 
     let (_refs_root, manifest) = load_manifest();
     let mut findings = Vec::new();
@@ -741,7 +741,7 @@ fn released_checkpoints_leave_no_parameter_at_random_init() {
 #[test]
 #[ignore = "requires PMETAL_REAL_WEIGHTS and multi-GB checkpoints; see the module docs"]
 fn released_checkpoints_claim_every_tensor() {
-    use pmetal_bridge::compat::ModuleParametersExt;
+    use pmetal_runtime::compat::ModuleParametersExt;
     use std::collections::BTreeSet;
 
     let (_refs_root, manifest) = load_manifest();

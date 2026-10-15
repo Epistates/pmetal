@@ -10,12 +10,12 @@ use crate::loader::{
 };
 use crate::traits::{CausalLMModel, ModelConfig};
 use crate::weight_format::{GgufModelConfig, WeightFormat, WeightLoader};
-use pmetal_bridge::compat::{
-    Array, Dtype, Exception, Module, ModuleParameters, ModuleParametersExt, nn, ops,
-};
 use pmetal_mlx::kv_cache::{
     CacheMode, FusedBatchKVCache, KVCache, KVCacheConfig, MambaCache,
     sanitize_cache_mode_for_config,
+};
+use pmetal_runtime::compat::{
+    Array, Dtype, Exception, Module, ModuleParameters, ModuleParametersExt, nn, ops,
 };
 use std::path::Path;
 
@@ -31,7 +31,7 @@ fn eval_module_parameters_batched(module: &impl ModuleParametersExt) -> Result<(
     let arrays: Vec<Array> = params.values().cloned().collect();
 
     for chunk in arrays.chunks(PARAM_EVAL_BATCH_SIZE) {
-        pmetal_bridge::compat::transforms::eval(chunk.iter())?;
+        pmetal_runtime::compat::transforms::eval(chunk.iter())?;
     }
 
     Ok(())
@@ -1820,7 +1820,7 @@ impl DynamicModel {
     }
 
     /// Where the projection onto the vocabulary sits in the walk
-    /// [`VisitLinears`](pmetal_bridge::compat::VisitLinears) makes, when it is
+    /// [`VisitLinears`](pmetal_runtime::compat::VisitLinears) makes, when it is
     /// a layer of its own; `None` when the model ties it to the token
     /// embedding or has none.
     ///
@@ -1830,7 +1830,7 @@ impl DynamicModel {
     pub fn output_projection_path(&mut self) -> Option<String> {
         let head: *const nn::Linear = self.lm_head_layer()?;
         let mut found = None;
-        pmetal_bridge::compat::VisitLinears::visit_linears_mut(self, "", &mut |path, linear| {
+        pmetal_runtime::compat::VisitLinears::visit_linears_mut(self, "", &mut |path, linear| {
             if std::ptr::eq(linear, head) {
                 found = Some(path.to_string());
             }
@@ -2356,26 +2356,26 @@ impl DynamicModel {
 ///
 /// This is what lets `pmetal-lora` attach adapters to a model it did not build
 /// and does not have the concrete type of.
-impl pmetal_bridge::compat::VisitLinears for DynamicModel {
+impl pmetal_runtime::compat::VisitLinears for DynamicModel {
     fn visit_linears_mut(
         &mut self,
         prefix: &str,
-        f: &mut dyn FnMut(&str, &mut pmetal_bridge::compat::Linear),
+        f: &mut dyn FnMut(&str, &mut pmetal_runtime::compat::Linear),
     ) {
         dispatch_uniform!(self, visit_linears_mut, prefix, f)
     }
 }
 
 impl ModuleParameters for DynamicModel {
-    fn parameters(&self) -> pmetal_bridge::compat::module::ModuleParamRef<'_> {
+    fn parameters(&self) -> pmetal_runtime::compat::module::ModuleParamRef<'_> {
         dispatch_uniform!(self, parameters)
     }
 
-    fn trainable_parameters(&self) -> pmetal_bridge::compat::module::ModuleParamRef<'_> {
+    fn trainable_parameters(&self) -> pmetal_runtime::compat::module::ModuleParamRef<'_> {
         dispatch_uniform!(self, trainable_parameters)
     }
 
-    fn parameters_mut(&mut self) -> pmetal_bridge::compat::module::ModuleParamMut<'_> {
+    fn parameters_mut(&mut self) -> pmetal_runtime::compat::module::ModuleParamMut<'_> {
         dispatch_uniform!(self, parameters_mut)
     }
 

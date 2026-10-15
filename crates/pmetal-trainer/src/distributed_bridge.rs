@@ -3,7 +3,7 @@
 //! Provides gradient synchronization, loss reduction, and barrier operations
 //! that integrate with the existing `FlattenedModuleParam` gradient format.
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, module::FlattenedModuleParam};
+use pmetal_runtime::compat::{Array, Dtype, Exception, module::FlattenedModuleParam};
 use std::sync::Arc;
 
 use pmetal_distributed::{CompressionStrategy, DistributedContext, GradientCompressor, ReduceOp};

@@ -10,15 +10,15 @@
 //! Variants:
 //! - **Llama 4 Scout**: 109B total params (16 experts), 17B active, 10M context
 //! - **Llama 4 Maverick**: 402B total params (128 experts), 17B active, 1M context
-use pmetal_bridge::compat::{Array, Dtype, Exception, Module, nn, ops};
-use pmetal_bridge::impl_module_params;
+use pmetal_runtime::compat::{Array, Dtype, Exception, Module, nn, ops};
+use pmetal_runtime::impl_module_params;
 
-use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     rope::{RopePositions, rope_embedding},
 };
 use pmetal_mlx::kv_cache::KVCache;
+use pmetal_runtime::rope::{RopeConfig, RotaryEmbedding};
 use serde::{Deserialize, Serialize};
 
 use crate::checkpointing::checkpointed_layer;
@@ -87,7 +87,7 @@ pub struct Llama4TextConfig {
     pub router_aux_loss_coef: f32,
 
     /// RoPE scaling (Scout: `rope_type: "llama3"`, factor 16), read by
-    /// [`pmetal_bridge::rope`].
+    /// [`pmetal_runtime::rope`].
     #[serde(default)]
     pub rope_scaling: Option<serde_json::Value>,
     /// transformers v5's spelling of the same, with `rope_theta` inside.
@@ -421,7 +421,7 @@ impl Llama4MoE {
             let expert_out = self.experts[expert_idx].forward(&expert_input)?;
 
             let updates = expert_out.reshape(&[count, 1, hidden_size]);
-            combined_out = pmetal_bridge::compat::indexing::scatter_add_single(
+            combined_out = pmetal_runtime::compat::indexing::scatter_add_single(
                 &combined_out,
                 &idx_array,
                 &updates,
@@ -997,7 +997,7 @@ pub fn sanitize_checkpoint(
             }
         }
     }
-    pmetal_bridge::check_unobserved_error()
+    pmetal_runtime::check_unobserved_error()
         .map_err(|e| Exception::custom(format!("llama4: splitting the experts failed: {e}")))?;
     Ok(out)
 }
@@ -1029,7 +1029,7 @@ impl Llama4TextConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::ModuleParametersExt;
+    use pmetal_runtime::compat::ModuleParametersExt;
     use serial_test::serial;
 
     #[test]
@@ -1067,9 +1067,9 @@ mod tests {
     #[serial]
     fn test_llama4_expert() {
         let expert = Llama4Expert::new(64, 256).unwrap();
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 10, 64],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
 
         let mut expert = expert;
@@ -1092,9 +1092,9 @@ mod tests {
         };
 
         let mut moe = Llama4MoE::new(&config).unwrap();
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[2, 5, config.hidden_size],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
 
         let shape = x.shape().to_vec();
@@ -1145,7 +1145,7 @@ mod tests {
                 let expert_id = Array::from_int(expert_idx as i32);
                 let mask = slot_indices.eq(&expert_id).unwrap();
                 let mask_f32 = mask
-                    .as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32())
+                    .as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32())
                     .unwrap();
                 let gate = mask_f32
                     .reshape(&[total_tokens, 1])
@@ -1194,11 +1194,11 @@ mod tests {
         };
 
         let mut moe = Llama4MoE::new(&config).unwrap();
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 4, config.hidden_size],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         )
-        .as_dtype(pmetal_bridge::compat::Dtype::Float16.as_i32())
+        .as_dtype(pmetal_runtime::compat::Dtype::Float16.as_i32())
         .unwrap();
 
         let output = moe.forward(&x).unwrap();

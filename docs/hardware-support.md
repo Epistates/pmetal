@@ -177,7 +177,7 @@ MLX upstream has NAX-optimized kernels for M5. Integration path:
 - [x] Static full-tile MPP extents for aligned M/N dispatches
 - [x] Benchmark and persist MLX vs MPP backend choice for 4-bit affine quantized linear inference on Apple10/M5
 - [x] Tier-aware MPP dispatcher tuning across `32×32`, `64×32`, `32×64`, and `64×64` MPP tile variants on Apple10/M5
-- [ ] Track upstream MLX NAX API changes and update `pmetal-bridge` bindings as needed
+- [ ] Track upstream MLX NAX API changes and update `pmetal-runtime` bindings as needed
 - [x] Benchmark and persist Apple10/M5 MPP FlashAttention vs Metal FlashAttention vs MLX fast SDPA for supported no-custom-mask `head_dim = 64`, `80`, `96`, and `128` inference shapes, including softcapped configs
 
 ### P1 — UltraFusion-aware distributed

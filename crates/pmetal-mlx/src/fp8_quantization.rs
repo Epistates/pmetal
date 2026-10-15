@@ -25,19 +25,19 @@
 //! # Status
 //!
 //! Runtime inference quantization is wired through the shared model loader and
-//! uses MLX native E4M3 FP8 encode/decode through `pmetal-bridge`.
+//! uses MLX native E4M3 FP8 encode/decode through `pmetal-runtime`.
 
-use pmetal_bridge::compat::{Array, Dtype, Exception};
+use pmetal_runtime::compat::{Array, Dtype, Exception};
 use serde::{Deserialize, Serialize};
 
 #[inline]
 fn to_fp8(x: &Array) -> Result<Array, Exception> {
-    pmetal_bridge::compat::ops::to_fp8(x)
+    pmetal_runtime::compat::ops::to_fp8(x)
 }
 
 #[inline]
 fn from_fp8(x: &Array, dtype: Dtype) -> Result<Array, Exception> {
-    pmetal_bridge::compat::ops::from_fp8(x, dtype)
+    pmetal_runtime::compat::ops::from_fp8(x, dtype)
 }
 
 /// FP8 format type.
@@ -313,7 +313,7 @@ pub fn calculate_fp8_savings(original_size_bytes: usize, dtype_bits: usize) -> (
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::random;
+    use pmetal_runtime::compat::random;
 
     #[test]
     fn test_fp8_format() {

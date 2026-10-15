@@ -1,4 +1,4 @@
-//! The native gpt-oss engine (`pmetal_bridge::gpt_oss_native`) against the
+//! The native gpt-oss engine (`pmetal_runtime::gpt_oss_native`) against the
 //! authoritative Hugging Face `transformers` `GptOssForCausalLM`.
 //!
 //! The fixture (transformers 5.19, torch 2.14.1, seed 5) is a whole
@@ -22,12 +22,12 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use common::{fixture_path, load_shard, ref_tensor};
-use pmetal_bridge::InlineArray;
-use pmetal_bridge::compat::{Array, ops::slice_axis};
-use pmetal_bridge::gpt_oss_native::{
+use pmetal_mlx::test_utils::{ParityReport, Tolerance, argmax_last_axis, print_report_table};
+use pmetal_runtime::InlineArray;
+use pmetal_runtime::compat::{Array, ops::slice_axis};
+use pmetal_runtime::gpt_oss_native::{
     NativeCache, NativeWeights, forward_step, load_config, load_model,
 };
-use pmetal_mlx::test_utils::{ParityReport, Tolerance, argmax_last_axis, print_report_table};
 use serial_test::serial;
 
 /// fp32 against fp32. The reference's own fp32-vs-fp64 noise on these logits
@@ -86,7 +86,7 @@ fn rows(a: &Array, start: i32, end: i32) -> Array {
 }
 
 fn drain_bridge(op: &str) {
-    pmetal_bridge::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
+    pmetal_runtime::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
 }
 
 fn max_abs_diff(a: &Array, b: &Array) -> f32 {
@@ -109,7 +109,7 @@ fn assert_all_pass(title: &str, reports: &[ParityReport]) {
 /// Feed the prompt in `chunks` (lengths summing to the prompt), one cache
 /// throughout, and return each chunk's logits.
 fn run_chunks(fx: &Fixture, chunks: &[i32], compiled: bool) -> Vec<(i32, InlineArray)> {
-    pmetal_bridge::decode::set_compiled_decode(compiled);
+    pmetal_runtime::decode::set_compiled_decode(compiled);
     let ids = fx.tensor("input_ids");
     let mut cache = NativeCache::new_empty(&fx.weights);
     let mut start = 0;
@@ -124,7 +124,7 @@ fn run_chunks(fx: &Fixture, chunks: &[i32], compiled: bool) -> Vec<(i32, InlineA
             cache.eval_and_detach_states();
         }
     }
-    pmetal_bridge::decode::set_compiled_decode(true);
+    pmetal_runtime::decode::set_compiled_decode(true);
     out
 }
 
@@ -311,11 +311,12 @@ fn packed_experts_pass_the_gradient_to_their_input() {
     let moe = &mut model.model.layers[0].mlp;
     let packed = moe.fused_experts().expect("fused experts").clone();
     assert!(packed.is_packed());
-    let x = pmetal_bridge::compat::random::normal(&[5, 64], pmetal_bridge::compat::Dtype::Float32);
+    let x =
+        pmetal_runtime::compat::random::normal(&[5, 64], pmetal_runtime::compat::Dtype::Float32);
 
     let grad_of = |moe: &mut pmetal_models::architectures::gpt_oss::GptOssMoE| {
-        pmetal_bridge::clear_last_error();
-        let (loss, grads) = pmetal_bridge::compat::nn::value_and_grad_explicit(
+        pmetal_runtime::clear_last_error();
+        let (loss, grads) = pmetal_runtime::compat::nn::value_and_grad_explicit(
             |arrays: &[Array]| moe.forward(&arrays[0]).unwrap().square().sum(None),
             std::slice::from_ref(&x),
             &[],
@@ -328,7 +329,7 @@ fn packed_experts_pass_the_gradient_to_their_input() {
         grads[0].clone()
     };
     let through_packed = grad_of(moe);
-    moe.set_fused_experts(packed.unpacked(pmetal_bridge::compat::Dtype::Float32.as_i32()));
+    moe.set_fused_experts(packed.unpacked(pmetal_runtime::compat::Dtype::Float32.as_i32()));
     let through_dense = grad_of(moe);
 
     let dx = through_packed.as_slice::<f32>();

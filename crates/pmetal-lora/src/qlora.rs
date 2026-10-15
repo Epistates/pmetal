@@ -3,7 +3,7 @@
 //! QLoRA (Dettmers et al., 2023, arXiv 2305.14314) is LoRA with the base
 //! weights stored in four bits and dequantized to the compute dtype inside
 //! the forward pass, the adapters staying in full precision. Here that is two
-//! properties of the same [`Linear`](pmetal_bridge::compat::Linear): its weight
+//! properties of the same [`Linear`](pmetal_runtime::compat::Linear): its weight
 //! is packed ([`quantize_base`]) and it carries an adapter
 //! ([`crate::AdaptedModel`]). Nothing per-architecture is involved, so every
 //! architecture the dispatcher builds can be fine-tuned this way, through the
@@ -30,10 +30,10 @@
 //! per-tensor scale the E4M3 block scales of a typical weight are subnormal and
 //! the loss is 2.703.
 
-use pmetal_bridge::QuantizedMode;
-use pmetal_bridge::compat::{Linear, ModuleParameters, VisitLinears};
-use pmetal_bridge::native_weight::QuantParams;
 use pmetal_models::DynamicModel;
+use pmetal_runtime::QuantizedMode;
+use pmetal_runtime::compat::{Linear, ModuleParameters, VisitLinears};
+use pmetal_runtime::native_weight::QuantParams;
 
 use super::LoraError;
 
@@ -130,7 +130,7 @@ impl QLoraConfig {
         }
     }
 
-    fn pack(&self, linear: &mut Linear) -> Result<(), pmetal_bridge::compat::Exception> {
+    fn pack(&self, linear: &mut Linear) -> Result<(), pmetal_runtime::compat::Exception> {
         match self.scheme {
             QLoraScheme::Nf4 => {
                 linear.quantize_codebook(&NF4_CODEBOOK, self.group_size, self.double_quant)
@@ -215,7 +215,7 @@ fn pack_projections(
         }
         // An FP8 checkpoint's scale can sit outside the layer (Nemotron-H's
         // `weight_scale`), where packing would never see it.
-        if linear.weight.value.dtype() == pmetal_bridge::compat::Dtype::Uint8 {
+        if linear.weight.value.dtype() == pmetal_runtime::compat::Dtype::Uint8 {
             report
                 .kept
                 .push((path.to_string(), "FP8 weights stay as loaded"));
@@ -237,14 +237,14 @@ fn pack_projections(
         // its dense source, and the whole model's packing would otherwise
         // run, intermediates and all, inside the first training step.
         let packed = config.pack(linear).and_then(|()| {
-            pmetal_bridge::compat::eval(linear.parameters().into_values().filter_map(|value| {
+            pmetal_runtime::compat::eval(linear.parameters().into_values().filter_map(|value| {
                 match value {
-                    pmetal_bridge::compat::NestedValue::Value(a) => Some(a),
-                    pmetal_bridge::compat::NestedValue::Map(_) => None,
+                    pmetal_runtime::compat::NestedValue::Value(a) => Some(a),
+                    pmetal_runtime::compat::NestedValue::Map(_) => None,
                 }
             }))?;
-            pmetal_bridge::check_unobserved_error().map_err(|e| {
-                pmetal_bridge::compat::Exception::custom(format!("packing {path}: {e}"))
+            pmetal_runtime::check_unobserved_error().map_err(|e| {
+                pmetal_runtime::compat::Exception::custom(format!("packing {path}: {e}"))
             })
         });
         match packed {
@@ -256,8 +256,8 @@ fn pack_projections(
                     .iter()
                     .filter(|(name, _)| !name.starts_with("lora_") && name.as_ref() != "bias")
                     .map(|(_, value)| match value {
-                        pmetal_bridge::compat::NestedValue::Value(a) => a.nbytes(),
-                        pmetal_bridge::compat::NestedValue::Map(_) => 0,
+                        pmetal_runtime::compat::NestedValue::Value(a) => a.nbytes(),
+                        pmetal_runtime::compat::NestedValue::Map(_) => 0,
                     })
                     .sum::<usize>();
             }
@@ -273,7 +273,7 @@ fn pack_projections(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::{Array, Dtype, random};
+    use pmetal_runtime::compat::{Array, Dtype, random};
 
     fn layer(in_features: i32) -> Linear {
         Linear::new(in_features, 256, false).expect("layer")
@@ -296,7 +296,7 @@ mod tests {
                 ..Default::default()
             };
             let report = pack_projections(&mut model, None, &config).expect("pack");
-            pmetal_bridge::check_unobserved_error().expect("no bridge error");
+            pmetal_runtime::check_unobserved_error().expect("no bridge error");
             assert_eq!(report.packed, 1, "{scheme}");
             assert_eq!(report.dense_bytes, n * 4, "{scheme}: f32 dense");
             // The 4-byte NVFP4 tensor scale rounds into the comparison.
@@ -365,7 +365,7 @@ mod tests {
             lm_head: Linear,
             embed_out: Linear,
         }
-        pmetal_bridge::impl_module_params!(Headed; lm_head, embed_out);
+        pmetal_runtime::impl_module_params!(Headed; lm_head, embed_out);
 
         let mut model = Headed {
             lm_head: layer(512),
@@ -383,7 +383,7 @@ mod tests {
         );
         assert!(model.embed_out.quant.is_none(), "the head was packed");
         assert!(model.lm_head.quant.is_some(), "`lm_head` was kept by name");
-        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+        pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
     }
 
     #[test]
@@ -431,7 +431,7 @@ mod tests {
                 .square()
                 .sum(None);
             diff.eval();
-            pmetal_bridge::check_unobserved_error().expect("no bridge error");
+            pmetal_runtime::check_unobserved_error().expect("no bridge error");
             let relative = diff.item_f32().sqrt() / norm;
             assert!(relative < bound, "{scheme}: relative error {relative}");
         }

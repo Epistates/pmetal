@@ -40,7 +40,7 @@
 
 use super::DistillLoss;
 use crate::Result;
-use pmetal_bridge::compat::{Array, ops};
+use pmetal_runtime::compat::{Array, ops};
 
 /// Universal Logit Distillation loss.
 ///
@@ -192,7 +192,7 @@ fn pad_last_axis_to(arr: &Array, n: usize) -> Array {
     pad_shape[last] = extra as i32;
     let total: usize = pad_shape.iter().map(|&s| s as usize).product();
     let zeros = Array::from_f32_slice(&vec![0.0_f32; total], &pad_shape);
-    pmetal_bridge::compat::ops::concatenate_axis(&[arr, &zeros], -1)
+    pmetal_runtime::compat::ops::concatenate_axis(&[arr, &zeros], -1)
 }
 
 #[cfg(test)]

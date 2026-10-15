@@ -8,12 +8,12 @@
 //! data is a constant to autograd, so its gradient comes out as zeros and
 //! fails both checks.
 
-use pmetal_bridge::compat::Array;
-use pmetal_bridge::compat::nn::value_and_grad_explicit;
 use pmetal_distill::losses::{
     DistillLoss, HiddenStateLoss, JensenShannonLoss, KlDivergenceLoss, SoftCrossEntropyLoss,
 };
 use pmetal_distill::{DistillConfig, DistillMethod, Distiller, LossConfig, LossType};
+use pmetal_runtime::compat::Array;
+use pmetal_runtime::compat::nn::value_and_grad_explicit;
 use serial_test::serial;
 
 const SHAPE: [i32; 3] = [1, 3, 5];
@@ -39,7 +39,7 @@ fn mask() -> Array {
 }
 
 fn drain() {
-    pmetal_bridge::check_unobserved_error().expect("a bridge op threw");
+    pmetal_runtime::check_unobserved_error().expect("a bridge op threw");
 }
 
 /// Loss value and autograd gradient of `f` at `x`.
@@ -50,7 +50,7 @@ fn autograd(f: &dyn Fn(&Array) -> Array, x: &[f32], shape: &[i32]) -> (f32, Vec<
     grads[0].eval();
     drain();
     let grad = grads[0]
-        .as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32())
+        .as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32())
         .to_f32_vec(x.len())
         .unwrap();
     (loss.item::<f32>(), grad)

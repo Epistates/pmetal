@@ -11,9 +11,9 @@
 
 use std::path::Path;
 
-use pmetal_bridge::compat::{Array, Exception};
-use pmetal_bridge::native_weight::{EmbeddingWeight, LayerWeight, QuantParams};
 use pmetal_mlx::kv_cache::KVCache;
+use pmetal_runtime::compat::{Array, Exception};
+use pmetal_runtime::native_weight::{EmbeddingWeight, LayerWeight, QuantParams};
 
 use crate::dflash_decoder::DFlashDraftQuant;
 use crate::dflash_drafts::{DFlashDraft, load_dflash_draft};
@@ -114,14 +114,14 @@ impl DFlashDrafter {
                     embed,
                     None,
                     None,
-                    QuantParams::defaults_for(pmetal_bridge::QuantizedMode::Affine),
+                    QuantParams::defaults_for(pmetal_runtime::QuantizedMode::Affine),
                 ),
                 lm_head.map(|w| {
                     LayerWeight::new(
                         w,
                         None,
                         None,
-                        QuantParams::defaults_for(pmetal_bridge::QuantizedMode::Affine),
+                        QuantParams::defaults_for(pmetal_runtime::QuantizedMode::Affine),
                     )
                 }),
             ),
@@ -129,7 +129,7 @@ impl DFlashDrafter {
                 draft.quantize(params)?;
                 let pack = |w: Array| {
                     let (w, s, b) = w.quantize_weights(params.group_size, params.bits);
-                    pmetal_bridge::check_last_error()
+                    pmetal_runtime::check_last_error()
                         .map(|()| (w, s, b))
                         .map_err(|e| Exception::custom(format!("DFlash target head: {e}")))
                 };
@@ -241,7 +241,7 @@ impl DFlashDrafter {
         )?;
         self.pending.clear();
         let _ = tokens.eval();
-        pmetal_bridge::check_unobserved_error()
+        pmetal_runtime::check_unobserved_error()
             .map_err(|e| Exception::custom(format!("DFlash draft: {e}")))?;
         Ok(tokens.as_slice::<u32>().to_vec())
     }

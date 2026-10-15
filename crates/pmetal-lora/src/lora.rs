@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::path::Path;
 
-use pmetal_bridge::compat::{Array, Exception};
+use pmetal_runtime::compat::{Array, Exception};
 
 /// Error type for LoRA operations.
 #[derive(Debug, thiserror::Error)]
@@ -33,7 +33,7 @@ pub fn load_safetensors_map(path: impl AsRef<Path>) -> Result<HashMap<String, Ar
         )))
     })?;
     let entries =
-        pmetal_bridge::inline_array::load_safetensors_shard(path_str).ok_or_else(|| {
+        pmetal_runtime::inline_array::load_safetensors_shard(path_str).ok_or_else(|| {
             LoraError::Mlx(Exception::custom(format!(
                 "failed to load safetensors shard: {}",
                 path.display()

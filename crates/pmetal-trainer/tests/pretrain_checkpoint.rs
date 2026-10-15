@@ -4,9 +4,9 @@
 //! resumed-step loss is NOT near initial loss (proving the optimizer
 //! momentum/velocity were restored, not reset to zero).
 
-use pmetal_bridge::compat::optimizers::AdamWBuilder;
-use pmetal_bridge::compat::{Dtype, random};
 use pmetal_models::architectures::{GptOssConfig, GptOssForCausalLM};
+use pmetal_runtime::compat::optimizers::AdamWBuilder;
+use pmetal_runtime::compat::{Dtype, random};
 use pmetal_trainer::pretrain::{
     CheckpointMeta, PretrainConfig, load_checkpoint, pretrain_step, run_pretrain, save_checkpoint,
 };

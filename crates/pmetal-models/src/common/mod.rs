@@ -4,7 +4,7 @@
 //! block that every Tier-1 / Tier-2 fused-decode architecture delegates
 //! to. Keeping it in one place avoids ~10 copies of the same q/k/v/rope/
 //! sdpa sequence and lets future kernel upgrades land once. `rotary`
-//! hands an architecture config's RoPE keys to `pmetal_bridge::rope`, the
+//! hands an architecture config's RoPE keys to `pmetal_runtime::rope`, the
 //! one implementation of every scaling type.
 
 pub mod batched_attention;

@@ -1,6 +1,6 @@
 //! Array extension utilities for MLX.
 
-use pmetal_bridge::compat::{Array, Dtype, Exception};
+use pmetal_runtime::compat::{Array, Dtype, Exception};
 
 type Result<T> = std::result::Result<T, Exception>;
 
@@ -80,23 +80,23 @@ impl ArrayExt for Array {
 
 /// Create a zeros array with the given shape and dtype.
 pub fn zeros(shape: &[i32], dtype: Dtype) -> Result<Array> {
-    Ok(pmetal_bridge::compat::ops::zeros(shape, dtype))
+    Ok(pmetal_runtime::compat::ops::zeros(shape, dtype))
 }
 
 /// Create a ones array with the given shape and dtype.
 pub fn ones(shape: &[i32], dtype: Dtype) -> Result<Array> {
-    Ok(pmetal_bridge::compat::ops::ones(shape, dtype))
+    Ok(pmetal_runtime::compat::ops::ones(shape, dtype))
 }
 
 /// Create a random normal array with the given shape and dtype.
 pub fn randn(shape: &[i32], dtype: Dtype) -> Result<Array> {
-    let a = pmetal_bridge::compat::random::normal(shape, Dtype::Float32);
+    let a = pmetal_runtime::compat::random::normal(shape, Dtype::Float32);
     Ok(a.as_dtype(dtype.as_i32()))
 }
 
 /// Create a random uniform array with the given shape, range, and dtype.
 pub fn rand(shape: &[i32], low: f32, high: f32, dtype: Dtype) -> Result<Array> {
-    let base = pmetal_bridge::compat::random::uniform(shape, Dtype::Float32);
+    let base = pmetal_runtime::compat::random::uniform(shape, Dtype::Float32);
     // Scale from [0,1) to [low, high)
     let range = Array::from_f32(high - low);
     let offset = Array::from_f32(low);

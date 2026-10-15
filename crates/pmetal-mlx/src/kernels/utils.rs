@@ -5,11 +5,11 @@
 
 use crate::{bridge::MlxMetalBridge, error::MlxError};
 use half::f16;
-use pmetal_bridge::compat::{Array, Dtype};
 use pmetal_metal::{
     buffer::{BufferUsage, MetalBuffer},
     context::MetalContext,
 };
+use pmetal_runtime::compat::{Array, Dtype};
 
 /// Result type for kernel utilities.
 pub type Result<T> = std::result::Result<T, MlxError>;

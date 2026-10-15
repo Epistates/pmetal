@@ -32,9 +32,9 @@
 
 use std::collections::HashMap;
 
-use pmetal_bridge::compat::{Array, Exception, ModuleParametersExt, Param, nn, ops};
-use pmetal_bridge::impl_module_params;
 use pmetal_mlx::kv_cache::KVCache;
+use pmetal_runtime::compat::{Array, Exception, ModuleParametersExt, Param, nn, ops};
+use pmetal_runtime::impl_module_params;
 
 use super::dflash_draft::{
     DFlashAttention, DFlashDraftConfig, DFlashMlp, LoadReport, make_context_cache,
@@ -75,7 +75,7 @@ impl GroupedDynamicCausalConv {
         Ok(Self {
             base_kernel: Param::new(ops::zeros(
                 &[2, kernel_size, hidden_size],
-                pmetal_bridge::compat::Dtype::Float32,
+                pmetal_runtime::compat::Dtype::Float32,
             )),
             kernel_projection: nn::LinearBuilder::new(hidden_size, 2 * kernel_size * groups)
                 .bias(false)
@@ -255,7 +255,7 @@ impl CandidateSelector {
         let codebook = || {
             Param::new(ops::zeros(
                 &[config.vocab_size, rank],
-                pmetal_bridge::compat::Dtype::Float32,
+                pmetal_runtime::compat::Dtype::Float32,
             ))
         };
         Ok(Self {
@@ -426,10 +426,10 @@ impl DFlash2DraftModel {
     /// convolution base kernels stay as loaded).
     pub fn quantize(
         &mut self,
-        params: pmetal_bridge::native_weight::QuantParams,
+        params: pmetal_runtime::native_weight::QuantParams,
     ) -> Result<(), Exception> {
         let mut result = Ok(());
-        pmetal_bridge::compat::VisitLinears::visit_linears_mut(self, "", &mut |_, linear| {
+        pmetal_runtime::compat::VisitLinears::visit_linears_mut(self, "", &mut |_, linear| {
             if result.is_ok() {
                 result = linear.quantize(params);
             }

@@ -14,18 +14,18 @@
 //!
 //! Performance optimizations:
 //! - GPU-native sampling filters (top_k, top_p, min_p) - no CPU round-trips
-//! - Uses pmetal_bridge::compat::random::categorical for GPU-native categorical sampling
+//! - Uses pmetal_runtime::compat::random::categorical for GPU-native categorical sampling
 //! - Dedicated generation stream for parallel execution
 //! - All tensor operations stay on GPU until final token extraction
-use pmetal_bridge::compat::ops::{
+use pmetal_mlx::kv_cache::KVCache;
+use pmetal_runtime::compat::ops::{
     argmax_axis, async_eval, logsumexp_axis_keepdims, select_axis, take_along_axis,
 };
-use pmetal_bridge::compat::random::categorical;
-use pmetal_bridge::compat::{Array, Dtype, Exception};
-use pmetal_bridge::decode::{
+use pmetal_runtime::compat::random::categorical;
+use pmetal_runtime::compat::{Array, Dtype, Exception};
+use pmetal_runtime::decode::{
     DecodePenalties, SamplingParams, filtered_log_probs, last_token_logits, prompt_tokens_to_input,
 };
-use pmetal_mlx::kv_cache::KVCache;
 #[cfg(feature = "ane")]
 use std::collections::HashMap;
 
@@ -113,14 +113,14 @@ fn with_cached_hybrid_cpu_engine<R>(
 /// The previous wired limit.
 #[inline]
 fn set_wired_limit(limit: usize) -> usize {
-    pmetal_bridge::inline_array::set_wired_limit(limit)
+    pmetal_runtime::inline_array::set_wired_limit(limit)
 }
 
 /// Get the Metal device info to determine optimal wired limit.
 ///
 /// Returns the max recommended working set size.
 fn get_max_recommended_wired_limit() -> usize {
-    pmetal_bridge::inline_array::get_max_recommended_size()
+    pmetal_runtime::inline_array::get_max_recommended_size()
 }
 
 /// RAII guard for managing wired memory limit during generation.
@@ -160,12 +160,12 @@ impl Drop for WiredLimitGuard {
 /// The bridge keeps one generation stream per thread (an MLX stream works
 /// only on the thread that made it), so there is no stream value to hold.
 /// The stream stays the default after the call returns, async evaluations
-/// included; [`pmetal_bridge::inline_array::reset_default_stream`] restores
+/// included; [`pmetal_runtime::inline_array::reset_default_stream`] restores
 /// MLX's own.
 #[inline]
 pub fn use_generation_stream() {
-    pmetal_bridge::inline_array::new_generation_stream();
-    pmetal_bridge::inline_array::set_generation_stream();
+    pmetal_runtime::inline_array::new_generation_stream();
+    pmetal_runtime::inline_array::set_generation_stream();
 }
 
 /// Release the Metal buffers MLX's allocator holds for reuse.
@@ -626,10 +626,10 @@ pub struct GenerationOutput {
     pub stopped_by_length: bool,
     /// Per-step decode timing, populated by `generate_cached_async_streaming`.
     /// The native path on `inference_runner` also produces the same struct
-    /// via `pmetal_bridge::decode::DecodeMetrics`, which is what the CLI
+    /// via `pmetal_runtime::decode::DecodeMetrics`, which is what the CLI
     /// summary print ingests — keeping the shape identical keeps the stats
     /// display DRY across both paths.
-    pub decode_metrics: Option<pmetal_bridge::decode::DecodeMetrics>,
+    pub decode_metrics: Option<pmetal_runtime::decode::DecodeMetrics>,
     /// Speculative decoding acceptance/accounting metrics.
     pub speculative_metrics: Option<SpeculativeDecodeMetrics>,
 }
@@ -708,7 +708,7 @@ pub struct Sampler {
     /// `config` as the bridge reads it ([`GenerationConfig::sampling_params`]).
     params: SamplingParams,
     /// How many tokens this sampler has drawn: with a seed, draw `n` uses
-    /// [`pmetal_bridge::decode::draw_key`]`(seed, n)`.
+    /// [`pmetal_runtime::decode::draw_key`]`(seed, n)`.
     draws: std::cell::Cell<u64>,
 }
 
@@ -730,7 +730,7 @@ impl Sampler {
         self.draws.set(draw + 1);
         self.config
             .seed
-            .map(|seed| pmetal_bridge::decode::draw_key(seed, draw))
+            .map(|seed| pmetal_runtime::decode::draw_key(seed, draw))
     }
 
     /// Sample the next token from `[1, vocab]` logits and read it back:
@@ -882,7 +882,7 @@ impl pmetal_metal::ane::lm::TokenSampler for HostLogitsSampler {
             .sampler
             .sample(&row, self.penalties.as_mut())
             .map_err(|e| MetalError::Internal(format!("sampling: {e}")))?;
-        pmetal_bridge::check_unobserved_error()
+        pmetal_runtime::check_unobserved_error()
             .map_err(|e| MetalError::Internal(format!("sampling: {e}")))?;
         Ok(token)
     }
@@ -1022,7 +1022,7 @@ pub fn sampling_log_probs(
 /// compare against.
 ///
 /// Seeded, the `n`-th draw of either kind comes from
-/// [`pmetal_bridge::decode::draw_key`]`(seed, n)` (or its bits, for a
+/// [`pmetal_runtime::decode::draw_key`]`(seed, n)` (or its bits, for a
 /// uniform), as the plain sampler's tokens do: no random state is shared
 /// with the thread or with another generation, so a seeded speculative
 /// decode picks the same tokens whichever thread runs it and whatever else
@@ -1062,10 +1062,10 @@ impl SpeculativeDraws {
         let draw = self.advance();
         let key = self
             .seed
-            .map(|seed| pmetal_bridge::decode::draw_key(seed, draw));
+            .map(|seed| pmetal_runtime::decode::draw_key(seed, draw));
         let token = categorical(log_probs, -1, key.as_ref());
         token.eval();
-        pmetal_bridge::check_unobserved_error()
+        pmetal_runtime::check_unobserved_error()
             .map_err(|e| Exception::custom(format!("speculative sample: {e}")))?;
         Ok(token.item::<u32>())
     }
@@ -1073,7 +1073,7 @@ impl SpeculativeDraws {
     /// A uniform in `[0, 1)`, with 24 random bits.
     pub fn uniform(&mut self) -> f32 {
         let draw = self.advance();
-        let bits = pmetal_bridge::decode::draw_bits(self.uniform_seed, draw);
+        let bits = pmetal_runtime::decode::draw_bits(self.uniform_seed, draw);
         (bits >> 40) as f32 / (1u64 << 24) as f32
     }
 }
@@ -1095,7 +1095,7 @@ pub fn correction_log_probs(
         .maximum(&Array::from_f32(0.0));
     let total = residual.sum_axis(-1, true);
     let total_value = total.item::<f32>();
-    pmetal_bridge::check_unobserved_error()
+    pmetal_runtime::check_unobserved_error()
         .map_err(|e| Exception::custom(format!("speculative correction distribution: {e}")))?;
     if !total_value.is_finite() || total_value <= 1e-20 {
         return Ok(target_log_probs.clone());
@@ -1385,7 +1385,7 @@ where
                 use_generation_stream();
                 // Convert Uint32 token to Int32 for model input (argmax returns Uint32)
                 let next_input = current_y
-                    .as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32())
+                    .as_dtype(pmetal_runtime::compat::Dtype::Int32.as_i32())
                     .reshape(&[1, -1]);
                 let next_output = forward_fn(&next_input, cache)?;
                 let next_logits = select_axis(&next_output, 0, 1);
@@ -1500,7 +1500,7 @@ where
             let (y, lp) = {
                 use_generation_stream();
                 let next_input = current_y
-                    .as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32())
+                    .as_dtype(pmetal_runtime::compat::Dtype::Int32.as_i32())
                     .reshape(&[1, -1]);
                 let next_output = forward_fn(&next_input, cache)?;
                 let next_logits = select_axis(&next_output, 0, 1);
@@ -1582,9 +1582,9 @@ where
 ///
 /// Drops the first step as warmup (it covers prefill fall-out / JIT caches)
 /// and returns `None` if fewer than 2 usable samples are available. The
-/// shape is identical to `pmetal_bridge::decode::DecodeMetrics` so the CLI
+/// shape is identical to `pmetal_runtime::decode::DecodeMetrics` so the CLI
 /// summary print path works for both the native and dynamic-model routes.
-fn build_decode_metrics(step_ns: &[u128]) -> Option<pmetal_bridge::decode::DecodeMetrics> {
+fn build_decode_metrics(step_ns: &[u128]) -> Option<pmetal_runtime::decode::DecodeMetrics> {
     // n=0 is warmup (includes prefill fall-out / JIT caches).
     let body = step_ns.get(1..)?;
     if body.is_empty() {
@@ -1602,7 +1602,7 @@ fn build_decode_metrics(step_ns: &[u128]) -> Option<pmetal_bridge::decode::Decod
     } else {
         0.0
     };
-    Some(pmetal_bridge::decode::DecodeMetrics {
+    Some(pmetal_runtime::decode::DecodeMetrics {
         tok_per_sec,
         avg_step_ms,
         p50_step_ms,
@@ -1750,7 +1750,7 @@ pub fn is_hybrid_cpu_compatible(
 /// `config.json`, flat or nested under `text_config`.
 ///
 /// The config is read through
-/// [`normalize_text_config`](pmetal_bridge::qwen3_native::family::normalize_text_config),
+/// [`normalize_text_config`](pmetal_runtime::qwen3_native::family::normalize_text_config),
 /// as both GPU engines read it: transformers' defaults for absent keys, the
 /// outer `tie_word_embeddings`, `layer_types`, `rope_parameters` and the
 /// output gate resolved the same way, and anything it cannot run refused by
@@ -1764,11 +1764,11 @@ pub fn hybrid_cpu_inference_config(
     pmetal_metal::ane::inference_hybrid::Qwen3NextInferenceConfig,
     pmetal_metal::error::MetalError,
 > {
-    use pmetal_bridge::qwen3_native::family::{
-        GdnGateActivation, gdn_qk_rms_norm_eps, normalize_text_config,
-    };
     use pmetal_metal::ane::inference_hybrid::{GdnOutputGate, Qwen3NextInferenceConfig};
     use pmetal_metal::error::MetalError;
+    use pmetal_runtime::qwen3_native::family::{
+        GdnGateActivation, gdn_qk_rms_norm_eps, normalize_text_config,
+    };
 
     let text = normalize_text_config(config_json).map_err(MetalError::InvalidConfig)?;
     let usize_of = |key: &str| -> std::result::Result<usize, MetalError> {
@@ -1931,7 +1931,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::decode::greedy_token;
+    use pmetal_runtime::decode::greedy_token;
 
     /// The correction distribution is the clipped, renormalized residual of
     /// the target over the draft, and the target when there is none.
@@ -1959,7 +1959,7 @@ mod tests {
         for (g, w) in got.iter().zip(target) {
             assert!((g - w).abs() < 1e-6, "{got:?}");
         }
-        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+        pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
     }
 
     #[test]
@@ -2179,7 +2179,7 @@ mod tests {
             }
             counts[token.item::<u32>() as usize] += 1;
         }
-        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+        pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
         assert!(want.iter().filter(|&&p| p > 0.0).count() > 2, "{want:?}");
         assert!(want.contains(&0.0), "{want:?}");
         for (i, (&count, &p)) in counts.iter().zip(&want).enumerate() {
@@ -2303,7 +2303,7 @@ mod tests {
             .map(|_| sampler.sample(&logits, penalties.as_mut()).unwrap())
             .collect();
         assert_eq!(picks, [1, 3, 4]);
-        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+        pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
     }
 
     #[cfg(feature = "ane")]

@@ -5158,7 +5158,6 @@ dependencies = [
  "indicatif",
  "libc",
  "parquet",
- "pmetal-bridge",
  "pmetal-core",
  "pmetal-data",
  "pmetal-distill",
@@ -5172,6 +5171,7 @@ dependencies = [
  "pmetal-mhc",
  "pmetal-mlx",
  "pmetal-models",
+ "pmetal-runtime",
  "pmetal-serve",
  "pmetal-trainer",
  "pmetal-vocoder",
@@ -5190,23 +5190,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "walkdir",
-]
-
-[[package]]
-name = "pmetal-bridge"
-version = "0.6.0"
-dependencies = [
- "cc",
- "cmake",
- "half",
- "memmap2",
- "pmetal-bridge",
- "rand 0.10.3",
- "safetensors",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tempfile",
 ]
 
 [[package]]
@@ -5243,10 +5226,10 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "parquet",
- "pmetal-bridge",
  "pmetal-core",
  "pmetal-gguf",
  "pmetal-mlx",
+ "pmetal-runtime",
  "rand 0.10.3",
  "rayon",
  "serde",
@@ -5263,7 +5246,7 @@ version = "0.6.0"
 dependencies = [
  "bitcode",
  "criterion",
- "pmetal-bridge",
+ "pmetal-runtime",
  "safetensors",
  "serde",
  "serde-saphyr",
@@ -5289,7 +5272,7 @@ dependencies = [
  "ordered-float 5.5.0",
  "parking_lot",
  "petgraph",
- "pmetal-bridge",
+ "pmetal-runtime",
  "serde",
  "serde_json",
  "sha3",
@@ -5338,10 +5321,10 @@ name = "pmetal-lora"
 version = "0.6.0"
 dependencies = [
  "criterion",
- "pmetal-bridge",
  "pmetal-core",
  "pmetal-mlx",
  "pmetal-models",
+ "pmetal-runtime",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
@@ -5375,7 +5358,7 @@ dependencies = [
  "hf-hub",
  "memmap2",
  "ndarray",
- "pmetal-bridge",
+ "pmetal-runtime",
  "rand 0.10.3",
  "regex",
  "safetensors",
@@ -5431,9 +5414,9 @@ version = "0.6.0"
 dependencies = [
  "dirs 7.0.0",
  "half",
- "pmetal-bridge",
  "pmetal-core",
  "pmetal-metal",
+ "pmetal-runtime",
  "rand 0.10.3",
  "serde",
  "serde_json",
@@ -5452,12 +5435,12 @@ dependencies = [
  "json5",
  "objc2",
  "objc2-metal",
- "pmetal-bridge",
  "pmetal-core",
  "pmetal-data",
  "pmetal-gguf",
  "pmetal-metal",
  "pmetal-mlx",
+ "pmetal-runtime",
  "safetensors",
  "serde",
  "serde_json",
@@ -5472,19 +5455,36 @@ name = "pmetal-py"
 version = "0.6.0"
 dependencies = [
  "pmetal",
- "pmetal-bridge",
  "pmetal-core",
  "pmetal-data",
  "pmetal-hub",
  "pmetal-lora",
  "pmetal-mlx",
  "pmetal-models",
+ "pmetal-runtime",
  "pmetal-trainer",
  "pyo3",
  "pyo3-build-config",
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "pmetal-runtime"
+version = "0.6.0"
+dependencies = [
+ "cc",
+ "cmake",
+ "half",
+ "memmap2",
+ "pmetal-runtime",
+ "rand 0.10.3",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
 ]
 
 [[package]]
@@ -5498,11 +5498,11 @@ dependencies = [
  "criterion",
  "futures",
  "image",
- "pmetal-bridge",
  "pmetal-data",
  "pmetal-metal",
  "pmetal-mlx",
  "pmetal-models",
+ "pmetal-runtime",
  "serde",
  "serde_json",
  "tempfile",
@@ -5527,7 +5527,6 @@ dependencies = [
  "image",
  "indicatif",
  "parquet",
- "pmetal-bridge",
  "pmetal-core",
  "pmetal-data",
  "pmetal-distill",
@@ -5538,6 +5537,7 @@ dependencies = [
  "pmetal-metal",
  "pmetal-mlx",
  "pmetal-models",
+ "pmetal-runtime",
  "prost",
  "rand 0.10.3",
  "safetensors",
@@ -5558,7 +5558,7 @@ dependencies = [
  "criterion",
  "half",
  "hf-hub",
- "pmetal-bridge",
+ "pmetal-runtime",
  "safetensors",
  "serde",
  "serde_json",

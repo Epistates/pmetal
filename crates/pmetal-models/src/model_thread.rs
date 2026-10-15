@@ -199,7 +199,7 @@ fn run<S>(state: &mut S, queue: &mpsc::Receiver<Job<S>>, mut background: Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::Array;
+    use pmetal_runtime::compat::Array;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -221,7 +221,7 @@ mod tests {
                     .call(move |x: &mut Array| {
                         let s = x.sum(None);
                         s.eval();
-                        pmetal_bridge::check_unobserved_error()
+                        pmetal_runtime::check_unobserved_error()
                             .map(|()| s.item_f32() + round as f32)
                     })
                     .unwrap()
@@ -248,8 +248,9 @@ mod tests {
         .join()
         .unwrap();
         let s = x.0.sum(None);
-        pmetal_bridge::expect_bridge_errors(|| s.eval());
-        let err = pmetal_bridge::check_unobserved_error().expect_err("cross-thread eval must fail");
+        pmetal_runtime::expect_runtime_errors(|| s.eval());
+        let err =
+            pmetal_runtime::check_unobserved_error().expect_err("cross-thread eval must fail");
         assert!(err.to_string().contains("Stream"), "{err}");
     }
 

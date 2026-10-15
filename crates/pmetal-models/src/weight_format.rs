@@ -16,7 +16,7 @@
 //! let weights = WeightLoader::load_gguf("./model.gguf");
 //! ```
 
-use pmetal_bridge::compat::{Array, Dtype};
+use pmetal_runtime::compat::{Array, Dtype};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -43,10 +43,10 @@ pub enum WeightFormatError {
     MissingWeight(String),
     /// MLX error.
     #[error("MLX error: {0}")]
-    Mlx(#[from] pmetal_bridge::compat::Exception),
+    Mlx(#[from] pmetal_runtime::compat::Exception),
     /// MLX IO error.
     #[error("MLX IO error: {0}")]
-    MlxIo(#[from] pmetal_bridge::compat::IoError),
+    MlxIo(#[from] pmetal_runtime::compat::IoError),
     /// JSON error.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
@@ -192,7 +192,7 @@ impl WeightLoader {
         if path.is_file() {
             // Single file
             let path_str = path.to_str().unwrap_or_default();
-            if let Some(pairs) = pmetal_bridge::inline_array::load_safetensors_shard(path_str) {
+            if let Some(pairs) = pmetal_runtime::inline_array::load_safetensors_shard(path_str) {
                 for (name, array) in pairs {
                     weights.insert(name, Self::convert_dtype_for_training(array)?);
                 }
@@ -202,7 +202,8 @@ impl WeightLoader {
             let single_file = path.join("model.safetensors");
             if single_file.exists() {
                 let path_str = single_file.to_str().unwrap_or_default();
-                if let Some(pairs) = pmetal_bridge::inline_array::load_safetensors_shard(path_str) {
+                if let Some(pairs) = pmetal_runtime::inline_array::load_safetensors_shard(path_str)
+                {
                     for (name, array) in pairs {
                         weights.insert(name, Self::convert_dtype_for_training(array)?);
                     }
@@ -234,7 +235,7 @@ impl WeightLoader {
                     let shard_path = path.join(shard_file);
                     let path_str = shard_path.to_str().unwrap_or_default();
                     if let Some(pairs) =
-                        pmetal_bridge::inline_array::load_safetensors_shard(path_str)
+                        pmetal_runtime::inline_array::load_safetensors_shard(path_str)
                     {
                         for (name, array) in pairs {
                             weights.insert(name, Self::convert_dtype_for_training(array)?);

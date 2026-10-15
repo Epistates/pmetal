@@ -1,0 +1,2035 @@
+// Fused compiled operations — @mx.compile(shapeless=True) equivalents.
+// Extracted from bridge.cpp for maintainability.
+
+#include "bridge_internal.h"
+
+// ============================================================================
+// Fused compiled ops — matching Python's @mx.compile(shapeless=True)
+// Each creates a compiled closure on first call, caches it, and replays.
+// This produces a single Compiled graph node instead of N separate nodes.
+// Must be outside extern "C" for C++ template/lambda support.
+// ============================================================================
+
+using namespace mlx::core;
+using CompiledFn = std::function<std::vector<array>(const std::vector<array>&)>;
+
+// Heap-allocate and intentionally leak compiled functions.  Function-local
+// static CompiledFn objects destruct at program exit via __cxa_atexit, calling
+// compile_erase() into libmlx.dylib's CompilerCache.  Cross-DSO atexit
+// ordering is unspecified — the CompilerCache may already be torn down,
+// causing SIGSEGV.  Heap-leaked objects are never destroyed, avoiding the
+// problem entirely (the OS reclaims all memory at process exit).
+static CompiledFn* make_compiled(CompiledFn fn) {
+    return new CompiledFn(mlx::core::compile(std::move(fn), /*shapeless=*/true));
+}
+
+// shapeless=false: works with ALL primitives (Split, CustomKernel, etc.)
+// but only replays the tape when input shapes match the first trace.
+// Perfect for T=1 decode where shapes are always the same.
+static CompiledFn* make_compiled_fixed(CompiledFn fn) {
+    return new CompiledFn(mlx::core::compile(std::move(fn), /*shapeless=*/false));
+}
+
+// The rotation `RotaryEmbedding::apply` (src/rope.rs) performs, for a compiled
+// decode graph: `fast::rope` from the kernel's `(base, scale)`, or from the
+// period table when there is one (YaRN, Llama 3 bands, LongRoPE), then the
+// attention factor on the rotated channels in f32. `freqs` and `gain` are
+// graph inputs, so a LongRoPE table switch replays the same trace.
+static array compiled_rope(
+    const array& x,
+    int dims,
+    bool traditional,
+    float base,
+    float scale,
+    const array& offset,
+    bool has_freqs,
+    const array& freqs,
+    bool has_gain,
+    const array& gain
+) {
+    auto rotated = has_freqs
+        ? fast::rope(x, dims, traditional, std::nullopt, 1.0f, offset,
+                     std::optional<array>(freqs))
+        : fast::rope(x, dims, traditional, std::optional<float>(base), scale, offset);
+    if (has_gain) {
+        rotated = astype(multiply(astype(rotated, float32), gain), x.dtype());
+    }
+    return rotated;
+}
+
+// A compiled graph takes every input positionally, so an absent optional
+// array still needs a slot.
+static array optional_input(const mlx_inline_array* a) {
+    return a != nullptr ? as_arr(a) : array(0.0f);
+}
+
+extern "C" {
+
+void mlx_inline_fused_swiglu(mlx_inline_array* dst,
+    const mlx_inline_array* gate, const mlx_inline_array* up) {
+    BRIDGE_TRY_DST("fused_swiglu", dst, {
+        CompileCacheLock cache_lock;
+        static auto* compiled = make_compiled(
+            [](const std::vector<array>& inputs) -> std::vector<array> {
+                auto& g = inputs[0];
+                auto& u = inputs[1];
+                return {multiply(multiply(g, sigmoid(g)), u)};
+            });
+        auto result = (*compiled)({as_arr(gate), as_arr(up)});
+        new (dst->buf) array(result[0]);
+    });
+}
+
+// Tanh-approximation GELU gating matching MLX's `nn.gelu_approx(gate) * up`.
+// Structure: 0.5 * g * (1 + tanh(sqrt(2/pi) * (g + 0.044715 * g^3))) * u
+// All scalar constants are astype'd to gate.dtype() inside the compiled
+// lambda so bf16 inputs stay bf16 (no silent f32 promotion of the whole
+// MLP result). Shapeless compile — one trace reused across all layers.
+void mlx_inline_fused_geglu_tanh(mlx_inline_array* dst,
+    const mlx_inline_array* gate, const mlx_inline_array* up) {
+    BRIDGE_TRY_DST("fused_geglu_tanh", dst, {
+        CompileCacheLock cache_lock;
+        static auto* compiled = make_compiled(
+            [](const std::vector<array>& inputs) -> std::vector<array> {
+                auto& g = inputs[0];
+                auto& u = inputs[1];
+                auto dt = g.dtype();
+                auto half     = astype(array(0.5f),         dt);
+                auto one      = astype(array(1.0f),         dt);
+                auto sqrt2_pi = astype(array(0.7978845608f), dt);
+                auto coef     = astype(array(0.044715f),    dt);
+                auto g3       = multiply(multiply(g, g), g);
+                auto inner    = add(g, multiply(coef, g3));
+                auto t        = tanh(multiply(sqrt2_pi, inner));
+                auto gelu_g   = multiply(half, multiply(g, add(one, t)));
+                return {multiply(gelu_g, u)};
+            });
+        auto result = (*compiled)({as_arr(gate), as_arr(up)});
+        new (dst->buf) array(result[0]);
+    });
+}
+
+void mlx_inline_fused_silu(mlx_inline_array* dst, const mlx_inline_array* x) {
+    BRIDGE_TRY_DST("fused_silu", dst, {
+        CompileCacheLock cache_lock;
+        static auto* compiled = make_compiled(
+            [](const std::vector<array>& inputs) -> std::vector<array> {
+                auto& x = inputs[0];
+                return {multiply(x, sigmoid(x))};
+            });
+        auto result = (*compiled)({as_arr(x)});
+        new (dst->buf) array(result[0]);
+    });
+}
+
+void mlx_inline_fused_compute_g(mlx_inline_array* dst,
+    const mlx_inline_array* a_log, const mlx_inline_array* a, const mlx_inline_array* dt_bias) {
+    BRIDGE_TRY_DST("fused_compute_g", dst, {
+        CompileCacheLock cache_lock;
+        static auto* compiled = make_compiled(
+            [](const std::vector<array>& inputs) -> std::vector<array> {
+                auto decay = exp(astype(inputs[0], float32));
+                auto sp = log1p(exp(add(inputs[1], inputs[2])));
+                return {exp(negative(multiply(decay, sp)))};
+            });
+        auto result = (*compiled)({as_arr(a_log), as_arr(a), as_arr(dt_bias)});
+        new (dst->buf) array(result[0]);
+    });
+}
+
+void mlx_inline_fused_precise_swiglu(mlx_inline_array* dst,
+    const mlx_inline_array* x, const mlx_inline_array* gate) {
+    BRIDGE_TRY_DST("fused_precise_swiglu", dst, {
+        CompileCacheLock cache_lock;
+        static auto* compiled = make_compiled(
+            [](const std::vector<array>& inputs) -> std::vector<array> {
+                auto& x = inputs[0];
+                auto& g = inputs[1];
+                auto g32 = multiply(astype(g, float32), sigmoid(astype(g, float32)));
+                auto x32 = astype(x, float32);
+                return {astype(multiply(g32, x32), x.dtype())};
+            });
+        auto result = (*compiled)({as_arr(x), as_arr(gate)});
+        new (dst->buf) array(result[0]);
+    });
+}
+
+void mlx_inline_fused_precise_sigmoid_gate(mlx_inline_array* dst,
+    const mlx_inline_array* x, const mlx_inline_array* gate) {
+    BRIDGE_TRY_DST("fused_precise_sigmoid_gate", dst, {
+        CompileCacheLock cache_lock;
+        static auto* compiled = make_compiled(
+            [](const std::vector<array>& inputs) -> std::vector<array> {
+                auto& x = inputs[0];
+                auto& g = inputs[1];
+                auto g32 = sigmoid(astype(g, float32));
+                auto x32 = astype(x, float32);
+                return {astype(multiply(g32, x32), x.dtype())};
+            });
+        auto result = (*compiled)({as_arr(x), as_arr(gate)});
+        new (dst->buf) array(result[0]);
+    });
+}
+
+// shapeless=false version — fixed shapes, works with ALL primitives.
+//
+// ⚠️ The traced graph bakes in the head geometry, the epsilons and the gate
+// activation, so it is cached per combination of them. One process-wide trace
+// served whichever Qwen3.5-family model ran first, and a second model with
+// different dimensions replayed it.
+void mlx_inline_compiled_gdn_layer_fixed(
+    mlx_inline_array* dst_out,
+    mlx_inline_array* dst_conv_state,
+    mlx_inline_array* dst_ssm_state,
+    const mlx_inline_array* normed,
+    const mlx_inline_array* qkv_w, const mlx_inline_array* z_w,
+    const mlx_inline_array* b_w, const mlx_inline_array* a_w,
+    const mlx_inline_array* conv_w,
+    const mlx_inline_array* q_nw, const mlx_inline_array* k_nw,
+    const mlx_inline_array* a_log, const mlx_inline_array* dt_bias,
+    const mlx_inline_array* norm_w, const mlx_inline_array* out_w,
+    const mlx_inline_array* conv_state_in, const mlx_inline_array* ssm_state_in,
+    int nv, int nk, int dk, int dv, int cd, int ck, int kd, float norm_eps,
+    float qk_eps, bool sigmoid_gate
+) {
+    struct Entry {
+        int nv, nk, dk, dv, cd, ck, kd;
+        float norm_eps, qk_eps;
+        bool sigmoid_gate;
+        CompiledFn* compiled;
+    };
+    // Heap-leaked to avoid cross-DSO static destructor ordering crash.
+    static auto* entries = new std::vector<Entry>();
+    try {
+        CompileCacheLock cache_lock;
+        CompiledFn* compiled = nullptr;
+        for (auto& e : *entries) {
+            if (e.nv == nv && e.nk == nk && e.dk == dk && e.dv == dv && e.cd == cd
+                && e.ck == ck && e.kd == kd && e.norm_eps == norm_eps
+                && e.qk_eps == qk_eps && e.sigmoid_gate == sigmoid_gate) {
+                compiled = e.compiled;
+                break;
+            }
+        }
+        if (!compiled) {
+            int NV=nv, NK=nk, DK=dk, DV=dv, CD=cd, CK=ck, KD=kd;
+            float EPS=norm_eps, QK_EPS=qk_eps;
+            bool SIGMOID_GATE=sigmoid_gate;
+            compiled = make_compiled_fixed(
+                [NV, NK, DK, DV, CD, CK, KD, EPS, QK_EPS, SIGMOID_GATE](const std::vector<array>& ins) -> std::vector<array> {
+                    auto& normed = ins[0];
+                    auto& qkv_w = ins[1]; auto& z_w = ins[2];
+                    auto& b_w = ins[3]; auto& a_w = ins[4]; auto& conv_w = ins[5];
+                    auto& q_nw = ins[6]; auto& k_nw = ins[7];
+                    auto& a_log_arr = ins[8]; auto& dt_bias_arr = ins[9];
+                    auto& norm_w_arr = ins[10]; auto& out_w = ins[11];
+                    auto& conv_state = ins[12]; auto& ssm_state = ins[13];
+                    int B = normed.shape(0); int S = normed.shape(1);
+
+                    auto qkv = matmul(normed, qkv_w);
+                    auto z = reshape(matmul(normed, z_w), {B, S, NV, DV});
+                    auto b_val = matmul(normed, b_w);
+                    auto a_val = matmul(normed, a_w);
+
+                    auto conv_in = concatenate({conv_state, qkv}, 1);
+                    auto new_conv = slice(conv_in, {0, 1, 0}, {B, CK, CD});
+                    auto conv_out = mlx::core::conv1d(conv_in, conv_w, 1, 0, 1, CD);
+                    auto conv_act = multiply(conv_out, sigmoid(conv_out));
+
+                    // Single split → 3 siblings sharing one Split primitive (matches Python).
+                    auto conv_parts = split(conv_act, Shape{KD, KD * 2}, -1);
+                    auto q = fast::rms_norm(reshape(conv_parts[0], {B, S, NK, DK}), q_nw, QK_EPS);
+                    auto k = fast::rms_norm(reshape(conv_parts[1], {B, S, NK, DK}), k_nw, QK_EPS);
+                    auto v = reshape(conv_parts[2], {B, S, NV, DV});
+
+                    auto g = exp(negative(multiply(exp(astype(a_log_arr, float32)),
+                                 log1p(exp(add(a_val, dt_bias_arr))))));
+                    auto beta = sigmoid(b_val);
+
+                    auto& kernel = get_gdn_kernel();
+                    auto kout = kernel(
+                        {q, k, v, g, beta, ssm_state, array(S)},
+                        {{B, S, NV, DV}, ssm_state.shape()},
+                        {q.dtype(), ssm_state.dtype()},
+                        {32, DV, B * NV}, {32, 4, 1},
+                        {{"InT", q.dtype()}, {"StT", ssm_state.dtype()},
+                         {"Dk", DK}, {"Dv", DV}, {"Hk", NK}, {"Hv", NV}},
+                        std::nullopt, false, {});
+
+                    auto out_n = fast::rms_norm(kout[0], norm_w_arr, EPS);
+                    auto z32 = astype(z, float32);
+                    auto g32 = SIGMOID_GATE ? sigmoid(z32) : multiply(z32, sigmoid(z32));
+                    auto output = matmul(
+                        reshape(astype(multiply(g32, astype(out_n, float32)), q.dtype()),
+                                {B, S, NV * DV}), out_w);
+                    return {output, new_conv, kout[1]};
+                });
+            entries->push_back(Entry{nv, nk, dk, dv, cd, ck, kd, norm_eps, qk_eps,
+                                     sigmoid_gate, compiled});
+        }
+
+        auto result = (*compiled)({
+            as_arr(normed),
+            as_arr(qkv_w), as_arr(z_w), as_arr(b_w), as_arr(a_w), as_arr(conv_w),
+            as_arr(q_nw), as_arr(k_nw), as_arr(a_log), as_arr(dt_bias),
+            as_arr(norm_w), as_arr(out_w), as_arr(conv_state_in), as_arr(ssm_state_in)
+        });
+        new (dst_out->buf) array(result[0]);
+        new (dst_conv_state->buf) array(result[1]);
+        new (dst_ssm_state->buf) array(result[2]);
+        pmetal_runtime_clear_error_internal();
+    } catch (const std::exception& e) {
+        pmetal_runtime_set_last_error("compiled_gdn_layer_fixed", e.what());
+        bridge_placeholder(dst_out);
+        bridge_placeholder(dst_conv_state);
+        bridge_placeholder(dst_ssm_state);
+    } catch (...) {
+        pmetal_runtime_set_last_error("compiled_gdn_layer_fixed", "unknown C++ exception");
+        bridge_placeholder(dst_out);
+        bridge_placeholder(dst_conv_state);
+        bridge_placeholder(dst_ssm_state);
+    }
+}
+
+void mlx_inline_compiled_attn_layer_fixed(
+    mlx_inline_array* dst_out,
+    mlx_inline_array* dst_cache_keys,
+    mlx_inline_array* dst_cache_vals,
+    const mlx_inline_array* normed,
+    const mlx_inline_array* q_w,
+    const mlx_inline_array* k_w,
+    const mlx_inline_array* v_w,
+    const mlx_inline_array* o_w,
+    const mlx_inline_array* q_nw,
+    const mlx_inline_array* k_nw,
+    const mlx_inline_array* cache_keys_in,
+    const mlx_inline_array* cache_vals_in,
+    int kv_offset,
+    int rope_offset,
+    int n_heads,
+    int n_kv,
+    int head_dim,
+    float scale,
+    int rope_dims,
+    float rope_base,
+    float rope_scale,
+    const mlx_inline_array* rope_freqs,    // null: rotate from (base, scale)
+    const mlx_inline_array* rope_gain,     // null: attention factor 1
+    float q_norm_eps,
+    float k_norm_eps,
+    bool gated
+) {
+    struct Entry {
+        int batch;
+        int cache_len;
+        int n_heads;
+        int n_kv;
+        int head_dim;
+        int rope_dims;
+        int gated;
+        int has_freqs;
+        int has_gain;
+        // The trace bakes these in too, so two models that share a geometry
+        // but not a RoPE base or norm epsilon must not share an entry.
+        float scale, rope_base, rope_scale, q_norm_eps, k_norm_eps;
+        CompiledFn compiled;
+    };
+    static auto* entries = new std::vector<Entry>();
+
+    try {
+        CompileCacheLock cache_lock;
+        int batch = as_arr(normed).shape(0);
+        int cache_len = as_arr(cache_keys_in).shape(2);
+        int has_freqs = rope_freqs != nullptr ? 1 : 0;
+        int has_gain = rope_gain != nullptr ? 1 : 0;
+
+        CompiledFn* compiled = nullptr;
+        for (auto& entry : *entries) {
+            if (entry.batch == batch
+                && entry.cache_len == cache_len
+                && entry.n_heads == n_heads
+                && entry.n_kv == n_kv
+                && entry.head_dim == head_dim
+                && entry.rope_dims == rope_dims
+                && entry.gated == static_cast<int>(gated)
+                && entry.has_freqs == has_freqs
+                && entry.has_gain == has_gain
+                && entry.scale == scale
+                && entry.rope_base == rope_base
+                && entry.rope_scale == rope_scale
+                && entry.q_norm_eps == q_norm_eps
+                && entry.k_norm_eps == k_norm_eps) {
+                compiled = &entry.compiled;
+                break;
+            }
+        }
+
+        if (compiled == nullptr) {
+            int NH = n_heads;
+            int NKV = n_kv;
+            int HD = head_dim;
+            int RD = rope_dims;
+            int L = cache_len;
+            bool GATED = gated;
+            float SCALE = scale;
+            float RBASE = rope_base;
+            float RSCALE = rope_scale;
+            float QEPS = q_norm_eps;
+            float KEPS = k_norm_eps;
+            bool HAS_FREQS = has_freqs == 1;
+            bool HAS_GAIN = has_gain == 1;
+
+            entries->push_back(Entry{
+                batch,
+                cache_len,
+                n_heads,
+                n_kv,
+                head_dim,
+                rope_dims,
+                static_cast<int>(gated),
+                has_freqs,
+                has_gain,
+                scale,
+                rope_base,
+                rope_scale,
+                q_norm_eps,
+                k_norm_eps,
+                *make_compiled_fixed(
+                    [NH, NKV, HD, RD, L, GATED, SCALE, RBASE, RSCALE, QEPS, KEPS,
+                     HAS_FREQS, HAS_GAIN]
+                    (const std::vector<array>& ins) -> std::vector<array> {
+                        using namespace mlx::core;
+
+                        auto& normed = ins[0];
+                        auto& q_w = ins[1];
+                        auto& k_w = ins[2];
+                        auto& v_w = ins[3];
+                        auto& o_w = ins[4];
+                        auto& q_nw = ins[5];
+                        auto& k_nw = ins[6];
+                        auto& cache_keys = ins[7];
+                        auto& cache_vals = ins[8];
+                        auto& kv_offset_arr = ins[9];
+                        auto& rope_offset_arr = ins[10];
+                        auto& rope_freqs_arr = ins[11];
+                        auto& rope_gain_arr = ins[12];
+
+                        int B = normed.shape(0);
+                        int S = normed.shape(1);
+
+                        auto q_proj = matmul(normed, q_w);
+                        array queries(0.0f);
+                        array gate(0.0f);
+                        if (GATED) {
+                            auto qg = reshape(q_proj, {B, S, NH, HD * 2});
+                            auto qg_parts = split(qg, Shape{HD}, -1);
+                            queries = qg_parts[0];
+                            gate = reshape(qg_parts[1], {B, S, NH * HD});
+                        } else {
+                            queries = reshape(q_proj, {B, S, NH, HD});
+                        }
+
+                        auto new_k = matmul(normed, k_w);
+                        auto new_v = matmul(normed, v_w);
+
+                        queries = fast::rms_norm(queries, q_nw, QEPS);
+                        auto keys = fast::rms_norm(reshape(new_k, {B, S, NKV, HD}), k_nw, KEPS);
+                        auto values = reshape(new_v, {B, S, NKV, HD});
+
+                        queries = transpose(queries, {0, 2, 1, 3});
+                        keys = transpose(keys, {0, 2, 1, 3});
+                        values = transpose(values, {0, 2, 1, 3});
+
+                        queries = compiled_rope(queries, RD, false, RBASE, RSCALE,
+                                                rope_offset_arr, HAS_FREQS, rope_freqs_arr,
+                                                HAS_GAIN, rope_gain_arr);
+                        keys = compiled_rope(keys, RD, false, RBASE, RSCALE,
+                                             rope_offset_arr, HAS_FREQS, rope_freqs_arr,
+                                             HAS_GAIN, rope_gain_arr);
+
+                        auto kv_indices = broadcast_to(
+                            reshape(kv_offset_arr, {1, 1, 1, 1}),
+                            {B, NKV, S, HD});
+                        auto updated_keys = put_along_axis(cache_keys, kv_indices, keys, 2);
+                        auto updated_vals = put_along_axis(cache_vals, kv_indices, values, 2);
+
+                        auto next_offset = add(kv_offset_arr, array(S));
+                        auto positions = reshape(arange(L, int32), {1, 1, 1, L});
+                        auto valid_mask = less(positions, reshape(next_offset, {1, 1, 1, 1}));
+
+                        auto output = fast::scaled_dot_product_attention(
+                            queries, updated_keys, updated_vals, SCALE, "", valid_mask);
+                        output = transpose(output, {0, 2, 1, 3});
+                        output = reshape(output, {B, S, NH * HD});
+                        if (GATED) {
+                            output = multiply(output, sigmoid(gate));
+                        }
+                        auto result = matmul(output, o_w);
+                        return {result, updated_keys, updated_vals};
+                    })
+            });
+            compiled = &entries->back().compiled;
+        }
+
+        auto result = (*compiled)({
+            as_arr(normed),
+            as_arr(q_w),
+            as_arr(k_w),
+            as_arr(v_w),
+            as_arr(o_w),
+            as_arr(q_nw),
+            as_arr(k_nw),
+            as_arr(cache_keys_in),
+            as_arr(cache_vals_in),
+            array(kv_offset),
+            array(rope_offset),
+            optional_input(rope_freqs),
+            optional_input(rope_gain),
+        });
+        new (dst_out->buf) array(result[0]);
+        new (dst_cache_keys->buf) array(result[1]);
+        new (dst_cache_vals->buf) array(result[2]);
+        pmetal_runtime_clear_error_internal();
+    } catch (const std::exception& e) {
+        pmetal_runtime_set_last_error("compiled_attn_layer_fixed", e.what());
+        bridge_placeholder(dst_out);
+        bridge_placeholder(dst_cache_keys);
+        bridge_placeholder(dst_cache_vals);
+    } catch (...) {
+        pmetal_runtime_set_last_error("compiled_attn_layer_fixed", "unknown C++ exception");
+        bridge_placeholder(dst_out);
+        bridge_placeholder(dst_cache_keys);
+        bridge_placeholder(dst_cache_vals);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// GPT-OSS fused [T=1] decode attention layer (full attention only).
+//
+// Adapted from `compiled_attn_layer_fixed` to handle GPT-OSS' invariants:
+//   * q/k/v/o biases (always present in real models — caller asserts).
+//   * No q/k norm.
+//   * Traditional=false RoPE over the full head_dim.
+//   * Per-head attention sinks in the softmax.
+// Full and sliding-window layers alike: the new key is written at slot
+// `kv_write` and attention reads the first `kv_valid` slots, so a full
+// layer passes (offset, offset + 1) and a sliding ring (offset % window,
+// min(offset + 1, window)). Order within the cache never matters, since keys
+// are rotated before they are stored.
+// ----------------------------------------------------------------------------
+void mlx_inline_compiled_gptoss_attn_layer_fixed(
+    mlx_inline_array* dst_out,
+    mlx_inline_array* dst_cache_keys,
+    mlx_inline_array* dst_cache_vals,
+    const mlx_inline_array* normed,
+    const mlx_inline_array* q_w,
+    const mlx_inline_array* k_w,
+    const mlx_inline_array* v_w,
+    const mlx_inline_array* o_w,
+    const mlx_inline_array* q_b,
+    const mlx_inline_array* k_b,
+    const mlx_inline_array* v_b,
+    const mlx_inline_array* o_b,
+    const mlx_inline_array* sinks,
+    const mlx_inline_array* cache_keys_in,
+    const mlx_inline_array* cache_vals_in,
+    int kv_write,
+    int kv_valid,
+    int rope_offset,
+    int n_heads,
+    int n_kv,
+    int head_dim,
+    float scale,
+    float rope_base,
+    float rope_scale,
+    const mlx_inline_array* rope_freqs,    // null: rotate from (base, scale)
+    const mlx_inline_array* rope_gain      // null: attention factor 1
+) {
+    struct Entry {
+        int batch;
+        int cache_len;
+        int n_heads;
+        int n_kv;
+        int head_dim;
+        int dtype;
+        int has_freqs;
+        int has_gain;
+        // Baked into the trace, so they key it too.
+        float scale, rope_base, rope_scale;
+        CompiledFn compiled;
+    };
+    static auto* entries = new std::vector<Entry>();
+
+    try {
+        CompileCacheLock cache_lock;
+        int batch = as_arr(normed).shape(0);
+        int cache_len = as_arr(cache_keys_in).shape(2);
+        int dtype = static_cast<int>(as_arr(normed).dtype().val());
+        int has_freqs = rope_freqs != nullptr ? 1 : 0;
+        int has_gain = rope_gain != nullptr ? 1 : 0;
+
+        CompiledFn* compiled = nullptr;
+        for (auto& entry : *entries) {
+            if (entry.batch == batch
+                && entry.cache_len == cache_len
+                && entry.n_heads == n_heads
+                && entry.n_kv == n_kv
+                && entry.head_dim == head_dim
+                && entry.dtype == dtype
+                && entry.has_freqs == has_freqs
+                && entry.has_gain == has_gain
+                && entry.scale == scale
+                && entry.rope_base == rope_base
+                && entry.rope_scale == rope_scale) {
+                compiled = &entry.compiled;
+                break;
+            }
+        }
+
+        if (compiled == nullptr) {
+            int NH = n_heads;
+            int NKV = n_kv;
+            int HD = head_dim;
+            int L = cache_len;
+            float SCALE = scale;
+            float RBASE = rope_base;
+            float RSCALE = rope_scale;
+            bool HAS_FREQS = has_freqs == 1;
+            bool HAS_GAIN = has_gain == 1;
+
+            entries->push_back(Entry{
+                batch,
+                cache_len,
+                n_heads,
+                n_kv,
+                head_dim,
+                dtype,
+                has_freqs,
+                has_gain,
+                scale,
+                rope_base,
+                rope_scale,
+                *make_compiled_fixed(
+                    [NH, NKV, HD, L, SCALE, RBASE, RSCALE, HAS_FREQS, HAS_GAIN]
+                    (const std::vector<array>& ins) -> std::vector<array> {
+                        using namespace mlx::core;
+
+                        auto& normed = ins[0];
+                        auto& q_w = ins[1];
+                        auto& k_w = ins[2];
+                        auto& v_w = ins[3];
+                        auto& o_w = ins[4];
+                        auto& q_b = ins[5];
+                        auto& k_b = ins[6];
+                        auto& v_b = ins[7];
+                        auto& o_b = ins[8];
+                        auto& cache_keys = ins[9];
+                        auto& cache_vals = ins[10];
+                        auto& kv_write_arr = ins[11];
+                        auto& rope_offset_arr = ins[12];
+                        auto& rope_freqs_arr = ins[13];
+                        auto& rope_gain_arr = ins[14];
+                        auto& sinks_arr = ins[15];
+                        auto& kv_valid_arr = ins[16];
+
+                        int B = normed.shape(0);
+                        int S = normed.shape(1);
+
+                        auto q_proj = add(matmul(normed, q_w), q_b);
+                        auto new_k = add(matmul(normed, k_w), k_b);
+                        auto new_v = add(matmul(normed, v_w), v_b);
+
+                        auto queries = reshape(q_proj, {B, S, NH, HD});
+                        auto keys = reshape(new_k, {B, S, NKV, HD});
+                        auto values = reshape(new_v, {B, S, NKV, HD});
+
+                        queries = transpose(queries, {0, 2, 1, 3});
+                        keys = transpose(keys, {0, 2, 1, 3});
+                        values = transpose(values, {0, 2, 1, 3});
+
+                        // Full RoPE over the head, split-half, as the per-op
+                        // path's `RotaryEmbedding::apply` rotates it.
+                        queries = compiled_rope(queries, HD, false, RBASE, RSCALE,
+                                                rope_offset_arr, HAS_FREQS, rope_freqs_arr,
+                                                HAS_GAIN, rope_gain_arr);
+                        keys = compiled_rope(keys, HD, false, RBASE, RSCALE,
+                                             rope_offset_arr, HAS_FREQS, rope_freqs_arr,
+                                             HAS_GAIN, rope_gain_arr);
+
+                        auto kv_indices = broadcast_to(
+                            reshape(kv_write_arr, {1, 1, 1, 1}),
+                            {B, NKV, S, HD});
+                        auto updated_keys = put_along_axis(cache_keys, kv_indices, keys, 2);
+                        auto updated_vals = put_along_axis(cache_vals, kv_indices, values, 2);
+
+                        auto positions = reshape(arange(L, int32), {1, 1, 1, L});
+                        auto valid_mask = less(positions, reshape(kv_valid_arr, {1, 1, 1, 1}));
+
+                        auto output = fast::scaled_dot_product_attention(
+                            queries, updated_keys, updated_vals, SCALE, "", valid_mask,
+                            std::optional<array>(sinks_arr));
+                        output = transpose(output, {0, 2, 1, 3});
+                        output = reshape(output, {B, S, NH * HD});
+
+                        auto result = add(matmul(output, o_w), o_b);
+                        return {result, updated_keys, updated_vals};
+                    })
+            });
+            compiled = &entries->back().compiled;
+        }
+
+        auto result = (*compiled)({
+            as_arr(normed),
+            as_arr(q_w),
+            as_arr(k_w),
+            as_arr(v_w),
+            as_arr(o_w),
+            as_arr(q_b),
+            as_arr(k_b),
+            as_arr(v_b),
+            as_arr(o_b),
+            as_arr(cache_keys_in),
+            as_arr(cache_vals_in),
+            array(kv_write),
+            array(rope_offset),
+            optional_input(rope_freqs),
+            optional_input(rope_gain),
+            as_arr(sinks),
+            array(kv_valid),
+        });
+        new (dst_out->buf) array(result[0]);
+        new (dst_cache_keys->buf) array(result[1]);
+        new (dst_cache_vals->buf) array(result[2]);
+        pmetal_runtime_clear_error_internal();
+    } catch (const std::exception& e) {
+        pmetal_runtime_set_last_error("compiled_gptoss_attn_layer_fixed", e.what());
+        bridge_placeholder(dst_out);
+        bridge_placeholder(dst_cache_keys);
+        bridge_placeholder(dst_cache_vals);
+    } catch (...) {
+        pmetal_runtime_set_last_error("compiled_gptoss_attn_layer_fixed", "unknown C++ exception");
+        bridge_placeholder(dst_out);
+        bridge_placeholder(dst_cache_keys);
+        bridge_placeholder(dst_cache_vals);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Llama 4 iRoPE fused [T=1] decode attention layer.
+//
+// One kernel covers both layer flavours via static flags captured into the
+// compiled closure. The shape signature includes the flag combo so each
+// (RoPE/NoPE × qk_norm × temp_tuning × has_biases) variant gets its own
+// trace.
+//   * use_rope    — `q.rope(head_dim, traditional=true, ...)` on Q and K.
+//   * use_qk_norm — `rms_norm(weight=None, eps=qk_norm_eps)` on Q and K.
+//   * has_biases  — add q/k/v/o biases.
+//   * temp_tuning — NoPE-only multiplicative scale on Q built from
+//                   `log(floor((rope_offset+1)/floor_scale)+1) * attn_scale + 1`.
+// ----------------------------------------------------------------------------
+void mlx_inline_compiled_llama4_attn_layer_fixed(
+    mlx_inline_array* dst_out,
+    mlx_inline_array* dst_cache_keys,
+    mlx_inline_array* dst_cache_vals,
+    const mlx_inline_array* normed,
+    const mlx_inline_array* q_w,
+    const mlx_inline_array* k_w,
+    const mlx_inline_array* v_w,
+    const mlx_inline_array* o_w,
+    const mlx_inline_array* q_b,
+    const mlx_inline_array* k_b,
+    const mlx_inline_array* v_b,
+    const mlx_inline_array* o_b,
+    const mlx_inline_array* cache_keys_in,
+    const mlx_inline_array* cache_vals_in,
+    int kv_offset,
+    int rope_offset,
+    int n_heads,
+    int n_kv,
+    int head_dim,
+    float scale,
+    float rope_base,
+    float rope_scale,
+    const mlx_inline_array* rope_freqs,    // null: rotate from (base, scale)
+    const mlx_inline_array* rope_gain,     // null: attention factor 1
+    bool use_rope,
+    bool use_qk_norm,
+    bool has_biases,
+    bool temp_tuning,
+    int floor_scale,
+    float temp_attn_scale,
+    float qk_norm_eps,
+    int kv_start
+) {
+    struct Entry {
+        int batch;
+        int cache_len;
+        int n_heads;
+        int n_kv;
+        int head_dim;
+        int use_rope;
+        int use_qk_norm;
+        int has_biases;
+        int temp_tuning;
+        int dtype;
+        int has_freqs;
+        int has_gain;
+        // Baked into the trace, so they key it too.
+        float scale, rope_base, rope_scale, temp_attn_scale, qk_norm_eps;
+        int floor_scale;
+        CompiledFn compiled;
+    };
+    static auto* entries = new std::vector<Entry>();
+
+    try {
+        CompileCacheLock cache_lock;
+        int batch = as_arr(normed).shape(0);
+        int cache_len = as_arr(cache_keys_in).shape(2);
+        int dtype = static_cast<int>(as_arr(normed).dtype().val());
+        int has_freqs = rope_freqs != nullptr ? 1 : 0;
+        int has_gain = rope_gain != nullptr ? 1 : 0;
+
+        CompiledFn* compiled = nullptr;
+        for (auto& entry : *entries) {
+            if (entry.batch == batch
+                && entry.cache_len == cache_len
+                && entry.n_heads == n_heads
+                && entry.n_kv == n_kv
+                && entry.head_dim == head_dim
+                && entry.use_rope == static_cast<int>(use_rope)
+                && entry.use_qk_norm == static_cast<int>(use_qk_norm)
+                && entry.has_biases == static_cast<int>(has_biases)
+                && entry.temp_tuning == static_cast<int>(temp_tuning)
+                && entry.dtype == dtype
+                && entry.has_freqs == has_freqs
+                && entry.has_gain == has_gain
+                && entry.scale == scale
+                && entry.rope_base == rope_base
+                && entry.rope_scale == rope_scale
+                && entry.temp_attn_scale == temp_attn_scale
+                && entry.qk_norm_eps == qk_norm_eps
+                && entry.floor_scale == floor_scale) {
+                compiled = &entry.compiled;
+                break;
+            }
+        }
+
+        if (compiled == nullptr) {
+            int NH = n_heads;
+            int NKV = n_kv;
+            int HD = head_dim;
+            int L = cache_len;
+            float SCALE = scale;
+            float RBASE = rope_base;
+            float RSCALE = rope_scale;
+            bool UROPE = use_rope;
+            bool UQKN = use_qk_norm;
+            bool HBIAS = has_biases;
+            bool TTUNE = temp_tuning;
+            int FLOOR = floor_scale;
+            float TSCALE = temp_attn_scale;
+            float QKEPS = qk_norm_eps;
+            bool HAS_FREQS = has_freqs == 1;
+            bool HAS_GAIN = has_gain == 1;
+
+            entries->push_back(Entry{
+                batch,
+                cache_len,
+                n_heads,
+                n_kv,
+                head_dim,
+                static_cast<int>(use_rope),
+                static_cast<int>(use_qk_norm),
+                static_cast<int>(has_biases),
+                static_cast<int>(temp_tuning),
+                dtype,
+                has_freqs,
+                has_gain,
+                scale,
+                rope_base,
+                rope_scale,
+                temp_attn_scale,
+                qk_norm_eps,
+                floor_scale,
+                *make_compiled_fixed(
+                    [NH, NKV, HD, L, SCALE, RBASE, RSCALE,
+                     UROPE, UQKN, HBIAS, TTUNE, FLOOR, TSCALE, QKEPS, HAS_FREQS, HAS_GAIN]
+                    (const std::vector<array>& ins) -> std::vector<array> {
+                        using namespace mlx::core;
+
+                        auto& normed = ins[0];
+                        auto& q_w = ins[1];
+                        auto& k_w = ins[2];
+                        auto& v_w = ins[3];
+                        auto& o_w = ins[4];
+                        auto& q_b = ins[5];
+                        auto& k_b = ins[6];
+                        auto& v_b = ins[7];
+                        auto& o_b = ins[8];
+                        auto& cache_keys = ins[9];
+                        auto& cache_vals = ins[10];
+                        auto& kv_offset_arr = ins[11];
+                        auto& rope_offset_arr = ins[12];
+                        auto& rope_freqs_arr = ins[13];
+                        auto& rope_gain_arr = ins[14];
+
+                        int B = normed.shape(0);
+                        int S = normed.shape(1);
+
+                        auto q_proj = matmul(normed, q_w);
+                        auto new_k = matmul(normed, k_w);
+                        auto new_v = matmul(normed, v_w);
+                        if (HBIAS) {
+                            q_proj = add(q_proj, q_b);
+                            new_k = add(new_k, k_b);
+                            new_v = add(new_v, v_b);
+                        }
+
+                        auto queries = reshape(q_proj, {B, S, NH, HD});
+                        auto keys = reshape(new_k, {B, S, NKV, HD});
+                        auto values = reshape(new_v, {B, S, NKV, HD});
+
+                        queries = transpose(queries, {0, 2, 1, 3});
+                        keys = transpose(keys, {0, 2, 1, 3});
+                        values = transpose(values, {0, 2, 1, 3});
+
+                        if (UROPE) {
+                            // Llama 4 uses traditional=true RoPE.
+                            queries = compiled_rope(queries, HD, true, RBASE, RSCALE,
+                                                    rope_offset_arr, HAS_FREQS, rope_freqs_arr,
+                                                    HAS_GAIN, rope_gain_arr);
+                            keys = compiled_rope(keys, HD, true, RBASE, RSCALE,
+                                                 rope_offset_arr, HAS_FREQS, rope_freqs_arr,
+                                                 HAS_GAIN, rope_gain_arr);
+                        }
+
+                        if (UQKN) {
+                            // Weight-less RMS norm at the model's rms_norm_eps.
+                            queries = fast::rms_norm(queries, std::nullopt, QKEPS);
+                            keys = fast::rms_norm(keys, std::nullopt, QKEPS);
+                        }
+
+                        if (TTUNE && !UROPE) {
+                            // For T=1 decode, S=1 — a single scalar position.
+                            // Python:
+                            //   pos = rope_offset + 0 + 1
+                            //   floored = floor(pos / floor_scale)
+                            //   scale = log(floored + 1) * attn_scale + 1
+                            //   queries *= scale
+                            auto pos = add(astype(rope_offset_arr, float32), array(1.0f));
+                            auto floored = floor(divide(pos, array(static_cast<float>(FLOOR))));
+                            auto temp_scale_f32 = add(
+                                multiply(log(add(floored, array(1.0f))),
+                                         array(TSCALE)),
+                                array(1.0f));
+                            auto temp_scale = astype(temp_scale_f32, queries.dtype());
+                            queries = multiply(queries, temp_scale);
+                        }
+
+                        auto kv_indices = broadcast_to(
+                            reshape(kv_offset_arr, {1, 1, 1, 1}),
+                            {B, NKV, S, HD});
+                        auto updated_keys = put_along_axis(cache_keys, kv_indices, keys, 2);
+                        auto updated_vals = put_along_axis(cache_vals, kv_indices, values, 2);
+
+                        // Slots `kv_start..offset + S`: the whole cache on a
+                        // NoPE layer, the current chunk on a chunked one.
+                        auto next_offset = add(kv_offset_arr, array(S));
+                        auto positions = reshape(arange(L, int32), {1, 1, 1, L});
+                        auto valid_mask = logical_and(
+                            less(positions, reshape(next_offset, {1, 1, 1, 1})),
+                            greater_equal(positions, reshape(ins[15], {1, 1, 1, 1})));
+
+                        auto output = fast::scaled_dot_product_attention(
+                            queries, updated_keys, updated_vals, SCALE, "", valid_mask);
+                        output = transpose(output, {0, 2, 1, 3});
+                        output = reshape(output, {B, S, NH * HD});
+
+                        auto result = matmul(output, o_w);
+                        if (HBIAS) {
+                            result = add(result, o_b);
+                        }
+                        return {result, updated_keys, updated_vals};
+                    })
+            });
+            compiled = &entries->back().compiled;
+        }
+
+        auto result = (*compiled)({
+            as_arr(normed),
+            as_arr(q_w),
+            as_arr(k_w),
+            as_arr(v_w),
+            as_arr(o_w),
+            as_arr(q_b),
+            as_arr(k_b),
+            as_arr(v_b),
+            as_arr(o_b),
+            as_arr(cache_keys_in),
+            as_arr(cache_vals_in),
+            array(kv_offset),
+            array(rope_offset),
+            optional_input(rope_freqs),
+            optional_input(rope_gain),
+            array(kv_start),
+        });
+        new (dst_out->buf) array(result[0]);
+        new (dst_cache_keys->buf) array(result[1]);
+        new (dst_cache_vals->buf) array(result[2]);
+        pmetal_runtime_clear_error_internal();
+    } catch (const std::exception& e) {
+        pmetal_runtime_set_last_error("compiled_llama4_attn_layer_fixed", e.what());
+        bridge_placeholder(dst_out);
+        bridge_placeholder(dst_cache_keys);
+        bridge_placeholder(dst_cache_vals);
+    } catch (...) {
+        pmetal_runtime_set_last_error("compiled_llama4_attn_layer_fixed", "unknown C++ exception");
+        bridge_placeholder(dst_out);
+        bridge_placeholder(dst_cache_keys);
+        bridge_placeholder(dst_cache_vals);
+    }
+}
+
+void mlx_inline_compiled_moe_layer_fixed(
+    mlx_inline_array* dst_out,
+    const mlx_inline_array* x,
+    const mlx_inline_array* router_w,
+    const mlx_inline_array* moe_gate_w,
+    const mlx_inline_array* moe_up_w,
+    const mlx_inline_array* moe_down_w,
+    const mlx_inline_array* shared_gate_w,
+    const mlx_inline_array* shared_up_w,
+    const mlx_inline_array* shared_down_w,
+    const mlx_inline_array* shared_expert_gate_w,
+    int top_k,
+    bool norm_topk_prob
+) {
+    struct Entry {
+        int batch;
+        int hidden;
+        int num_experts;
+        int routed_hidden;
+        int shared_hidden;
+        int top_k;
+        int dtype;
+        int norm_topk_prob;
+        CompiledFn compiled;
+    };
+    static auto* entries = new std::vector<Entry>();
+
+    try {
+        CompileCacheLock cache_lock;
+        int batch = as_arr(x).shape(0);
+        int hidden = as_arr(x).shape(2);
+        int num_experts = as_arr(router_w).shape(1);
+        int routed_hidden = as_arr(moe_down_w).shape(1);
+        int shared_hidden = as_arr(shared_down_w).shape(0);
+        int dtype = static_cast<int>(as_arr(x).dtype().val());
+
+        CompiledFn* compiled = nullptr;
+        for (auto& entry : *entries) {
+            if (entry.batch == batch
+                && entry.hidden == hidden
+                && entry.num_experts == num_experts
+                && entry.routed_hidden == routed_hidden
+                && entry.shared_hidden == shared_hidden
+                && entry.top_k == top_k
+                && entry.dtype == dtype
+                && entry.norm_topk_prob == static_cast<int>(norm_topk_prob)) {
+                compiled = &entry.compiled;
+                break;
+            }
+        }
+
+        if (compiled == nullptr) {
+            int TOPK = top_k;
+            bool NORM_TOPK = norm_topk_prob;
+            entries->push_back(Entry{
+                batch,
+                hidden,
+                num_experts,
+                routed_hidden,
+                shared_hidden,
+                top_k,
+                dtype,
+                static_cast<int>(norm_topk_prob),
+                *make_compiled_fixed(
+                    [TOPK, NORM_TOPK](const std::vector<array>& ins) -> std::vector<array> {
+                        using namespace mlx::core;
+
+                        auto& x = ins[0];
+                        auto& router_w = ins[1];
+                        auto& moe_gate_w = ins[2];
+                        auto& moe_up_w = ins[3];
+                        auto& moe_down_w = ins[4];
+                        auto& shared_gate_w = ins[5];
+                        auto& shared_up_w = ins[6];
+                        auto& shared_down_w = ins[7];
+                        auto& shared_expert_gate_w = ins[8];
+
+                        int B = x.shape(0);
+                        int S = x.shape(1);
+                        int H = x.shape(2);
+                        int expert_count = router_w.shape(1);
+
+                        auto x_flat = reshape(x, {B * S, H});
+                        // Routed in f32 as transformers does (`softmax(...,
+                        // dtype=torch.float)`); only the weights go back to the
+                        // model dtype.
+                        auto gates = softmax(
+                            astype(matmul(x_flat, router_w), float32), -1, /*precise=*/true);
+                        auto all_inds = argpartition(gates, -TOPK, -1);
+                        auto inds = slice(all_inds, {0, expert_count - TOPK}, {B * S, expert_count});
+                        auto scores = take_along_axis(gates, inds, -1);
+                        if (NORM_TOPK) {
+                            scores = divide(scores, sum(scores, {-1}, true));
+                        }
+                        scores = astype(scores, x.dtype());
+
+                        auto switch_in = expand_dims(expand_dims(x_flat, 1), 2);
+                        auto rhs_indices = std::optional<array>(inds);
+                        auto x_gate_exp =
+                            gather_mm(switch_in, moe_gate_w, std::nullopt, rhs_indices, false);
+                        auto x_up_exp =
+                            gather_mm(switch_in, moe_up_w, std::nullopt, rhs_indices, false);
+                        auto x_act = multiply(multiply(x_gate_exp, sigmoid(x_gate_exp)), x_up_exp);
+                        auto y_exp =
+                            squeeze(gather_mm(x_act, moe_down_w, std::nullopt, rhs_indices, false), 2);
+                        auto scores_exp = reshape(scores, {B * S, TOPK, 1});
+                        auto y_routed = sum(multiply(y_exp, scores_exp), {-2}, false);
+
+                        auto sh_gate = matmul(x_flat, shared_gate_w);
+                        auto sh_up = matmul(x_flat, shared_up_w);
+                        auto sh_act = multiply(multiply(sh_gate, sigmoid(sh_gate)), sh_up);
+                        auto sh_out = matmul(sh_act, shared_down_w);
+                        auto sh_scale = sigmoid(matmul(x_flat, shared_expert_gate_w));
+                        auto y_shared = multiply(sh_out, sh_scale);
+
+                        return {reshape(add(y_routed, y_shared), {B, S, H})};
+                    })
+            });
+            compiled = &entries->back().compiled;
+        }
+
+        auto result = (*compiled)({
+            as_arr(x),
+            as_arr(router_w),
+            as_arr(moe_gate_w),
+            as_arr(moe_up_w),
+            as_arr(moe_down_w),
+            as_arr(shared_gate_w),
+            as_arr(shared_up_w),
+            as_arr(shared_down_w),
+            as_arr(shared_expert_gate_w),
+        });
+        new (dst_out->buf) array(result[0]);
+        pmetal_runtime_clear_error_internal();
+    } catch (const std::exception& e) {
+        pmetal_runtime_set_last_error("compiled_moe_layer_fixed", e.what());
+        bridge_placeholder(dst_out);
+    } catch (...) {
+        pmetal_runtime_set_last_error("compiled_moe_layer_fixed", "unknown C++ exception");
+        bridge_placeholder(dst_out);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Gemma 4 fused decoder layer halves
+// ----------------------------------------------------------------------------
+//
+// Two compiled functions cover the entire Gemma 4 layer except the residual
+// adds and the per-layer scalar multiply (which are 3 cheap element-wise
+// ops left outside to keep the FFI surface narrow):
+//
+//   * `mlx_inline_compiled_gemma4_attn_block`
+//        x → input_layernorm → q/k/v projections (k_eq_v variant supported)
+//          → q_norm / k_norm / v_norm-no-scale
+//          → transpose to [B,H,L,D] → partial RoPE via custom `freqs`
+//          → KV cache update (put_along_axis) → SDPA → o_proj
+//          → post_attention_layernorm
+//        (out, cache_keys', cache_vals')
+//
+//   * `mlx_inline_compiled_gemma4_mlp_block`
+//        x → pre_feedforward_layernorm → gate_proj / up_proj
+//          → tanh-approx GELU → multiply → down_proj → post_feedforward_layernorm
+//        (out)
+//
+// Each call site keeps a list of `Entry` records keyed by shape signature
+// (batch, seq_len, cache_len, n_heads, n_kv, head_dim, k_eq_v, has_freqs),
+// every scalar the trace bakes in (norm epsilons, RoPE base and width), and
+// the quantization signature of every projection, so prefill-vs-decode,
+// sliding-vs-full and 4-bit-vs-8-bit layers, and models that differ in any
+// of those values, each get their own shapeless=false compiled trace.
+//
+// Projections arrive as `mlx_inline_qweight` rather than bare arrays. Each one
+// occupies three input slots (weight, scales, biases) whether or not it is
+// packed, so the traced lambda can index by position while the kernel choice
+// rides in the captured signature. See `qproj_matmul` in bridge_internal.h.
+
+void mlx_inline_compiled_gemma4_attn_block(
+    mlx_inline_array* dst_out,
+    mlx_inline_array* dst_cache_keys,
+    mlx_inline_array* dst_cache_vals,
+    // Wider-than-Qwen3 compiled graph: includes input_layernorm at the
+    // top and post_attention_layernorm at the bottom. Empirically, for
+    // Gemma 4 31B this gives ~15-20% better decode time than the
+    // narrower Qwen3-style variant — the per-op cost of launching two
+    // extra `fast::rms_norm` kernels outside the compile outweighs the
+    // savings from a smaller compile trace.
+    const mlx_inline_array* x,
+    const mlx_inline_array* in_norm_w,
+    const mlx_inline_qweight* q_w,
+    const mlx_inline_qweight* k_w,
+    const mlx_inline_qweight* v_w,         // may be null when use_k_eq_v
+    const mlx_inline_qweight* o_w,
+    const mlx_inline_array* q_norm_w,
+    const mlx_inline_array* k_norm_w,
+    const mlx_inline_array* post_norm_w,
+    const mlx_inline_array* rope_freqs,    // may be null for full rotation
+    const mlx_inline_array* cache_keys_in,
+    const mlx_inline_array* cache_vals_in,
+    int kv_offset,                         // absolute position of the new token(s)
+    int cache_base,                        // absolute position of cache slot 0
+    int n_heads,
+    int n_kv,
+    int head_dim,
+    float in_norm_eps,
+    float qk_norm_eps,
+    float post_norm_eps,
+    int sliding_window,                    // 0 = causal, >0 = sliding window
+    bool use_k_eq_v,
+    float rope_base,                       // ignored when rope_freqs != null
+    int rope_dims                          // = head_dim for partial freqs path
+) {
+    // Everything the trace depends on. A trace is replayed whenever the key
+    // matches, so a value the lambda below bakes in and this omits is replayed
+    // stale for the next caller that differs in it (the norm epsilons, the
+    // RoPE base and the rotated width were left out, and a second model with
+    // the same geometry ran the first one's).
+    struct Key {
+        int batch, seq_len, cache_len, n_heads, n_kv, head_dim, rope_dims;
+        int k_eq_v, has_freqs, sliding_window, dtype;
+        float in_norm_eps, qk_norm_eps, post_norm_eps, rope_base;
+        QProjSig q_sig, k_sig, v_sig, o_sig;
+        bool operator==(const Key&) const = default;
+    };
+    struct Entry {
+        Key key;
+        CompiledFn compiled;
+    };
+    static auto* entries = new std::vector<Entry>();
+
+    try {
+        CompileCacheLock cache_lock;
+        int batch = as_arr(x).shape(0);
+        int seq_len = as_arr(x).shape(1);
+        int cache_len = as_arr(cache_keys_in).shape(2);
+        int dtype = static_cast<int>(as_arr(x).dtype().val());
+        int has_freqs = (rope_freqs != nullptr) ? 1 : 0;
+
+        // Under k_eq_v there is no v_proj at all, and the caller passes q_w in
+        // its slot as a placeholder. Signing it as dense keeps the key stable.
+        QProjSig q_sig = qproj_sig(q_w);
+        QProjSig k_sig = qproj_sig(k_w);
+        QProjSig v_sig = use_k_eq_v ? QProjSig{} : qproj_sig(v_w);
+        QProjSig o_sig = qproj_sig(o_w);
+
+        const Key key{batch, seq_len, cache_len, n_heads, n_kv, head_dim, rope_dims,
+                      static_cast<int>(use_k_eq_v), has_freqs, sliding_window, dtype,
+                      in_norm_eps, qk_norm_eps, post_norm_eps, rope_base,
+                      q_sig, k_sig, v_sig, o_sig};
+        CompiledFn* compiled = nullptr;
+        for (auto& entry : *entries) {
+            if (entry.key == key) {
+                compiled = &entry.compiled;
+                break;
+            }
+        }
+
+        if (compiled == nullptr) {
+            int NH = n_heads;
+            int NKV = n_kv;
+            int HD = head_dim;
+            int RD = rope_dims;
+            int L = cache_len;
+            int SW = sliding_window;
+            bool KEV = use_k_eq_v;
+            bool HAS_FREQS = has_freqs == 1;
+            float INE = in_norm_eps;
+            float QKE = qk_norm_eps;
+            float PNE = post_norm_eps;
+            float RBASE = rope_base;
+            QProjSig QS = q_sig;
+            QProjSig KS = k_sig;
+            QProjSig VS = v_sig;
+            QProjSig OS = o_sig;
+
+            entries->push_back(Entry{
+                key,
+                *make_compiled_fixed(
+                    [NH, NKV, HD, RD, L, SW, KEV, HAS_FREQS, INE, QKE, PNE, RBASE,
+                     QS, KS, VS, OS]
+                    (const std::vector<array>& ins) -> std::vector<array> {
+                        using namespace mlx::core;
+
+                        std::size_t idx = 0;
+                        const array& x = ins[idx++];
+                        const array& in_norm_w = ins[idx++];
+                        const array& q_w = ins[idx++];
+                        const array& q_scales = ins[idx++];
+                        const array& q_biases = ins[idx++];
+                        const array& q_tscale = ins[idx++];
+                        const array& k_w = ins[idx++];
+                        const array& k_scales = ins[idx++];
+                        const array& k_biases = ins[idx++];
+                        const array& k_tscale = ins[idx++];
+                        // v_w is only present when !KEV, but we always pass
+                        // a placeholder to keep the input vector shape stable.
+                        const array& v_w = ins[idx++];
+                        const array& v_scales = ins[idx++];
+                        const array& v_biases = ins[idx++];
+                        const array& v_tscale = ins[idx++];
+                        const array& o_w = ins[idx++];
+                        const array& o_scales = ins[idx++];
+                        const array& o_biases = ins[idx++];
+                        const array& o_tscale = ins[idx++];
+                        const array& q_norm_w = ins[idx++];
+                        const array& k_norm_w = ins[idx++];
+                        const array& post_norm_w = ins[idx++];
+                        const array& rope_freqs_arr = ins[idx++];
+                        const array& cache_keys = ins[idx++];
+                        const array& cache_vals = ins[idx++];
+                        const array& kv_offset_arr = ins[idx++];
+                        const array& cache_base_arr = ins[idx++];
+
+                        int B = x.shape(0);
+                        int S = x.shape(1);
+
+                        // 1. Input layernorm.
+                        auto normed = fast::rms_norm(x, in_norm_w, INE);
+
+                        // 2. Q/K/V projections. A dense weight is expected in
+                        // `[in, out]` form (pre-transposed by the caller at
+                        // load time — matches the qwen3_native pattern, avoids
+                        // per-step strided matmul); a packed one keeps the
+                        // checkpoint's `[out, in]` and transposes in-kernel.
+                        auto q_proj = qproj_matmul(normed, q_w, q_scales, q_biases, q_tscale, QS);
+                        auto k_proj = qproj_matmul(normed, k_w, k_scales, k_biases, k_tscale, KS);
+                        // For attention_k_eq_v full layers, values are taken
+                        // from the *raw* k_proj output BEFORE k_norm — we keep
+                        // a copy here and skip the v_proj matmul.
+                        array v_pre = k_proj;
+                        if (!KEV) {
+                            v_pre = qproj_matmul(normed, v_w, v_scales, v_biases, v_tscale, VS);
+                        }
+
+                        auto q4 = reshape(q_proj, {B, S, NH, HD});
+                        auto k4 = reshape(k_proj, {B, S, NKV, HD});
+                        auto v4 = reshape(v_pre, {B, S, NKV, HD});
+
+                        // 2. Per-head norms. v uses the no-scale variant.
+                        auto q = fast::rms_norm(q4, q_norm_w, QKE);
+                        auto k = fast::rms_norm(k4, k_norm_w, QKE);
+                        auto v = fast::rms_norm(v4, std::nullopt, QKE);
+
+                        // 3. Transpose to [B, H, L, D].
+                        q = transpose(q, {0, 2, 1, 3});
+                        k = transpose(k, {0, 2, 1, 3});
+                        v = transpose(v, {0, 2, 1, 3});
+
+                        // 4. RoPE — partial via custom freqs, or full base.
+                        if (HAS_FREQS) {
+                            q = fast::rope(q, HD, false, std::nullopt, 1.0f,
+                                           kv_offset_arr,
+                                           std::optional<array>(rope_freqs_arr));
+                            k = fast::rope(k, HD, false, std::nullopt, 1.0f,
+                                           kv_offset_arr,
+                                           std::optional<array>(rope_freqs_arr));
+                        } else {
+                            q = fast::rope(q, RD, false,
+                                           std::optional<float>(RBASE), 1.0f,
+                                           kv_offset_arr);
+                            k = fast::rope(k, RD, false,
+                                           std::optional<float>(RBASE), 1.0f,
+                                           kv_offset_arr);
+                        }
+
+                        // 5. KV cache write. For prefill `S > 1` the indices
+                        // must vary per token: position `kv_offset + s` for
+                        // each `s in 0..S`. For decode `S == 1` this
+                        // collapses to a single scalar. Without the
+                        // `arange(S)` term every prefill token would be
+                        // scatter-written to the same slot, clobbering
+                        // earlier positions.
+                        //
+                        // The cache buffer's slot 0 holds absolute position
+                        // `cache_base` (0 for a layer that keeps every key; a
+                        // sliding layer's buffer starts where its window does),
+                        // so the slot is `kv_offset - cache_base + s`.
+                        auto seq_range = reshape(arange(S, int32), {1, 1, S, 1});
+                        auto kv_indices = broadcast_to(
+                            add(seq_range,
+                                reshape(subtract(kv_offset_arr, cache_base_arr),
+                                        {1, 1, 1, 1})),
+                            {B, NKV, S, HD});
+                        auto updated_keys = put_along_axis(cache_keys, kv_indices, k, 2);
+                        auto updated_vals = put_along_axis(cache_vals, kv_indices, v, 2);
+
+                        // 6. Build the attention mask, per query row. A
+                        //    key-only `[1,1,1,L]` mask is right for decode
+                        //    (`S == 1`) and wrong for prefill: with no query
+                        //    axis every prompt token sees every other one,
+                        //    including the ones after it, and the layer runs
+                        //    bidirectionally. Keying it off each query's own
+                        //    absolute position covers both, and collapses to
+                        //    exactly the old mask when `S == 1`.
+                        auto query_pos = add(
+                            reshape(arange(S, int32), {1, 1, S, 1}),
+                            reshape(kv_offset_arr, {1, 1, 1, 1}));
+                        // Slot `j` holds absolute position `cache_base + j`; a
+                        // slot not written yet is past every query.
+                        auto positions = add(
+                            reshape(arange(L, int32), {1, 1, 1, L}),
+                            reshape(cache_base_arr, {1, 1, 1, 1}));
+                        auto valid_mask = less_equal(positions, query_pos);
+                        if (SW > 0) {
+                            auto in_window = greater(
+                                positions, subtract(query_pos, array(SW)));
+                            valid_mask = logical_and(valid_mask, in_window);
+                        }
+
+                        // 7. SDPA (scale=1.0, Gemma 4 bakes scale into weights).
+                        auto output = fast::scaled_dot_product_attention(
+                            q, updated_keys, updated_vals, 1.0f, "", valid_mask);
+                        output = transpose(output, {0, 2, 1, 3});
+                        output = reshape(output, {B, S, NH * HD});
+
+                        // 8. Output projection + post_attention_layernorm.
+                        auto attn_out = qproj_matmul(output, o_w, o_scales, o_biases, o_tscale, OS);
+                        auto post = fast::rms_norm(attn_out, post_norm_w, PNE);
+                        return {post, updated_keys, updated_vals};
+                    })
+            });
+            compiled = &entries->back().compiled;
+        }
+
+        // Build the input vector. We always emit v_w's three slots — when
+        // use_k_eq_v=true the caller passes q_w as a placeholder (the
+        // compiled lambda branches on KEV and ignores them). Same for
+        // rope_freqs: when null the caller passes a 1-element scalar dummy.
+        // This keeps the input vector shape stable across calls.
+        const mlx_inline_qweight* v_input = use_k_eq_v ? q_w : v_w;
+        const array& freqs_input = (rope_freqs != nullptr)
+            ? as_arr(rope_freqs)
+            : qproj_dummy();
+
+        std::vector<array> ins;
+        ins.reserve(25);
+        ins.push_back(as_arr(x));
+        ins.push_back(as_arr(in_norm_w));
+        push_qproj(ins, q_w);
+        push_qproj(ins, k_w);
+        push_qproj(ins, v_input);
+        push_qproj(ins, o_w);
+        ins.push_back(as_arr(q_norm_w));
+        ins.push_back(as_arr(k_norm_w));
+        ins.push_back(as_arr(post_norm_w));
+        ins.push_back(freqs_input);
+        ins.push_back(as_arr(cache_keys_in));
+        ins.push_back(as_arr(cache_vals_in));
+        ins.push_back(array(kv_offset));
+        ins.push_back(array(cache_base));
+
+        auto result = (*compiled)(ins);
+        new (dst_out->buf) array(result[0]);
+        new (dst_cache_keys->buf) array(result[1]);
+        new (dst_cache_vals->buf) array(result[2]);
+        pmetal_runtime_clear_error_internal();
+    } catch (const std::exception& e) {
+        pmetal_runtime_set_last_error("compiled_gemma4_attn_block", e.what());
+        bridge_placeholder(dst_out);
+        bridge_placeholder(dst_cache_keys);
+        bridge_placeholder(dst_cache_vals);
+    } catch (...) {
+        pmetal_runtime_set_last_error("compiled_gemma4_attn_block", "unknown C++ exception");
+        bridge_placeholder(dst_out);
+        bridge_placeholder(dst_cache_keys);
+        bridge_placeholder(dst_cache_vals);
+    }
+}
+
+void mlx_inline_compiled_gemma4_shared_attn_decode(
+    mlx_inline_array* dst_out,
+    const mlx_inline_array* x,
+    const mlx_inline_array* in_norm_w,
+    const mlx_inline_qweight* q_w,
+    const mlx_inline_qweight* o_w,
+    const mlx_inline_array* q_norm_w,
+    const mlx_inline_array* post_norm_w,
+    const mlx_inline_array* rope_freqs,
+    const mlx_inline_array* cache_keys_in,
+    const mlx_inline_array* cache_vals_in,
+    int valid_kv_len,                      // absolute count of tokens the source cache holds
+    int rope_offset,
+    int cache_base,                        // absolute position of cache slot 0
+    int n_heads,
+    int n_kv,
+    int head_dim,
+    float in_norm_eps,
+    float q_norm_eps,
+    float post_norm_eps,
+    int sliding_window,
+    float rope_base,
+    int rope_dims
+) {
+    // Everything the trace depends on (see `mlx_inline_compiled_gemma4_attn_block`).
+    struct Key {
+        int batch, seq_len, cache_len, n_heads, n_kv, head_dim, rope_dims;
+        int has_freqs, sliding_window, dtype;
+        float in_norm_eps, q_norm_eps, post_norm_eps, rope_base;
+        QProjSig q_sig, o_sig;
+        bool operator==(const Key&) const = default;
+    };
+    struct Entry {
+        Key key;
+        CompiledFn compiled;
+    };
+    static auto* entries = new std::vector<Entry>();
+
+    try {
+        CompileCacheLock cache_lock;
+        int batch = as_arr(x).shape(0);
+        int seq_len = as_arr(x).shape(1);
+        int cache_len = as_arr(cache_keys_in).shape(2);
+        int dtype = static_cast<int>(as_arr(x).dtype().val());
+        int has_freqs = (rope_freqs != nullptr) ? 1 : 0;
+        QProjSig q_sig = qproj_sig(q_w);
+        QProjSig o_sig = qproj_sig(o_w);
+
+        const Key key{batch, seq_len, cache_len, n_heads, n_kv, head_dim, rope_dims,
+                      has_freqs, sliding_window, dtype,
+                      in_norm_eps, q_norm_eps, post_norm_eps, rope_base,
+                      q_sig, o_sig};
+        CompiledFn* compiled = nullptr;
+        for (auto& entry : *entries) {
+            if (entry.key == key) {
+                compiled = &entry.compiled;
+                break;
+            }
+        }
+
+        if (compiled == nullptr) {
+            int NH = n_heads;
+            int NKV = n_kv;
+            int HD = head_dim;
+            int RD = rope_dims;
+            int L = cache_len;
+            int SW = sliding_window;
+            bool HAS_FREQS = has_freqs == 1;
+            float INE = in_norm_eps;
+            float QNE = q_norm_eps;
+            float PNE = post_norm_eps;
+            float RBASE = rope_base;
+            QProjSig QS = q_sig;
+            QProjSig OS = o_sig;
+
+            entries->push_back(Entry{
+                key,
+                *make_compiled_fixed(
+                    [NH, NKV, HD, RD, L, SW, HAS_FREQS, INE, QNE, PNE, RBASE, QS, OS]
+                    (const std::vector<array>& ins) -> std::vector<array> {
+                        using namespace mlx::core;
+
+                        std::size_t idx = 0;
+                        const array& x = ins[idx++];
+                        const array& in_norm_w = ins[idx++];
+                        const array& q_w = ins[idx++];
+                        const array& q_scales = ins[idx++];
+                        const array& q_biases = ins[idx++];
+                        const array& q_tscale = ins[idx++];
+                        const array& o_w = ins[idx++];
+                        const array& o_scales = ins[idx++];
+                        const array& o_biases = ins[idx++];
+                        const array& o_tscale = ins[idx++];
+                        const array& q_norm_w = ins[idx++];
+                        const array& post_norm_w = ins[idx++];
+                        const array& rope_freqs_arr = ins[idx++];
+                        const array& cache_keys = ins[idx++];
+                        const array& cache_vals = ins[idx++];
+                        const array& valid_kv_len_arr = ins[idx++];
+                        const array& rope_offset_arr = ins[idx++];
+                        const array& cache_base_arr = ins[idx++];
+
+                        int B = x.shape(0);
+                        int S = x.shape(1);
+
+                        auto normed = fast::rms_norm(x, in_norm_w, INE);
+                        auto q_proj = qproj_matmul(normed, q_w, q_scales, q_biases, q_tscale, QS);
+                        auto q = reshape(q_proj, {B, S, NH, HD});
+                        q = fast::rms_norm(q, q_norm_w, QNE);
+                        q = transpose(q, {0, 2, 1, 3});
+
+                        if (HAS_FREQS) {
+                            q = fast::rope(q, HD, false, std::nullopt, 1.0f,
+                                           rope_offset_arr,
+                                           std::optional<array>(rope_freqs_arr));
+                        } else {
+                            q = fast::rope(q, RD, false,
+                                           std::optional<float>(RBASE), 1.0f,
+                                           rope_offset_arr);
+                        }
+
+                        // Slot `j` holds absolute position `cache_base + j`.
+                        auto positions = add(
+                            reshape(arange(L, int32), {1, 1, 1, L}),
+                            reshape(cache_base_arr, {1, 1, 1, 1}));
+                        auto valid_mask = less(
+                            positions, reshape(valid_kv_len_arr, {1, 1, 1, 1}));
+                        if (SW > 0) {
+                            auto window_start = subtract(valid_kv_len_arr, array(SW));
+                            auto in_window = greater_equal(
+                                positions,
+                                reshape(window_start, {1, 1, 1, 1}));
+                            valid_mask = logical_and(valid_mask, in_window);
+                        }
+
+                        auto output = fast::scaled_dot_product_attention(
+                            q, cache_keys, cache_vals, 1.0f, "", valid_mask);
+                        output = transpose(output, {0, 2, 1, 3});
+                        output = reshape(output, {B, S, NH * HD});
+
+                        auto attn_out = qproj_matmul(output, o_w, o_scales, o_biases, o_tscale, OS);
+                        auto post = fast::rms_norm(attn_out, post_norm_w, PNE);
+                        return {post};
+                    })
+            });
+            compiled = &entries->back().compiled;
+        }
+
+        const array& freqs_input = (rope_freqs != nullptr)
+            ? as_arr(rope_freqs)
+            : qproj_dummy();
+
+        std::vector<array> ins;
+        ins.reserve(17);
+        ins.push_back(as_arr(x));
+        ins.push_back(as_arr(in_norm_w));
+        push_qproj(ins, q_w);
+        push_qproj(ins, o_w);
+        ins.push_back(as_arr(q_norm_w));
+        ins.push_back(as_arr(post_norm_w));
+        ins.push_back(freqs_input);
+        ins.push_back(as_arr(cache_keys_in));
+        ins.push_back(as_arr(cache_vals_in));
+        ins.push_back(array(valid_kv_len));
+        ins.push_back(array(rope_offset));
+        ins.push_back(array(cache_base));
+
+        auto result = (*compiled)(ins);
+        new (dst_out->buf) array(result[0]);
+        pmetal_runtime_clear_error_internal();
+    } catch (const std::exception& e) {
+        pmetal_runtime_set_last_error("compiled_gemma4_shared_attn_decode", e.what());
+        bridge_placeholder(dst_out);
+    } catch (...) {
+        pmetal_runtime_set_last_error("compiled_gemma4_shared_attn_decode", "unknown C++ exception");
+        bridge_placeholder(dst_out);
+    }
+}
+
+void mlx_inline_compiled_gemma4_mlp_block(
+    mlx_inline_array* dst_out,
+    const mlx_inline_array* x,
+    const mlx_inline_array* pre_norm_w,
+    const mlx_inline_qweight* gate_w,
+    const mlx_inline_qweight* up_w,
+    const mlx_inline_qweight* down_w,
+    const mlx_inline_array* post_norm_w,
+    float pre_norm_eps,
+    float post_norm_eps
+) {
+    // Everything the trace depends on (see `mlx_inline_compiled_gemma4_attn_block`).
+    struct Key {
+        int batch, seq_len, hidden, intermediate, dtype;
+        float pre_norm_eps, post_norm_eps;
+        QProjSig gate_sig, up_sig, down_sig;
+        bool operator==(const Key&) const = default;
+    };
+    struct Entry {
+        Key key;
+        CompiledFn compiled;
+    };
+    static auto* entries = new std::vector<Entry>();
+
+    try {
+        CompileCacheLock cache_lock;
+        int batch = as_arr(x).shape(0);
+        int seq_len = as_arr(x).shape(1);
+        int hidden = as_arr(x).shape(2);
+        int intermediate = qproj_out_dim(gate_w);
+        int dtype = static_cast<int>(as_arr(x).dtype().val());
+        QProjSig gate_sig = qproj_sig(gate_w);
+        QProjSig up_sig = qproj_sig(up_w);
+        QProjSig down_sig = qproj_sig(down_w);
+
+        const Key key{batch, seq_len, hidden, intermediate, dtype,
+                      pre_norm_eps, post_norm_eps, gate_sig, up_sig, down_sig};
+        CompiledFn* compiled = nullptr;
+        for (auto& entry : *entries) {
+            if (entry.key == key) {
+                compiled = &entry.compiled;
+                break;
+            }
+        }
+
+        if (compiled == nullptr) {
+            float PRE = pre_norm_eps;
+            float POST = post_norm_eps;
+            QProjSig GS = gate_sig;
+            QProjSig US = up_sig;
+            QProjSig DS = down_sig;
+            entries->push_back(Entry{
+                key,
+                *make_compiled_fixed(
+                    [PRE, POST, GS, US, DS](const std::vector<array>& ins) -> std::vector<array> {
+                        using namespace mlx::core;
+                        std::size_t idx = 0;
+                        const array& x = ins[idx++];
+                        const array& pre_w = ins[idx++];
+                        const array& gate_w = ins[idx++];
+                        const array& gate_scales = ins[idx++];
+                        const array& gate_biases = ins[idx++];
+                        const array& gate_tscale = ins[idx++];
+                        const array& up_w = ins[idx++];
+                        const array& up_scales = ins[idx++];
+                        const array& up_biases = ins[idx++];
+                        const array& up_tscale = ins[idx++];
+                        const array& down_w = ins[idx++];
+                        const array& down_scales = ins[idx++];
+                        const array& down_biases = ins[idx++];
+                        const array& down_tscale = ins[idx++];
+                        const array& post_w = ins[idx++];
+
+                        // pre_feedforward_layernorm.
+                        auto h = fast::rms_norm(x, pre_w, PRE);
+
+                        // Tanh-approx GELU on gate_proj output, multiply by
+                        // up_proj output. Matches the reference `geglu(gate, x) =
+                        // nn.gelu_approx(gate) * x` (sqrt(2/pi)·(g + 0.044715·g^3)).
+                        auto gate = qproj_matmul(h, gate_w, gate_scales, gate_biases, gate_tscale, GS);
+                        auto up = qproj_matmul(h, up_w, up_scales, up_biases, up_tscale, US);
+
+                        // Scalars MUST be cast to gate.dtype() or bf16
+                        // inputs silently promote to f32, forcing every
+                        // downstream matmul to rematerialize its weights
+                        // in f32 per-op. Same fix as fused_geglu_tanh.
+                        auto dt = gate.dtype();
+                        auto half = astype(array(0.5f), dt);
+                        auto one = astype(array(1.0f), dt);
+                        auto sqrt2_pi = astype(array(0.7978845608f), dt);
+                        auto coef = astype(array(0.044715f), dt);
+                        auto gate3 = multiply(multiply(gate, gate), gate);
+                        auto inner = add(gate, multiply(coef, gate3));
+                        auto t = tanh(multiply(sqrt2_pi, inner));
+                        auto gelu_g = multiply(half, multiply(gate, add(one, t)));
+
+                        auto activated = multiply(gelu_g, up);
+                        auto down = qproj_matmul(activated, down_w, down_scales, down_biases, down_tscale, DS);
+                        // post_feedforward_layernorm.
+                        auto post = fast::rms_norm(down, post_w, POST);
+                        return {post};
+                    })
+            });
+            compiled = &entries->back().compiled;
+        }
+
+        std::vector<array> ins;
+        ins.reserve(15);
+        ins.push_back(as_arr(x));
+        ins.push_back(as_arr(pre_norm_w));
+        push_qproj(ins, gate_w);
+        push_qproj(ins, up_w);
+        push_qproj(ins, down_w);
+        ins.push_back(as_arr(post_norm_w));
+
+        auto result = (*compiled)(ins);
+        new (dst_out->buf) array(result[0]);
+        pmetal_runtime_clear_error_internal();
+    } catch (const std::exception& e) {
+        pmetal_runtime_set_last_error("compiled_gemma4_mlp_block", e.what());
+        bridge_placeholder(dst_out);
+    } catch (...) {
+        pmetal_runtime_set_last_error("compiled_gemma4_mlp_block", "unknown C++ exception");
+        bridge_placeholder(dst_out);
+    }
+}
+
+void mlx_inline_compiled_gemma4_per_layer_input_block(
+    mlx_inline_array* dst_out,
+    const mlx_inline_array* x,
+    const mlx_inline_array* layer_input,
+    const mlx_inline_qweight* gate_w,
+    const mlx_inline_qweight* projection_w,
+    const mlx_inline_array* post_norm_w,
+    float post_norm_eps
+) {
+    // Everything the trace depends on (see `mlx_inline_compiled_gemma4_attn_block`).
+    struct Key {
+        int batch, seq_len, hidden, per_layer_hidden, dtype;
+        float post_norm_eps;
+        QProjSig gate_sig, projection_sig;
+        bool operator==(const Key&) const = default;
+    };
+    struct Entry {
+        Key key;
+        CompiledFn compiled;
+    };
+    static auto* entries = new std::vector<Entry>();
+
+    try {
+        CompileCacheLock cache_lock;
+        int batch = as_arr(x).shape(0);
+        int seq_len = as_arr(x).shape(1);
+        int hidden = as_arr(x).shape(2);
+        int per_layer_hidden = as_arr(layer_input).shape(2);
+        int dtype = static_cast<int>(as_arr(x).dtype().val());
+        QProjSig gate_sig = qproj_sig(gate_w);
+        QProjSig projection_sig = qproj_sig(projection_w);
+
+        const Key key{batch, seq_len, hidden, per_layer_hidden, dtype,
+                      post_norm_eps, gate_sig, projection_sig};
+        CompiledFn* compiled = nullptr;
+        for (auto& entry : *entries) {
+            if (entry.key == key) {
+                compiled = &entry.compiled;
+                break;
+            }
+        }
+
+        if (compiled == nullptr) {
+            float POST = post_norm_eps;
+            QProjSig GS = gate_sig;
+            QProjSig PS = projection_sig;
+            entries->push_back(Entry{
+                key,
+                *make_compiled_fixed(
+                    [POST, GS, PS](const std::vector<array>& ins) -> std::vector<array> {
+                        using namespace mlx::core;
+                        std::size_t idx = 0;
+                        const array& x = ins[idx++];
+                        const array& layer_input = ins[idx++];
+                        const array& gate_w = ins[idx++];
+                        const array& gate_scales = ins[idx++];
+                        const array& gate_biases = ins[idx++];
+                        const array& gate_tscale = ins[idx++];
+                        const array& projection_w = ins[idx++];
+                        const array& projection_scales = ins[idx++];
+                        const array& projection_biases = ins[idx++];
+                        const array& projection_tscale = ins[idx++];
+                        const array& post_norm_w = ins[idx++];
+
+                        auto gate = qproj_matmul(x, gate_w, gate_scales, gate_biases, gate_tscale, GS);
+
+                        auto dt = gate.dtype();
+                        auto half = astype(array(0.5f), dt);
+                        auto one = astype(array(1.0f), dt);
+                        auto sqrt2_pi = astype(array(0.7978845608f), dt);
+                        auto coef = astype(array(0.044715f), dt);
+                        auto gate3 = multiply(multiply(gate, gate), gate);
+                        auto inner = add(gate, multiply(coef, gate3));
+                        auto t = tanh(multiply(sqrt2_pi, inner));
+                        auto gelu_g = multiply(half, multiply(gate, add(one, t)));
+
+                        auto mixed = multiply(gelu_g, layer_input);
+                        auto projected = qproj_matmul(mixed, projection_w, projection_scales, projection_biases, projection_tscale, PS);
+                        auto post = fast::rms_norm(projected, post_norm_w, POST);
+                        return {add(x, post)};
+                    })
+            });
+            compiled = &entries->back().compiled;
+        }
+
+        std::vector<array> ins;
+        ins.reserve(11);
+        ins.push_back(as_arr(x));
+        ins.push_back(as_arr(layer_input));
+        push_qproj(ins, gate_w);
+        push_qproj(ins, projection_w);
+        ins.push_back(as_arr(post_norm_w));
+
+        auto result = (*compiled)(ins);
+        new (dst_out->buf) array(result[0]);
+        pmetal_runtime_clear_error_internal();
+    } catch (const std::exception& e) {
+        pmetal_runtime_set_last_error("compiled_gemma4_per_layer_input_block", e.what());
+        bridge_placeholder(dst_out);
+    } catch (...) {
+        pmetal_runtime_set_last_error("compiled_gemma4_per_layer_input_block", "unknown C++ exception");
+        bridge_placeholder(dst_out);
+    }
+}
+
+} // extern "C"
+
+// ============================================================================
+// Generic mlx::core::compile() wrapper — see bridge.h for the ABI docs.
+// ============================================================================
+//
+// Each `RuntimeCompiledHandle` owns one compiled closure; the `CompileCtx`
+// member holds the Rust callback + ctx + max output count, and the
+// lambda captured by `mlx::core::compile()` dereferences through a
+// stable pointer into that member. Because the handle is heap-allocated
+// and never moved, the captured pointer stays valid for the life of the
+// handle.
+
+struct CompileCtx {
+    mlx_rust_compile_forward_fn fn;
+    void* ctx;
+    int n_outputs_max;
+};
+
+struct RuntimeCompiledHandle {
+    CompiledFn fn;
+    CompileCtx cctx;
+};
+
+// Trampoline: MLX gives us a std::vector<array>; we wrap each as an
+// inline buffer, hand control to Rust, then collect the Rust-populated
+// outputs back into a std::vector<array>.
+//
+// Rust gets a borrowed InlineArray per input, whose placement-new'd array is
+// destroyed on the way out (`CallbackInputs`), and `n_outputs_max`
+// uninitialised slots to placement-new its results into (`CallbackOutputs`).
+static std::vector<array> rust_compile_trampoline(
+    const std::vector<array>& inputs,
+    const CompileCtx* cctx
+) {
+    CallbackInputs in(inputs);
+    CallbackOutputs out(cctx->n_outputs_max);
+
+    int n_out = 0;
+    const int status = cctx->fn(
+        in.data(), in.size(), out.data(), out.capacity(), &n_out, cctx->ctx);
+    if (status == 2) {
+        // The closure made more arrays than there are slots; `n_out` says how
+        // many, and Rust wrote none of them.
+        throw std::invalid_argument(
+            "the compiled closure returned " + std::to_string(n_out)
+            + " arrays but n_outputs_max is " + std::to_string(out.capacity()));
+    }
+    if (status != 0) {
+        throw RustCallbackPanicked();
+    }
+    n_out = std::max(0, std::min(n_out, out.capacity()));
+    out.adopt(n_out);
+
+    std::vector<array> results;
+    results.reserve(static_cast<size_t>(n_out));
+    for (int i = 0; i < n_out; ++i) {
+        results.push_back(out[i]);
+    }
+    return results;
+}
+
+extern "C" {
+
+void* mlx_inline_compile_make(
+    mlx_rust_compile_forward_fn fn,
+    void* ctx,
+    int n_outputs_max,
+    bool shapeless
+) {
+    if (n_outputs_max <= 0) {
+        pmetal_runtime_set_last_error("compile_make", "n_outputs_max must be > 0");
+        return nullptr;
+    }
+    try {
+        auto* handle = new RuntimeCompiledHandle;
+        handle->cctx = CompileCtx{fn, ctx, n_outputs_max};
+        // Capture a pointer to the handle's own cctx member; it stays
+        // alive for as long as the handle (heap-allocated, never moved).
+        CompileCtx* cctx_ptr = &handle->cctx;
+        auto lambda = [cctx_ptr](const std::vector<array>& inputs) -> std::vector<array> {
+            return rust_compile_trampoline(inputs, cctx_ptr);
+        };
+        handle->fn = mlx::core::compile(std::move(lambda), shapeless);
+        pmetal_runtime_clear_error_internal();
+        return handle;
+    } catch (const std::exception& e) {
+        pmetal_runtime_set_last_error("compile_make", e.what());
+        return nullptr;
+    } catch (...) {
+        pmetal_runtime_set_last_error("compile_make", "unknown C++ exception");
+        return nullptr;
+    }
+}
+
+int mlx_inline_compile_call(
+    void* compiled_handle,
+    const mlx_inline_array* const* inputs,
+    int n_inputs,
+    mlx_inline_array* outputs,
+    int n_outputs_max,
+    int* n_outputs_written
+) {
+    if (!compiled_handle) {
+        pmetal_runtime_set_last_error("compile_call", "null handle");
+        if (n_outputs_written) *n_outputs_written = 0;
+        return -1;
+    }
+    try {
+        CompileCacheLock cache_lock;
+        auto* h = static_cast<RuntimeCompiledHandle*>(compiled_handle);
+
+        std::vector<array> input_arrs;
+        input_arrs.reserve(static_cast<size_t>(std::max(0, n_inputs)));
+        for (int i = 0; i < n_inputs; ++i) {
+            input_arrs.push_back(as_arr(inputs[i]));
+        }
+
+        auto results = h->fn(input_arrs);
+
+        if (static_cast<int>(results.size()) > n_outputs_max) {
+            throw std::invalid_argument(
+                "the compiled closure returned " + std::to_string(results.size())
+                + " arrays but n_outputs_max is " + std::to_string(n_outputs_max));
+        }
+        const int n = static_cast<int>(results.size());
+        for (int i = 0; i < n; ++i) {
+            new (outputs[i].buf) array(std::move(results[i]));
+        }
+        if (n_outputs_written) *n_outputs_written = n;
+        pmetal_runtime_clear_error_internal();
+        return 0;
+    } catch (const std::exception& e) {
+        pmetal_runtime_set_last_error("compile_call", e.what());
+        if (n_outputs_written) *n_outputs_written = 0;
+        return -1;
+    } catch (...) {
+        pmetal_runtime_set_last_error("compile_call", "unknown C++ exception");
+        if (n_outputs_written) *n_outputs_written = 0;
+        return -1;
+    }
+}
+
+void mlx_inline_compile_free(void* compiled_handle) {
+    if (compiled_handle) {
+        // Destroying the closure erases its entries from MLX's compile cache.
+        CompileCacheLock cache_lock;
+        delete static_cast<RuntimeCompiledHandle*>(compiled_handle);
+    }
+}
+
+} // extern "C"
+
+// ============================================================================
+// Full Qwen3.5 forward pass — single C++ function, low FFI overhead.
+//
+// The entire forward pass (embedding, all N layers, final norm, lm_head) runs
+// here as pure C++ MLX ops.  No Rust stack frame is entered between ops;
+// intermediate arrays are C++ locals, never placement-new'd through the FFI
+// bridge.  This eliminates ~1800 Rust<->C++ FFI round trips per decode step.
+//
+// Important: this path still rebuilds the MLX graph on every token. It is not
+// a traced or tape-replayed whole-model decode session.
+// ============================================================================

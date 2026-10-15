@@ -6,8 +6,8 @@
 //! the AdamW optimizer step are correctly wired through the full-parameter
 //! path without LoRA or any dataset plumbing.
 
-use pmetal_bridge::compat::{Dtype, random};
 use pmetal_models::architectures::{GptOssConfig, GptOssForCausalLM};
+use pmetal_runtime::compat::{Dtype, random};
 use pmetal_trainer::pretrain::{PretrainConfig, run_pretrain};
 use serial_test::serial;
 

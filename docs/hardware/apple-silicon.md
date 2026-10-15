@@ -62,7 +62,7 @@ M5 (Apple10, arch gen 17) introduces Neural Accelerator units within GPU cores f
 - Quantized inference (FP4/FP8)
 - Scaled dot-product attention
 
-Accessed via Metal 4.0 (`-std=metal4.0`) kernels. NAX availability is checked via `DeviceProperties::has_nax()`. PMetal currently ships the Metal 4 dispatcher, NAX-capable hardware detection, persisted Apple10/M5 MPP dispatch tuning across `32×32`, `64×32`, `32×64`, and `64×64` threadgroup variants, and persisted runtime selection between MLX fast SDPA, Metal FlashAttention, and MPP FlashAttention for supported no-custom-mask `head_dim = 64`, `80`, `96`, and `128` inference shapes, including softcapped configs. Remaining work is to track upstream MLX NAX API changes and keep `pmetal-bridge` bindings current.
+Accessed via Metal 4.0 (`-std=metal4.0`) kernels. NAX availability is checked via `DeviceProperties::has_nax()`. PMetal currently ships the Metal 4 dispatcher, NAX-capable hardware detection, persisted Apple10/M5 MPP dispatch tuning across `32×32`, `64×32`, `32×64`, and `64×64` threadgroup variants, and persisted runtime selection between MLX fast SDPA, Metal FlashAttention, and MPP FlashAttention for supported no-custom-mask `head_dim = 64`, `80`, `96`, and `128` inference shapes, including softcapped configs. Remaining work is to track upstream MLX NAX API changes and keep `pmetal-runtime` bindings current.
 
 ## ANE (Apple Neural Engine)
 

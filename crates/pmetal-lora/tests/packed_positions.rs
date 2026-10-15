@@ -10,10 +10,10 @@
 //! the same loss, and produces an adapter trained on positions the model will
 //! never see at inference.
 
-use pmetal_bridge::compat::Array;
 use pmetal_core::LoraConfig;
 use pmetal_lora::{AdaptedModel, TrainableModel};
 use pmetal_models::dispatcher::DynamicModel;
+use pmetal_runtime::compat::Array;
 
 const CASES: &[(&str, &str)] = &[
     (

@@ -26,7 +26,7 @@
 
 use super::{DistillLoss, SPARSE_TOPK_DEFAULT, align_vocab_with_k};
 use crate::Result;
-use pmetal_bridge::compat::{Array, ops};
+use pmetal_runtime::compat::{Array, ops};
 
 /// Reverse-KL distillation with optional teacher mixing.
 pub struct MiniLlmLoss {

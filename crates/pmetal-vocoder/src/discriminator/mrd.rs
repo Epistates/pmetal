@@ -7,7 +7,7 @@ use super::DiscriminatorOutput;
 use crate::audio::{StftConfig, stft};
 use crate::error::Result;
 use crate::nn::WeightNormConv1d;
-use pmetal_bridge::compat::{Array, nn};
+use pmetal_runtime::compat::{Array, nn};
 
 /// Multi-Resolution Discriminator.
 ///

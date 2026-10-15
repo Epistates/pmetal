@@ -5,20 +5,20 @@ use super::init::{apply_depth_scaled_init, zero_biases};
 use super::loss::causal_lm_loss;
 use super::{CausalLm, PretrainConfig, PretrainError};
 
-use pmetal_bridge::compat::{
+use pmetal_core::LearningRateScheduler;
+use pmetal_data::streaming::StreamPosition;
+use pmetal_runtime::compat::{
     Array, Exception,
     module::FlattenedModuleParam,
     nn::value_and_grad,
     optimizers::{AdamW, AdamWBuilder, Optimizer},
 };
-use pmetal_core::LearningRateScheduler;
-use pmetal_data::streaming::StreamPosition;
 
 fn clip_grad_norm(
     mut grads: FlattenedModuleParam,
     max_norm: f32,
 ) -> Result<FlattenedModuleParam, Exception> {
-    pmetal_bridge::training::clip_grad_norm_map(&mut grads, max_norm);
+    pmetal_runtime::training::clip_grad_norm_map(&mut grads, max_norm);
     Ok(grads)
 }
 

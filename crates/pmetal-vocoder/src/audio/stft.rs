@@ -1,7 +1,7 @@
 //! Short-Time Fourier Transform (STFT) implementation using MLX.
 
 use crate::error::Result;
-use pmetal_bridge::compat::{Array, fft, ops};
+use pmetal_runtime::compat::{Array, fft, ops};
 
 /// STFT configuration.
 #[derive(Debug, Clone)]

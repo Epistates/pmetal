@@ -13,11 +13,11 @@
 mod common;
 
 use common::{fixture_path, load_shard, ref_tensor};
-use pmetal_bridge::compat::{Array, ops::slice_axis};
 use pmetal_mlx::speculative::SpecCapture;
 use pmetal_mlx::test_utils::{ParityReport, Tolerance};
 use pmetal_models::dflash_decoder::DFlashTarget;
 use pmetal_models::dflash_native_target::NativeQwen3Target;
+use pmetal_runtime::compat::{Array, ops::slice_axis};
 use serial_test::serial;
 
 const PROMPT: i32 = 20;
@@ -47,7 +47,7 @@ fn checkpoint() -> Checkpoint {
 }
 
 fn drain(op: &str) {
-    pmetal_bridge::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
+    pmetal_runtime::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
 }
 
 fn forward(target: &mut NativeQwen3Target, ids: &Array) -> Array {

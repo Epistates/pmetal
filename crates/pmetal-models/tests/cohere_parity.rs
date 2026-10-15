@@ -19,10 +19,10 @@ mod common;
 
 use common::{fixture_path, load_shard, ref_tensor};
 
-use pmetal_bridge::compat::{Array, Module};
 use pmetal_mlx::test_utils::{
     ParityReport, Tolerance, argmax_last_axis, print_report_table, to_f32_vec_eval,
 };
+use pmetal_runtime::compat::{Array, Module};
 
 use pmetal_models::architectures::cohere::{CohereConfig, CohereForCausalLM};
 use pmetal_models::loader::load_generic_weights;

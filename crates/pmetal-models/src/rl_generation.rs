@@ -30,7 +30,7 @@
 //! 3. **Early Exit Masking**: Skip computation for finished sequences
 //! 4. **Async Pipelining**: Overlap sampling with next forward pass
 //! 5. **Speculative Decoding**: Layer-split draft/verify for 2-4x generation speedup
-use pmetal_bridge::compat::{Array, Exception, ops};
+use pmetal_runtime::compat::{Array, Exception, ops};
 
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_mlx::prefix_cache::PrefixCachedGenerator;
@@ -332,7 +332,7 @@ impl BatchedRlGenerator {
                 // Sample the first token from the last prompt position:
                 // logits [1, L, V] -> [1, V].
                 let last_logits =
-                    pmetal_bridge::compat::ops::select_axis(&logits, prompt_len as i32 - 1, 1);
+                    pmetal_runtime::compat::ops::select_axis(&logits, prompt_len as i32 - 1, 1);
                 let token = self.sample(&last_logits)?;
                 current_tokens[seq_idx] = token;
                 sequences[seq_idx].push(token);
@@ -374,7 +374,7 @@ impl BatchedRlGenerator {
                 logits.eval();
 
                 // Sample the next token: logits [1, 1, V] -> [1, V].
-                let last_logits = pmetal_bridge::compat::ops::select_axis(&logits, 0, 1);
+                let last_logits = pmetal_runtime::compat::ops::select_axis(&logits, 0, 1);
                 let token = self.sample(&last_logits)?;
                 current_tokens[seq_idx] = token;
                 sequences[seq_idx].push(token);
@@ -496,7 +496,7 @@ impl BatchedRlGenerator {
 
             // Sample the first token from the last prompt position.
             let last_logits =
-                pmetal_bridge::compat::ops::select_axis(&logits, prompt_len as i32 - 1, 1);
+                pmetal_runtime::compat::ops::select_axis(&logits, prompt_len as i32 - 1, 1);
             let token = self.sample(&last_logits)?;
             last_tokens[seq_idx] = token;
             sequences[seq_idx].push(token);
@@ -556,8 +556,8 @@ impl BatchedRlGenerator {
                 let mut draft_tokens: Vec<u32> = Vec::with_capacity(k);
                 let mut draft_current = {
                     // seed_logits: [1, 1, vocab] -> select batch 0 -> [1, vocab] -> select seq 0 -> [vocab]
-                    let row = pmetal_bridge::compat::ops::select_axis(
-                        &pmetal_bridge::compat::ops::select_axis(&seed_logits, 0, 0),
+                    let row = pmetal_runtime::compat::ops::select_axis(
+                        &pmetal_runtime::compat::ops::select_axis(&seed_logits, 0, 0),
                         0,
                         0,
                     );
@@ -569,8 +569,8 @@ impl BatchedRlGenerator {
                     let input = Array::from_slice(&[draft_current as i32], &[1, 1]);
                     let logits = draft_fn(&input, &mut draft_caches[seq_idx])?;
                     logits.eval();
-                    let row = pmetal_bridge::compat::ops::select_axis(
-                        &pmetal_bridge::compat::ops::select_axis(&logits, 0, 0),
+                    let row = pmetal_runtime::compat::ops::select_axis(
+                        &pmetal_runtime::compat::ops::select_axis(&logits, 0, 0),
                         0,
                         0,
                     );
@@ -605,9 +605,9 @@ impl BatchedRlGenerator {
                 let mut n_accepted_draft: usize = 0;
 
                 // Remove batch dim once: verify_logits [1, k+1, vocab] -> [k+1, vocab]
-                let vl_no_batch = pmetal_bridge::compat::ops::select_axis(&verify_logits, 0, 0);
+                let vl_no_batch = pmetal_runtime::compat::ops::select_axis(&verify_logits, 0, 0);
                 for (i, &draft_tok) in draft_tokens.iter().enumerate() {
-                    let row = pmetal_bridge::compat::ops::select_axis(&vl_no_batch, i as i32, 0);
+                    let row = pmetal_runtime::compat::ops::select_axis(&vl_no_batch, i as i32, 0);
                     let verifier_tok = greedy_argmax_1d(&row);
 
                     if verifier_tok == draft_tok {
@@ -631,7 +631,7 @@ impl BatchedRlGenerator {
                 // use deterministic verification to keep accept/reject semantics clean.
                 if n_accepted_draft == k {
                     let bonus_row =
-                        pmetal_bridge::compat::ops::select_axis(&vl_no_batch, k as i32, 0);
+                        pmetal_runtime::compat::ops::select_axis(&vl_no_batch, k as i32, 0);
                     let bonus_tok = greedy_argmax_1d(&bonus_row);
                     accepted_tokens.push(bonus_tok);
                 }
@@ -782,7 +782,7 @@ impl BatchedRlGenerator {
 /// Used inside `generate_speculative` for draft sampling and accept/reject
 /// decisions.  The caller must have already called `.eval()` on `row`.
 fn greedy_argmax_1d(row: &Array) -> u32 {
-    use pmetal_bridge::compat::indexing::argmax;
+    use pmetal_runtime::compat::indexing::argmax;
     let idx = argmax(row);
     idx.item::<u32>()
 }
@@ -892,7 +892,7 @@ mod tests {
         };
         let mut generator = BatchedRlGenerator::new(config, create_test_kv_config());
         let out = generator.generate(counting_model, &[2, 3, 4]).unwrap();
-        pmetal_bridge::check_unobserved_error().unwrap();
+        pmetal_runtime::check_unobserved_error().unwrap();
         for (seq, n) in out.token_ids.iter().zip(&out.num_generated) {
             // The first token comes from the last prompt position, every later
             // one from the token before it, and exactly max_new_tokens are made.
@@ -930,7 +930,7 @@ mod tests {
         let out = generator
             .generate_speculative(counting_model, counting_model, &[1, 2])
             .unwrap();
-        pmetal_bridge::check_unobserved_error().unwrap();
+        pmetal_runtime::check_unobserved_error().unwrap();
         for seq in &out.token_ids {
             assert_eq!(&seq[..6], &[1, 2, 3, 4, 5, 6]);
             assert!(seq.windows(2).all(|w| w[1] == (w[0] + 1) % 16), "{seq:?}");

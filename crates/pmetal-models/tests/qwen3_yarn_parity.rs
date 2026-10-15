@@ -23,8 +23,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use common::{fixture_path, load_shard, ref_tensor};
-use pmetal_bridge::compat::{Array, ops::slice_axis};
 use pmetal_mlx::test_utils::{ParityReport, Tolerance, argmax_last_axis, print_report_table};
+use pmetal_runtime::compat::{Array, ops::slice_axis};
 use serial_test::serial;
 
 /// Tokens fed as one prefill before the cached decode takes over: inside the
@@ -74,7 +74,7 @@ fn rows(a: &Array, start: i32, end: i32) -> Array {
 }
 
 fn drain_bridge(op: &str) {
-    pmetal_bridge::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
+    pmetal_runtime::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
 }
 
 fn assert_all_pass(title: &str, reports: &[ParityReport]) {
@@ -146,9 +146,9 @@ fn dynamic_qwen3_yarn_matches_transformers() {
 #[test]
 #[serial]
 fn native_qwen3_yarn_chunked_prefill_matches_transformers() {
-    use pmetal_bridge::decode::{prefill_last_logits, prompt_tokens_to_input};
-    use pmetal_bridge::qwen3_native::{NativeCache, forward_step_last, load_config, load_model};
     use pmetal_mlx::test_utils::to_f32_vec_eval;
+    use pmetal_runtime::decode::{prefill_last_logits, prompt_tokens_to_input};
+    use pmetal_runtime::qwen3_native::{NativeCache, forward_step_last, load_config, load_model};
 
     let fx = checkpoint();
     let config = load_config(fx.path()).expect("native config parses");
@@ -195,7 +195,7 @@ fn native_qwen3_yarn_chunked_prefill_matches_transformers() {
 #[test]
 #[serial]
 fn native_qwen3_yarn_matches_transformers() {
-    use pmetal_bridge::qwen3_native::{NativeCache, forward_step_hidden, load_config, load_model};
+    use pmetal_runtime::qwen3_native::{NativeCache, forward_step_hidden, load_config, load_model};
 
     let fx = checkpoint();
     let config = load_config(fx.path()).expect("native config parses");
@@ -225,7 +225,7 @@ fn native_qwen3_yarn_matches_transformers() {
     // YaRN's period table and attention factor; the per-op path it replaces
     // must give the same logits.
     let decode = |compiled: bool| {
-        pmetal_bridge::decode::set_compiled_decode(compiled);
+        pmetal_runtime::decode::set_compiled_decode(compiled);
         let mut cache = NativeCache::new_empty(&weights);
         let (_, prefill) = forward_step_hidden(&weights, &rows(&ids, 0, PREFILL), &mut cache);
         drain_bridge("native cached prefill");
@@ -235,7 +235,7 @@ fn native_qwen3_yarn_matches_transformers() {
             drain_bridge("native decode step");
             steps.push(step);
         }
-        pmetal_bridge::decode::set_compiled_decode(true);
+        pmetal_runtime::decode::set_compiled_decode(true);
         steps
     };
     let compiled = decode(true);

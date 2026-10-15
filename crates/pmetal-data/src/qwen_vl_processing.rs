@@ -35,7 +35,7 @@ use base64::Engine as _;
 /// The decoded-image type every function here takes, re-exported so callers
 /// need not depend on `image` themselves.
 pub use image::RgbImage;
-use pmetal_bridge::compat::Array;
+use pmetal_runtime::compat::Array;
 use serde::Deserialize;
 
 use crate::pillow_resample::{self, ResampleFilter};

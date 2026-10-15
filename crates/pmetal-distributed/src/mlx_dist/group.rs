@@ -2,10 +2,10 @@
 //!
 //! The group is initialized once at process startup via
 //! [`DistributedGroup::init`]; sub-groups come from
-//! [`DistributedGroup::split`]. It wraps [`pmetal_bridge::distributed::Group`],
+//! [`DistributedGroup::split`]. It wraps [`pmetal_runtime::distributed::Group`],
 //! which calls MLX's C++ distributed API directly.
 
-use pmetal_bridge::distributed::{self, Group};
+use pmetal_runtime::distributed::{self, Group};
 
 /// A communication group for distributed operations.
 pub struct DistributedGroup {

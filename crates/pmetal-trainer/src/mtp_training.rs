@@ -9,10 +9,6 @@
 
 use std::path::{Path, PathBuf};
 
-use pmetal_bridge::compat::{
-    Array, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, ops,
-    optimizers::{AdamW, AdamWBuilder, Optimizer},
-};
 use pmetal_core::{LearningRateScheduler, LrSchedulerType};
 use pmetal_mlx::{
     kv_cache::{KVCache, KVCacheConfig},
@@ -24,6 +20,10 @@ use pmetal_models::architectures::{
     Qwen3NextConfig, Qwen3NextForCausalLM, Qwen3NextMtpForCausalLM,
 };
 use pmetal_models::{Gemma4MtpKvSources, validate_gemma4_mtp_pair, validate_qwen3_next_mtp_pair};
+use pmetal_runtime::compat::{
+    Array, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, ops,
+    optimizers::{AdamW, AdamWBuilder, Optimizer},
+};
 use serde::{Deserialize, Serialize};
 
 use crate::dflash_training::{DFlashTrainStepConfig, dflash_train_step};
@@ -188,7 +188,7 @@ pub fn qwen3_next_mtp_loss(
     let mut total: Option<Array> = None;
     for layer_idx in 0..layers {
         let (_, logits) = mtp.forward_logits(&input_tokens, &hidden, None, None, layer_idx)?;
-        let loss = pmetal_bridge::training::cross_entropy_loss(&logits, &labels, -100);
+        let loss = pmetal_runtime::training::cross_entropy_loss(&logits, &labels, -100);
         total = Some(match total {
             Some(acc) => acc.add(&loss),
             None => loss,
@@ -238,7 +238,7 @@ pub fn gemma4_assistant_mtp_loss(
         let labels = input_ids.slice(&[0, pos + 2], &[batch, pos + 3]);
         let vocab = assistant.config.text_config.vocab_size;
         let logits = logits.reshape(&[batch, 1, vocab]);
-        let loss = pmetal_bridge::training::cross_entropy_loss(&logits, &labels, -100);
+        let loss = pmetal_runtime::training::cross_entropy_loss(&logits, &labels, -100);
         total = Some(match total {
             Some(acc) => acc.add(&loss),
             None => loss,
@@ -387,10 +387,10 @@ where
         let mut vag = nn::value_and_grad(|model: &mut M, batch: &B| loss_fn(model, batch));
         let (loss, mut grads) = vag(model, &batch)?;
         if let Some(max_norm) = config.max_grad_norm {
-            pmetal_bridge::training::clip_grad_norm_map(&mut grads, max_norm);
+            pmetal_runtime::training::clip_grad_norm_map(&mut grads, max_norm);
         }
         optimizer.update(model, grads)?;
-        pmetal_bridge::compat::eval_params(model.trainable_parameters())?;
+        pmetal_runtime::compat::eval_params(model.trainable_parameters())?;
 
         loss.eval();
         let loss_value = crate::step_check::check_step(step + 1, loss.item::<f32>())?;
@@ -741,11 +741,11 @@ mod tests {
     /// choice at `i + 1`, which is its choice for `x[i + 2]`.
     #[test]
     fn the_qwen_mtp_loss_pairs_each_state_with_the_next_token() {
-        pmetal_bridge::compat::random::seed(3);
+        pmetal_runtime::compat::random::seed(3);
         let config = tiny_qwen_config();
         let mut target = Qwen3NextForCausalLM::new(config.clone()).unwrap();
         let mut mtp = Qwen3NextMtpForCausalLM::new(config).unwrap();
-        let ids = pmetal_bridge::decode::prompt_tokens_to_input(&[5, 9, 1, 33, 7, 12]);
+        let ids = pmetal_runtime::decode::prompt_tokens_to_input(&[5, 9, 1, 33, 7, 12]);
         let loss = loss_value(&qwen3_next_mtp_loss(&mut target, &mut mtp, &ids).unwrap());
 
         let mut capture = SpecCapture::with_layers_and_embedding(Vec::new(), false);
@@ -757,7 +757,7 @@ mod tests {
         let (_, mtp_logits) = mtp
             .forward_logits(&next, &ops::slice_axis(&states, 1, 0, 4), None, None, 0)
             .unwrap();
-        let want = loss_value(&pmetal_bridge::training::cross_entropy_loss(
+        let want = loss_value(&pmetal_runtime::training::cross_entropy_loss(
             &mtp_logits,
             &labels,
             -100,
@@ -803,7 +803,7 @@ mod tests {
     /// target's cache up to `i`, position `i + 1`, against `x[i + 2]`.
     #[test]
     fn the_gemma4_assistant_loss_reads_the_scaled_next_token_at_its_position() {
-        pmetal_bridge::compat::random::seed(4);
+        pmetal_runtime::compat::random::seed(4);
         let mut target = Gemma4ForCausalLM::new(tiny_gemma_config(
             &["sliding_attention", "full_attention"],
             32,
@@ -821,7 +821,7 @@ mod tests {
         })
         .unwrap();
         let tokens = [5u32, 9, 1, 33, 7];
-        let ids = pmetal_bridge::decode::prompt_tokens_to_input(&tokens);
+        let ids = pmetal_runtime::decode::prompt_tokens_to_input(&tokens);
         let loss =
             loss_value(&gemma4_assistant_mtp_loss(&mut target, &mut assistant, &ids).unwrap());
 
@@ -829,12 +829,12 @@ mod tests {
         for i in 0..tokens.len() - 2 {
             let mut cache = gemma4_target_cache(&target, tokens.len());
             let mut capture = SpecCapture::with_layers_and_embedding(Vec::new(), false);
-            let prefix = pmetal_bridge::decode::prompt_tokens_to_input(&tokens[..=i]);
+            let prefix = pmetal_runtime::decode::prompt_tokens_to_input(&tokens[..=i]);
             let (states, _) = target
                 .forward_hidden_with_capture(&prefix, None, Some(&mut cache), &mut capture)
                 .unwrap();
             let state = ops::slice_axis(&states, 1, i as i32, i as i32 + 1);
-            let next = pmetal_bridge::decode::prompt_tokens_to_input(&tokens[i + 1..i + 2]);
+            let next = pmetal_runtime::decode::prompt_tokens_to_input(&tokens[i + 1..i + 2]);
             let embedding = Module::forward(&mut target.model.embed_tokens, &next)
                 .unwrap()
                 .multiply(&Array::from_f32(target.model.embed_scale));
@@ -849,8 +849,8 @@ mod tests {
                     i as i32 + 1,
                 )
                 .unwrap();
-            let label = pmetal_bridge::decode::prompt_tokens_to_input(&tokens[i + 2..i + 3]);
-            total += loss_value(&pmetal_bridge::training::cross_entropy_loss(
+            let label = pmetal_runtime::decode::prompt_tokens_to_input(&tokens[i + 2..i + 3]);
+            total += loss_value(&pmetal_runtime::training::cross_entropy_loss(
                 &logits.reshape(&[1, 1, 64]),
                 &label,
                 -100,

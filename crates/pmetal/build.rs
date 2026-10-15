@@ -3,7 +3,7 @@
 //! Embeds the `mlx.metallib` built with the MLX this binary links, gzip
 //! compressed, so an installed `pmetal` carries its own kernels (~31 MB of
 //! ~102 MB). On first use the binary writes it to the per-version metallib
-//! cache (`pmetal_bridge::metallib::Cache`). Its SHA-256 is compiled in as
+//! cache (`pmetal_runtime::metallib::Cache`). Its SHA-256 is compiled in as
 //! `PMETAL_EMBEDDED_METALLIB_SHA256`, which names the cache entry and checks
 //! the bytes written there.
 
@@ -11,9 +11,9 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=DEP_PMETAL_BRIDGE_MLX_LIB_DIR");
-    println!("cargo:rerun-if-env-changed=DEP_PMETAL_BRIDGE_MLX_METALLIB");
-    println!("cargo:rerun-if-env-changed=DEP_PMETAL_BRIDGE_MIN_MACOS");
+    println!("cargo:rerun-if-env-changed=DEP_PMETAL_RUNTIME_MLX_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=DEP_PMETAL_RUNTIME_MLX_METALLIB");
+    println!("cargo:rerun-if-env-changed=DEP_PMETAL_RUNTIME_MIN_MACOS");
 
     if env::var("CARGO_CFG_TARGET_OS").unwrap() != "macos" {
         return;
@@ -29,7 +29,7 @@ fn main() {
     // This used to fall back to scanning sibling build directories and to an
     // unversioned copy in ~/.cache, either of which could hold another MLX
     // revision's kernels.
-    let metallib = env::var("DEP_PMETAL_BRIDGE_MLX_METALLIB")
+    let metallib = env::var("DEP_PMETAL_RUNTIME_MLX_METALLIB")
         .ok()
         .map(PathBuf::from)
         .filter(|p| p.is_file());
@@ -46,7 +46,7 @@ fn main() {
             // binary then looks for a metallib instead of extracting one.
             std::fs::write(&dest, b"").unwrap();
             println!(
-                "cargo:warning=pmetal-bridge published no mlx.metallib (built without the \
+                "cargo:warning=pmetal-runtime published no mlx.metallib (built without the \
                  `metal` feature?), so none is embedded. The binary will look for one at run time."
             );
         }
@@ -61,7 +61,7 @@ fn main() {
 /// those breaks the build outright under Xcode 27 (#29). A link arg from here
 /// applies to this package's artifacts and nothing else.
 fn emit_deployment_target() {
-    let Ok(min_macos) = env::var("DEP_PMETAL_BRIDGE_MIN_MACOS") else {
+    let Ok(min_macos) = env::var("DEP_PMETAL_RUNTIME_MIN_MACOS") else {
         return;
     };
     println!("cargo:rustc-link-arg=-mmacosx-version-min={min_macos}");
@@ -125,7 +125,7 @@ fn linkage_in_dir(candidate: PathBuf) -> Option<MlxLinkage> {
 }
 
 fn find_mlx_linkage() -> MlxLinkage {
-    if let Ok(path) = env::var("DEP_PMETAL_BRIDGE_MLX_LIB_DIR") {
+    if let Ok(path) = env::var("DEP_PMETAL_RUNTIME_MLX_LIB_DIR") {
         if let Some(linkage) = linkage_in_dir(PathBuf::from(path)) {
             return linkage;
         }
@@ -153,7 +153,7 @@ fn find_mlx_linkage() -> MlxLinkage {
         }
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !name.starts_with("pmetal-bridge-") {
+        if !name.starts_with("pmetal-runtime-") {
             continue;
         }
         let candidate = path.join("out/build/lib");

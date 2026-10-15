@@ -16,7 +16,7 @@
 
 use crate::mlx_dist::group::DistributedGroup;
 use crate::mlx_dist::ops;
-use pmetal_bridge::compat::{Array, Exception};
+use pmetal_runtime::compat::{Array, Exception};
 
 /// Forward pass for a column-sharded linear layer (AllToSharded).
 ///

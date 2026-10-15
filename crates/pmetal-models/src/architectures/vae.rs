@@ -2,8 +2,8 @@
 //!
 //! Implementation of Flux.1 and SDXL compatible VAEs optimized for Apple Silicon.
 //! This implementation uses NHWC format for consistency with MLX standards.
-use pmetal_bridge::compat::{Array, Exception, nn};
-use pmetal_bridge::impl_module_params;
+use pmetal_runtime::compat::{Array, Exception, nn};
+use pmetal_runtime::impl_module_params;
 
 use serde::{Deserialize, Serialize};
 
@@ -121,7 +121,7 @@ impl UpSampler {
 
         // NHWC upsampling: [B, H, 1, W, 1, C] -> [B, H, 2, W, 2, C] -> [B, H*2, W*2, C]
         let x = x.expand_dims_axes(&[2, 4]);
-        let x = pmetal_bridge::compat::ops::broadcast_to(&x, &[b, h, 2, w, 2, c]);
+        let x = pmetal_runtime::compat::ops::broadcast_to(&x, &[b, h, 2, w, 2, c]);
         let x = x.reshape(&[b, h * 2, w * 2, c]);
 
         Ok(self.conv.forward(&x))
@@ -209,7 +209,7 @@ impl VAEAttentionBlock {
 
         let scale = 1.0 / (c as f32).sqrt();
         let attn_out =
-            pmetal_bridge::compat::fast::scaled_dot_product_attention(&q, &k, &v, scale, "");
+            pmetal_runtime::compat::fast::scaled_dot_product_attention(&q, &k, &v, scale, "");
 
         let attn_out = attn_out.squeeze_axes(&[1]).reshape(&[b, h, w, c]);
         let out = self.proj_out.forward(&attn_out);
@@ -507,18 +507,18 @@ impl FluxVAE {
         let h = encoder.forward(x)?;
 
         // Output is 32 channels: [mean (16), logvar (16)]
-        let mean = pmetal_bridge::compat::ops::slice_last_to(&h, 16);
+        let mean = pmetal_runtime::compat::ops::slice_last_to(&h, 16);
 
         if sample {
-            let logvar = pmetal_bridge::compat::ops::slice_last_from(&h, 16);
+            let logvar = pmetal_runtime::compat::ops::slice_last_from(&h, 16);
             // Clamp logvar to prevent numerical overflow in exp()
-            let logvar = pmetal_bridge::compat::ops::clip(
+            let logvar = pmetal_runtime::compat::ops::clip(
                 &logvar,
                 Some(&Array::from_f32(-30.0)),
                 Some(&Array::from_f32(20.0)),
             );
             let std = logvar.multiply(&Array::from_f32(0.5)).exp();
-            let noise = pmetal_bridge::compat::random::normal(mean.shape(), mean.dtype());
+            let noise = pmetal_runtime::compat::random::normal(mean.shape(), mean.dtype());
             let z = mean.add(&std.multiply(&noise));
             Ok(z.subtract(&Array::from_f32(Self::SHIFT_FACTOR))
                 .multiply(&Array::from_f32(Self::SCALING_FACTOR)))
@@ -540,7 +540,7 @@ impl FluxVAE {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::ops::zeros;
+    use pmetal_runtime::compat::ops::zeros;
 
     #[test]
     fn test_flux_vae_roundtrip() {
@@ -548,7 +548,7 @@ mod tests {
         let mut vae = FluxVAE::new(config);
 
         // Dummy input image: [1, 64, 64, 3]
-        let x = zeros(&[1, 64, 64, 3], pmetal_bridge::compat::Dtype::Float32);
+        let x = zeros(&[1, 64, 64, 3], pmetal_runtime::compat::Dtype::Float32);
 
         // Encode
         let z = vae.encode(&x, false).unwrap();

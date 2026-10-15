@@ -10,7 +10,7 @@
 //! (Yadav et al., NeurIPS 2023, Algorithm 1 step 3).
 
 use crate::Result;
-use pmetal_bridge::compat::{Array, Dtype};
+use pmetal_runtime::compat::{Array, Dtype};
 
 /// Compute sign consensus mask across multiple tensors.
 ///
@@ -67,7 +67,7 @@ pub fn sign_consensus(tensors: &[Array], weights: &[f32]) -> Result<Array> {
         let zero = Array::from_f32(0.0);
         let agrees = product
             .greater(&zero)
-            .as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
+            .as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32());
 
         // Add weight * tensor where the model agrees with the majority sign.
         let contribution = tensor.multiply(&Array::from_f32(*weight));
@@ -135,7 +135,7 @@ pub fn unanimous_agreement(tensors: &[Array]) -> Result<Array> {
     for tensor in &tensors[1..] {
         let tensor_sign = tensor.sign();
         let same = first_sign.equal(&tensor_sign);
-        let same_f32 = same.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
+        let same_f32 = same.as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32());
         agreement = agreement.multiply(&same_f32);
     }
 

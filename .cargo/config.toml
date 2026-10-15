@@ -7,7 +7,7 @@
 target-dir = "target"
 
 [env]
-# Every pmetal-bridge variant (each feature set, `-p` run and profile) runs
+# Every pmetal-runtime variant (each feature set, `-p` run and profile) runs
 # the build script, and without a prefix each compiled its own MLX (~800 MB
 # and several minutes apiece; 7 of them were found side by side). With one,
 # build.rs reuses a build whose fingerprint (MLX tag, features, profile,
@@ -36,6 +36,6 @@ RUST_TEST_THREADS = "1"
 # naming whichever proc macro lost the race. See #29.
 #
 # The deployment target is a property of the bridge, so the bridge owns it:
-# `pmetal-bridge/build.rs` defaults to MLX's macOS 14 floor, hands it to CMake
-# and cc, and publishes it as DEP_PMETAL_BRIDGE_MIN_MACOS. `pmetal/build.rs`
+# `pmetal-runtime/build.rs` defaults to MLX's macOS 14 floor, hands it to CMake
+# and cc, and publishes it as DEP_PMETAL_RUNTIME_MIN_MACOS. `pmetal/build.rs`
 # turns that into a link arg for the shipped binary, which is target-only.

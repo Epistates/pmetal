@@ -41,7 +41,7 @@
 //!
 //! Use `max_entries` to limit cache size and `clear()` to free memory when needed.
 
-use pmetal_bridge::compat::{Array, Exception};
+use pmetal_runtime::compat::{Array, Exception};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 

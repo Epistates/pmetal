@@ -17,7 +17,7 @@ pmetal-metal = { workspace = true }
 pmetal-models = { workspace = true }
 pmetal-data = { workspace = true }
 pmetal-mlx = { workspace = true }
-pmetal-bridge = { workspace = true }
+pmetal-runtime = { workspace = true }
 tokenizers = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -35,8 +35,8 @@ base64 = { workspace = true }
 image = { workspace = true }
 
 [dev-dependencies]
-# Fail every test at the bridge op that throws (pmetal-bridge `strict-errors`).
-pmetal-bridge = { workspace = true, features = ["strict-errors"] }
+# Fail every test at the bridge op that throws (pmetal-runtime `strict-errors`).
+pmetal-runtime = { workspace = true, features = ["strict-errors"] }
 criterion = { workspace = true }
 tempfile = { workspace = true }
 

@@ -1,7 +1,7 @@
 //! Native-bridge [`DFlashTarget`] for Qwen3 / Qwen3.5.
 //!
 //! Routes the DFlash verify-step target forward through the fused
-//! `pmetal_bridge::qwen3_native::forward_step_with_capture` path instead
+//! `pmetal_runtime::qwen3_native::forward_step_with_capture` path instead
 //! of the dynamic `pmetal-models` forward. Two wins fall out:
 //!
 //! 1. **Speed** — the native path runs the parallel-replay verify
@@ -19,10 +19,10 @@
 
 use std::path::Path;
 
-use pmetal_bridge::qwen3_native::{self, GdnReplay, NativeCache, NativeWeights};
 use pmetal_mlx::kv_cache::{KVCache, MambaCache};
 use pmetal_mlx::speculative::SpecCapture;
 use pmetal_mlx::{Array, Exception};
+use pmetal_runtime::qwen3_native::{self, GdnReplay, NativeCache, NativeWeights};
 
 use crate::dflash_decoder::DFlashTarget;
 
@@ -141,7 +141,7 @@ impl NativeQwen3Target {
 /// accepted-prefix slice) we print every position; for a full prompt we
 /// only print the last.
 fn trace_taps(tap_layers: &[usize], captured: &[Array]) {
-    use pmetal_bridge::compat::Dtype;
+    use pmetal_runtime::compat::Dtype;
     for (idx, h) in tap_layers.iter().zip(captured.iter()) {
         let t = h.dim(1);
         let hidden_dim = h.dim(2);

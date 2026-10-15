@@ -5,7 +5,7 @@
 //! by ensuring internal representations align with the teacher.
 
 use crate::{HiddenStateLossType, Result};
-use pmetal_bridge::compat::Array;
+use pmetal_runtime::compat::Array;
 
 /// Hidden state alignment loss.
 ///

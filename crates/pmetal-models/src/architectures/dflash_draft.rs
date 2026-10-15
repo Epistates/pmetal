@@ -30,12 +30,12 @@
 
 use std::collections::HashMap;
 
-use pmetal_bridge::compat::{Array, Exception, Param, nn, ops};
-use pmetal_bridge::impl_module_params;
+use pmetal_runtime::compat::{Array, Exception, Param, nn, ops};
+use pmetal_runtime::impl_module_params;
 use serde::{Deserialize, Serialize};
 
-use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
 use pmetal_mlx::kv_cache::KVCache;
+use pmetal_runtime::rope::{RopeConfig, RotaryEmbedding};
 
 // ----------------------------------------------------------------------------
 // Config
@@ -462,7 +462,7 @@ impl DFlashAttention {
 
         let mask = block_attention_mask(context_len, query_len, self.window, self.causal)
             .map(|m| m.as_dtype(queries.dtype().as_i32()));
-        let output = pmetal_bridge::compat::fast::scaled_dot_product_attention_masked(
+        let output = pmetal_runtime::compat::fast::scaled_dot_product_attention_masked(
             &queries,
             &keys,
             &values,
@@ -668,10 +668,10 @@ impl DFlashDraftModel {
     /// Qwen3-4B) and a draft reads half the bytes.
     pub fn quantize(
         &mut self,
-        params: pmetal_bridge::native_weight::QuantParams,
+        params: pmetal_runtime::native_weight::QuantParams,
     ) -> Result<(), Exception> {
         let mut result = Ok(());
-        pmetal_bridge::compat::VisitLinears::visit_linears_mut(self, "", &mut |_, linear| {
+        pmetal_runtime::compat::VisitLinears::visit_linears_mut(self, "", &mut |_, linear| {
             if result.is_ok() {
                 result = linear.quantize(params);
             }
@@ -850,13 +850,13 @@ mod tests {
 
         // Simulate the DFlash pipeline: noise embedding is [B, block, hidden]
         // and target_hidden is [B, ctx, num_target * hidden].
-        let noise = pmetal_bridge::compat::random::normal(
+        let noise = pmetal_runtime::compat::random::normal(
             &[1, block, hidden],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
-        let target_hidden = pmetal_bridge::compat::random::normal(
+        let target_hidden = pmetal_runtime::compat::random::normal(
             &[1, 6, num_target * hidden],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
 
         let out = model.forward(&noise, &target_hidden, None).unwrap();
@@ -870,7 +870,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_dflash_draft_block_attends_to_the_whole_context() {
-        use pmetal_bridge::compat::{Dtype, random::normal};
+        use pmetal_runtime::compat::{Dtype, random::normal};
         let config = tiny_config();
         let (hidden, block) = (config.hidden_size, config.block_size);
         let row = config.num_target_layers() as i32 * hidden;

@@ -34,9 +34,9 @@
 //! - The distillation loss uses the SAME student logits computed inside the closure,
 //!   so both objectives share one forward pass per step.
 
-use pmetal_bridge::compat::{Array, Exception, eval_params, nn, ops, optimizers::Optimizer};
 use pmetal_core::{EvalMetrics, TrainingConfig};
 use pmetal_lora::TrainableModel;
+use pmetal_runtime::compat::{Array, Exception, eval_params, nn, ops, optimizers::Optimizer};
 use std::time::Instant;
 use tracing::info;
 

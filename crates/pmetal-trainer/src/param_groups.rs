@@ -24,7 +24,7 @@
 //! [`EMBEDDING_MODULE_NAMES`]. Names match on whole path components, so
 //! BERT's `attention.output.dense` is not an output head.
 
-pub use pmetal_bridge::optimizer::{
+pub use pmetal_runtime::optimizer::{
     EMBEDDING_MODULE_NAMES, GroupRates, ParamClass, excluded_from_weight_decay,
 };
 
@@ -104,7 +104,7 @@ impl ParameterGroupConfig {
             name.strip_prefix(head)
                 .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
         });
-        in_head || pmetal_bridge::optimizer::under_module(name, &self.embedding_modules)
+        in_head || pmetal_runtime::optimizer::under_module(name, &self.embedding_modules)
     }
 
     /// The group the parameter called `name` trains in.

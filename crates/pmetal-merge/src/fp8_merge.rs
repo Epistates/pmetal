@@ -33,7 +33,7 @@
 //! let merged = merger.ties_merge_fp8(tensors, base, weights, densities, lambda)?;
 //! ```
 
-use pmetal_bridge::compat::Array;
+use pmetal_runtime::compat::Array;
 use tracing::debug;
 
 use crate::{MergeError, Result};

@@ -60,9 +60,9 @@ use crate::continuous_driver::{
 };
 use crate::engine::{TokenEvent, TokenLogprobEntry, detect_stop_sequence_suffix};
 use crate::prefix_cache::ServePrefixCache;
-use pmetal_bridge::compat::{Array, Exception};
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig, MambaCache};
 use pmetal_models::generation::{GenerationConfig, Sampler, token_logprobs};
+use pmetal_runtime::compat::{Array, Exception};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -345,14 +345,14 @@ impl ContinuousPump {
         // The sticky slot, both here and after the step: the step is many
         // ops, and one that threw early is cleared from the last-op slot by
         // every op that succeeds after it.
-        if let Err(stale) = pmetal_bridge::check_unobserved_error() {
+        if let Err(stale) = pmetal_runtime::check_unobserved_error() {
             tracing::debug!(
                 target: "pmetal_serve::continuous_pump",
                 "discarding an earlier bridge error: {stale}"
             );
         }
         let stepped = self.run_instruction(forward, instruction).and_then(|tick| {
-            pmetal_bridge::check_unobserved_error()
+            pmetal_runtime::check_unobserved_error()
                 .map(|()| tick)
                 .map_err(|e| Exception::custom(e.to_string()))
         });
@@ -671,8 +671,8 @@ impl ContinuousPump {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::Array;
     use pmetal_mlx::kv_cache::{KVCache, MambaCache};
+    use pmetal_runtime::compat::Array;
 
     fn cache_cfg() -> KVCacheConfig {
         KVCacheConfig::new(2, 32, 4, 64)
@@ -1223,7 +1223,7 @@ mod tests {
     fn hashed_logits(token: u32) -> Vec<f32> {
         (0..HASHED_VOCAB as u64)
             .map(|v| {
-                let draw = pmetal_bridge::decode::draw_bits(u64::from(token), v);
+                let draw = pmetal_runtime::decode::draw_bits(u64::from(token), v);
                 let bias = if v < 4 { 1.0 } else { 0.0 };
                 (draw >> 40) as f32 / (1u64 << 24) as f32 * 6.0 - 3.0 + bias
             })
@@ -1331,6 +1331,6 @@ mod tests {
                 "request {i}: the penalties change nothing"
             );
         }
-        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+        pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
     }
 }

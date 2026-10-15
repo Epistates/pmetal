@@ -17,11 +17,11 @@
 //!
 //! After quantisation the parameter arrays are stored as `uint8` (E4M3 format)
 //! in-place.  Inference code that reads these parameters must call
-//! `pmetal_bridge::compat::ops::from_fp8` to dequantise before computation — this matches the
+//! `pmetal_runtime::compat::ops::from_fp8` to dequantise before computation — this matches the
 //! semantics already used by `pmetal_mlx::fp8_quantization`.
 
-use pmetal_bridge::compat::ops::{from_fp8, to_fp8};
-use pmetal_bridge::compat::{Array, Dtype, Exception, ModuleParameters, ModuleParametersExt};
+use pmetal_runtime::compat::ops::{from_fp8, to_fp8};
+use pmetal_runtime::compat::{Array, Dtype, Exception, ModuleParameters, ModuleParametersExt};
 
 fn is_fp8_weight_candidate(key: &str, arr: &Array) -> bool {
     if !(key.ends_with(".weight") || key == "weight") {
@@ -73,7 +73,7 @@ pub fn dequantize_fp8_weight_for_compute(weight: &Array) -> Result<Array, Except
 ///
 /// # Errors
 ///
-/// Returns the first `Exception` produced by `pmetal_bridge::compat::ops::to_fp8` if any
+/// Returns the first `Exception` produced by `pmetal_runtime::compat::ops::to_fp8` if any
 /// quantisation call fails.
 pub fn quantize_model_linears<M: ModuleParameters>(model: &mut M) -> Result<(), Exception> {
     // Collect the keys we need to quantize first (avoid borrow issues).
@@ -93,7 +93,7 @@ pub fn quantize_model_linears<M: ModuleParameters>(model: &mut M) -> Result<(), 
     // Quantize each eligible weight.  We do this in two passes to satisfy the
     // borrow checker: first read + compute FP8 tensors (immutable borrow),
     // then write them back (mutable borrow).
-    let quantized: Vec<(std::rc::Rc<str>, pmetal_bridge::compat::Array)> = {
+    let quantized: Vec<(std::rc::Rc<str>, pmetal_runtime::compat::Array)> = {
         let flat = model.flatten_params();
         keys_to_quantize
             .iter()
@@ -119,8 +119,8 @@ pub fn quantize_model_linears<M: ModuleParameters>(model: &mut M) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::nn;
-    use pmetal_bridge::impl_module_params;
+    use pmetal_runtime::compat::nn;
+    use pmetal_runtime::impl_module_params;
 
     #[derive(Debug)]
     struct TinyModel {

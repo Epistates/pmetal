@@ -25,8 +25,8 @@
 
 use std::path::PathBuf;
 
-use pmetal_bridge::compat::{Array, ops::slice_axis};
 use pmetal_mlx::test_utils::{argmax_last_axis, load_shard, ref_tensor};
+use pmetal_runtime::compat::{Array, ops::slice_axis};
 use serial_test::serial;
 
 struct Reference {
@@ -44,7 +44,7 @@ fn reference() -> Option<Reference> {
     let file = std::env::var_os("PMETAL_GPT_OSS_REFERENCE")?;
     let shard = load_shard(&PathBuf::from(file));
     let ints = |key: &str| {
-        let a = ref_tensor(&shard, key).as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32());
+        let a = ref_tensor(&shard, key).as_dtype(pmetal_runtime::compat::Dtype::Int32.as_i32());
         a.eval();
         a.as_slice::<i32>().to_vec()
     };
@@ -64,12 +64,12 @@ fn ids(tokens: &[i32]) -> Array {
 }
 
 fn drain_bridge(op: &str) {
-    pmetal_bridge::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
+    pmetal_runtime::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
 }
 
 /// Max |diff| and the smallest per-row cosine of `[G, vocab]` logits.
 fn compare(got: &Array, want: &Array) -> (f32, f32) {
-    let got = got.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
+    let got = got.as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32());
     let diff = got.subtract(want).abs().max(None).item_f32();
     let dot = got.multiply(want).sum_axis(-1, false);
     let norms = got
@@ -128,7 +128,7 @@ fn report(engine: &str, how: &str, got: &Array, r: &Reference) {
 #[serial]
 #[ignore = "requires PMETAL_GPT_OSS_DIR, PMETAL_GPT_OSS_REFERENCE and the 13 GB release"]
 fn native_gpt_oss_20b_decodes_as_transformers() {
-    use pmetal_bridge::gpt_oss_native::{NativeCache, forward_step, load_config, load_model};
+    use pmetal_runtime::gpt_oss_native::{NativeCache, forward_step, load_config, load_model};
 
     let Some(r) = reference() else {
         eprintln!("PMETAL_GPT_OSS_DIR / PMETAL_GPT_OSS_REFERENCE not set; skipping");
@@ -156,7 +156,8 @@ fn native_gpt_oss_20b_decodes_as_transformers() {
         drain_bridge("native decode step");
         rows.push(step.squeeze(0));
     }
-    let decoded = pmetal_bridge::compat::ops::concatenate_axis(&rows.iter().collect::<Vec<_>>(), 0);
+    let decoded =
+        pmetal_runtime::compat::ops::concatenate_axis(&rows.iter().collect::<Vec<_>>(), 0);
     report("native", "cached greedy decode", &decoded, &r);
 }
 
@@ -194,6 +195,7 @@ fn dynamic_gpt_oss_20b_decodes_as_transformers() {
         drain_bridge("dynamic decode step");
         rows.push(step.squeeze(0));
     }
-    let decoded = pmetal_bridge::compat::ops::concatenate_axis(&rows.iter().collect::<Vec<_>>(), 0);
+    let decoded =
+        pmetal_runtime::compat::ops::concatenate_axis(&rows.iter().collect::<Vec<_>>(), 0);
     report("dynamic", "cached greedy decode", &decoded, &r);
 }

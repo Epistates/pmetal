@@ -6,7 +6,7 @@
 use super::DiscriminatorOutput;
 use crate::error::Result;
 use crate::nn::WeightNormConv1d;
-use pmetal_bridge::compat::{Array, nn, ops};
+use pmetal_runtime::compat::{Array, nn, ops};
 
 /// Multi-Period Discriminator.
 ///

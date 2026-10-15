@@ -7,10 +7,10 @@
 //! dtype. A run finishes and reports the same loss either way, so each of those
 //! gets its own assertion here.
 
-use pmetal_bridge::compat::{Array, Dtype, nn};
 use pmetal_core::LoraConfig;
 use pmetal_lora::{AdaptedModel, TrainableModel};
 use pmetal_models::dispatcher::DynamicModel;
+use pmetal_runtime::compat::{Array, Dtype, nn};
 
 /// One config per architecture family the dispatcher can put an alpha on.
 const CASES: &[(&str, &str)] = &[

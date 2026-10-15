@@ -1,6 +1,6 @@
 use super::*;
-use pmetal_bridge::compat::module::ModuleParameters;
-use pmetal_bridge::compat::optimizers::Updatable;
+use pmetal_runtime::compat::module::ModuleParameters;
+use pmetal_runtime::compat::optimizers::Updatable;
 
 impl TrainingLoop {
     /// Run training with sequence packing for 2-5x throughput improvement.

@@ -18,16 +18,16 @@
 use crate::decoder_layer::{
     AttentionModule, DecoderLayer, MlpModule, NormModule, std_pre_norm_forward,
 };
-use pmetal_bridge::compat::nn::{Embedding, Linear};
-use pmetal_bridge::compat::{Array, Exception, Module, Param, nn};
-use pmetal_bridge::impl_module_params;
+use pmetal_runtime::compat::nn::{Embedding, Linear};
+use pmetal_runtime::compat::{Array, Exception, Module, Param, nn};
+use pmetal_runtime::impl_module_params;
 
-use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     rope::{RopePositions, rope_embedding},
 };
 use pmetal_mlx::kv_cache::KVCache;
+use pmetal_runtime::rope::{RopeConfig, RotaryEmbedding};
 
 use crate::architectures::utils::{Activation, resolve_activation};
 use crate::checkpointing::checkpointed_layer;
@@ -72,7 +72,7 @@ pub struct PhiConfig {
     /// transformers' `Phi3Config`, it wins over the one inside `rope_scaling`.
     pub original_max_position_embeddings: Option<i32>,
     /// RoPE scaling (`longrope`, legacy `su`, for the 128K releases), read
-    /// by [`pmetal_bridge::rope`].
+    /// by [`pmetal_runtime::rope`].
     pub rope_scaling: Option<serde_json::Value>,
     /// Tie word embeddings.
     pub tie_word_embeddings: bool,
@@ -527,11 +527,11 @@ impl PhiMLP {
             PhiActivation::SwiGLU => {
                 // Split into gate and up projections
                 let gate =
-                    pmetal_bridge::compat::ops::slice_last_to(&hidden, self.intermediate_size);
+                    pmetal_runtime::compat::ops::slice_last_to(&hidden, self.intermediate_size);
                 let up =
-                    pmetal_bridge::compat::ops::slice_last_from(&hidden, self.intermediate_size);
+                    pmetal_runtime::compat::ops::slice_last_from(&hidden, self.intermediate_size);
                 // SwiGLU: silu(gate) * up
-                let gate_activated = pmetal_bridge::compat::ops::sigmoid(&gate).multiply(&gate);
+                let gate_activated = pmetal_runtime::compat::ops::sigmoid(&gate).multiply(&gate);
                 gate_activated.multiply(&up)
             }
             // `ACT2FN[hidden_act]` — `"gelu_new"` is the tanh approximation and
@@ -866,7 +866,7 @@ impl PhiForCausalLM {
         cache: &mut pmetal_mlx::kv_cache::FusedBatchKVCache,
     ) -> Result<Array, Exception> {
         use crate::common::{BatchedGqaAttnCfg, batched_prenorm_layer};
-        use pmetal_bridge::compat::Module;
+        use pmetal_runtime::compat::Module;
 
         let cfg = &self.model.config;
         let attn_cfg = BatchedGqaAttnCfg::for_rotary(
@@ -961,7 +961,7 @@ impl CausalLMModel for PhiForCausalLM {
     }
 
     fn eval(&self) -> Result<(), Exception> {
-        pmetal_bridge::compat::ModuleParametersExt::eval(self)
+        pmetal_runtime::compat::ModuleParametersExt::eval(self)
     }
 }
 
@@ -1000,7 +1000,7 @@ mod tests {
     /// The fixture rotates positions 0..6 with the long table (the reference
     /// asks for `seq_len = 129`), so the config here carries the fixture's
     /// `long_factor` as both tables; which table a reach picks is pinned
-    /// below and in `pmetal_bridge::rope`.
+    /// below and in `pmetal_runtime::rope`.
     ///
     /// Fixture: transformers 5.10.0.dev0 (torch 2.12), `Phi3Config` with
     /// `head_dim` 32, rotating a fixed input; the mscale is folded into
@@ -1012,7 +1012,7 @@ mod tests {
         let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.push("tests/fixtures/phi_surope_reference.safetensors");
         let shard: std::collections::HashMap<String, Array> =
-            pmetal_bridge::inline_array::load_safetensors_shard(path.to_str().unwrap())
+            pmetal_runtime::inline_array::load_safetensors_shard(path.to_str().unwrap())
                 .expect("load surope fixture")
                 .into_iter()
                 .collect();
@@ -1031,7 +1031,7 @@ mod tests {
         );
         let mut y_rust = rotary.apply(&x, 0);
         y_rust.eval().unwrap();
-        pmetal_bridge::check_unobserved_error().expect("bridge");
+        pmetal_runtime::check_unobserved_error().expect("bridge");
 
         let got = y_rust.to_f32_vec(384).expect("rust vec");
         let mut y_ref_eval = y_ref;
@@ -1095,9 +1095,9 @@ mod tests {
     #[serial]
     fn test_phi_rms_norm() {
         let mut norm = PhiRMSNorm::new(64, 1e-5);
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[2, 4, 64],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
 
         let out = norm.forward(&x).unwrap();
@@ -1120,9 +1120,9 @@ mod tests {
         };
 
         let mut attn = PhiAttention::new(&config).unwrap();
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[2, 4, 64],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
 
         let out = attn.forward(&x, None).unwrap();
@@ -1142,9 +1142,9 @@ mod tests {
         };
 
         let mut mlp = PhiMLP::new(&config).unwrap();
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[2, 4, 64],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
 
         let out = mlp.forward(&x).unwrap();
@@ -1166,9 +1166,9 @@ mod tests {
         };
 
         let mut layer = PhiDecoderLayer::new(&config).unwrap();
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[2, 4, 64],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
 
         let out = layer.forward(&x, None).unwrap();

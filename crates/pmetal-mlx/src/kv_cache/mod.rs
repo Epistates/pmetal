@@ -54,7 +54,7 @@ pub use rotating::*;
 pub use standard::*;
 pub use turboquant::*;
 
-use pmetal_bridge::compat::Dtype;
+use pmetal_runtime::compat::Dtype;
 
 /// Configuration for KV cache.
 #[derive(Debug, Clone, PartialEq, Eq)]

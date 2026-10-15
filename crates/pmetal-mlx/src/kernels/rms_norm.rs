@@ -1,8 +1,8 @@
 //! RMS Layer Normalization.
 //!
-//! Wraps the pmetal-bridge RmsNorm implementation.
+//! Wraps the pmetal-runtime RmsNorm implementation.
 
-use pmetal_bridge::compat::Array;
+use pmetal_runtime::compat::Array;
 
 /// Apply RMS normalization to a tensor (functional version).
 ///
@@ -14,13 +14,13 @@ use pmetal_bridge::compat::Array;
 /// # Returns
 /// Normalized tensor of same shape as input.
 pub fn rms_norm(x: &Array, weight: Option<&Array>, eps: f32) -> Array {
-    pmetal_bridge::compat::fast::rms_norm_opt(x, weight, eps)
+    pmetal_runtime::compat::fast::rms_norm_opt(x, weight, eps)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::{Dtype, ops, random};
+    use pmetal_runtime::compat::{Dtype, ops, random};
 
     #[test]
     fn test_rms_norm_functional() {

@@ -2,7 +2,7 @@
 //! 3.6 and 3.8 dense) against the authoritative Hugging Face `transformers`
 //! `Qwen3_5ForConditionalGeneration` oracle, on both of pmetal's engines: the
 //! `DynamicModel` path (`architectures/qwen3_next.rs`) and the native bridge
-//! (`pmetal_bridge::qwen3_native`), which is what `pmetal infer` runs.
+//! (`pmetal_runtime::qwen3_native`), which is what `pmetal infer` runs.
 //!
 //! Each fixture is a whole checkpoint directory from transformers 5.19 (torch
 //! 2.14.1, seed 7): the nested `config.json` Qwen
@@ -43,11 +43,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use common::{fixture_path, load_shard, ref_tensor};
-use pmetal_bridge::compat::{Array, ops::slice_axis};
 use pmetal_mlx::speculative::SpecCapture;
 use pmetal_mlx::test_utils::{ParityReport, Tolerance, argmax_last_axis, print_report_table};
 use pmetal_models::DynamicModel;
 use pmetal_models::architectures::qwen3_next_mtp::load_qwen3_next_mtp_from_dir;
+use pmetal_runtime::compat::{Array, ops::slice_axis};
 use serial_test::serial;
 
 /// Tokens fed as one prefill before the cached decode takes over.
@@ -113,7 +113,7 @@ fn rows(a: &Array, start: i32, end: i32) -> Array {
 }
 
 fn drain_bridge(op: &str) {
-    pmetal_bridge::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
+    pmetal_runtime::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
 }
 
 fn assert_all_pass(title: &str, reports: &[ParityReport]) {
@@ -269,7 +269,7 @@ fn dynamic_mtp(profile: &str) {
 // ---------------------------------------------------------------------------
 
 fn native_prefill_and_decode(profile: &str) {
-    use pmetal_bridge::qwen3_native::{NativeCache, forward_step_hidden, load_config, load_model};
+    use pmetal_runtime::qwen3_native::{NativeCache, forward_step_hidden, load_config, load_model};
 
     let fx = checkpoint(profile);
     let config = load_config(fx.path()).expect("native config parses");
@@ -324,9 +324,9 @@ fn native_prefill_and_decode(profile: &str) {
 /// (a GDN layer's recurrent state included) for the decode that follows, must
 /// be `transformers`'.
 fn native_chunked_prefill(profile: &str) {
-    use pmetal_bridge::decode::{prefill_last_logits, prompt_tokens_to_input};
-    use pmetal_bridge::qwen3_native::{NativeCache, forward_step_last, load_config, load_model};
     use pmetal_mlx::test_utils::to_f32_vec_eval;
+    use pmetal_runtime::decode::{prefill_last_logits, prompt_tokens_to_input};
+    use pmetal_runtime::qwen3_native::{NativeCache, forward_step_last, load_config, load_model};
 
     let fx = checkpoint(profile);
     let config = load_config(fx.path()).expect("native config parses");
@@ -377,9 +377,9 @@ fn native_chunked_prefill(profile: &str) {
 #[test]
 #[serial]
 fn swish_native_forked_prefix_continues_to_the_whole_prompts_logits() {
-    use pmetal_bridge::decode::prefill_last_logits;
-    use pmetal_bridge::qwen3_native::{NativeCache, forward_step_last, load_config, load_model};
     use pmetal_mlx::test_utils::to_f32_vec_eval;
+    use pmetal_runtime::decode::prefill_last_logits;
+    use pmetal_runtime::qwen3_native::{NativeCache, forward_step_last, load_config, load_model};
 
     let fx = checkpoint("swish");
     let config = load_config(fx.path()).expect("native config parses");
@@ -419,11 +419,11 @@ fn swish_native_forked_prefix_continues_to_the_whole_prompts_logits() {
 #[test]
 #[serial]
 fn swish_native_quantized_kv_prefill_does_not_depend_on_the_passes() {
-    use pmetal_bridge::decode::{prefill_last_logits, prompt_tokens_to_input};
-    use pmetal_bridge::qwen3_native::{
+    use pmetal_mlx::test_utils::{max_abs_diff, to_f32_vec_eval};
+    use pmetal_runtime::decode::{prefill_last_logits, prompt_tokens_to_input};
+    use pmetal_runtime::qwen3_native::{
         NativeCache, QuantCacheConfig, forward_step_last, load_config, load_model,
     };
-    use pmetal_mlx::test_utils::{max_abs_diff, to_f32_vec_eval};
 
     let fx = checkpoint("swish");
     let config = load_config(fx.path()).expect("native config parses");

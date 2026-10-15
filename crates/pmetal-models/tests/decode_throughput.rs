@@ -15,9 +15,9 @@
 //! prompt's last position and of eight cached decode steps to
 //! `PMETAL_DECODE_LOGITS` (when set), so two builds can be compared.
 
-use pmetal_bridge::compat::Array;
 use pmetal_models::dispatcher::DynamicModel;
 use pmetal_models::generation::{GenerationConfig, generate_cached_async_streaming};
+use pmetal_runtime::compat::Array;
 
 const PROMPT: [u32; 16] = [
     785, 6722, 315, 9625, 374, 12095, 13, 576, 6722, 315, 9856, 374, 19846, 13, 576, 6722,
@@ -28,7 +28,7 @@ fn last_row_f32(logits: &Array) -> Vec<f32> {
     let (seq, vocab) = (shape[1], shape[2]);
     let row = logits
         .slice(&[0, seq - 1, 0], &[1, seq, vocab])
-        .as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
+        .as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32());
     row.as_slice::<f32>().to_vec()
 }
 
@@ -99,5 +99,5 @@ fn decode_throughput_and_logits() {
         best = best.max(tps);
     }
     println!("decode: {best:.1} tok/s (best of 3, 128 greedy tokens)");
-    pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+    pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
 }

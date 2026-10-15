@@ -20,8 +20,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use common::{fixture_path, load_shard, ref_tensor};
-use pmetal_bridge::compat::{Array, Dtype, ops::slice_axis};
 use pmetal_mlx::test_utils::{ParityReport, Tolerance, argmax_last_axis, print_report_table};
+use pmetal_runtime::compat::{Array, Dtype, ops::slice_axis};
 use serial_test::serial;
 
 /// Tokens fed as one prefill before the cached decode takes over.
@@ -72,7 +72,7 @@ fn rows(a: &Array, start: i32, end: i32) -> Array {
 }
 
 fn drain_bridge(op: &str) {
-    pmetal_bridge::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
+    pmetal_runtime::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
 }
 
 fn max_abs_diff(a: &Array, b: &Array) -> f32 {
@@ -162,11 +162,11 @@ fn check_dynamic(variant: &str) {
     );
 }
 
-/// The native engine (`pmetal_bridge::llama4_native`): a prefill, then a
+/// The native engine (`pmetal_runtime::llama4_native`): a prefill, then a
 /// cached decode through its compiled single-token graph and through the
 /// per-op path, which must agree with each other and with transformers.
 fn check_native(variant: &str) {
-    use pmetal_bridge::llama4_native::{NativeCache, forward_step, load_config, load_model};
+    use pmetal_runtime::llama4_native::{NativeCache, forward_step, load_config, load_model};
 
     let fx = checkpoint(variant);
     let config = load_config(fx.path()).expect("native config parses");
@@ -187,7 +187,7 @@ fn check_native(variant: &str) {
     );
 
     let decode = |compiled: bool| {
-        pmetal_bridge::decode::set_compiled_decode(compiled);
+        pmetal_runtime::decode::set_compiled_decode(compiled);
         let mut cache = NativeCache::new_empty(&weights);
         let mut steps = vec![forward_step(&weights, &rows(&ids, 0, PREFILL), &mut cache)];
         for pos in PREFILL..t {
@@ -198,7 +198,7 @@ fn check_native(variant: &str) {
             ));
             drain_bridge("native decode step");
         }
-        pmetal_bridge::decode::set_compiled_decode(true);
+        pmetal_runtime::decode::set_compiled_decode(true);
         steps
     };
     let compiled = decode(true);
@@ -265,7 +265,7 @@ fn native_llama4_moe_matches_transformers() {
 #[test]
 #[serial]
 fn native_llama4_runs_an_mlx_quantized_checkpoint() {
-    use pmetal_bridge::llama4_native::{NativeCache, forward_step, load_config, load_model};
+    use pmetal_runtime::llama4_native::{NativeCache, forward_step, load_config, load_model};
 
     const GROUP: i32 = 32;
     let source = load_shard(&fixture_path("llama4_native_weights.safetensors"));
@@ -358,7 +358,7 @@ fn native_llama4_runs_an_mlx_quantized_checkpoint() {
     let reference = load_shard(&fixture_path("llama4_native_reference.safetensors"));
     let ids = ref_tensor(&reference, "input_ids").clone();
     let t = ids.dim(1);
-    let run = |weights: &pmetal_bridge::llama4_native::NativeWeights, chunks: &[i32]| {
+    let run = |weights: &pmetal_runtime::llama4_native::NativeWeights, chunks: &[i32]| {
         let mut cache = NativeCache::new_empty(weights);
         let mut start = 0;
         let mut logits = Vec::new();

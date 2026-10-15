@@ -13,7 +13,7 @@ categories.workspace = true
 default = []
 
 [dependencies]
-pmetal-bridge = { workspace = true }
+pmetal-runtime = { workspace = true }
 safetensors = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -29,8 +29,8 @@ ndarray = { workspace = true }
 regex = { workspace = true }
 
 [dev-dependencies]
-# Fail every test at the bridge op that throws (pmetal-bridge `strict-errors`).
-pmetal-bridge = { workspace = true, features = ["strict-errors"] }
+# Fail every test at the bridge op that throws (pmetal-runtime `strict-errors`).
+pmetal-runtime = { workspace = true, features = ["strict-errors"] }
 tempfile = { workspace = true }
 criterion = { workspace = true }
 

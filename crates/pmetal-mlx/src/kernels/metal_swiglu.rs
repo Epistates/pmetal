@@ -37,7 +37,7 @@
 //! let output = mlp.forward(&input, &gate_weight, &up_weight, &down_weight)?;
 //! ```
 
-use pmetal_bridge::compat::Array;
+use pmetal_runtime::compat::Array;
 
 use super::utils::Result;
 
@@ -295,7 +295,7 @@ fn apply_activation(x: &Array, activation: GatedActivationType) -> Array {
         // Tanh approximation: what `gelu_pytorch_tanh` / `gelu_new` name, and
         // what every GEGLU architecture actually uses, not the exact erf
         // `Array::gelu()`.
-        GatedActivationType::GEGLU => pmetal_bridge::compat::nn::gelu_tanh_approximate(x),
+        GatedActivationType::GEGLU => pmetal_runtime::compat::nn::gelu_tanh_approximate(x),
         GatedActivationType::ReGLU => x.relu(),
     }
 }
@@ -336,7 +336,7 @@ pub fn fused_geglu_forward(
     let gate = x.matmul(&gate_weight.t());
     let up = x.matmul(&up_weight.t());
 
-    let gelu_gate = pmetal_bridge::compat::nn::gelu_tanh_approximate(&gate);
+    let gelu_gate = pmetal_runtime::compat::nn::gelu_tanh_approximate(&gate);
     let hidden = gelu_gate.multiply(&up);
 
     Ok(hidden.matmul(&down_weight.t()))
@@ -401,7 +401,7 @@ pub fn fused_swiglu_lora_forward(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::{Dtype, random};
+    use pmetal_runtime::compat::{Dtype, random};
 
     #[test]
     fn test_fused_swiglu_config() {

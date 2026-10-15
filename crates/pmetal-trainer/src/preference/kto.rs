@@ -15,9 +15,9 @@
 //! out of the gradient. It is the reference point the prospect-theory value
 //! is measured from: without it, KTO only pushes rewards up or down.
 
-use pmetal_bridge::compat::{Array, nn, ops};
 use pmetal_core::{TrainingCallback, TrainingConfig};
 use pmetal_lora::TrainableModel;
+use pmetal_runtime::compat::{Array, nn, ops};
 
 use super::{
     MicroBatch, PreferenceError, PreferenceResult, PreferenceStepMetrics, Sequence,
@@ -140,7 +140,7 @@ impl KtoTrainer {
     ) -> PreferenceResult<Vec<PreferenceStepMetrics>>
     where
         M: TrainableModel,
-        O: pmetal_bridge::compat::optimizers::Optimizer,
+        O: pmetal_runtime::compat::optimizers::Optimizer,
     {
         if samples.is_empty() {
             return Err(PreferenceError::Data("no KTO examples".into()));
@@ -258,7 +258,7 @@ mod tests {
         let (loss, rewards) = cfg.loss(&policy, &reference, &kl, &[true, true, false, false]);
         loss.eval();
         rewards.eval();
-        pmetal_bridge::check_unobserved_error().unwrap();
+        pmetal_runtime::check_unobserved_error().unwrap();
 
         let r = [2.0f64, -1.0, 0.5, -3.0];
         let z = 0.4;

@@ -28,11 +28,11 @@ use common::{fixture_path, load_shard, ref_tensor};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use pmetal_bridge::compat::{Array, ops};
 use pmetal_mlx::speculative::SpecCapture;
 use pmetal_mlx::test_utils::{
     ParityReport, Tolerance, argmax_last_axis, print_report_table, to_f32_vec_eval,
 };
+use pmetal_runtime::compat::{Array, ops};
 
 use pmetal_models::architectures::gemma4::{Gemma4Config, Gemma4ForCausalLM, load_gemma4_weights};
 
@@ -357,10 +357,10 @@ fn native_checkpoint(
     weights_fixture: &str,
 ) -> (
     tempfile::TempDir,
-    pmetal_bridge::gemma4_native::Gemma4Config,
-    pmetal_bridge::gemma4_native::NativeWeights,
+    pmetal_runtime::gemma4_native::Gemma4Config,
+    pmetal_runtime::gemma4_native::NativeWeights,
 ) {
-    use pmetal_bridge::gemma4_native;
+    use pmetal_runtime::gemma4_native;
 
     // The native loader reads a checkpoint directory, not a tensor map.
     let dir = tempfile::tempdir().expect("temp dir");
@@ -407,8 +407,8 @@ fn gemma4_native_moe_chunked_prefill_matches_transformers() {
 /// Covers KV-sharing layers reading those buffers too.
 #[test]
 fn gemma4_native_cached_decode_past_the_window_matches_transformers() {
-    use pmetal_bridge::decode::prefill_last_logits;
-    use pmetal_bridge::gemma4_native::{self, forward_step_last};
+    use pmetal_runtime::decode::prefill_last_logits;
+    use pmetal_runtime::gemma4_native::{self, forward_step_last};
 
     let (_dir, config, weights) = native_checkpoint(
         shared_synthetic_config_json(),
@@ -443,11 +443,11 @@ fn gemma4_native_cached_decode_past_the_window_matches_transformers() {
         for pos in prefill..ids.len() {
             let step = forward_step_last(
                 &weights,
-                &pmetal_bridge::decode::prompt_tokens_to_input(&ids[pos..pos + 1]),
+                &pmetal_runtime::decode::prompt_tokens_to_input(&ids[pos..pos + 1]),
                 &mut cache,
             );
-            pmetal_bridge::check_unobserved_error().expect("native decode step");
-            let row = pmetal_bridge::compat::ops::slice_axis(want, 1, pos as i32, pos as i32 + 1);
+            pmetal_runtime::check_unobserved_error().expect("native decode step");
+            let row = pmetal_runtime::compat::ops::slice_axis(want, 1, pos as i32, pos as i32 + 1);
             let name = format!("prefill {prefill}, slack {slack}, step {pos}");
             reports.push(compare_checkpoint(
                 &name,
@@ -488,8 +488,8 @@ fn gemma4_native_cached_decode_past_the_window_matches_transformers() {
 /// pass's dtype, and returns f32 logits.
 #[test]
 fn gemma4_native_prefill_stays_in_the_models_dtype() {
-    use pmetal_bridge::compat::Dtype;
-    use pmetal_bridge::gemma4_native;
+    use pmetal_runtime::compat::Dtype;
+    use pmetal_runtime::gemma4_native;
 
     let bf16 = Dtype::Bfloat16.as_i32();
     for (label, config_json, weights_fixture, reference) in [
@@ -535,7 +535,7 @@ fn gemma4_native_prefill_stays_in_the_models_dtype() {
         let ids = input_ids_from_shard(&load_shard(&fixture_path(reference)));
         let mut cache = gemma4_native::build_cache(&weights, &config);
         let logits = gemma4_native::forward_step(&weights, &ids, &mut cache);
-        pmetal_bridge::check_unobserved_error().expect("native forward");
+        pmetal_runtime::check_unobserved_error().expect("native forward");
         assert_eq!(logits.dtype_raw(), bf16, "{label}: logits dtype");
         for (i, layer) in cache.layers.iter().enumerate() {
             for (name, array) in [("keys", &layer.keys), ("values", &layer.values)] {
@@ -553,9 +553,9 @@ fn gemma4_native_prefill_stays_in_the_models_dtype() {
 #[test]
 #[serial_test::serial]
 fn gemma4_native_prefill_memory_is_bounded_by_the_pass() {
-    use pmetal_bridge::decode::{SamplingParams, prefill_first_token};
-    use pmetal_bridge::gemma4_native::{self, forward_step};
-    use pmetal_bridge::inline_array::{clear_cache, get_peak_memory, reset_peak_memory};
+    use pmetal_runtime::decode::{SamplingParams, prefill_first_token};
+    use pmetal_runtime::gemma4_native::{self, forward_step};
+    use pmetal_runtime::inline_array::{clear_cache, get_peak_memory, reset_peak_memory};
 
     let (_dir, config, weights) =
         native_checkpoint(synthetic_config_json(), "gemma4_synth_weights.safetensors");
@@ -566,7 +566,7 @@ fn gemma4_native_prefill_memory_is_bounded_by_the_pass() {
         clear_cache();
         reset_peak_memory();
         let token = prefill(&mut cache);
-        pmetal_bridge::check_unobserved_error().expect("native prefill");
+        pmetal_runtime::check_unobserved_error().expect("native prefill");
         (get_peak_memory(), token)
     };
     let (whole, whole_token) = peak(&|cache| {
@@ -596,8 +596,8 @@ fn run_native_chunked_prefill(
     weights_fixture: &str,
     reference_fixture: &str,
 ) {
-    use pmetal_bridge::decode::prefill_last_logits;
-    use pmetal_bridge::gemma4_native::{self, forward_step_last};
+    use pmetal_runtime::decode::prefill_last_logits;
+    use pmetal_runtime::gemma4_native::{self, forward_step_last};
 
     let (_dir, config, weights) = native_checkpoint(config_json, weights_fixture);
     let ref_shard = load_shard(&fixture_path(reference_fixture));
@@ -607,14 +607,14 @@ fn run_native_chunked_prefill(
         .collect();
     let want = ref_tensor(&ref_shard, "logits");
     let len = ids.len() as i32;
-    let last = pmetal_bridge::compat::ops::slice_axis(want, 1, len - 1, len);
+    let last = pmetal_runtime::compat::ops::slice_axis(want, 1, len - 1, len);
     // The same bound as `run_native_synthetic_parity`'s logits.
     let tolerance = Tolerance::new(1.5e-5, 0.0);
 
     for chunk in [1, 3, 5, 8, 11, 12, 100] {
         let mut cache = gemma4_native::build_cache(&weights, &config);
         let logits = prefill_last_logits(&weights, &mut cache, &ids, chunk, forward_step_last);
-        pmetal_bridge::check_unobserved_error().expect("native chunked prefill");
+        pmetal_runtime::check_unobserved_error().expect("native chunked prefill");
         let report = compare_checkpoint(
             &format!("{label} chunk {chunk}"),
             &logits.reshape(&[1, 1, -1]),
@@ -631,10 +631,10 @@ fn run_native_chunked_prefill(
         prefill_last_logits(&weights, &mut cache, head, chunk, forward_step_last).eval();
         let step = gemma4_native::forward_step_last(
             &weights,
-            &pmetal_bridge::decode::prompt_tokens_to_input(&ids[ids.len() - 1..]),
+            &pmetal_runtime::decode::prompt_tokens_to_input(&ids[ids.len() - 1..]),
             &mut cache,
         );
-        pmetal_bridge::check_unobserved_error().expect("native decode after chunked prefill");
+        pmetal_runtime::check_unobserved_error().expect("native decode after chunked prefill");
         let report = compare_checkpoint(
             &format!("{label} decode after chunk {chunk}"),
             &step.reshape(&[1, 1, -1]),
@@ -652,7 +652,7 @@ fn run_native_synthetic_parity(
     weights_fixture: &str,
     reference_fixture: &str,
 ) {
-    use pmetal_bridge::gemma4_native;
+    use pmetal_runtime::gemma4_native;
 
     let (_dir, config, weights) = native_checkpoint(config_json, weights_fixture);
     let mut cache = gemma4_native::build_cache(&weights, &config);
@@ -660,7 +660,7 @@ fn run_native_synthetic_parity(
     let ref_shard = load_shard(&fixture_path(reference_fixture));
     let logits =
         gemma4_native::forward_step(&weights, &input_ids_from_shard(&ref_shard), &mut cache);
-    pmetal_bridge::check_unobserved_error().expect("native forward");
+    pmetal_runtime::check_unobserved_error().expect("native forward");
 
     // ⚠️ Tighter than `synthetic_tolerances`, which the module port can
     // afford because it also checks every layer's hidden state. With only the

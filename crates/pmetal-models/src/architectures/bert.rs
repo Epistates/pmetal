@@ -19,8 +19,8 @@
 //! The output is intended to be passed to a pooling layer
 //! (`pmetal_models::pooling::pool`) to produce fixed-size sentence embeddings.
 
-use pmetal_bridge::compat::{Array, Exception, Module, nn, ops};
-use pmetal_bridge::impl_module_params;
+use pmetal_runtime::compat::{Array, Exception, Module, nn, ops};
+use pmetal_runtime::impl_module_params;
 use serde::{Deserialize, Serialize};
 
 use crate::architectures::utils::{Activation, resolve_activation};

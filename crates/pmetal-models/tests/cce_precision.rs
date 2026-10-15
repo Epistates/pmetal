@@ -16,12 +16,12 @@
 
 use std::time::Instant;
 
-use pmetal_bridge::compat::{Array, Dtype, ops};
-use pmetal_bridge::inline_array::{
-    clear_cache, get_active_memory, get_peak_memory, reset_peak_memory, value_and_grad,
-};
 use pmetal_mlx::kernels::cut_cross_entropy::{CutCrossEntropy, CutCrossEntropyConfig};
 use pmetal_models::dispatcher::{DynamicModel, LmHead};
+use pmetal_runtime::compat::{Array, Dtype, ops};
+use pmetal_runtime::inline_array::{
+    clear_cache, get_active_memory, get_peak_memory, reset_peak_memory, value_and_grad,
+};
 
 const TEST_NAME: &str = "cut_cross_entropy_precision_on_a_real_checkpoint";
 
@@ -75,7 +75,7 @@ const VARIANTS: [&str; 5] = [
 
 /// The loss of `variant`, from the hidden states and the head weight.
 fn loss(variant: &str, head: &LmHead, targets: &Array, h: &Array, w: &Array) -> Array {
-    let ce = |z: &Array| pmetal_bridge::training::cross_entropy_loss(z, targets, -100);
+    let ce = |z: &Array| pmetal_runtime::training::cross_entropy_loss(z, targets, -100);
     match variant {
         "f32 reference" => ce(&logits(head, &f32_(h), &f32_(w))),
         "full logits" => ce(&logits(head, h, w)),
@@ -125,7 +125,7 @@ fn step(
     for g in &grads {
         g.eval();
     }
-    if let Err(e) = pmetal_bridge::check_unobserved_error() {
+    if let Err(e) = pmetal_runtime::check_unobserved_error() {
         panic!("{variant}: a bridge op threw: {e}");
     }
     (value, grads)

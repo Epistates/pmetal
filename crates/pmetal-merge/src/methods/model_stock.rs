@@ -16,7 +16,7 @@
 //! similarity weighting to approximate the center.
 
 use crate::{MergeError, MergeMethod, MergeParameters, Result};
-use pmetal_bridge::compat::Array;
+use pmetal_runtime::compat::Array;
 
 /// Model Stock merge method.
 ///

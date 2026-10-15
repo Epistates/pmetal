@@ -4,7 +4,7 @@
 //! their architecture from its `Config`, which is how eight of them came to
 //! compute something different from the model they would be served as. An
 //! [`AdaptedModel`] holds a [`DynamicModel`] — the *same* type `pmetal serve`
-//! runs — and attaches [`LoraAdapter`](pmetal_bridge::compat::LoraAdapter)s to
+//! runs — and attaches [`LoraAdapter`](pmetal_runtime::compat::LoraAdapter)s to
 //! its projections. There is one forward pass, so there is nothing to drift.
 //!
 //! This is the shape PEFT uses: build the model, then walk it and
@@ -14,11 +14,11 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
-use pmetal_bridge::compat::{
-    Array, Exception, ModuleParameters, ModuleParametersExt, NestedValue, VisitLinears,
-};
 use pmetal_core::LoraConfig;
 use pmetal_models::dispatcher::DynamicModel;
+use pmetal_runtime::compat::{
+    Array, Exception, ModuleParameters, ModuleParametersExt, NestedValue, VisitLinears,
+};
 
 use crate::{LoraError, load_safetensors_map, save_safetensors_map};
 
@@ -527,11 +527,11 @@ impl ModuleParameters for AdaptedModel {
         self.model.num_parameters()
     }
 
-    fn parameters(&self) -> pmetal_bridge::compat::ModuleParamRef<'_> {
+    fn parameters(&self) -> pmetal_runtime::compat::ModuleParamRef<'_> {
         self.model.parameters()
     }
 
-    fn parameters_mut(&mut self) -> pmetal_bridge::compat::ModuleParamMut<'_> {
+    fn parameters_mut(&mut self) -> pmetal_runtime::compat::ModuleParamMut<'_> {
         self.model.parameters_mut()
     }
 
@@ -546,27 +546,27 @@ impl ModuleParameters for AdaptedModel {
     ///
     /// Returned flat, with dotted paths, which is how a consumer sees it after
     /// flattening anyway.
-    fn trainable_parameters(&self) -> pmetal_bridge::compat::ModuleParamRef<'_> {
+    fn trainable_parameters(&self) -> pmetal_runtime::compat::ModuleParamRef<'_> {
         fn collect<'a>(
-            tree: &pmetal_bridge::compat::ModuleParamRef<'a>,
+            tree: &pmetal_runtime::compat::ModuleParamRef<'a>,
             prefix: &str,
-            out: &mut pmetal_bridge::compat::ModuleParamRef<'a>,
+            out: &mut pmetal_runtime::compat::ModuleParamRef<'a>,
         ) {
             for (name, value) in tree {
-                let path = pmetal_bridge::compat::child_path(prefix, name);
+                let path = pmetal_runtime::compat::child_path(prefix, name);
                 match value {
-                    pmetal_bridge::compat::NestedValue::Value(array) => {
+                    pmetal_runtime::compat::NestedValue::Value(array) => {
                         if is_adapter_key(&path) {
                             out.insert(Rc::from(path.as_str()), NestedValue::Value(array));
                         }
                     }
-                    pmetal_bridge::compat::NestedValue::Map(inner) => collect(inner, &path, out),
+                    pmetal_runtime::compat::NestedValue::Map(inner) => collect(inner, &path, out),
                 }
             }
         }
 
         let tree = self.model.parameters();
-        let mut out = pmetal_bridge::compat::ModuleParamRef::new();
+        let mut out = pmetal_runtime::compat::ModuleParamRef::new();
         collect(&tree, "", &mut out);
         out
     }

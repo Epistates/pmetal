@@ -4,7 +4,7 @@
 //! periodic inductive bias for modeling audio harmonics.
 
 use crate::error::Result;
-use pmetal_bridge::compat::{Array, Param, ops};
+use pmetal_runtime::compat::{Array, Param, ops};
 
 /// Snake activation function.
 ///

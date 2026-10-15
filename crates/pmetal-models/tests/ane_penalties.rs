@@ -80,7 +80,7 @@ fn penalized_greedy_decoding_matches_the_gpu() {
     .expect("generate on the GPU")
     .token_ids[PROMPT.len()..]
         .to_vec();
-    pmetal_bridge::check_unobserved_error().expect("GPU decode: no bridge op failed");
+    pmetal_runtime::check_unobserved_error().expect("GPU decode: no bridge op failed");
 
     let mut lm = load_fp16(&dir);
     let got = on_ane(&mut lm, &PROMPT, &config);

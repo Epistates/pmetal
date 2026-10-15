@@ -3,12 +3,12 @@
 //! Each architecture deserializes its own config struct, but the RoPE keys in
 //! it (`rope_theta`, `rope_scaling`, `rope_parameters`,
 //! `partial_rotary_factor`, `max_position_embeddings`) mean the same thing
-//! everywhere. This hands them to [`pmetal_bridge::rope`], the one parser and
+//! everywhere. This hands them to [`pmetal_runtime::rope`], the one parser and
 //! the one set of frequency formulas every engine uses, and names the model
 //! type in its errors (an unknown `rope_type` among them).
 
-use pmetal_bridge::compat::Exception;
-use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
+use pmetal_runtime::compat::Exception;
+use pmetal_runtime::rope::{RopeConfig, RotaryEmbedding};
 
 /// The rotary embedding for `config`'s keys. `config.rope_theta` doubles as
 /// the default base when the rope dict carries none.

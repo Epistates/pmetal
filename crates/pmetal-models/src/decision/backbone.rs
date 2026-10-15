@@ -9,8 +9,8 @@
 
 use std::path::Path;
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, Module};
-use pmetal_bridge::qwen3_native::{self, LayerWeight, NativeCache, NativeWeights, Qwen3Config};
+use pmetal_runtime::compat::{Array, Dtype, Exception, Module};
+use pmetal_runtime::qwen3_native::{self, LayerWeight, NativeCache, NativeWeights, Qwen3Config};
 
 use super::DecisionError;
 use crate::architectures::qwen3_5_vision::{EncodedMedia, Qwen3_5MultimodalConfig};

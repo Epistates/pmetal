@@ -6,7 +6,9 @@
 //! `1 / sqrt(2 * n_layers)`, keeping the residual signal stable regardless
 //! of model depth. We apply the same correction here.
 
-use pmetal_bridge::compat::{Array, Exception, ModuleParametersExt, module::ModuleParameters, ops};
+use pmetal_runtime::compat::{
+    Array, Exception, ModuleParametersExt, module::ModuleParameters, ops,
+};
 
 /// Re-scale residual-stream output projections (o_proj, down_proj) by
 /// `1 / sqrt(2 * n_layers)` following the GPT-NeoX convention.

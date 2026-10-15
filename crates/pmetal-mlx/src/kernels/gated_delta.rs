@@ -32,7 +32,7 @@
 //! - Chunkwise algorithm: Yang et al., "Gated Linear Attention Transformers with
 //!   Hardware-Efficient Training" (FLA, ICLR 2025).
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, linalg, ops};
+use pmetal_runtime::compat::{Array, Dtype, Exception, linalg, ops};
 
 /// Default chunk size for the chunkwise parallel GDN algorithm.
 /// Sequences longer than this use the parallel chunk path.
@@ -924,7 +924,7 @@ pub fn gated_delta_update_with_chunk_size_override(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::random;
+    use pmetal_runtime::compat::random;
     use serial_test::serial;
 
     fn to_f32_vec(arr: &Array) -> Vec<f32> {
@@ -1562,7 +1562,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_traced_recurrence_takes_the_differentiable_path() {
-        use pmetal_bridge::compat::nn::value_and_grad_explicit;
+        use pmetal_runtime::compat::nn::value_and_grad_explicit;
 
         let (b, hk, dk, hv, dv) = (1, 2, 32, 4, 16);
         let a_log = Array::from_f32_slice(&[0.5f32, 1.0, 1.5, 2.0], &[hv]);
@@ -1589,7 +1589,7 @@ mod tests {
                     &[],
                 )
                 .unwrap();
-                pmetal_bridge::check_unobserved_error().expect("a bridge op threw");
+                pmetal_runtime::check_unobserved_error().expect("a bridge op threw");
                 grads
             };
             let want = grad_of(true);

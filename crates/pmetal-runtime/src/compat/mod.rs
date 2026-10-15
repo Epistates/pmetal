@@ -1,0 +1,988 @@
+//! The model-building API the rest of the workspace programs against: arrays,
+//! modules, parameters, layers and ops, all backed by [`InlineArray`](crate::InlineArray).
+//!
+//! # What is covered
+//!
+//! - `Array` — re-export of [`InlineArray`](crate::InlineArray)
+//! - `Dtype` — integer codes matching MLX's encoding (same as bridge.h)
+//! - `Exception` — the error type of every fallible op
+//! - `Param<T>` — trainable-parameter wrapper with a freeze flag
+//! - `Module` / `ModuleParameters` traits
+//! - `ModuleParamRef` / `ModuleParamMut` / `FlattenedModuleParam` type aliases
+//! - `eval` / `eval_params` free functions
+//! - `ops::*` / `random::*` / `nn::*` / `fast::*` sub-modules
+
+mod traits;
+pub use traits::*;
+
+pub mod checkpoint;
+pub mod indexing;
+pub mod layers;
+pub mod lora;
+pub mod nn;
+pub mod ops;
+pub mod optimizers;
+
+// ── Array ────────────────────────────────────────────────────────────────────
+
+/// Re-export InlineArray as Array for source compatibility.
+pub use crate::InlineArray as Array;
+
+pub use checkpoint::checkpointed;
+pub use layers::{Linear, LinearQuant};
+pub use lora::LoraAdapter;
+
+// ── Dtype ────────────────────────────────────────────────────────────────────
+
+/// Array element type — integer codes matching MLX's `mlx_dtype` enum.
+///
+/// The `#[repr(i32)]` discriminants are kept in sync with `bridge.h` so that
+/// `dtype.as_i32()` can be passed directly to every bridge function that
+/// accepts a `dtype: i32` parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(i32)]
+pub enum Dtype {
+    Bool = 0,
+    Uint8 = 1,
+    Uint16 = 2,
+    Uint32 = 3,
+    Uint64 = 4,
+    Int8 = 5,
+    Int16 = 6,
+    Int32 = 7,
+    Int64 = 8,
+    Float16 = 9,
+    Float32 = 10,
+    Bfloat16 = 11,
+    Complex64 = 12,
+}
+
+impl Dtype {
+    /// Return the raw `i32` code expected by bridge functions.
+    #[inline]
+    pub fn as_i32(self) -> i32 {
+        self as i32
+    }
+
+    /// Convert a raw MLX dtype integer back to [`Dtype`].
+    pub fn from_raw(raw: i32) -> Self {
+        match raw {
+            0 => Dtype::Bool,
+            1 => Dtype::Uint8,
+            2 => Dtype::Uint16,
+            3 => Dtype::Uint32,
+            4 => Dtype::Uint64,
+            5 => Dtype::Int8,
+            6 => Dtype::Int16,
+            7 => Dtype::Int32,
+            8 => Dtype::Int64,
+            9 => Dtype::Float16,
+            10 => Dtype::Float32,
+            11 => Dtype::Bfloat16,
+            12 => Dtype::Complex64,
+            _ => Dtype::Float32, // fallback
+        }
+    }
+
+    /// Returns `true` if the dtype is a floating-point type.
+    #[inline]
+    pub fn is_float(self) -> bool {
+        matches!(self, Dtype::Float16 | Dtype::Float32 | Dtype::Bfloat16)
+    }
+
+    /// Returns `true` for float or complex types.
+    #[inline]
+    pub fn is_inexact(self) -> bool {
+        matches!(
+            self,
+            Dtype::Float16 | Dtype::Float32 | Dtype::Bfloat16 | Dtype::Complex64
+        )
+    }
+
+    /// Type promotion following MLX's rules (subset — covers float/int cases).
+    pub fn promote_with(self, other: Self) -> Self {
+        use Dtype::*;
+        // Simplified promotion: the cases that arise in model code, not MLX's
+        // full promotion table.
+        match (self, other) {
+            (a, b) if a == b => a,
+            (Float32, _) | (_, Float32) => Float32,
+            (Bfloat16, Float16) | (Float16, Bfloat16) => Float32,
+            (Bfloat16, _) | (_, Bfloat16) => Bfloat16,
+            (Float16, _) | (_, Float16) => Float16,
+            (Int64, _) | (_, Int64) => Int64,
+            (Uint64, _) | (_, Uint64) => Uint64,
+            (Int32, _) | (_, Int32) => Int32,
+            (Uint32, _) | (_, Uint32) => Uint32,
+            (Int16, _) | (_, Int16) => Int16,
+            (Uint16, _) | (_, Uint16) => Uint16,
+            (Int8, _) | (_, Int8) => Int8,
+            (Uint8, _) | (_, Uint8) => Uint8,
+            _ => self,
+        }
+    }
+}
+
+// ── Exception ────────────────────────────────────────────────────────────────
+
+/// The error type of every fallible op and module call.
+///
+/// Constructed either from a `String`/`&str` message or via [`Exception::custom`].
+#[derive(Debug)]
+pub struct Exception {
+    message: String,
+}
+
+impl Exception {
+    /// Create an exception with the given message.
+    #[track_caller]
+    pub fn custom(msg: impl Into<String>) -> Self {
+        Self {
+            message: msg.into(),
+        }
+    }
+
+    /// The error message string.
+    pub fn what(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for Exception {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for Exception {}
+
+impl From<String> for Exception {
+    fn from(s: String) -> Self {
+        Self::custom(s)
+    }
+}
+
+impl From<&str> for Exception {
+    fn from(s: &str) -> Self {
+        Self::custom(s)
+    }
+}
+
+impl From<crate::RuntimeError> for Exception {
+    fn from(err: crate::RuntimeError) -> Self {
+        Self::custom(err.to_string())
+    }
+}
+
+// ── Param ────────────────────────────────────────────────────────────────────
+
+/// A trainable-parameter wrapper.
+///
+/// Derefs transparently to `T`, carries a freeze flag.
+#[derive(Debug, Clone)]
+pub struct Param<T> {
+    /// The wrapped value.
+    pub value: T,
+    is_frozen: bool,
+}
+
+impl<T> Param<T> {
+    /// Wrap a value as a (non-frozen) trainable parameter.
+    pub fn new(value: T) -> Self {
+        Self {
+            value,
+            is_frozen: false,
+        }
+    }
+
+    /// Whether this parameter is currently frozen.
+    pub fn is_frozen(&self) -> bool {
+        self.is_frozen
+    }
+
+    /// Freeze the parameter (excluded from gradient computation).
+    pub fn freeze(&mut self) {
+        self.is_frozen = true;
+    }
+
+    /// Unfreeze the parameter.
+    pub fn unfreeze(&mut self) {
+        self.is_frozen = false;
+    }
+
+    /// Consume the wrapper and return the inner value.
+    pub fn into_inner(self) -> T {
+        self.value
+    }
+}
+
+impl<T> From<T> for Param<T> {
+    fn from(value: T) -> Self {
+        Self::new(value)
+    }
+}
+
+impl<T> std::ops::Deref for Param<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T> std::ops::DerefMut for Param<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+}
+
+impl<T: AsRef<U>, U> AsRef<U> for Param<T> {
+    fn as_ref(&self) -> &U {
+        self.value.as_ref()
+    }
+}
+
+// ── Module parameter tree types ───────────────────────────────────────────────
+
+/// Nested parameter value.
+///
+/// Used to represent a tree of named parameters for `ModuleParameters`.
+pub enum NestedValue<V> {
+    /// A leaf parameter value.
+    Value(V),
+    /// A sub-map of named nested values.
+    Map(std::collections::HashMap<std::rc::Rc<str>, NestedValue<V>>),
+}
+
+impl<V> NestedValue<V> {
+    /// Flatten the tree into a `HashMap<String, V>`.
+    pub fn flatten_into(self, prefix: &str, out: &mut std::collections::HashMap<String, V>) {
+        match self {
+            NestedValue::Value(v) => {
+                out.insert(prefix.to_owned(), v);
+            }
+            NestedValue::Map(m) => {
+                for (k, child) in m {
+                    let full = if prefix.is_empty() {
+                        k.to_string()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    child.flatten_into(&full, out);
+                }
+            }
+        }
+    }
+}
+
+/// Borrowed parameter tree (returned by `parameters()`).
+pub type ModuleParamRef<'a> = std::collections::HashMap<std::rc::Rc<str>, NestedValue<&'a Array>>;
+
+/// Mutably borrowed parameter tree (returned by `parameters_mut()`).
+pub type ModuleParamMut<'a> =
+    std::collections::HashMap<std::rc::Rc<str>, NestedValue<&'a mut Array>>;
+
+/// Owned, flattened parameter map (used by optimizers and `value_and_grad`).
+pub type FlattenedModuleParam = std::collections::HashMap<std::rc::Rc<str>, Array>;
+
+// ── Module traits ─────────────────────────────────────────────────────────────
+
+/// Forward-pass trait for neural-network modules.
+///
+/// The generic `Input` parameter allows both `&Array` and tuple inputs.
+pub trait Module<Input>: ModuleParameters + std::fmt::Debug {
+    /// Output type produced by the forward pass.
+    type Output;
+
+    /// Error type returned on failure.
+    type Error: std::error::Error;
+
+    /// Run the forward pass.
+    fn forward(&mut self, input: Input) -> Result<Self::Output, Self::Error>;
+
+    /// Toggle training mode (affects dropout, etc.).
+    fn training_mode(&mut self, mode: bool);
+}
+
+/// Accessor trait for module parameters — used by optimizers and autograd.
+pub trait ModuleParameters {
+    /// Total number of leaf parameters.
+    fn num_parameters(&self) -> usize;
+
+    /// Borrow all parameters as a nested tree.
+    fn parameters(&self) -> ModuleParamRef<'_>;
+
+    /// Mutably borrow all parameters.
+    fn parameters_mut(&mut self) -> ModuleParamMut<'_>;
+
+    /// Borrow only the trainable (non-frozen) parameters.
+    fn trainable_parameters(&self) -> ModuleParamRef<'_> {
+        // Default: identical to parameters(). Override to filter frozen params.
+        self.parameters()
+    }
+
+    /// Freeze all parameters.
+    fn freeze_parameters(&mut self, _recursive: bool) {}
+
+    /// Unfreeze all parameters.
+    fn unfreeze_parameters(&mut self, _recursive: bool) {}
+
+    /// Returns `Some(true)` if all parameters are frozen, `Some(false)` if at
+    /// least one is not, `None` if there are no parameters.
+    fn all_frozen(&self) -> Option<bool> {
+        None
+    }
+
+    /// Returns `Some(true)` if any parameter is frozen.
+    fn any_frozen(&self) -> Option<bool> {
+        None
+    }
+}
+
+// ── Top-level transform functions ─────────────────────────────────────────────
+
+/// Materialise the lazy computation graph for a set of arrays.
+///
+/// Each array is cloned (which shares the underlying MLX ref-count) and then
+/// evaluated.  The caller's originals are unaffected.
+pub fn eval<'a>(arrays: impl IntoIterator<Item = &'a Array>) -> Result<(), Exception> {
+    for a in arrays {
+        let c = a.clone();
+        c.eval();
+    }
+    Ok(())
+}
+
+/// Evaluate a borrowed parameter tree in place.
+pub fn eval_params(params: ModuleParamRef<'_>) -> Result<(), Exception> {
+    fn walk(node: &NestedValue<&Array>) {
+        match node {
+            NestedValue::Value(a) => {
+                let c = (*a).clone();
+                c.eval();
+            }
+            NestedValue::Map(m) => {
+                for v in m.values() {
+                    walk(v);
+                }
+            }
+        }
+    }
+    for v in params.values() {
+        walk(v);
+    }
+    Ok(())
+}
+
+// ── random sub-module ─────────────────────────────────────────────────────────
+
+/// Random sampling. Draws take the thread's global MLX key ([`random::seed`]
+/// seeds it) unless given a key ([`random::key`]).
+pub mod random {
+    use super::{Array, Dtype};
+    use std::cell::Cell;
+
+    pub fn normal(shape: &[i32], dtype: Dtype) -> Array {
+        Array::random_normal(shape, dtype.as_i32())
+    }
+    pub fn uniform(shape: &[i32], dtype: Dtype) -> Array {
+        Array::random_uniform(shape, dtype.as_i32())
+    }
+    /// Standard normal draws. With a `key` the draw is a function of it
+    /// alone; without one it takes the thread's global key.
+    pub fn normal_keyed(shape: &[i32], dtype: Dtype, key: Option<&Array>) -> Array {
+        Array::random_normal_keyed(shape, dtype.as_i32(), key)
+    }
+    /// Uniform draws in `[0, 1)`. With a `key` the draw is a function of it
+    /// alone; without one it takes the thread's global key.
+    pub fn uniform_keyed(shape: &[i32], dtype: Dtype, key: Option<&Array>) -> Array {
+        Array::random_uniform_keyed(shape, dtype.as_i32(), key)
+    }
+    /// Seed the thread's global MLX key and its [dropout stream](dropout_mask).
+    pub fn seed(s: u64) {
+        crate::inline_array::random_seed(s);
+        DROPOUT_STREAM.with(|stream| stream.set((s, 0)));
+    }
+
+    thread_local! {
+        /// `(seed, draws so far)` of the dropout stream.
+        static DROPOUT_STREAM: Cell<(u64, u64)> = Cell::new((clock_seed(), 0));
+    }
+
+    fn clock_seed() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64)
+    }
+
+    /// SplitMix64's output for draw `n` of a stream seeded with `seed`.
+    fn splitmix(seed: u64, n: u64) -> u64 {
+        let mut z = seed.wrapping_add(n.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A Bernoulli(`keep`) mask of `shape`, `true` where an element is kept,
+    /// drawn from the thread's dropout stream.
+    ///
+    /// The stream is a counter, not MLX's global key, and that is the point:
+    /// a gradient-checkpointed block runs its forward again during the
+    /// backward pass, and a mask drawn again from a moving global key is
+    /// another mask. [`checkpointed`](super::checkpointed) replays the
+    /// stream from where the block's forward started, so the recompute draws
+    /// the masks the forward did. [`seed`] resets it.
+    pub fn dropout_mask(keep: f32, shape: &[i32]) -> Array {
+        let (seed, n) = DROPOUT_STREAM.with(|stream| {
+            let (seed, n) = stream.get();
+            stream.set((seed, n + 1));
+            (seed, n)
+        });
+        let key = Array::random_key(splitmix(seed, n));
+        let u = Array::random_uniform_keyed(shape, Dtype::Float32.as_i32(), Some(&key));
+        u.less(&Array::from_f32(keep))
+    }
+
+    /// How many masks the dropout stream has drawn.
+    pub(crate) fn dropout_position() -> u64 {
+        DROPOUT_STREAM.with(|stream| stream.get().1)
+    }
+
+    /// Move the dropout stream to draw number `position`.
+    pub(crate) fn set_dropout_position(position: u64) {
+        DROPOUT_STREAM.with(|stream| stream.set((stream.get().0, position)));
+    }
+    /// Integers drawn uniformly from `[low, high)`. With a `key` the draw is
+    /// a function of it alone; without one it takes the thread's global key.
+    pub fn randint(low: i32, high: i32, shape: &[i32], dtype: Dtype, key: Option<&Array>) -> Array {
+        Array::random_randint(low, high, shape, dtype.as_i32(), key)
+    }
+    pub fn bernoulli(p: &Array, shape: &[i32]) -> Array {
+        Array::random_bernoulli(p, shape)
+    }
+    /// Uniform random in [lo, hi).
+    pub fn uniform_range(lo: f32, hi: f32, shape: &[i32], dtype: Dtype) -> Array {
+        // uniform() gives [0,1); scale and shift to [lo, hi).
+        let u = Array::random_uniform(shape, Dtype::Float32.as_i32());
+        let range = Array::from_f32(hi - lo);
+        let offset = Array::from_f32(lo);
+        let scaled = u.multiply(&range).add(&offset);
+        if dtype == Dtype::Float32 {
+            scaled
+        } else {
+            scaled.as_dtype(dtype.as_i32())
+        }
+    }
+    /// Uniform random normal in [0,1) as f32.  Deprecated alias for `uniform`.
+    pub fn uniform_f32(shape: &[i32]) -> Array {
+        Array::random_uniform(shape, Dtype::Float32.as_i32())
+    }
+
+    /// Sample from a categorical distribution.
+    ///
+    /// `logits`: unnormalized log-probabilities with the classes on `axis`.
+    /// Returns integer indices with `axis` removed. With a `key` the draw is
+    /// a function of it alone; without one it takes the thread's global key.
+    pub fn categorical(logits: &Array, axis: i32, key: Option<&Array>) -> Array {
+        logits.categorical(axis, key)
+    }
+
+    /// The PRNG key for `seed`, for the `key` argument of the samplers.
+    pub fn key(seed: u64) -> Array {
+        Array::random_key(seed)
+    }
+}
+
+// ── linalg sub-module ────────────────────────────────────────────────────────
+
+/// Linear algebra.
+pub mod linalg {
+    use super::Array;
+
+    /// Compute the inverse of a triangular matrix (batched over leading dims).
+    ///
+    /// Dispatches on the CPU stream because `tri_inv` has no registered VJP — it is
+    /// used as a fixed preconditioner in the GDN WY factorization and must not appear
+    /// on the autograd tape.
+    pub fn tri_inv(a: &Array, upper: bool) -> Array {
+        a.tri_inv(upper, true /* use_cpu */)
+    }
+
+    /// Economy SVD — returns `(U, S, Vt)`.
+    ///
+    /// Always runs on the CPU stream (GPU SVD is not available in MLX).
+    pub fn svd(a: &Array) -> (Array, Array, Array) {
+        a.svd()
+    }
+}
+
+// ── fast sub-module ───────────────────────────────────────────────────────────
+
+/// MLX's fused kernels: RMS norm, RoPE and scaled dot-product attention.
+pub mod fast {
+    use super::Array;
+
+    /// RMS normalisation with an optional affine weight.
+    /// `weight` may be `Option<&Array>` or `&Array` (converted automatically via `IntoRmsWeight`).
+    pub fn rms_norm(x: &Array, weight: &Array, eps: f32) -> Array {
+        x.rms_norm(Some(weight), eps)
+    }
+
+    /// RMS normalisation with an explicit `Option<&Array>` weight.
+    pub fn rms_norm_opt(x: &Array, weight: Option<&Array>, eps: f32) -> Array {
+        x.rms_norm(weight, eps)
+    }
+
+    /// Rotary position embedding.
+    pub fn rope(
+        x: &Array,
+        dims: i32,
+        traditional: bool,
+        base: f32,
+        scale: f32,
+        offset: i32,
+    ) -> Array {
+        x.rope(dims, traditional, base, scale, offset)
+    }
+
+    /// Rotary position embedding with an explicit inverse-frequency
+    /// array. Use this when the template rotates only a subset of the
+    /// head dimensions but the rotation pairing still uses the full
+    /// head_dim — for example Gemma 4's `ProportionalRoPE`.
+    /// The `freqs` array has shape `[head_dim / 2]` where non-rotated
+    /// slots are filled with `f32::INFINITY` so mlx skips them.
+    pub fn rope_with_freqs(
+        x: &Array,
+        dims: i32,
+        traditional: bool,
+        scale: f32,
+        offset: i32,
+        freqs: &Array,
+    ) -> Array {
+        x.rope_with_freqs(dims, traditional, scale, offset, freqs)
+    }
+
+    /// Scaled dot-product attention with a string mask mode: `""` for none or
+    /// `"causal"`. Any other mode throws; an explicit mask array goes through
+    /// [`scaled_dot_product_attention_masked`].
+    pub fn scaled_dot_product_attention(
+        q: &Array,
+        k: &Array,
+        v: &Array,
+        scale: f32,
+        mask_mode: &str,
+    ) -> Array {
+        q.sdpa(k, v, scale, mask_mode)
+    }
+
+    /// SDPA with an explicit mask array (pass `None` for no mask).
+    pub fn scaled_dot_product_attention_masked(
+        q: &Array,
+        k: &Array,
+        v: &Array,
+        scale: f32,
+        mask: Option<&Array>,
+    ) -> Array {
+        q.sdpa_with_mask(k, v, scale, mask)
+    }
+}
+
+// ── fft sub-module ────────────────────────────────────────────────────────────
+
+/// Real FFTs.
+pub mod fft {
+    use super::Array;
+
+    /// Real FFT along `axis`. `n` = `None` uses full axis length.
+    pub fn rfft(a: &Array, n: Option<i32>, axis: i32) -> Array {
+        a.rfft(n.unwrap_or(-1), axis)
+    }
+
+    /// Inverse real FFT along `axis`. `n` = `None` infers from input.
+    pub fn irfft(a: &Array, n: Option<i32>, axis: i32) -> Array {
+        a.irfft(n.unwrap_or(-1), axis)
+    }
+}
+
+// ── IoError ───────────────────────────────────────────────────────────────────
+
+/// An IO error from safetensors loading.
+#[derive(Debug)]
+pub struct IoError {
+    message: String,
+}
+
+impl IoError {
+    pub fn new(msg: impl Into<String>) -> Self {
+        Self {
+            message: msg.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for IoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for IoError {}
+
+impl From<String> for IoError {
+    fn from(s: String) -> Self {
+        Self::new(s)
+    }
+}
+
+impl From<&str> for IoError {
+    fn from(s: &str) -> Self {
+        Self::new(s)
+    }
+}
+
+impl From<crate::RuntimeError> for IoError {
+    fn from(err: crate::RuntimeError) -> Self {
+        Self::new(err.to_string())
+    }
+}
+
+impl From<std::io::Error> for IoError {
+    fn from(e: std::io::Error) -> Self {
+        Self::new(e.to_string())
+    }
+}
+
+/// Flatten a borrowed nested-value tree into an owned FlattenedModuleParam by cloning each Array.
+fn flatten_nested_ref_owned(
+    map: &std::collections::HashMap<std::rc::Rc<str>, NestedValue<&Array>>,
+    prefix: &str,
+    out: &mut FlattenedModuleParam,
+) {
+    for (k, v) in map {
+        let full: std::rc::Rc<str> = if prefix.is_empty() {
+            k.clone()
+        } else {
+            format!("{prefix}.{k}").into()
+        };
+        match v {
+            NestedValue::Value(arr) => {
+                out.insert(full, (*arr).clone());
+            }
+            NestedValue::Map(child) => {
+                flatten_nested_ref_owned(child, &full, out);
+            }
+        }
+    }
+}
+
+fn flatten_nested_mut_owned<'a>(
+    map: std::collections::HashMap<std::rc::Rc<str>, NestedValue<&'a mut Array>>,
+    prefix: &str,
+    out: &mut std::collections::HashMap<String, &'a mut Array>,
+) {
+    for (k, v) in map {
+        let full: String = if prefix.is_empty() {
+            k.to_string()
+        } else {
+            format!("{prefix}.{k}")
+        };
+        match v {
+            NestedValue::Value(arr) => {
+                out.insert(full, arr);
+            }
+            NestedValue::Map(child) => {
+                flatten_nested_mut_owned(child, &full, out);
+            }
+        }
+    }
+}
+
+/// Update a single trainable parameter leaf in a mutable parameter tree.
+///
+/// Used by `nn::value_and_grad` to inject autograd-tracked parameter arrays
+/// back into the model before invoking the user's loss function.
+pub(crate) fn update_trainable_param(
+    pm: &mut std::collections::HashMap<std::rc::Rc<str>, NestedValue<&mut Array>>,
+    key: &std::rc::Rc<str>,
+    value: Array,
+) {
+    // The nested tree may use multi-segment keys at any level
+    // (e.g. "layers.0" as a single key at the root, then "self_attn", etc.).
+    // We try all possible splits: consume dots left-to-right, testing whether
+    // the current prefix exists as a key in the current map.
+    update_trainable_param_recurse(pm, key.as_ref(), value);
+}
+
+fn update_trainable_param_recurse(
+    map: &mut std::collections::HashMap<std::rc::Rc<str>, NestedValue<&mut Array>>,
+    remaining: &str,
+    value: Array,
+) {
+    // Try the whole remaining string as a direct key first (leaf case).
+    let remaining_rc: std::rc::Rc<str> = remaining.into();
+    if let Some(entry) = map.get_mut(&remaining_rc) {
+        match entry {
+            NestedValue::Value(arr) => {
+                **arr = value;
+                return;
+            }
+            NestedValue::Map(_) => {
+                // Exact match hit a map, not a leaf — shouldn't happen, but bail.
+                return;
+            }
+        }
+    }
+
+    // Try progressively longer prefixes up to each '.' separator.
+    let bytes = remaining.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'.' {
+            let prefix: std::rc::Rc<str> = remaining[..i].into();
+            if let Some(NestedValue::Map(child)) = map.get_mut(&prefix) {
+                update_trainable_param_recurse(child, &remaining[i + 1..], value);
+                return;
+            }
+        }
+    }
+}
+
+// ── ops extras (sin, cos, rsqrt, etc.) ────────────────────────────────────────
+
+pub mod ops_ext {
+    use super::Array;
+
+    pub fn sin(a: &Array) -> Array {
+        a.sin()
+    }
+    pub fn cos(a: &Array) -> Array {
+        a.cos()
+    }
+    pub fn rsqrt(a: &Array) -> Array {
+        a.rsqrt()
+    }
+    pub fn zeros_like(a: &Array) -> Array {
+        a.zeros_like()
+    }
+    pub fn ones_like(a: &Array) -> Array {
+        a.ones_like()
+    }
+    pub fn tile(a: &Array, reps: &[i32]) -> Array {
+        a.tile(reps)
+    }
+    pub fn linspace(start: f32, stop: f32, n: i32, dtype: super::Dtype) -> Array {
+        Array::linspace(start, stop, n, dtype.as_i32())
+    }
+    pub fn split_sections(a: &Array, sections: i32, axis: i32) -> Vec<Array> {
+        a.split_sections(sections, axis)
+    }
+    pub fn scatter_add_single(a: &Array, indices: &Array, updates: &Array, axis: i32) -> Array {
+        a.scatter_add_axis(indices, updates, axis)
+    }
+    pub fn topk_axis(a: &Array, k: i32, axis: i32) -> Array {
+        a.topk(k, axis)
+    }
+    pub fn put_along_axis(a: &Array, indices: &Array, values: &Array, axis: Option<i32>) -> Array {
+        a.put_along_axis_op(indices, values, axis.unwrap_or(-1))
+    }
+    pub fn addmm(c: &Array, a: &Array, b: &Array) -> Array {
+        Array::addmm(c, a, b)
+    }
+    pub fn argmax_axis(a: &Array, axis: i32, keepdims: bool) -> Array {
+        // bridge has argmax(axis) without keepdims; wrap manually
+        let out = a.argmax(axis);
+        if keepdims { out.expand_dims(axis) } else { out }
+    }
+    pub fn argmax(a: &Array) -> Array {
+        a.argmax(-1)
+    }
+}
+
+// ── losses ───────────────────────────────────────────────────────────────────
+pub mod losses {
+    use super::Array;
+
+    #[derive(Debug, Clone, Copy)]
+    pub enum LossReduction {
+        None,
+        Sum,
+        Mean,
+    }
+
+    pub struct BinaryCrossEntropyBuilder {
+        reduction: LossReduction,
+        with_logits: bool,
+    }
+
+    impl Default for BinaryCrossEntropyBuilder {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl BinaryCrossEntropyBuilder {
+        pub fn new() -> Self {
+            Self {
+                reduction: LossReduction::Mean,
+                with_logits: true,
+            }
+        }
+        pub fn reduction(mut self, r: LossReduction) -> Self {
+            self.reduction = r;
+            self
+        }
+        pub fn with_logits(mut self, v: bool) -> Self {
+            self.with_logits = v;
+            self
+        }
+        pub fn build(self) -> BinaryCrossEntropy {
+            BinaryCrossEntropy {
+                reduction: self.reduction,
+                with_logits: self.with_logits,
+            }
+        }
+    }
+
+    /// Binary cross-entropy, MLX's `nn.losses.binary_cross_entropy`.
+    pub struct BinaryCrossEntropy {
+        reduction: LossReduction,
+        with_logits: bool,
+    }
+
+    impl BinaryCrossEntropy {
+        /// Element-wise BCE of `inputs` against `targets` in `{0, 1}`, then
+        /// the reduction.
+        ///
+        /// With logits, `logaddexp(0, x) - x·t`, which is
+        /// `-(t·log σ(x) + (1 - t)·log(1 - σ(x)))` without overflow. With
+        /// probabilities, `-(t·log p + (1 - t)·log(1 - p))` with each log
+        /// clipped at -100, as MLX and PyTorch do.
+        pub fn call(&self, inputs: &Array, targets: &Array) -> Array {
+            let loss = if self.with_logits {
+                let zero = Array::scalar_like(0.0, inputs);
+                zero.logaddexp(inputs).subtract(&inputs.multiply(targets))
+            } else {
+                let floor = Array::scalar_like(-100.0, inputs);
+                let one = Array::scalar_like(1.0, inputs);
+                let log_p = inputs.log().maximum(&floor);
+                let log_not_p = one.subtract(inputs).log().maximum(&floor);
+                targets
+                    .multiply(&log_p)
+                    .add(&one.subtract(targets).multiply(&log_not_p))
+                    .negative()
+            };
+            match self.reduction {
+                LossReduction::Mean => loss.mean_all(),
+                LossReduction::Sum => loss.sum_all(),
+                LossReduction::None => loss,
+            }
+        }
+    }
+}
+
+// ── transforms compat ─────────────────────────────────────────────────────────
+
+pub mod transforms {
+    use super::{Array, Exception};
+
+    pub fn eval<'a>(arrays: impl IntoIterator<Item = &'a Array>) -> Result<(), Exception> {
+        super::eval(arrays)
+    }
+
+    /// Set the Metal wired memory limit.
+    pub fn set_wired_limit(limit: usize) -> usize {
+        crate::inline_array::set_wired_limit(limit)
+    }
+
+    /// Set the wired memory limit to the device's recommended maximum.
+    pub fn set_wired_limit_max() -> usize {
+        crate::inline_array::set_wired_limit_max()
+    }
+
+    /// Clear the MLX array cache.
+    pub fn clear_cache() {
+        crate::inline_array::clear_cache();
+    }
+}
+
+// ── builder compat ─────────────────────────────────────────────────────────────
+
+/// The builder trait the layer builders implement.
+pub mod builder {
+    /// A builder that produces a `T`, or fails with `Self::Error`.
+    pub trait Builder<T> {
+        type Error: std::error::Error;
+        fn build(self) -> Result<T, Self::Error>;
+    }
+}
+
+// ── module compat ─────────────────────────────────────────────────────────────
+
+pub mod module {
+    pub use super::{
+        FlattenedModuleParam, Module, ModuleParamMut, ModuleParamRef, ModuleParameters,
+        ModuleParametersExt, NestedValue, Param,
+    };
+
+    pub fn update_parameters<M: ModuleParameters>(
+        model: &mut M,
+        updates: impl Iterator<Item = (std::rc::Rc<str>, super::Array)>,
+    ) {
+        let mut pm = model.parameters_mut();
+        for (key, val) in updates {
+            if let Some(super::NestedValue::Value(arr)) = pm.get_mut(&key) {
+                **arr = val;
+            }
+        }
+    }
+}
+
+// ── extra free functions ──────────────────────────────────────────────────────
+
+/// Stop-gradient passthrough — severs the autograd tape.
+pub fn stop_gradient(a: &Array) -> Result<Array, Exception> {
+    Ok(a.stop_gradient())
+}
+
+// Lifetime re-borrow helpers — these are safe because the sub-map lifetime
+// is bounded by `self: 'a` and we never alias mutable references.
+#[allow(clippy::needless_lifetimes)]
+unsafe fn clone_nested_ref_lifetime<'a>(v: NestedValue<&Array>) -> NestedValue<&'a Array> {
+    match v {
+        NestedValue::Value(r) => NestedValue::Value(unsafe { &*(r as *const Array) }),
+        NestedValue::Map(m) => {
+            let mut out = std::collections::HashMap::new();
+            for (k, child) in m {
+                out.insert(k, unsafe { clone_nested_ref_lifetime(child) });
+            }
+            NestedValue::Map(out)
+        }
+    }
+}
+
+#[allow(clippy::needless_lifetimes)]
+unsafe fn clone_nested_mut_lifetime<'a>(v: NestedValue<&mut Array>) -> NestedValue<&'a mut Array> {
+    match v {
+        NestedValue::Value(r) => NestedValue::Value(unsafe { &mut *(r as *mut Array) }),
+        NestedValue::Map(m) => {
+            let mut out = std::collections::HashMap::new();
+            for (k, child) in m {
+                out.insert(k, unsafe { clone_nested_mut_lifetime(child) });
+            }
+            NestedValue::Map(out)
+        }
+    }
+}
+
+// Re-export layers into nn for source compatibility with `use ... nn`
+pub mod nn_layers {
+    pub use super::layers::*;
+}
+
+// ── `array!` macro ────────────────────────────────────────────────────────────
+
+/// `array!` macro: create a scalar Array from a literal (f32 cast).
+#[macro_export]
+macro_rules! array {
+    ($val:expr) => {
+        $crate::compat::Array::from_f32($val as f32)
+    };
+}

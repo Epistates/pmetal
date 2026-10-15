@@ -9,7 +9,7 @@ repository.workspace = true
 [features]
 default = []
 # MLX distributed C API wrappers (JACCL/Ring/RDMA backends)
-mlx-collectives = ["dep:pmetal-bridge"]
+mlx-collectives = ["dep:pmetal-runtime"]
 # Weight sharding, distributed linear layers
 tensor-parallel = ["mlx-collectives"]
 # MoE expert dispatch across nodes
@@ -67,11 +67,11 @@ ordered-float = { workspace = true }
 if-addrs = { workspace = true }
 
 # MLX bridge (optional — gated behind mlx-collectives feature)
-pmetal-bridge = { workspace = true, optional = true }
+pmetal-runtime = { workspace = true, optional = true }
 
 [dev-dependencies]
-# Fail every test at the bridge op that throws (pmetal-bridge `strict-errors`).
-pmetal-bridge = { workspace = true, features = ["strict-errors"] }
+# Fail every test at the bridge op that throws (pmetal-runtime `strict-errors`).
+pmetal-runtime = { workspace = true, features = ["strict-errors"] }
 tempfile = { workspace = true }
 
 [lints]

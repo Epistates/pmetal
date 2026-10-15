@@ -26,7 +26,7 @@
 
 use super::{DistillLoss, KlDivergenceLoss, SPARSE_TOPK_DEFAULT};
 use crate::Result;
-use pmetal_bridge::compat::{Array, ops};
+use pmetal_runtime::compat::{Array, ops};
 
 /// Trait for an on-policy sampler. The trainer implements this to produce
 /// student-generated sequences that the teacher then scores. Stays simple
@@ -220,7 +220,7 @@ mod tests {
             Array::from_f32_slice(&[0.0_f32, 1.0, 5.0, 2.0, 3.0, 4.0, 0.0, 0.0], &[1, 2, 4]);
         let sampled = GreedySampler.sample(&logits).unwrap();
         assert_eq!(sampled.shape(), &[1, 2]);
-        let mut as_f = sampled.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
+        let mut as_f = sampled.as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32());
         let ids: Vec<f32> = as_f.to_f32_vec(2).unwrap();
         assert_eq!(ids, vec![2.0_f32, 1.0]);
     }

@@ -26,13 +26,13 @@ pub use loss::{PairLoss, PreferenceLoss};
 use std::cell::RefCell;
 use std::time::Instant;
 
-use pmetal_bridge::compat::{
-    Array, Exception, FlattenedModuleParam, nn, optimizers::Optimizer, transforms,
-};
 use pmetal_core::{
     EvalMetrics, LearningRateScheduler, StepMetrics, TrainingCallback, TrainingConfig,
 };
 use pmetal_lora::TrainableModel;
+use pmetal_runtime::compat::{
+    Array, Exception, FlattenedModuleParam, nn, optimizers::Optimizer, transforms,
+};
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
 
@@ -223,7 +223,7 @@ impl PreferenceTrainer {
                     .chain(idx.iter().map(|&i| &pairs[i].rejected))
                     .collect();
                 let logps = batch_log_probs(model, &seqs, normalized)?;
-                let mut halves = pmetal_bridge::compat::ops::split(&logps, 2, 0).into_iter();
+                let mut halves = pmetal_runtime::compat::ops::split(&logps, 2, 0).into_iter();
                 let (chosen, rejected) = (halves.next().unwrap(), halves.next().unwrap());
                 let reference = reference.as_ref().map(|r| {
                     let c: Vec<f32> = idx.iter().map(|&i| r[i].0).collect();
@@ -311,13 +311,13 @@ pub(crate) fn sequence_log_probs<M: TrainableModel>(
 ) -> Result<Vec<f32>, Exception> {
     let mut out = Vec::with_capacity(seqs.len());
     for part in seqs.chunks(chunk.max(1)) {
-        let logps = pmetal_bridge::compat::ops::stop_gradient(&batch_log_probs(
+        let logps = pmetal_runtime::compat::ops::stop_gradient(&batch_log_probs(
             model,
             part,
             length_normalized,
         )?);
         logps.eval();
-        pmetal_bridge::check_unobserved_error().map_err(|e| Exception::custom(e.to_string()))?;
+        pmetal_runtime::check_unobserved_error().map_err(|e| Exception::custom(e.to_string()))?;
         out.extend_from_slice(logps.as_slice::<f32>());
     }
     Ok(out)
@@ -454,7 +454,7 @@ where
                     to_eval.push(kl);
                 }
                 transforms::eval(to_eval)?;
-                pmetal_bridge::check_unobserved_error()
+                pmetal_runtime::check_unobserved_error()
                     .map_err(|e| Exception::custom(e.to_string()))?;
 
                 losses.push(loss.item_f32());
@@ -479,7 +479,7 @@ where
                     *g = g.multiply(&scale);
                 }
             }
-            let grad_norm = pmetal_bridge::training::clip_grad_norm_map(
+            let grad_norm = pmetal_runtime::training::clip_grad_norm_map(
                 &mut grads,
                 config.max_grad_norm as f32,
             );
@@ -489,7 +489,7 @@ where
             grad_norm.eval();
             let params = model.lora_parameters();
             transforms::eval(params.values())?;
-            pmetal_bridge::check_unobserved_error()
+            pmetal_runtime::check_unobserved_error()
                 .map_err(|e| Exception::custom(e.to_string()))?;
             step += 1;
 

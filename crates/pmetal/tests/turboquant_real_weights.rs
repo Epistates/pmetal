@@ -19,9 +19,9 @@
 
 use std::path::PathBuf;
 
-use pmetal_bridge::InlineArray;
-use pmetal_bridge::qwen3_native::{self, NativeCache, NativeWeights};
-use pmetal_bridge::turboquant::TurboQuantConfig;
+use pmetal_runtime::InlineArray;
+use pmetal_runtime::qwen3_native::{self, NativeCache, NativeWeights};
+use pmetal_runtime::turboquant::TurboQuantConfig;
 
 const TEXT_TOKENS: usize = 1_600;
 const PREFILL: usize = 256;
@@ -54,7 +54,7 @@ fn run(weights: &NativeWeights, tokens: &[i32], quantized: Option<TurboQuantConf
         let input = InlineArray::from_i32_slice(&tokens[at..at + step]).reshape(&[1, step as i32]);
         let logits = qwen3_native::forward_step(weights, &input, &mut cache)
             .reshape(&[step as i32, vocab])
-            .as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
+            .as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32());
         let targets =
             InlineArray::from_i32_slice_shaped(&tokens[at + 1..at + 1 + step], &[step as i32, 1]);
         let picked = logits.log_softmax(-1).take_along_axis(&targets, -1);
@@ -66,7 +66,7 @@ fn run(weights: &NativeWeights, tokens: &[i32], quantized: Option<TurboQuantConf
         top1.extend_from_slice(best.as_slice::<u32>());
         at += step;
     }
-    pmetal_bridge::check_unobserved_error().expect("a bridge op threw");
+    pmetal_runtime::check_unobserved_error().expect("a bridge op threw");
     Run { nll, top1 }
 }
 

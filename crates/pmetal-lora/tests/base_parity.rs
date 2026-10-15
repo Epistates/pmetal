@@ -34,13 +34,13 @@ use std::path::Path;
 use std::rc::Rc;
 
 use common::{ArchCase, SEQ_LEN, cases, config_int, every_projection, input_ids, stage};
-use pmetal_bridge::compat::{Array, ModuleParametersExt};
 use pmetal_core::LoraConfig;
 use pmetal_lora::{AdaptedModel, DynamicLoraModel, TrainableModel};
 use pmetal_mlx::test_utils::{
     ParityReport, Tolerance, argmax_last_axis, max_abs_diff, max_abs_value, print_report_table,
 };
 use pmetal_models::dispatcher::DynamicModel;
+use pmetal_runtime::compat::{Array, ModuleParametersExt};
 
 /// Both paths run the same ops in f32 over the same weights, so the only
 /// legitimate difference is op-ordering noise (a fused SDPA on one side and an
@@ -277,7 +277,7 @@ fn parameter_paths_do_not_collide() {
 /// attach adapters to the wrong layers, or to none.
 #[test]
 fn the_linear_walker_agrees_with_the_parameter_tree() {
-    use pmetal_bridge::compat::VisitLinears;
+    use pmetal_runtime::compat::VisitLinears;
 
     for case in cases() {
         let Ok(mut model) = DynamicModel::from_config(case.config_json) else {
@@ -405,11 +405,11 @@ fn every_architecture_trains() {
         };
         let mut model = AdaptedModel::attach(base, lora.clone()).expect("attach");
         let ids = input_ids(config_int(&case, "vocab_size").expect("vocab"));
-        let mut optimizer = pmetal_bridge::compat::optimizers::AdamW::new(1e-2, 0.0);
+        let mut optimizer = pmetal_runtime::compat::optimizers::AdamW::new(1e-2, 0.0);
         let losses: Vec<f32> = (0..8)
             .map(|_| common::train_step(&mut model, &mut optimizer, &ids))
             .collect();
-        pmetal_bridge::clear_last_error();
+        pmetal_runtime::clear_last_error();
         if !losses.iter().all(|l| l.is_finite()) || losses[7] >= losses[0] {
             failures.push(format!("{}: {losses:?}", case.name));
         }
@@ -463,11 +463,11 @@ fn merging_preserves_the_adapted_output() {
         .into_iter()
         .map(|(k, v)| {
             let value = if k.ends_with("lora_b") {
-                pmetal_bridge::compat::random::uniform_range(
+                pmetal_runtime::compat::random::uniform_range(
                     -0.02,
                     0.02,
                     v.shape(),
-                    pmetal_bridge::compat::Dtype::Float32,
+                    pmetal_runtime::compat::Dtype::Float32,
                 )
             } else {
                 v
@@ -530,11 +530,11 @@ fn adapters_round_trip_through_a_file() {
         .lora_parameters()
         .into_iter()
         .map(|(k, v)| {
-            let value = pmetal_bridge::compat::random::uniform_range(
+            let value = pmetal_runtime::compat::random::uniform_range(
                 -0.1,
                 0.1,
                 v.shape(),
-                pmetal_bridge::compat::Dtype::Float32,
+                pmetal_runtime::compat::Dtype::Float32,
             );
             (k, value)
         })
@@ -707,7 +707,7 @@ fn an_adapter_the_model_has_no_slot_for_fails_to_load() {
         .expect_err("the head's adapter has no slot");
     assert!(err.to_string().contains("lm_head.lora_"), "{err}");
     std::fs::remove_dir_all(&dir).ok();
-    pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+    pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
 }
 
 /// Only the adapters are trainable, across the whole model.

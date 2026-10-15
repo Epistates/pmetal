@@ -44,7 +44,7 @@
 
 use std::time::Duration;
 
-use pmetal_bridge::compat::Array;
+use pmetal_runtime::compat::Array;
 use tracing::{debug, info};
 
 use crate::loader::TensorLoader;

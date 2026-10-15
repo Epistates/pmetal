@@ -1,6 +1,6 @@
 //! DataLoader for creating training batches.
 
-use pmetal_bridge::compat::{Array, ops as mlx_ops};
+use pmetal_runtime::compat::{Array, ops as mlx_ops};
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use crate::image_processing::FixedSizeImageProcessor;
 pub enum DataLoaderError {
     /// Failed to convert batch contents into MLX arrays.
     #[error("failed to create MLX arrays for batch: {0}")]
-    Mlx(#[from] pmetal_bridge::compat::Exception),
+    Mlx(#[from] pmetal_runtime::compat::Exception),
     /// Failed to preprocess an image for a multimodal sample.
     #[error("failed to preprocess image for sample {sample_index} at {path}: {source}")]
     ImagePreprocess {
@@ -22,7 +22,7 @@ pub enum DataLoaderError {
         /// Path of the image that failed preprocessing.
         path: std::path::PathBuf,
         /// Underlying MLX/image-processing failure.
-        source: pmetal_bridge::compat::Exception,
+        source: pmetal_runtime::compat::Exception,
     },
     /// Multimodal batches require image data for every sample.
     #[error("sample {sample_index} is missing images in a multimodal batch")]

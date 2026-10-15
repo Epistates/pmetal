@@ -9,17 +9,17 @@
 //!
 //! Ported from the MLX reference implementation (Apple, 2025).
 
-use pmetal_bridge::compat::ops::{
+use pmetal_runtime::compat::ops::{
     select_axis, slice_axis, slice_axis_from, slice_last_from, slice_last_to,
 };
-use pmetal_bridge::compat::{
+use pmetal_runtime::compat::{
     Array, Dtype, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters, Param,
     VisitLinears, nn, ops,
 };
-use pmetal_bridge::impl_module_params;
-use pmetal_bridge::qwen3_native::family::gdn_qk_rms_norm_eps;
-use pmetal_bridge::qwen3_native::mrope::MropeTables;
-use pmetal_bridge::rope::RotaryEmbedding;
+use pmetal_runtime::impl_module_params;
+use pmetal_runtime::qwen3_native::family::gdn_qk_rms_norm_eps;
+use pmetal_runtime::qwen3_native::mrope::MropeTables;
+use pmetal_runtime::rope::RotaryEmbedding;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -31,7 +31,6 @@ use crate::expert_io::ExpertOffloadContext;
 use crate::expert_prefetch::{ExpertPrefetcher, PrefetchedExpert};
 use crate::fp8_utils::dequantize_fp8_weight_for_compute;
 use crate::traits::ModelConfig;
-use pmetal_bridge::native_weight::LayerWeight;
 use pmetal_metal::expert_buffer::{ExpertBufferPool, ExpertBufferPoolConfig};
 use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry, SequenceKey};
 use pmetal_mlx::{
@@ -44,6 +43,7 @@ use pmetal_mlx::{
         rope::{RopePositions, rope_embedding},
     },
 };
+use pmetal_runtime::native_weight::LayerWeight;
 
 // ============================================================================
 // Configuration
@@ -189,7 +189,7 @@ pub struct Qwen3NextSanitizeOptions {
 /// Nested RoPE parameters from HuggingFace config format.
 ///
 /// The YaRN keys arrive resolved by
-/// [`family::normalize_text_config`](pmetal_bridge::qwen3_native::family::normalize_text_config)
+/// [`family::normalize_text_config`](pmetal_runtime::qwen3_native::family::normalize_text_config)
 /// (defaults filled in, `attention_factor` computed); see
 /// [`Qwen3NextConfig::rotary`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -265,7 +265,7 @@ impl Qwen3NextConfig {
     /// Parse a checkpoint's `config.json`, flat or nested under `text_config`.
     ///
     /// The text config is read through
-    /// [`family::normalize_text_config`](pmetal_bridge::qwen3_native::family::normalize_text_config),
+    /// [`family::normalize_text_config`](pmetal_runtime::qwen3_native::family::normalize_text_config),
     /// the reading the native engine parses too: transformers' defaults for
     /// absent keys, the outer `tie_word_embeddings` for a nested config,
     /// `rope_parameters` over the legacy RoPE keys, `layer_types` expanded,
@@ -280,7 +280,7 @@ impl Qwen3NextConfig {
 
     /// [`from_config_json`](Self::from_config_json) on an already-parsed value.
     pub fn from_config_value(config: &serde_json::Value) -> Result<Self, Exception> {
-        let text = pmetal_bridge::qwen3_native::family::normalize_text_config(config)
+        let text = pmetal_runtime::qwen3_native::family::normalize_text_config(config)
             .map_err(|e| Exception::custom(format!("Qwen3.5 config: {e}")))?;
         let mut parsed: Self = serde_json::from_value(text)
             .map_err(|e| Exception::custom(format!("Qwen3.5 config: {e}")))?;
@@ -337,21 +337,21 @@ impl Qwen3NextConfig {
     }
 
     /// The rotary embedding, YaRN included, read by the same
-    /// [`pmetal_bridge::rope`] parser the native engine uses.
+    /// [`pmetal_runtime::rope`] parser the native engine uses.
     ///
     /// A YaRN `rope_parameters` comes resolved from
     /// [`from_config_value`](Self::from_config_value); a config built in code
     /// without its resolved keys gets transformers' defaults.
-    pub fn rotary(&self) -> Result<pmetal_bridge::rope::Rotary, Exception> {
+    pub fn rotary(&self) -> Result<pmetal_runtime::rope::Rotary, Exception> {
         let to_json = |v: Option<serde_json::Result<serde_json::Value>>| {
             v.transpose()
                 .map_err(|e| Exception::custom(format!("rope config: {e}")))
         };
         let rope_scaling = to_json(self.rope_scaling.as_ref().map(serde_json::to_value))?;
         let rope_parameters = to_json(self.rope_parameters.as_ref().map(serde_json::to_value))?;
-        pmetal_bridge::rope::Rotary::from_config(
+        pmetal_runtime::rope::Rotary::from_config(
             self.get_head_dim(),
-            pmetal_bridge::rope::RopeConfig {
+            pmetal_runtime::rope::RopeConfig {
                 rope_scaling: rope_scaling.as_ref(),
                 rope_parameters: rope_parameters.as_ref(),
                 rope_theta: Some(self.rope_theta as f64),
@@ -566,7 +566,7 @@ impl_module_params!(Qwen3NextRMSNormGated; weight);
 
 /// Activation applied to the gate of a [`Qwen3NextRMSNormGated`]: the one
 /// type the native engine uses too, so the two read `output_gate_type` alike.
-pub use pmetal_bridge::qwen3_native::family::GdnGateActivation as GateActivation;
+pub use pmetal_runtime::qwen3_native::family::GdnGateActivation as GateActivation;
 
 #[cfg(test)]
 thread_local! {
@@ -577,8 +577,8 @@ thread_local! {
 /// `(silu(gate.f32()) * norm_out.f32()).as(norm_out.dtype)`, the reference's
 /// `_precise_swiglu`, which it compiles with `mx.compile(shapeless=True)`.
 fn precise_swiglu(norm_out: &Array, gate: &Array) -> Array {
-    let gate_f32 = nn::silu(&gate.cast(pmetal_bridge::compat::Dtype::Float32));
-    let norm_f32 = norm_out.cast(pmetal_bridge::compat::Dtype::Float32);
+    let gate_f32 = nn::silu(&gate.cast(pmetal_runtime::compat::Dtype::Float32));
+    let norm_f32 = norm_out.cast(pmetal_runtime::compat::Dtype::Float32);
     gate_f32.multiply(&norm_f32).as_dtype(norm_out.dtype_raw())
 }
 
@@ -591,18 +591,18 @@ fn precise_swiglu(norm_out: &Array, gate: &Array) -> Array {
 fn compiled_precise_swiglu(
     norm_out: &Array,
     gate: &Array,
-    out_dtype: pmetal_bridge::compat::Dtype,
+    out_dtype: pmetal_runtime::compat::Dtype,
 ) -> Result<Array, Exception> {
     thread_local! {
         // Never dropped: a compiled function destroyed during process
-        // teardown can outlive libmlx (see `pmetal_bridge::compile`).
-        static COMPILED: std::cell::RefCell<Option<std::mem::ManuallyDrop<pmetal_bridge::CompiledFn>>> =
+        // teardown can outlive libmlx (see `pmetal_runtime::compile`).
+        static COMPILED: std::cell::RefCell<Option<std::mem::ManuallyDrop<pmetal_runtime::CompiledFn>>> =
             const { std::cell::RefCell::new(None) };
     }
     let out = COMPILED.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.is_none() {
-            *slot = pmetal_bridge::CompiledFn::new(1, true, |inputs: &[Array]| {
+            *slot = pmetal_runtime::CompiledFn::new(1, true, |inputs: &[Array]| {
                 #[cfg(test)]
                 SWIGLU_TRACES.with(|n| n.set(n.get() + 1));
                 vec![precise_swiglu(&inputs[0], &inputs[1])]
@@ -638,7 +638,7 @@ impl Qwen3NextRMSNormGated {
     }
 
     pub fn forward(&self, x: &Array, gate: Option<&Array>) -> Result<Array, Exception> {
-        let normed = pmetal_bridge::compat::fast::rms_norm(x, self.weight.as_ref(), self.eps);
+        let normed = pmetal_runtime::compat::fast::rms_norm(x, self.weight.as_ref(), self.eps);
         match (gate, self.gate_activation) {
             // `_precise_swiglu` through mlx::core::compile (shapeless).
             // Fuses silu(gate.f32()) * norm.f32() → cast_back into 1 Metal dispatch
@@ -976,7 +976,7 @@ impl Qwen3NextAttention {
     /// Rotate queries and keys `[B, heads, L, head_dim]`: one position per
     /// token (`positions` `[L]`, or the contiguous run from `offset`), or
     /// three, for a prompt carrying images or videos (`positions` `[3, L]`,
-    /// interleaved mRoPE; see `pmetal_bridge::qwen3_native::mrope`).
+    /// interleaved mRoPE; see `pmetal_runtime::qwen3_native::mrope`).
     fn rotate(
         &self,
         queries: &Array,
@@ -1094,11 +1094,11 @@ impl Qwen3NextGatedDeltaNet {
 
         let dt_bias = Param::new(Array::ones_f32(&[num_v_heads]));
         let a_log = Param::new(
-            pmetal_bridge::compat::random::uniform_range(
+            pmetal_runtime::compat::random::uniform_range(
                 0.0,
                 16.0,
                 &[num_v_heads],
-                pmetal_bridge::compat::Dtype::Float32,
+                pmetal_runtime::compat::Dtype::Float32,
             )
             .log(),
         );
@@ -1358,8 +1358,8 @@ impl Qwen3NextGatedDeltaNet {
         let v = parts[2].reshape(&[b_dim, s, self.num_v_heads, self.head_v_dim]);
 
         // Q/K normalization (fused fast:: ops)
-        let q = pmetal_bridge::compat::fast::rms_norm(&q, &self.q_norm_weight, self.qk_norm_eps);
-        let k = pmetal_bridge::compat::fast::rms_norm(&k, &self.k_norm_weight, self.qk_norm_eps);
+        let q = pmetal_runtime::compat::fast::rms_norm(&q, &self.q_norm_weight, self.qk_norm_eps);
+        let k = pmetal_runtime::compat::fast::rms_norm(&k, &self.k_norm_weight, self.qk_norm_eps);
 
         // GDN recurrence via Metal kernel (1 dispatch) or ops fallback
         let (out, new_ssm) = gated_delta_update(
@@ -1454,9 +1454,9 @@ impl Qwen3NextGatedDeltaNet {
         let k_conv = k_conv.reshape(&[batch, seq_len, self.num_k_heads, self.head_k_dim]);
         let v_conv = v_conv.reshape(&[batch, seq_len, self.num_v_heads, self.head_v_dim]);
         let q_normed =
-            pmetal_bridge::compat::fast::rms_norm(&q_conv, &self.q_norm_weight, self.qk_norm_eps);
+            pmetal_runtime::compat::fast::rms_norm(&q_conv, &self.q_norm_weight, self.qk_norm_eps);
         let k_normed =
-            pmetal_bridge::compat::fast::rms_norm(&k_conv, &self.k_norm_weight, self.qk_norm_eps);
+            pmetal_runtime::compat::fast::rms_norm(&k_conv, &self.k_norm_weight, self.qk_norm_eps);
 
         // Compute g and beta OUTSIDE gated_delta_update so we can stash
         // them in the capture — the internal implementation derives them
@@ -1482,7 +1482,7 @@ impl Qwen3NextGatedDeltaNet {
         {
             Some(s) => Some(s),
             None => {
-                ssm_state_arr = pmetal_bridge::compat::ops::zeros_dtype(
+                ssm_state_arr = pmetal_runtime::compat::ops::zeros_dtype(
                     &[batch, self.num_v_heads, self.head_v_dim, self.head_k_dim],
                     conv_out.dtype(),
                 );
@@ -1539,9 +1539,9 @@ impl Qwen3NextGatedDeltaNet {
 
         // Q/K normalization: fast::rms_norm (fused Metal op) with pre-baked scale weights.
         let q_normed =
-            pmetal_bridge::compat::fast::rms_norm(&q_conv, &self.q_norm_weight, self.qk_norm_eps);
+            pmetal_runtime::compat::fast::rms_norm(&q_conv, &self.q_norm_weight, self.qk_norm_eps);
         let k_normed =
-            pmetal_bridge::compat::fast::rms_norm(&k_conv, &self.k_norm_weight, self.qk_norm_eps);
+            pmetal_runtime::compat::fast::rms_norm(&k_conv, &self.k_norm_weight, self.qk_norm_eps);
 
         let ssm_state = cache.as_ref().and_then(|c| c.ssm_state.as_ref());
 
@@ -1627,9 +1627,9 @@ impl Qwen3NextGatedDeltaNet {
         // q gets inv_scale² (because rms_norm divides by sqrt(mean) not sqrt(sum)),
         // k gets inv_scale.
         let q_normed =
-            pmetal_bridge::compat::fast::rms_norm(&q_conv, &self.q_norm_weight, self.qk_norm_eps);
+            pmetal_runtime::compat::fast::rms_norm(&q_conv, &self.q_norm_weight, self.qk_norm_eps);
         let k_normed =
-            pmetal_bridge::compat::fast::rms_norm(&k_conv, &self.k_norm_weight, self.qk_norm_eps);
+            pmetal_runtime::compat::fast::rms_norm(&k_conv, &self.k_norm_weight, self.qk_norm_eps);
         let ssm_state = cache.as_ref().and_then(|c| c.ssm_state.as_ref());
         let (out, new_state) = gated_delta_update(
             &q_normed,
@@ -1720,7 +1720,7 @@ impl Qwen3NextGatedDeltaNet {
             let conv_input = cache_entry.update_conv_state(&qkv, self.conv_kernel_size)?;
             nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)
         } else {
-            let conv_state = pmetal_bridge::compat::ops::zeros_dtype(
+            let conv_state = pmetal_runtime::compat::ops::zeros_dtype(
                 &[b, self.conv_kernel_size - 1, self.conv_dim],
                 qkv.dtype(),
             );
@@ -1807,7 +1807,7 @@ impl Qwen3NextGatedDeltaNet {
             let conv_input = cache_entry.update_conv_state(&qkv, self.conv_kernel_size)?;
             nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)
         } else {
-            let conv_state = pmetal_bridge::compat::ops::zeros_dtype(
+            let conv_state = pmetal_runtime::compat::ops::zeros_dtype(
                 &[b, self.conv_kernel_size - 1, self.conv_dim],
                 qkv.dtype(),
             );
@@ -1911,7 +1911,7 @@ impl Qwen3NextGatedDeltaNet {
             let conv_input = cache_entry.update_conv_state(&qkv, self.conv_kernel_size)?;
             nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)
         } else {
-            let conv_state = pmetal_bridge::compat::ops::zeros_dtype(
+            let conv_state = pmetal_runtime::compat::ops::zeros_dtype(
                 &[b, self.conv_kernel_size - 1, self.conv_dim],
                 qkv.dtype(),
             );
@@ -1988,7 +1988,7 @@ pub(crate) fn attach_expert_offload(
             .gate
             .weight
             .as_ref()
-            .cast(pmetal_bridge::compat::Dtype::Float32);
+            .cast(pmetal_runtime::compat::Dtype::Float32);
         w.eval();
         gate_weights.insert(*layer_idx, w.as_slice().to_vec());
     }
@@ -2370,8 +2370,8 @@ impl Qwen3NextSparseMoeBlock {
         // Compute routing probabilities
         let gate_logits = self.gate.forward(&x_flat);
         let gates = ops::softmax_axis(
-            &if gate_logits.dtype() != pmetal_bridge::compat::Dtype::Float32 {
-                gate_logits.cast(pmetal_bridge::compat::Dtype::Float32)
+            &if gate_logits.dtype() != pmetal_runtime::compat::Dtype::Float32 {
+                gate_logits.cast(pmetal_runtime::compat::Dtype::Float32)
             } else {
                 gate_logits
             },
@@ -2390,7 +2390,7 @@ impl Qwen3NextSparseMoeBlock {
 
         // SwitchGLU forward using gather_mm — same as the reference SwitchGLU
         // x_flat: [N, D], indices: [N, k]
-        let top_indices_i32 = top_indices.cast(pmetal_bridge::compat::Dtype::Int32);
+        let top_indices_i32 = top_indices.cast(pmetal_runtime::compat::Dtype::Int32);
 
         // Reshape [N, D] → [N, 1, 1, D] — same as the reference expand_dims(-2, -3).
         // Critical for gather_mm batch dimension semantics — without this,
@@ -2452,7 +2452,7 @@ impl Qwen3NextSparseMoeBlock {
         let gates = ops::softmax_axis(&gate_logits.cast(Dtype::Float32), -1);
         let (top_indices, top_weights) =
             crate::moe_routing::topk_normalize(&gates, self.top_k, self.norm_topk_prob)?;
-        let routed = pmetal_bridge::native_moe::switch_glu(
+        let routed = pmetal_runtime::native_moe::switch_glu(
             &x_flat,
             &packed.gate,
             &packed.up,
@@ -2486,8 +2486,8 @@ impl Qwen3NextSparseMoeBlock {
     fn route_experts(&mut self, x_flat: &Array) -> Result<(Array, Vec<usize>, i32), Exception> {
         let gate_logits = self.gate.forward(x_flat);
         let gates = ops::softmax_axis(
-            &if gate_logits.dtype() != pmetal_bridge::compat::Dtype::Float32 {
-                gate_logits.cast(pmetal_bridge::compat::Dtype::Float32)
+            &if gate_logits.dtype() != pmetal_runtime::compat::Dtype::Float32 {
+                gate_logits.cast(pmetal_runtime::compat::Dtype::Float32)
             } else {
                 gate_logits
             },
@@ -2500,7 +2500,7 @@ impl Qwen3NextSparseMoeBlock {
         let (top_indices, top_weights) =
             crate::moe_routing::topk_normalize(&gates, k, self.norm_topk_prob)?;
 
-        let top_indices_u32 = top_indices.cast(pmetal_bridge::compat::Dtype::Uint32);
+        let top_indices_u32 = top_indices.cast(pmetal_runtime::compat::Dtype::Uint32);
         top_indices_u32.eval();
         let flat_u32: Vec<u32> = top_indices_u32.as_slice().to_vec();
         let expert_indices: Vec<usize> = flat_u32.iter().map(|&i| i as usize).collect();
@@ -2627,7 +2627,7 @@ impl Qwen3NextSparseMoeBlock {
                         let token_input = select_axis(&window_input, token_offset as i32, 0)
                             .reshape(&[1, hidden]);
                         let token_input_f32 =
-                            token_input.cast(pmetal_bridge::compat::Dtype::Float32);
+                            token_input.cast(pmetal_runtime::compat::Dtype::Float32);
                         token_input_f32.eval();
                         let input_buf = pmetal_mlx::bridge::MlxMetalBridge::copy_as_f32(
                             &metal_ctx,
@@ -2708,7 +2708,7 @@ impl Qwen3NextSparseMoeBlock {
                         let token_input = select_axis(&window_input, token_offset as i32, 0)
                             .reshape(&[1, hidden]);
                         let token_input_f32 =
-                            token_input.cast(pmetal_bridge::compat::Dtype::Float32);
+                            token_input.cast(pmetal_runtime::compat::Dtype::Float32);
                         token_input_f32.eval();
                         let input_buf = pmetal_mlx::bridge::MlxMetalBridge::copy_as_f32(
                             &metal_ctx,
@@ -2862,7 +2862,7 @@ impl Qwen3NextSparseMoeBlock {
             let record = &ctx.layout.record;
 
             // x_flat to Metal buffer (tiny for T=1 decode)
-            let x_flat_f32 = x_flat.cast(pmetal_bridge::compat::Dtype::Float32);
+            let x_flat_f32 = x_flat.cast(pmetal_runtime::compat::Dtype::Float32);
             x_flat_f32.eval();
             let input_buf =
                 pmetal_mlx::bridge::MlxMetalBridge::copy_as_f32(&metal_ctx, &x_flat_f32)
@@ -4132,7 +4132,7 @@ pub fn sanitize_weights(
     // the same canonicalization the native loader applies.
     let original_keys: Vec<String> = weights.keys().cloned().collect();
     for old_key in original_keys {
-        let new_key = pmetal_bridge::qwen3_native::family::canonical_checkpoint_key(&old_key);
+        let new_key = pmetal_runtime::qwen3_native::family::canonical_checkpoint_key(&old_key);
         if new_key != old_key {
             if let Some(v) = weights.remove(&old_key) {
                 weights.insert(new_key, v);
@@ -4262,8 +4262,8 @@ mod tests {
         std::thread::spawn(|| {
             for seq in [1, 7, 33] {
                 let shape = [1, seq, 64];
-                let norm = pmetal_bridge::compat::random::normal(&shape, Dtype::Bfloat16);
-                let gate = pmetal_bridge::compat::random::normal(&shape, Dtype::Bfloat16);
+                let norm = pmetal_runtime::compat::random::normal(&shape, Dtype::Bfloat16);
+                let gate = pmetal_runtime::compat::random::normal(&shape, Dtype::Bfloat16);
                 let got = compiled_precise_swiglu(&norm, &gate, Dtype::Bfloat16).unwrap();
                 let want = precise_swiglu(&norm, &gate);
                 assert_eq!(got.dtype(), Dtype::Bfloat16);
@@ -4283,7 +4283,7 @@ mod tests {
                 1,
                 "three sequence lengths share one shapeless trace"
             );
-            pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+            pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
         })
         .join()
         .unwrap();
@@ -4383,9 +4383,9 @@ mod tests {
     #[serial]
     fn test_mlp_forward_shape() {
         let mut mlp = Qwen3NextMLP::new(32, 64).unwrap();
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 4, 32],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let output = mlp.forward(&x).unwrap();
         assert_eq!(output.shape(), &[1, 4, 32]);
@@ -4395,9 +4395,9 @@ mod tests {
     #[serial]
     fn test_mlp_forward_matches_manual_swiglu() {
         let mut mlp = Qwen3NextMLP::new(32, 64).unwrap();
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 4, 32],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
 
         let gate = mlp.gate_proj.forward(&x).unwrap();
@@ -4422,9 +4422,9 @@ mod tests {
     #[serial]
     fn test_gated_rms_norm() {
         let norm = Qwen3NextRMSNormGated::new(32, 1e-6).unwrap();
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 4, 32],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
 
         // Without gate
@@ -4432,9 +4432,9 @@ mod tests {
         assert_eq!(out1.shape(), &[1, 4, 32]);
 
         // With gate
-        let gate = pmetal_bridge::compat::random::normal(
+        let gate = pmetal_runtime::compat::random::normal(
             &[1, 4, 32],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let out2 = norm.forward(&x, Some(&gate)).unwrap();
         assert_eq!(out2.shape(), &[1, 4, 32]);
@@ -4445,9 +4445,9 @@ mod tests {
     fn test_attention_output_shape() {
         let config = tiny_config();
         let mut attn = Qwen3NextAttention::new(&config).unwrap();
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 4, 32],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let output = attn.forward(&x, None, None, None).unwrap();
         assert_eq!(output.shape(), &[1, 4, 32]);
@@ -4465,7 +4465,7 @@ mod tests {
         );
 
         let custom_mask =
-            pmetal_bridge::compat::ops::ones(&[1, 1, 1, 1], pmetal_bridge::compat::Dtype::Bool);
+            pmetal_runtime::compat::ops::ones(&[1, 1, 1, 1], pmetal_runtime::compat::Dtype::Bool);
         assert_eq!(
             Qwen3NextAttention::mask_type_for_call(Some(&custom_mask), false, 4),
             AttentionMaskType::None
@@ -4481,9 +4481,9 @@ mod tests {
     fn test_gdn_output_shape() {
         let config = tiny_config();
         let mut gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 4, 32],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let output = gdn.forward(&x, None, None).unwrap();
         assert_eq!(output.shape(), &[1, 4, 32]);
@@ -4505,23 +4505,23 @@ mod tests {
             ..tiny_config()
         };
         let mut gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 4, 32],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
-        pmetal_bridge::clear_last_error();
-        let (loss, grads) = pmetal_bridge::compat::nn::value_and_grad_explicit(
+        pmetal_runtime::clear_last_error();
+        let (loss, grads) = pmetal_runtime::compat::nn::value_and_grad_explicit(
             |arrays: &[Array]| gdn.forward(&arrays[0], None, None).unwrap().sum(None),
             std::slice::from_ref(&x),
             &[],
         )
         .unwrap();
-        pmetal_bridge::check_unobserved_error().expect("no bridge op failed under value_and_grad");
+        pmetal_runtime::check_unobserved_error().expect("no bridge op failed under value_and_grad");
 
         assert!(loss.item::<f32>().is_finite());
         // Evaluate before reading: as_slice on a lazy array reads a null pointer.
         grads[0].eval();
-        pmetal_bridge::check_unobserved_error().expect("the gradient evaluates");
+        pmetal_runtime::check_unobserved_error().expect("the gradient evaluates");
         let dx = grads[0].as_slice::<f32>();
         assert!(dx.iter().all(|g| g.is_finite()), "finite input gradient");
         assert!(dx.iter().any(|g| *g != 0.0), "non-zero input gradient");
@@ -4587,7 +4587,7 @@ mod tests {
         let shifted = weights
             .get("model.layers.0.input_layernorm.weight")
             .unwrap()
-            .cast(pmetal_bridge::compat::Dtype::Float32)
+            .cast(pmetal_runtime::compat::Dtype::Float32)
             .unwrap();
         // cast() is lazy; evaluate before reading via as_slice() to avoid a
         // null-dereference inside Buffer::raw_ptr on an unevaluated array.
@@ -4612,9 +4612,9 @@ mod tests {
     fn test_gdn_combined_input_projection_matches_separate_linears() {
         let config = tiny_config();
         let mut gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 1, 32],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
 
         let qkv_ref = gdn.in_proj_qkv.forward(&x).unwrap();
@@ -4710,9 +4710,9 @@ mod tests {
     fn test_sparse_moe_shared_forward_matches_separate_paths() {
         let config = tiny_config();
         let mut moe = Qwen3NextSparseMoeBlock::new(&config).unwrap();
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[5, config.hidden_size],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
 
         let shared_ref = moe.shared_expert.forward(&x).unwrap();
@@ -4755,9 +4755,9 @@ mod tests {
     fn test_sparse_moe_shared_combined_projection_refreshes_after_weight_replacement() {
         let config = tiny_config();
         let mut moe = Qwen3NextSparseMoeBlock::new(&config).unwrap();
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[3, config.hidden_size],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
 
         let _ = moe.forward_shared_expert_and_gate(&x).unwrap();
@@ -4798,7 +4798,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_sparse_moe_block_output_excludes_its_input() {
-        use pmetal_bridge::compat::ModuleParametersExt;
+        use pmetal_runtime::compat::ModuleParametersExt;
 
         let config = Qwen3NextConfig {
             num_experts: 4,
@@ -4826,9 +4826,9 @@ mod tests {
         let mut config = tiny_config();
         config.hidden_size = 4096;
         let gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 1, 4096],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
 
         let qkv_ref = gdn.in_proj_qkv.forward(&x).unwrap();
@@ -4918,13 +4918,13 @@ mod tests {
         let mut small_config = tiny_config();
         small_config.hidden_size = 2048;
         let small_gdn = Qwen3NextGatedDeltaNet::new(&small_config).unwrap();
-        let decode = pmetal_bridge::compat::random::normal(
+        let decode = pmetal_runtime::compat::random::normal(
             &[1, 1, 2048],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
-        let prefill = pmetal_bridge::compat::random::normal(
+        let prefill = pmetal_runtime::compat::random::normal(
             &[1, 2, 2048],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         assert!(small_gdn.should_use_flattened_decode_proj(&decode, None));
         assert!(!small_gdn.should_use_flattened_decode_proj(&prefill, None));
@@ -4932,9 +4932,9 @@ mod tests {
         let mut large_config = tiny_config();
         large_config.hidden_size = 4096;
         let large_gdn = Qwen3NextGatedDeltaNet::new(&large_config).unwrap();
-        let large_decode = pmetal_bridge::compat::random::normal(
+        let large_decode = pmetal_runtime::compat::random::normal(
             &[1, 1, 4096],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         assert!(!large_gdn.should_use_flattened_decode_proj(&large_decode, None));
     }
@@ -4943,9 +4943,9 @@ mod tests {
     fn test_gdn_decode_out_projection_matches_linear_forward() {
         let config = tiny_config();
         let gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
-        let out = pmetal_bridge::compat::random::normal(
+        let out = pmetal_runtime::compat::random::normal(
             &[1, 1, gdn.num_v_heads, gdn.head_v_dim],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let reference = gdn
             .out_proj
@@ -4974,13 +4974,13 @@ mod tests {
     fn test_gdn_cached_decode_matches_general_path() {
         let config = tiny_config();
         let mut gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
-        let prefill = pmetal_bridge::compat::random::normal(
+        let prefill = pmetal_runtime::compat::random::normal(
             &[1, 3, 32],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
-        let decode = pmetal_bridge::compat::random::normal(
+        let decode = pmetal_runtime::compat::random::normal(
             &[1, 1, 32],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let mut cache_general = MambaCacheEntry::default();
         let mut cache_fast = MambaCacheEntry::default();
@@ -5077,9 +5077,9 @@ mod tests {
         // Linear (GDN) layer
         let mut layer0 = Qwen3NextDecoderLayer::new(&config, 0).unwrap();
         assert!(layer0.is_linear);
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 4, 32],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let out0 = layer0.forward(&x, None, None, None, None).unwrap();
         assert_eq!(out0.shape(), &[1, 4, 32]);
@@ -5296,9 +5296,9 @@ mod tests {
             Qwen3NextRoutedExpertMode::Placeholder,
         )
         .unwrap();
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 2, config.hidden_size],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let err = block.forward(&x).unwrap_err().to_string();
         assert!(err.contains("enable expert offloading"));

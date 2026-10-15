@@ -6,7 +6,7 @@
 //! bounded in [0, 1], making it easy to interpret and compare across runs.
 
 use crate::Result;
-use pmetal_bridge::compat::{Array, ops};
+use pmetal_runtime::compat::{Array, ops};
 
 use super::DistillLoss;
 

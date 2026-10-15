@@ -21,11 +21,11 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use common::{SEQ_LEN, cases, every_projection_lora, input_ids};
-use pmetal_bridge::compat::{Array, Dtype, random};
-use pmetal_bridge::inline_array::value_and_grad;
 use pmetal_lora::AdaptedModel;
 use pmetal_mlx::kernels::with_training_mode;
 use pmetal_models::dispatcher::DynamicModel;
+use pmetal_runtime::compat::{Array, Dtype, random};
+use pmetal_runtime::inline_array::value_and_grad;
 
 /// Positions whose logits enter the loss. A few, so the loss stays O(1) and a
 /// finite difference resolves its derivative in f32.
@@ -89,7 +89,7 @@ fn vocab_of(config_json: &str) -> i32 {
 }
 
 fn drain(case: &str) {
-    if let Err(e) = pmetal_bridge::check_unobserved_error() {
+    if let Err(e) = pmetal_runtime::check_unobserved_error() {
         panic!("{case}: a bridge op threw: {e}");
     }
 }
@@ -424,7 +424,7 @@ fn cce_against_logits(
     names.sort();
 
     let (want, want_grads) = step_with(model, &names, ids, |model, ids| {
-        pmetal_bridge::training::causal_lm_loss(&logits(model, ids), ids, -100)
+        pmetal_runtime::training::causal_lm_loss(&logits(model, ids), ids, -100)
     });
     let (got, got_grads) = step_with(model, &names, ids, |model, ids| {
         let hidden = hidden(model, ids);

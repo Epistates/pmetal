@@ -15,8 +15,8 @@
 //! actually takes, so a per-architecture cache built with the wrong geometry
 //! is in scope here rather than hidden behind a hand-built one.
 
-use pmetal_bridge::compat::Array;
 use pmetal_models::dispatcher::DynamicModel;
+use pmetal_runtime::compat::Array;
 
 const PROMPT: [i32; 5] = [3, 11, 7, 2, 9];
 const STEPS: usize = 4;

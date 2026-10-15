@@ -10,14 +10,14 @@
 use crate::checkpointing::checkpointed_layer;
 use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
 use crate::traits::ModelConfig;
-use pmetal_bridge::compat::{Array, Exception, Module, nn};
-use pmetal_bridge::impl_module_params;
-use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     rope::{RopePositions, rope_embedding},
 };
 use pmetal_mlx::kv_cache::KVCache;
+use pmetal_runtime::compat::{Array, Exception, Module, nn};
+use pmetal_runtime::impl_module_params;
+use pmetal_runtime::rope::{RopeConfig, RotaryEmbedding};
 use serde::{Deserialize, Serialize};
 
 /// Qwen2 model configuration.
@@ -75,7 +75,7 @@ pub struct Qwen2Config {
     #[serde(default)]
     pub attention_dropout: f32,
     /// RoPE scaling (YaRN on the Qwen2.5 cards), read by
-    /// [`pmetal_bridge::rope`].
+    /// [`pmetal_runtime::rope`].
     #[serde(default)]
     pub rope_scaling: Option<serde_json::Value>,
     /// transformers v5's spelling of the same, with `rope_theta` inside.
@@ -892,13 +892,13 @@ use super::utils::create_causal_mask;
 
 /// Create a sliding window causal attention mask.
 fn create_sliding_window_mask(seq_len: i32, window_size: i32) -> Result<Array, Exception> {
-    use pmetal_bridge::compat::Dtype;
+    use pmetal_runtime::compat::Dtype;
     // Create lower triangular mask
-    let causal_mask = pmetal_bridge::compat::ops::tri(seq_len, seq_len, 0, Dtype::Float32);
+    let causal_mask = pmetal_runtime::compat::ops::tri(seq_len, seq_len, 0, Dtype::Float32);
 
     // Create window mask: positions within window_size distance
     let indices =
-        pmetal_bridge::compat::ops::arange_from(0, seq_len).as_dtype(Dtype::Float32.as_i32());
+        pmetal_runtime::compat::ops::arange_from(0, seq_len).as_dtype(Dtype::Float32.as_i32());
     let row_indices = indices.reshape(&[seq_len, 1]);
     let col_indices = indices.reshape(&[1, seq_len]);
     let distance = row_indices.subtract(&col_indices);
@@ -906,7 +906,7 @@ fn create_sliding_window_mask(seq_len: i32, window_size: i32) -> Result<Array, E
     // Valid if distance >= 0 and distance < window_size
     let window_size_arr = Array::from_f32(window_size as f32);
     let zero = Array::from_f32(0.0);
-    let in_window = pmetal_bridge::compat::ops::logical_and(
+    let in_window = pmetal_runtime::compat::ops::logical_and(
         &distance.greater_equal(&zero),
         &distance.less(&window_size_arr),
     );
@@ -915,7 +915,7 @@ fn create_sliding_window_mask(seq_len: i32, window_size: i32) -> Result<Array, E
     let combined = causal_mask.multiply(&in_window.as_dtype(Dtype::Float32.as_i32()));
 
     let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-    Ok(pmetal_bridge::compat::ops::where_fn(
+    Ok(pmetal_runtime::compat::ops::where_fn(
         &combined.equal(&zero),
         &neg_inf,
         &zero,
@@ -992,9 +992,9 @@ mod tests {
         let config = small_config();
         let mut attn = Qwen2Attention::new(&config).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 4, 128],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let output = attn.forward(&x, None).unwrap();
 
@@ -1007,9 +1007,9 @@ mod tests {
         let config = small_config();
         let mut mlp = Qwen2MLP::new(&config).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 4, 128],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let output = mlp.forward(&x).unwrap();
 
@@ -1022,9 +1022,9 @@ mod tests {
         let config = small_config();
         let mut layer = Qwen2DecoderLayer::new(&config).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 4, 128],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let output = layer.forward(&x, None).unwrap();
 
@@ -1037,7 +1037,7 @@ mod tests {
         let config = small_config();
         let mut model = Qwen2Model::new(config).unwrap();
 
-        let input_ids = pmetal_bridge::compat::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = pmetal_runtime::compat::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
         let output = model.forward(&input_ids, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 128]);
@@ -1049,7 +1049,7 @@ mod tests {
         let config = small_config();
         let mut model = Qwen2ForCausalLM::new(config).unwrap();
 
-        let input_ids = pmetal_bridge::compat::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = pmetal_runtime::compat::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
         let logits = model.forward(&input_ids, None).unwrap();
 
         assert_eq!(logits.shape(), &[1, 4, 1000]); // [batch, seq, vocab]

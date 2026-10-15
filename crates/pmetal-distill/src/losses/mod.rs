@@ -53,7 +53,7 @@ pub use tvd::TvdLoss;
 pub use universal_logit::UniversalLogitLoss;
 
 use crate::Result;
-use pmetal_bridge::compat::{Array, Dtype, ops};
+use pmetal_runtime::compat::{Array, Dtype, ops};
 
 /// Default number of top-k teacher tokens to use when vocab sizes differ.
 ///

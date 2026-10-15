@@ -1457,7 +1457,7 @@ pub(crate) async fn run_quantization_mlx(
     group_size: i32,
     target_bpw: Option<f32>,
 ) -> anyhow::Result<()> {
-    use pmetal_bridge::mlx_quant;
+    use pmetal_runtime::mlx_quant;
 
     println!("========================================");
     println!("  PMetal MLX Safetensors Quantization");

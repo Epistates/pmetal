@@ -1,4 +1,4 @@
-use pmetal_bridge::compat::{Array, Dtype};
+use pmetal_runtime::compat::{Array, Dtype};
 
 use crate::{MergeMethod, MergeParameters, Result, error::MergeError};
 

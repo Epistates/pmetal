@@ -18,7 +18,7 @@
 
 use super::MergeMethod;
 use crate::{MergeError, MergeParameters, Result};
-use pmetal_bridge::compat::Array;
+use pmetal_runtime::compat::Array;
 
 /// SLERP merge implementation.
 #[derive(Debug, Clone, Default)]

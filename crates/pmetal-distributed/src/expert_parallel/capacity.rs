@@ -4,7 +4,7 @@
 //! imbalanced workloads where some experts are overloaded while
 //! others are idle.
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
+use pmetal_runtime::compat::{Array, Dtype, Exception, ops};
 
 /// Policy for handling tokens that exceed expert capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

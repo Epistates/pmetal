@@ -10,10 +10,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use pmetal_bridge::turboquant::{
-    TurboQuantConfig as BridgeTurboQuantConfig,
-    TurboQuantTensorConfig as BridgeTurboQuantTensorConfig,
-};
 use pmetal_data::Tokenizer;
 use pmetal_data::chat_templates::{ChatTemplateKwargs, ChatTemplateType, Message, ToolDefinition};
 use pmetal_data::qwen_vl_processing::{ProcessedMedia, QwenVlProcessor};
@@ -33,6 +29,10 @@ use pmetal_models::{
     Gemma4MtpConfig, GenerationOutput, Qwen3NextMtpConfig, generate_cached_async_streaming,
     generate_gemma4_mtp_streaming, generate_qwen3_native_mtp_streaming,
     generate_qwen3_next_mtp_streaming, validate_gemma4_mtp_pair, validate_qwen3_next_mtp_pair,
+};
+use pmetal_runtime::turboquant::{
+    TurboQuantConfig as RuntimeTurboQuantConfig,
+    TurboQuantTensorConfig as RuntimeTurboQuantTensorConfig,
 };
 
 #[cfg(feature = "lora")]
@@ -209,7 +209,7 @@ enum LoadedModel {
     #[cfg(feature = "lora")]
     Lora(DynamicLoraModel),
     /// Native InlineArray path — no `DynamicModel` needed.
-    /// All weights loaded by the pmetal-bridge native engine.
+    /// All weights loaded by the pmetal-runtime native engine.
     NativeOnly,
 }
 
@@ -248,14 +248,14 @@ pub struct InferenceGenState {
     qwen_mtp: Option<Qwen3NextMtpForCausalLM>,
     qwen_mtp_cache: Option<KVCache>,
     qwen_mtp_config: Option<Qwen3NextMtpConfig>,
-    native_turboquant: Option<BridgeTurboQuantConfig>,
+    native_turboquant: Option<RuntimeTurboQuantConfig>,
     /// Zero-overhead affine KV cache quantization config for native path
-    native_quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
+    native_quant_config: Option<pmetal_runtime::qwen3_native::QuantCacheConfig>,
     /// Model directory path — used for native InlineArray weight loading.
     model_path: PathBuf,
     /// Decode throughput metrics from the last native generation run.
     /// `None` on non-native paths or when fewer than 20 steps were measured.
-    pub last_decode_metrics: Option<pmetal_bridge::decode::DecodeMetrics>,
+    pub last_decode_metrics: Option<pmetal_runtime::decode::DecodeMetrics>,
     /// Enable n-gram repetition loop detection (opt-in).
     detect_repetition: bool,
     /// Preprocessed images the prompt's image tokens stand for.
@@ -335,7 +335,7 @@ impl InferenceRunner {
             && config.experts_dir.is_none()
             && (!mtp_requested || config.qwen_mtp)
         {
-            crate::native_inference::load_native_bridge_info(model_path)
+            crate::native_inference::load_native_runtime_info(model_path)
                 .map_err(Exception::custom)?
         } else {
             None
@@ -573,7 +573,7 @@ impl InferenceRunner {
                             "--kv-qjl is not supported with mixed-bit presets; ignoring"
                         );
                     }
-                    Some(pmetal_bridge::qwen3_native::QuantCacheConfig {
+                    Some(pmetal_runtime::qwen3_native::QuantCacheConfig {
                         bits: mb.regular_bits,
                         group_size: 64,
                         mixed_bit: Some(mb),
@@ -589,7 +589,7 @@ impl InferenceRunner {
                                     "--kv-qjl is only effective for Q2-Q3; ignoring for Q{bits}"
                                 );
                             }
-                            Some(pmetal_bridge::qwen3_native::QuantCacheConfig {
+                            Some(pmetal_runtime::qwen3_native::QuantCacheConfig {
                                 bits,
                                 group_size: group_size as i32,
                                 mixed_bit: None,
@@ -985,7 +985,7 @@ impl InferenceGenState {
                     ))),
                 },
                 LoadedModel::NativeOnly => {
-                    crate::native_inference::ensure_native_bridge_metal_available()
+                    crate::native_inference::ensure_native_runtime_metal_available()
                         .map_err(Exception::custom)?;
                     generate_qwen3_native_mtp_streaming(
                         &self.model_path,
@@ -1376,7 +1376,7 @@ fn load_standard_model_for_inference(
 }
 
 fn native_bridge_base_cache_config(
-    info: crate::native_inference::NativeBridgeInfo,
+    info: crate::native_inference::NativeRuntimeInfo,
     max_seq_len: usize,
 ) -> KVCacheConfig {
     KVCacheConfig::new(
@@ -1390,7 +1390,7 @@ fn native_bridge_base_cache_config(
 }
 
 fn native_cache_mode_supported(
-    info: crate::native_inference::NativeBridgeInfo,
+    info: crate::native_inference::NativeRuntimeInfo,
     mode: CacheMode,
 ) -> bool {
     match mode {
@@ -1417,8 +1417,8 @@ fn native_cache_mode_supported(
 /// so that quantization groups align cleanly.
 fn mixed_bit_config_from_preset(
     preset: Option<&str>,
-    info: crate::native_inference::NativeBridgeInfo,
-) -> Option<pmetal_bridge::qwen3_native::MixedBitConfig> {
+    info: crate::native_inference::NativeRuntimeInfo,
+) -> Option<pmetal_runtime::qwen3_native::MixedBitConfig> {
     let preset = preset?;
     let (outlier_bits, regular_bits) = match preset {
         "q2_5" => (3u8, 2u8),
@@ -1449,7 +1449,7 @@ fn mixed_bit_config_from_preset(
         regular_bits,
         "Enabling TurboQuant v2 mixed-bit KV cache"
     );
-    Some(pmetal_bridge::qwen3_native::MixedBitConfig {
+    Some(pmetal_runtime::qwen3_native::MixedBitConfig {
         outlier_count,
         outlier_bits,
         regular_bits,
@@ -1457,9 +1457,9 @@ fn mixed_bit_config_from_preset(
 }
 
 fn turboquant_config_from_mode(
-    info: crate::native_inference::NativeBridgeInfo,
+    info: crate::native_inference::NativeRuntimeInfo,
     mode: CacheMode,
-) -> Option<BridgeTurboQuantConfig> {
+) -> Option<RuntimeTurboQuantConfig> {
     if !info.supports_turboquant {
         return None;
     }
@@ -1474,23 +1474,25 @@ fn turboquant_config_from_mode(
 /// quantizes keys with the MSE codebook alone (no QJL residual) and has no
 /// per-block outliers, pack modes or skip-list: those knobs belong to the
 /// other TurboQuant cache.
-fn bridge_turboquant_config(config: TurboQuantConfig) -> BridgeTurboQuantConfig {
-    BridgeTurboQuantConfig {
+fn bridge_turboquant_config(config: TurboQuantConfig) -> RuntimeTurboQuantConfig {
+    RuntimeTurboQuantConfig {
         keys: bridge_turboquant_tensor_config(config.keys),
         values: bridge_turboquant_tensor_config(config.values),
         recent_window: config.recent_window,
-        ..BridgeTurboQuantConfig::uniform(8, 8)
+        ..RuntimeTurboQuantConfig::uniform(8, 8)
     }
 }
 
-fn bridge_turboquant_tensor_config(config: TurboQuantTensorConfig) -> BridgeTurboQuantTensorConfig {
+fn bridge_turboquant_tensor_config(
+    config: TurboQuantTensorConfig,
+) -> RuntimeTurboQuantTensorConfig {
     match config {
-        TurboQuantTensorConfig::Uniform { bits } => BridgeTurboQuantTensorConfig::uniform(bits),
+        TurboQuantTensorConfig::Uniform { bits } => RuntimeTurboQuantTensorConfig::uniform(bits),
         TurboQuantTensorConfig::Mixed {
             regular_bits,
             outlier_bits,
             outlier_count,
-        } => BridgeTurboQuantTensorConfig::mixed(regular_bits, outlier_bits, outlier_count),
+        } => RuntimeTurboQuantTensorConfig::mixed(regular_bits, outlier_bits, outlier_count),
     }
 }
 
@@ -2197,7 +2199,7 @@ fn build_plain_conversation_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native_inference::{NativeArch, NativeBridgeInfo};
+    use crate::native_inference::{NativeArch, NativeRuntimeInfo};
     use tempfile::tempdir;
 
     fn qwen3_cache_config(max_seq_len: usize) -> KVCacheConfig {
@@ -2206,7 +2208,7 @@ mod tests {
 
     #[test]
     fn native_bridge_base_cache_config_preserves_asymmetric_value_dim() {
-        let info = NativeBridgeInfo {
+        let info = NativeRuntimeInfo {
             arch: NativeArch::DeepSeek,
             num_layers: 61,
             num_kv_heads: 128,
@@ -2235,7 +2237,7 @@ mod tests {
 
     #[test]
     fn native_cache_mode_support_respects_turboquant_capability() {
-        let qwen = NativeBridgeInfo {
+        let qwen = NativeRuntimeInfo {
             arch: NativeArch::Qwen3_5,
             num_layers: 28,
             num_kv_heads: 2,
@@ -2243,7 +2245,7 @@ mod tests {
             value_head_dim: 128,
             supports_turboquant: true,
         };
-        let llama4 = NativeBridgeInfo {
+        let llama4 = NativeRuntimeInfo {
             arch: NativeArch::Llama4,
             num_layers: 48,
             num_kv_heads: 8,

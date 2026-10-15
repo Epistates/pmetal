@@ -1,5 +1,5 @@
 use crate::{MergeError, MergeMethod, MergeParameters, Result};
-use pmetal_bridge::compat::Array;
+use pmetal_runtime::compat::Array;
 
 /// Passthrough "merge" - copies the tensor from the first model that contains it.
 ///

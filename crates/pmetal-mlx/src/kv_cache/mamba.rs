@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Weak};
 
-use pmetal_bridge::compat::{Array, Exception, ops};
+use pmetal_runtime::compat::{Array, Exception, ops};
 
 use crate::kernels::gated_delta_state_advance;
 

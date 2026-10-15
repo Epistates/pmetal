@@ -1,6 +1,6 @@
 //! Error and result types shared by the trainers.
 
-use pmetal_bridge::compat::Exception;
+use pmetal_runtime::compat::Exception;
 
 /// Error type for SFT training.
 #[derive(Debug, thiserror::Error)]

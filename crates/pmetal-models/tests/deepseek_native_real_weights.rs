@@ -22,19 +22,19 @@
 
 use std::path::PathBuf;
 
-use pmetal_bridge::compat::Array;
-use pmetal_bridge::compat::ops::slice_axis;
-use pmetal_bridge::deepseek_native::{NativeCache, forward_step, load_config, load_model};
 use pmetal_mlx::test_utils::{argmax_last_axis, load_shard, ref_tensor};
+use pmetal_runtime::compat::Array;
+use pmetal_runtime::compat::ops::slice_axis;
+use pmetal_runtime::deepseek_native::{NativeCache, forward_step, load_config, load_model};
 use serial_test::serial;
 
 fn drain_bridge(op: &str) {
-    pmetal_bridge::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
+    pmetal_runtime::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
 }
 
 /// Per-position cosine of `[1, T, vocab]` logits.
 fn cosines(got: &Array, want: &Array) -> Vec<f32> {
-    let got = got.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
+    let got = got.as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32());
     let dot = got.multiply(want).sum_axis(-1, false);
     let norms = got
         .square()
@@ -78,7 +78,7 @@ fn native_deepseek_runs_the_mlx_4bit_conversion_as_mlx_does() {
     let dir = PathBuf::from(dir);
     let reference = load_shard(&PathBuf::from(file));
     let ints = |key: &str| -> Vec<i32> {
-        let a = ref_tensor(&reference, key).as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32());
+        let a = ref_tensor(&reference, key).as_dtype(pmetal_runtime::compat::Dtype::Int32.as_i32());
         a.eval();
         a.as_slice::<i32>().to_vec()
     };

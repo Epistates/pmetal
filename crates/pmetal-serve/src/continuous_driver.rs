@@ -27,10 +27,10 @@
 //! ship incrementally arch-by-arch.
 
 use crate::continuous_batch::SlotId;
-use pmetal_bridge::compat::{Array, Exception};
-use pmetal_bridge::decode::DecodePenalties;
 use pmetal_mlx::kv_cache::{BatchKVCache, FusedBatchKVCache, KVCache, KVCacheConfig, MambaCache};
 use pmetal_models::generation::Sampler;
+use pmetal_runtime::compat::{Array, Exception};
+use pmetal_runtime::decode::DecodePenalties;
 use std::collections::HashMap;
 
 /// Trait that the driver uses to invoke the model's forward pass.
@@ -418,7 +418,7 @@ pub fn drive_decode_step<F: SlotForward>(
     state: &mut ContinuousEngineState,
     slots: &[(SlotId, u32)],
 ) -> Result<Vec<SlotStepOutput>, Exception> {
-    use pmetal_bridge::compat::ops::async_eval;
+    use pmetal_runtime::compat::ops::async_eval;
 
     // Phase 1: schedule forwards, collect lazy logits per slot.
     let mut lazy: Vec<(SlotId, Array)> = Vec::with_capacity(slots.len());
@@ -483,7 +483,7 @@ pub fn drive_fused_decode_step<F: FusedBatchForward>(
     state: &mut ContinuousEngineState,
     slots: &[(SlotId, u32)],
 ) -> Result<Vec<SlotStepOutput>, Exception> {
-    use pmetal_bridge::compat::ops::async_eval;
+    use pmetal_runtime::compat::ops::async_eval;
 
     if slots.is_empty() {
         return Ok(Vec::new());
@@ -570,7 +570,7 @@ fn extract_last_logits(logits: &Array) -> Result<Array, Exception> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::Array;
+    use pmetal_runtime::compat::Array;
 
     fn make_config() -> KVCacheConfig {
         KVCacheConfig::new(2, 32, 4, 64)
@@ -724,7 +724,7 @@ mod tests {
             seeded_slot_tokens(&[None, Some(9)]),
             "an unseeded and a differently seeded slot moved the seeded slot's tokens"
         );
-        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+        pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
     }
 
     #[test]

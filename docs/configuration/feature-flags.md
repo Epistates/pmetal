@@ -26,7 +26,7 @@ Entries marked `Yes*` are not listed in `default` but arrive through one of thos
 | `distributed` | Yes | `pmetal-distributed` | Distributed training and `pmetal cluster` |
 | `ane` | Yes | — | Apple Neural Engine |
 | `dashboard` | Yes | — | TUI control center |
-| `native-only` | **No** | `pmetal-bridge` | Bridge-only build, without `pmetal-mlx` or `pmetal-models` |
+| `native-only` | **No** | `pmetal-runtime` | Bridge-only build, without `pmetal-mlx` or `pmetal-models` |
 | `vocoder` | **No** | `pmetal-vocoder` | BigVGAN neural vocoder |
 | `mhc` | **No** | `pmetal-mhc` | Manifold-Constrained Hyper-Connections |
 | `serve` | **No** | `pmetal-serve` | OpenAI-compatible inference server (`pmetal serve`) |

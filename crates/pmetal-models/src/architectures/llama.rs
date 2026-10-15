@@ -4,14 +4,14 @@
 
 use std::collections::HashMap;
 
-use pmetal_bridge::compat::{Array, Exception, Module, nn};
-use pmetal_bridge::impl_module_params;
-use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa, get_training_context,
     rope::{RopePositions, rope_embedding},
 };
 use pmetal_mlx::kv_cache::KVCache;
+use pmetal_runtime::compat::{Array, Exception, Module, nn};
+use pmetal_runtime::impl_module_params;
+use pmetal_runtime::rope::{RopeConfig, RotaryEmbedding};
 use serde::{Deserialize, Serialize};
 
 use crate::checkpointing::checkpointed_layer;
@@ -49,7 +49,7 @@ pub struct LlamaConfig {
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f32,
     /// RoPE scaling (`rope_type` `"llama3"` for Llama 3.1 onward), read by
-    /// [`pmetal_bridge::rope`].
+    /// [`pmetal_runtime::rope`].
     #[serde(default)]
     pub rope_scaling: Option<serde_json::Value>,
     /// transformers v5's spelling of the same, with `rope_theta` inside.
@@ -884,7 +884,7 @@ impl crate::traits::CausalLMModel for LlamaForCausalLM {
     }
 
     fn eval(&self) -> Result<(), Exception> {
-        pmetal_bridge::compat::ModuleParametersExt::eval(self)
+        pmetal_runtime::compat::ModuleParametersExt::eval(self)
     }
 }
 
@@ -918,9 +918,9 @@ mod tests {
         let config = small_config();
         let mut attn = LlamaAttention::new(&config, 0).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 4, 64],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let output = attn.forward(&x, None).unwrap();
 
@@ -933,9 +933,9 @@ mod tests {
         let config = small_config();
         let mut mlp = LlamaMLP::new(&config).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 4, 64],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let output = mlp.forward(&x).unwrap();
 
@@ -948,9 +948,9 @@ mod tests {
         let config = small_config();
         let mut layer = LlamaDecoderLayer::new(&config, 0).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 4, 64],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let output = layer.forward(&x, None).unwrap();
 
@@ -970,9 +970,9 @@ mod tests {
         let config = small_config();
         let mut layer = LlamaDecoderLayer::new(&config, 0).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(
+        let x = pmetal_runtime::compat::random::normal(
             &[1, 4, 64],
-            pmetal_bridge::compat::Dtype::Float32,
+            pmetal_runtime::compat::Dtype::Float32,
         );
         let via_trait = {
             let dyn_layer: &mut dyn DecoderLayer = &mut layer;
@@ -987,7 +987,7 @@ mod tests {
         let config = small_config();
         let mut model = LlamaModel::new(config).unwrap();
 
-        let input_ids = pmetal_bridge::compat::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = pmetal_runtime::compat::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
         let output = model.forward(&input_ids, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -999,7 +999,7 @@ mod tests {
         let config = small_config();
         let mut model = LlamaForCausalLM::new(config).unwrap();
 
-        let input_ids = pmetal_bridge::compat::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = pmetal_runtime::compat::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
         let logits = model.forward(&input_ids, None).unwrap();
 
         assert_eq!(logits.shape(), &[1, 4, 1000]); // [batch, seq, vocab]

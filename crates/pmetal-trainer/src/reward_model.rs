@@ -34,9 +34,9 @@
 //! ).unwrap();
 //! ```
 
-use pmetal_bridge::compat::{Array, ops};
-use pmetal_bridge::inline_array;
 use pmetal_data::Tokenizer;
+use pmetal_runtime::compat::{Array, ops};
+use pmetal_runtime::inline_array;
 use std::path::Path;
 use std::sync::Mutex;
 
