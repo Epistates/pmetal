@@ -222,16 +222,64 @@ fn dynamic_cached_decode(profile: &str) {
         ));
     }
     assert_all_pass(&format!("{profile}: dynamic cached decode"), &reports);
+}
 
-    // The InlineArray decode path is tried on the first step only: the swish
-    // checkpoint takes it, and the sigmoid one keeps the reason it can't
-    // rather than trying, and logging, again every step.
-    let DynamicModel::Qwen3Next(qwen) = &model else {
-        panic!("{profile}: a Qwen3.5 checkpoint loads as Qwen3Next");
-    };
-    let inline = qwen.inline_weights.as_ref().map(Result::is_ok);
-    let want_inline = Some(profile != "sigmoid");
-    assert_eq!(inline, want_inline, "{profile}: InlineArray decode weights");
+/// The prompt prefilled in passes of several sizes through the `DynamicModel`
+/// caches, the sizes chosen to split it inside a GDN layer's convolution window
+/// (kernel 4) and the reference's 64-token chunk: the logits of every pass, and
+/// the decode that follows the last, must be `transformers`'.
+fn dynamic_chunked_prefill(profile: &str) {
+    let fx = checkpoint(profile);
+    let mut model = DynamicModel::load(fx.path()).expect("checkpoint loads");
+    let ids = fx.input_ids();
+    let t = fx.seq_len();
+    let want = fx.tensor("logits");
+
+    let mut reports = Vec::new();
+    for chunk in [1, 2, 3, 7, 33, 64, 69] {
+        let mut kv = model.create_cache(t as usize + 1);
+        let mut mamba = model
+            .create_mamba_cache()
+            .expect("hybrid model has a GDN cache");
+        // Everything but the last token, `chunk` tokens per pass; then the last
+        // token alone, a decode step from the state the passes left.
+        let mut start = 0;
+        while start < t - 1 {
+            let end = (start + chunk).min(t - 1);
+            let logits = model
+                .forward_with_hybrid_cache(
+                    &rows(&ids, start, end),
+                    None,
+                    Some(&mut kv),
+                    Some(&mut mamba),
+                )
+                .expect("prefill pass");
+            drain_bridge("dynamic chunked prefill");
+            reports.push(ParityReport::compute(
+                &format!("chunk_{chunk}_rows_{start}_{end}"),
+                &logits,
+                &rows(&want, start, end),
+                DECODE_TOL,
+            ));
+            start = end;
+        }
+        let step = model
+            .forward_with_hybrid_cache(
+                &rows(&ids, t - 1, t),
+                None,
+                Some(&mut kv),
+                Some(&mut mamba),
+            )
+            .expect("decode step");
+        drain_bridge("dynamic decode after chunked prefill");
+        reports.push(ParityReport::compute(
+            &format!("chunk_{chunk}_decode"),
+            &step,
+            &rows(&want, t - 1, t),
+            DECODE_TOL,
+        ));
+    }
+    assert_all_pass(&format!("{profile}: dynamic chunked prefill"), &reports);
 }
 
 fn dynamic_mtp(profile: &str) {
@@ -524,6 +572,30 @@ fn swish_native_chunked_prefill_matches_transformers() {
 /// The routed-experts profile (`qwen3_5_moe`): every layer a sparse block of
 /// 8 experts, 2 per token, plus a shared expert behind its own sigmoid gate,
 /// in transformers' fused `gate_up_proj` layout. 40 tokens.
+#[test]
+#[serial]
+fn swish_dynamic_chunked_prefill_matches_transformers() {
+    dynamic_chunked_prefill("swish");
+}
+
+#[test]
+#[serial]
+fn moe_dynamic_prefill_matches_transformers() {
+    dynamic_prefill("moe");
+}
+
+#[test]
+#[serial]
+fn moe_dynamic_cached_decode_matches_transformers() {
+    dynamic_cached_decode("moe");
+}
+
+#[test]
+#[serial]
+fn moe_dynamic_chunked_prefill_matches_transformers() {
+    dynamic_chunked_prefill("moe");
+}
+
 #[test]
 #[serial]
 fn moe_native_matches_transformers() {

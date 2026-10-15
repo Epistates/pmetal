@@ -29,7 +29,6 @@ pub mod qwen3;
 pub mod qwen3_5_vision;
 pub mod qwen3_moe;
 pub mod qwen3_next;
-pub mod qwen3_next_inline;
 pub mod qwen3_next_mtp;
 pub mod qwen4_exp;
 pub mod t5;

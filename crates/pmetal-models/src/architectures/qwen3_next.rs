@@ -31,7 +31,7 @@ use crate::expert_io::{ExpertOffloadContext, copy_as_f32};
 use crate::expert_prefetch::{ExpertPrefetcher, PrefetchedExpert};
 use crate::fp8_utils::dequantize_fp8_weight_for_compute;
 use crate::traits::ModelConfig;
-use pmetal_cache::kv_cache::{KVCache, MambaCache, MambaCacheEntry, SequenceKey};
+use pmetal_cache::kv_cache::{KVCache, MambaCache, MambaCacheEntry};
 use pmetal_metal::expert_buffer::{ExpertBufferPool, ExpertBufferPoolConfig};
 use pmetal_runtime::native_weight::LayerWeight;
 use pmetal_runtime::nn::{
@@ -3727,20 +3727,6 @@ pub struct Qwen3NextForCausalLM {
     pub model: Qwen3NextModel,
     pub lm_head: Option<nn::Linear>,
     pub config: Qwen3NextConfig,
-    /// InlineArray weights for zero-overhead decode, built on the first decode
-    /// step: `None` until then, then the weights or why this model can't take
-    /// that path (a sigmoid-gated checkpoint, say), so it is tried once.
-    pub inline_weights: Option<Result<super::qwen3_next_inline::InlineModelWeights, String>>,
-    /// InlineArray decode state, one per sequence being decoded, keyed by the
-    /// caller's `MambaCache`. It lives across decode steps (no conversion per
-    /// step) and takes over from the caller's caches, which the inline path
-    /// doesn't update. Keeping a single one made every sequence after the
-    /// first decode against the first one's state.
-    pub inline_caches: Vec<(SequenceKey, super::qwen3_next_inline::InlineCache)>,
-    /// The projection weights `inline_weights` was built from, by identity.
-    /// The engine multiplies by copies of them, so a change to any (a merge,
-    /// a reload) rebuilds it.
-    pub inline_built_from: Option<Vec<usize>>,
 }
 impl_module_params!(Qwen3NextForCausalLM; model, lm_head);
 
@@ -3768,27 +3754,7 @@ impl Qwen3NextForCausalLM {
             model,
             lm_head,
             config,
-            inline_weights: None,
-            inline_caches: Vec::new(),
-            inline_built_from: None,
         })
-    }
-
-    /// Every projection's stored weight, by identity, when each is plain
-    /// ([`nn::Linear::plain_weight`]); `None` when any is not. The InlineArray
-    /// decode engine multiplies by the weights directly, so an adapter or a
-    /// packed weight on any projection keeps a model off it: it would decode
-    /// as the base model, or read packed words as weights.
-    fn plain_projection_ids(&mut self) -> Option<Vec<usize>> {
-        let mut ids = Some(Vec::new());
-        self.visit_linears_mut(
-            "",
-            &mut |_, linear| match (linear.plain_weight(), ids.as_mut()) {
-                (Some(weight), Some(list)) => list.push(weight.id()),
-                _ => ids = None,
-            },
-        );
-        ids
     }
 
     pub fn requires_expert_offloading(&self) -> bool {
@@ -3821,77 +3787,6 @@ impl Qwen3NextForCausalLM {
         kv_cache: Option<&mut KVCache>,
         mamba_cache: Option<&mut MambaCache>,
     ) -> Result<Array, Exception> {
-        // Decode (T=1): use InlineArray path for zero-overhead graph build
-        let plain = (mask.is_none()
-            && input_ids.dim(1) == 1
-            && kv_cache.is_some()
-            && mamba_cache.is_some())
-        .then(|| self.plain_projection_ids())
-        .flatten();
-        if let Some(projections) = plain {
-            // Build the InlineArray weights on the first decode step, and
-            // again only if the projections' weights change: a model that
-            // can't take that path decodes on the standard one from then on.
-            if self.inline_built_from.as_ref() != Some(&projections) {
-                self.inline_weights = None;
-                self.inline_built_from = Some(projections);
-            }
-            if self.inline_weights.is_none() {
-                let built = super::qwen3_next_inline::InlineModelWeights::from_model(self)
-                    .map_err(|e| e.to_string());
-                match &built {
-                    Ok(weights) => tracing::debug!(
-                        layers = weights.layers.len(),
-                        "InlineArray decode weights ready"
-                    ),
-                    Err(reason) => {
-                        tracing::info!("Decoding on the standard path: {reason}");
-                    }
-                }
-                self.inline_weights = Some(built);
-            }
-            if let (Some(Ok(weights)), Some(kv), Some(mb)) = (
-                self.inline_weights.as_ref(),
-                kv_cache.as_ref(),
-                mamba_cache.as_ref(),
-            ) {
-                // This sequence's inline state, bootstrapped from its caches
-                // on its first decode step. Sequences that have finished
-                // (their cache dropped or reset) give theirs up.
-                self.inline_caches.retain(|(key, _)| key.is_live());
-                let slot = match self
-                    .inline_caches
-                    .iter()
-                    .position(|(key, _)| key.belongs_to(mb))
-                {
-                    Some(slot) => slot,
-                    None => {
-                        tracing::debug!(
-                            "[INLINE] Bootstrapping InlineCache from the prefill caches"
-                        );
-                        self.inline_caches.push((
-                            mb.sequence_key(),
-                            super::qwen3_next_inline::InlineCache::from_caches(
-                                kv,
-                                mb,
-                                &weights.layers,
-                            ),
-                        ));
-                        self.inline_caches.len() - 1
-                    }
-                };
-
-                // Pure InlineArray decode. From here on the InlineCache owns
-                // the decode state; `kv_cache` / `mamba_cache` are not updated.
-                let token = super::qwen3_next_inline::ia_from_array(input_ids);
-                let logits = super::qwen3_next_inline::inline_decode_step_pure(
-                    weights,
-                    &token,
-                    &mut self.inline_caches[slot].1,
-                );
-                return Ok(super::qwen3_next_inline::ia_to_array(&logits));
-            }
-        }
         let h = self
             .model
             .forward_with_cache(input_ids, mask, kv_cache, mamba_cache)?;
@@ -3966,10 +3861,9 @@ impl Qwen3NextForCausalLM {
     /// the tapped layers — the target side of a DFlash speculative verify
     /// step for the hybrid-attention Qwen3.5 stack.
     ///
-    /// This path intentionally bypasses the InlineArray decode closure used
-    /// by `forward_with_cache` for `T = 1`: verify always runs with
-    /// `T > 1` (multiple draft tokens), so the standard layer-by-layer
-    /// forward is the correct target.
+    /// Verify always runs with `T > 1` (multiple draft tokens), so this is the
+    /// layer-by-layer forward with the GDN layers recording their rollback
+    /// inputs.
     pub fn forward_with_capture(
         &mut self,
         input_ids: &Array,
