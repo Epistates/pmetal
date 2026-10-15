@@ -10,7 +10,13 @@
 //! BigVGAN uses:
 //! - Transposed convolutions for upsampling (256x for 24 kHz)
 //! - Anti-aliased Multi-Periodicity (AMP) blocks with Snake activations
-//! - Multi-period and multi-resolution discriminators for adversarial training
+//! - Multi-period, multi-resolution, multi-band and constant-Q discriminators
+//!   for adversarial training ([`discriminator`], [`loss`], [`train`])
+//!
+//! Inference runs the activations as one fused GPU kernel after
+//! [`BigVGAN::prepare_for_inference`]; [`StreamingSynthesizer`] synthesises
+//! live or very long input piece by piece with output identical to a single
+//! pass.
 //!
 //! # Example
 //!

@@ -308,3 +308,47 @@ broadcast) are based on Burn's collective framework.
 Source: https://github.com/tracel-ai/burn
 License: MIT / Apache 2.0
 File: crates/pmetal-distributed/src/collective.rs
+
+
+10. BigVGAN (NVIDIA)
+--------------------
+
+The pmetal-vocoder crate reimplements the BigVGAN vocoder (Lee et al., 2023)
+and checks its numbers against the reference implementation's: the generator
+and its anti-aliased Snake activations, the discriminators (HiFi-GAN's
+multi-period discriminator, the multi-resolution, multi-band and multi-scale
+sub-band CQT discriminators), the mel front end, the losses and the training
+recipe, plus a reader for its released checkpoints.
+
+    Copyright (c) 2024 NVIDIA CORPORATION.
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+Source: https://github.com/NVIDIA/BigVGAN
+License: MIT
+Files: crates/pmetal-vocoder/ (the test fixtures under tests/fixtures hold values
+computed by the reference code and a copy of a release's config.json)
+
+BigVGAN in turn adapts HiFi-GAN (Kong et al., MIT), the Snake activation
+(Ziyin et al.; implementation by Edward Dixon, MIT), alias-free-torch
+(junjun3518, Apache 2.0), julius (Defossez, MIT), the Descript audio codec's
+multi-scale mel loss (MIT), Vocos' multi-band discriminator (MIT) and Amphion's
+CQT discriminator (MIT). The constant-Q transform follows nnAudio (MIT) and
+the sample-rate converter follows torchaudio's windowed-sinc kernel (BSD
+2-Clause); the mel filterbank follows librosa (ISC).
