@@ -133,12 +133,13 @@ impl LearningRateScheduler {
             }
 
             LrSchedulerType::CosineWithRestarts => {
-                let cycle_length = decay_steps.div_ceil(self.num_restarts.max(1));
-                let cycle_progress = if cycle_length > 0 {
-                    (current_decay_step % cycle_length) as f64 / cycle_length as f64
-                } else {
-                    0.0
-                };
+                // `num_restarts` hard-restarted cosine cycles over the decay
+                // span, then the floor: the same curve as transformers'
+                // `get_cosine_with_hard_restarts_schedule_with_warmup`.
+                if progress >= 1.0 {
+                    return self.min_lr;
+                }
+                let cycle_progress = (self.num_restarts.max(1) as f64 * progress) % 1.0;
                 self.min_lr
                     + (self.base_lr - self.min_lr) * 0.5 * (1.0 + (PI * cycle_progress).cos())
             }
@@ -498,6 +499,98 @@ mod tests {
         // All post-warmup steps at base LR
         assert!((scheduler.get_lr(50) - 1e-4).abs() < 1e-10);
         assert!((scheduler.get_lr(99) - 1e-4).abs() < 1e-10);
+    }
+
+    /// transformers' `_get_cosine_with_hard_restarts_schedule_with_warmup_lr_lambda`,
+    /// term for term.
+    fn reference_hard_restarts(step: usize, warmup: usize, total: usize, cycles: usize) -> f64 {
+        if step < warmup {
+            return step as f64 / warmup.max(1) as f64;
+        }
+        let progress = (step - warmup) as f64 / total.saturating_sub(warmup).max(1) as f64;
+        if progress >= 1.0 {
+            return 0.0;
+        }
+        (0.5 * (1.0 + (PI * ((cycles as f64 * progress) % 1.0)).cos())).max(0.0)
+    }
+
+    #[test]
+    fn cosine_with_restarts_matches_the_reference_schedule() {
+        for (total, warmup, cycles) in [
+            (100, 0, 1),
+            (100, 10, 2),
+            (97, 7, 3),
+            (50, 0, 5),
+            (9, 0, 3),
+            (10, 2, 4),
+        ] {
+            let s =
+                LearningRateScheduler::new(1.0, total, warmup, LrSchedulerType::CosineWithRestarts)
+                    .with_num_restarts(cycles);
+            for step in 0..=total + 3 {
+                let want = reference_hard_restarts(step, warmup, total, cycles);
+                let got = s.get_lr(step);
+                assert!(
+                    (got - want).abs() < 1e-12,
+                    "total={total} warmup={warmup} cycles={cycles} step={step}: got {got}, want {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decay_schedules_match_the_reference_formulas() {
+        // transformers' get_linear_schedule_with_warmup,
+        // get_cosine_schedule_with_warmup (num_cycles = 0.5) and
+        // get_polynomial_decay_schedule_with_warmup (lr_end = 0), as the
+        // multiplier on the peak rate.
+        for (total, warmup) in [(100usize, 0usize), (100, 10), (37, 5), (8, 7), (10, 1)] {
+            let denom = total.saturating_sub(warmup).max(1) as f64;
+            for step in 0..=total {
+                let warm = step as f64 / warmup.max(1) as f64;
+                let progress = step.saturating_sub(warmup) as f64 / denom;
+                let (linear, cosine, quad) = if step < warmup {
+                    (warm, warm, warm)
+                } else {
+                    (
+                        ((total - step) as f64 / denom).max(0.0),
+                        (0.5 * (1.0 + (PI * 2.0 * 0.5 * progress).cos())).max(0.0),
+                        (1.0 - progress).powi(2),
+                    )
+                };
+                for (kind, want) in [
+                    (LrSchedulerType::Linear, linear),
+                    (LrSchedulerType::Cosine, cosine),
+                    (LrSchedulerType::Polynomial, quad),
+                ] {
+                    let mut s = LearningRateScheduler::new(1.0, total, warmup, kind);
+                    if kind == LrSchedulerType::Polynomial {
+                        s = s.with_polynomial_power(2.0);
+                    }
+                    assert!(
+                        (s.get_lr(step) - want).abs() < 1e-12,
+                        "{kind:?} total={total} warmup={warmup} step={step}: got {}, want {want}",
+                        s.get_lr(step)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cosine_with_restarts_ends_at_the_floor_and_stays_there() {
+        let s = LearningRateScheduler::new(1e-3, 100, 0, LrSchedulerType::CosineWithRestarts)
+            .with_num_restarts(2)
+            .with_min_lr(1e-5);
+        // The last step of the run and everything past it sit at the floor
+        // instead of jumping back to the peak for a restart nobody asked for.
+        for step in [100, 101, 150, 1_000] {
+            assert!(
+                (s.get_lr(step) - 1e-5).abs() < 1e-12,
+                "step {step}: {}",
+                s.get_lr(step)
+            );
+        }
     }
 
     #[test]
