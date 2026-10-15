@@ -1150,6 +1150,152 @@ fn windowed_footprint_is_the_window_not_the_context() {
 }
 
 // ---------------------------------------------------------------------------
+// Fused batch cache: rows of different lengths
+// ---------------------------------------------------------------------------
+
+/// Attention of one query over `keys`/`values` (`[n, DIM]` rows per KV head,
+/// flattened `[HKV][n][DIM]`), in f64: the answer for `HQ` query heads.
+fn attention_reference(q: &[f32], keys: &[f32], values: &[f32], n: usize) -> Vec<f64> {
+    let groups = HQ / HKV;
+    let mut out = vec![0.0f64; HQ * DIM];
+    for head in 0..HQ {
+        let kv = head / groups;
+        let qh = &q[head * DIM..(head + 1) * DIM];
+        let logits: Vec<f64> = (0..n)
+            .map(|t| {
+                let k = &keys[(kv * n + t) * DIM..][..DIM];
+                qh.iter()
+                    .zip(k)
+                    .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                    .sum::<f64>()
+                    * f64::from(scale())
+            })
+            .collect();
+        let m = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let weights: Vec<f64> = logits.iter().map(|l| (l - m).exp()).collect();
+        let z: f64 = weights.iter().sum();
+        for t in 0..n {
+            let v = &values[(kv * n + t) * DIM..][..DIM];
+            for d in 0..DIM {
+                out[head * DIM + d] += weights[t] / z * f64::from(v[d]);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn fused_batch_rows_of_different_lengths_each_attend_to_their_own_tokens() {
+    let slots = 5;
+    let lengths = [9usize, 3, 14, 1, 6];
+    let mut rng = Rng::new(95);
+    // Per slot: its tokens' keys and values, `[token][HKV][DIM]`.
+    let history: Vec<(Vec<f32>, Vec<f32>)> = lengths
+        .iter()
+        .map(|&n| {
+            (
+                rng.normals(n * HKV * DIM, 1.0),
+                rng.normals(n * HKV * DIM, 1.0),
+            )
+        })
+        .collect();
+    let queries: Vec<Vec<f32>> = (0..slots).map(|_| rng.normals(HQ * DIM, 1.0)).collect();
+
+    let config = KVCacheConfig::new(1, 32, HKV, DIM);
+    let mut cache = FusedBatchKVCache::new(config, slots).unwrap();
+    for slot in 0..slots {
+        cache.admit(slot).unwrap();
+    }
+    for step in 0..*lengths.iter().max().unwrap() {
+        // The rows still running, in an order that is neither sorted nor
+        // contiguous.
+        let mut active: Vec<usize> = (0..slots).filter(|&s| lengths[s] > step).collect();
+        active.reverse();
+        let n = active.len();
+        let mut new_k = Vec::with_capacity(n * HKV * DIM);
+        let mut new_v = Vec::with_capacity(n * HKV * DIM);
+        for &slot in &active {
+            new_k.extend_from_slice(&history[slot].0[step * HKV * DIM..][..HKV * DIM]);
+            new_v.extend_from_slice(&history[slot].1[step * HKV * DIM..][..HKV * DIM]);
+        }
+        let shape = [n, HKV, 1, DIM];
+        let (k, v, mask) = cache
+            .update_and_fetch_batched(0, &active, &array(&new_k, &shape), &array(&new_v, &shape))
+            .unwrap();
+
+        // Attention of each active row's query, through the returned keys,
+        // values and padding mask.
+        let q: Vec<f32> = active.iter().flat_map(|&s| queries[s].clone()).collect();
+        let q = array(&q, &[n, HQ, 1, DIM]);
+        let out = q.sdpa_with_mask(&k, &v, scale(), Some(&mask));
+        let out = to_f32_vec_eval(&out);
+        for (row, &slot) in active.iter().enumerate() {
+            let have = step + 1;
+            // That slot's keys and values so far as `[HKV][have][DIM]`.
+            let gather = |buf: &[f32]| {
+                let mut g = Vec::with_capacity(HKV * have * DIM);
+                for kv in 0..HKV {
+                    for t in 0..have {
+                        g.extend_from_slice(&buf[(t * HKV + kv) * DIM..][..DIM]);
+                    }
+                }
+                g
+            };
+            let want = attention_reference(
+                &queries[slot],
+                &gather(&history[slot].0),
+                &gather(&history[slot].1),
+                have,
+            );
+            let got = &out[row * HQ * DIM..(row + 1) * HQ * DIM];
+            let err = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (f64::from(*a) - b).abs())
+                .fold(0.0, f64::max);
+            assert!(err < 1e-4, "step {step} slot {slot}: max error {err}");
+            assert_eq!(cache.offset_for(0, slot), have);
+        }
+    }
+    pmetal_runtime::check_unobserved_error().unwrap();
+}
+
+/// Milliseconds per decode step of the fused cache's update and fetch at a
+/// realistic size: 8 slots, 8 KV heads, 4096 positions, head dimension 128,
+/// bf16, 20 steps after a warm-up. Not a regression test (it asserts
+/// nothing); run with `--ignored --nocapture` on a quiet machine.
+#[test]
+#[ignore = "timing; run by hand"]
+fn fused_batch_update_cost() {
+    let (slots, heads, positions, dim) = (8usize, 8usize, 4096usize, 128usize);
+    let config = KVCacheConfig::new(1, positions, heads, dim).with_dtype(Dtype::Bfloat16);
+    let mut cache = FusedBatchKVCache::new(config, slots).unwrap();
+    for slot in 0..slots {
+        cache.admit(slot).unwrap();
+    }
+    let active: Vec<usize> = (0..slots).collect();
+    let mut rng = Rng::new(96);
+    let shape = [slots, heads, 1, dim];
+    let step = |cache: &mut FusedBatchKVCache, rng: &mut Rng| {
+        let k = array(&rng.normals(slots * heads * dim, 1.0), &shape)
+            .as_dtype(Dtype::Bfloat16.as_i32());
+        let (keys, values, mask) = cache.update_and_fetch_batched(0, &active, &k, &k).unwrap();
+        keys.eval();
+        values.eval();
+        mask.eval();
+    };
+    for _ in 0..8 {
+        step(&mut cache, &mut rng);
+    }
+    let start = std::time::Instant::now();
+    for _ in 0..20 {
+        step(&mut cache, &mut rng);
+    }
+    let ms = start.elapsed().as_secs_f64() * 1000.0 / 20.0;
+    eprintln!("fused batch update+fetch: {ms:.2} ms/step");
+}
+
+// ---------------------------------------------------------------------------
 // Cost: writes land in the existing buffer
 // ---------------------------------------------------------------------------
 
