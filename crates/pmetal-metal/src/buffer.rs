@@ -85,6 +85,12 @@ pub struct MetalBuffer<T: Copy + FromBytes + IntoBytes> {
     _phantom: PhantomData<T>,
 }
 
+/// Cloning a buffer clones the handle, not the memory: both values name the
+/// same allocation (as does [`MetalBuffer::reinterpret`]). That is what a
+/// kernel wants, but the slice accessors ([`as_slice`](MetalBuffer::as_slice),
+/// [`as_mut_slice`](MetalBuffer::as_mut_slice), [`copy_from_slice`](MetalBuffer::copy_from_slice))
+/// trust that nothing else is reading or writing the memory through another
+/// handle or the GPU while they are used; `&mut self` does not prove it.
 impl<T: Copy + FromBytes + IntoBytes> Clone for MetalBuffer<T> {
     fn clone(&self) -> Self {
         Self {

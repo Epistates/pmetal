@@ -1,33 +1,38 @@
 #![allow(unsafe_code)]
 
-//! Tuna: The "Tuna" Kernel Auto-Tuner.
+//! Tuna: the kernel auto-tuner.
 //!
-//! "Tuna" automatically finds the optimal kernel parameters (tile sizes, etc.)
-//! for the running hardware (e.g., M1 vs M3 Max) by benchmarking candidates at runtime.
+//! "Tuna" finds good kernel parameters (tile sizes, threadgroup shapes) for the
+//! running hardware by benchmarking candidates at runtime.
 //!
 //! # How it works
 //!
 //! 1. **Check Cache**: Looks up if we've already tuned this kernel for the given problem size.
-//! 2. **Generate Candidates**: Creates a list of valid tile configurations (e.g., 32x32, 64x32).
-//! 3. **Benchmark**: Runs each candidate for a few iterations, measuring execution time.
-//! 4. **Select Winner**: Picks the fastest config and caches it.
+//! 2. **Generate Candidates**: Creates a list of valid configurations (e.g., 32x32, 64x32),
+//!    led by the heuristic's choice.
+//! 3. **Benchmark**: Times each candidate (the median of five runs after a warm-up). A
+//!    candidate whose command buffer fails is skipped.
+//! 4. **Select Winner**: The fastest candidate replaces the heuristic only if it is at least
+//!    3 percent faster, so noise cannot flip the choice from run to run. A winner is cached.
 //!
 //! # Persistent Disk Cache
 //!
-//! When created via [`Tuner::with_persistent_cache`], tuning results are stored at
-//! `~/.cache/pmetal/tuna/` as JSON files (one per kernel type). This means subsequent
-//! process launches skip the benchmarking phase entirely for previously-seen problem sizes.
+//! A tuner made with [`Tuner::for_device`] stores results as JSON files (one per kernel
+//! type) under `~/.cache/pmetal/tuna/<scope>/`. The scope names the chip (including its GPU
+//! core count) and a digest of the compiled shader library, so results are never reused
+//! across different silicon or different builds of the kernels. Subsequent launches skip
+//! the benchmarking phase for previously-seen problem sizes. Concurrent processes merge
+//! their results into the same files.
 //!
 //! # Example
 //!
 //! ```ignore
-//! let tuner = Tuner::new();
-//! let config = tuner.tune_lora_forward(&ctx, batch_size, in_features, out_features, rank)?;
+//! let ctx = MetalContext::global()?;
+//! let config = ctx.tuner().tune_swiglu(&ctx, batch_size, hidden_size, intermediate_size)?;
 //! println!("Best config: {:?}", config);
 //!
-//! // Or with persistent cache:
-//! let tuner = Tuner::with_persistent_cache();
-//! let config = tuner.tune_lora_forward(&ctx, batch_size, in_features, out_features, rank)?;
+//! // A tuner of your own, in memory only:
+//! let tuner = Tuner::new();
 //! ```
 
 use std::collections::HashMap;
