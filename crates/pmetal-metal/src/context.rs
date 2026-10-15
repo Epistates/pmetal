@@ -9,7 +9,7 @@
 //! `supportsFamily`, the generation from the architecture name, the core count
 //! from the IO registry. Memory bandwidth is the one figure Metal does not
 //! report, so it is measured once per machine and checked against the
-//! published peak for the chip (see [`crate::chip`]).
+//! published peak for the chip.
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
