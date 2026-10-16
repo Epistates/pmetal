@@ -1573,11 +1573,41 @@ impl DynamicModel {
                     .map_err(|e| Exception::custom(e.to_string()))?;
                 Ok(Self::Mistral(model))
             }
+            ModelArchitecture::Phi | ModelArchitecture::Phi4 => {
+                // LongRoPE's two factor tables ride beside the weights.
+                let mut table = |name: &str| -> Result<Option<Vec<f32>>, Exception> {
+                    weights
+                        .remove(name)
+                        .map(|mut t| {
+                            let n = t.size();
+                            t.to_f32_vec(n).ok_or_else(|| {
+                                Exception::custom(format!("GGUF: could not read {name}"))
+                            })
+                        })
+                        .transpose()
+                };
+                let short = table("rope_factors_short.weight")?;
+                let long = table("rope_factors_long.weight")?;
+                gguf_config
+                    .set_longrope_factors(short.as_deref(), long.as_deref())
+                    .map_err(|e| Exception::custom(format!("GGUF: {e}")))?;
+                let mut config = gguf_config.to_phi_config();
+                config.tie_word_embeddings = tied;
+
+                crate::weight_format::name_phi3_fused_tensors(&mut weights);
+                crate::loader::split_phi_fused_qkv(&mut weights, &config);
+                let mut model = PhiForCausalLM::new(config)?;
+                assign_weights(&mut model, weights, &policy)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                Ok(if arch == ModelArchitecture::Phi4 {
+                    Self::Phi4(model)
+                } else {
+                    Self::Phi(model)
+                })
+            }
             other => Err(Exception::custom(format!(
                 "GGUF inference loading is not yet implemented for {other} \
-                 (supported: dense Llama, Qwen2, Qwen3, Mistral). Phi-3 GGUFs fuse the \
-                 attention and MLP projections and carry LongRoPE factors, none of which \
-                 the loader reads yet."
+                 (supported: dense Llama, Qwen2, Qwen3, Mistral, Phi-3)."
             ))),
         }
     }

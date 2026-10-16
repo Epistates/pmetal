@@ -405,3 +405,164 @@ fn gguf_rope_scaling_metadata_is_read_and_unknown_types_are_refused() {
     let err = DynamicModel::load(&path).err().expect("refused");
     assert!(err.to_string().contains("rope_freqs"), "{err}");
 }
+
+/// Phi-3 GGUFs fuse the attention projections (`attn_qkv`, rows q, k, v) and
+/// the SwiGLU gate and up (`ffn_up`, rows gate, up), keep LongRoPE's factors in
+/// `rope_factors_short` / `rope_factors_long` tensors, and give `phi3.*`
+/// metadata where the head is `hidden / heads` and `rope.dimension_count` only
+/// the rotated part of it. Written out from a model's own tensors in that
+/// layout, the file loads to the model the safetensors checkpoint does, past the
+/// original context where the long table applies.
+#[test]
+fn a_phi3_gguf_loads_to_the_model_its_safetensors_checkpoint_does() {
+    use pmetal_runtime::compat::{ModuleParametersExt, random};
+
+    const PHI_HIDDEN: u64 = 32;
+    const PHI_HEADS: u64 = 4;
+    const PHI_KV: u64 = 2;
+    const PHI_HEAD_DIM: u64 = PHI_HIDDEN / PHI_HEADS; // 8
+    const PHI_ROT: u64 = 4; // partial rotary factor 0.5
+    const PHI_FF: u64 = 64;
+    const PHI_LAYERS: u64 = 2;
+    const ORIGINAL: u32 = 8;
+    let short = [1.0f32, 1.5];
+    let long = [2.0f32, 4.0];
+
+    let config = serde_json::json!({
+        "model_type": "phi3", "vocab_size": VOCAB, "hidden_size": PHI_HIDDEN,
+        "intermediate_size": PHI_FF, "num_hidden_layers": PHI_LAYERS,
+        "num_attention_heads": PHI_HEADS, "num_key_value_heads": PHI_KV,
+        "max_position_embeddings": 64, "original_max_position_embeddings": ORIGINAL,
+        "rope_theta": 10000.0, "partial_rotary_factor": 0.5, "rms_norm_eps": 1e-5,
+        "tie_word_embeddings": false,
+        "rope_scaling": {"rope_type": "longrope", "short_factor": short, "long_factor": long},
+    });
+
+    // A model with random weights, saved as the Hugging Face checkpoint.
+    random::seed(21);
+    let model = DynamicModel::from_config(&config.to_string()).expect("build phi3");
+    let params: Vec<(String, Array)> = model
+        .flatten_params()
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect();
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+    let entries: Vec<(&str, &Array)> = params.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    Array::save_safetensors(
+        dir.path().join("model.safetensors").to_str().unwrap(),
+        &entries,
+    )
+    .expect("save the checkpoint");
+    let mut from_safetensors = DynamicModel::load(dir.path()).expect("the checkpoint loads");
+
+    // The same tensors in the GGUF's layout.
+    let host = |name: &str| -> Vec<f32> {
+        let (_, array) = params
+            .iter()
+            .find(|(k, _)| k == name)
+            .unwrap_or_else(|| panic!("no parameter {name}"));
+        let mut array = array.as_dtype(Dtype::Float32.as_i32());
+        let n = array.size();
+        array.to_f32_vec(n).expect("read")
+    };
+    let rows = |name: &str, rows: u64| (vec![rows, PHI_HIDDEN], host(name));
+    let mut b = GgufBuilder::with_model("phi3", "tiny-phi3-test");
+    b.add_u32("phi3.embedding_length", PHI_HIDDEN as u32);
+    b.add_u32("phi3.block_count", PHI_LAYERS as u32);
+    b.add_u32("phi3.attention.head_count", PHI_HEADS as u32);
+    b.add_u32("phi3.attention.head_count_kv", PHI_KV as u32);
+    b.add_u32("phi3.feed_forward_length", PHI_FF as u32);
+    b.add_u32("phi3.rope.dimension_count", PHI_ROT as u32);
+    b.add_u32("phi3.context_length", 64);
+    b.add_u32("phi3.rope.scaling.original_context_length", ORIGINAL);
+    b.add_f32("phi3.attention.layer_norm_rms_epsilon", 1e-5);
+    b.add_f32("phi3.rope.freq_base", 10000.0);
+    b.add_string_array(
+        "tokenizer.ggml.tokens",
+        (0..VOCAB).map(|i| format!("<t{i}>")).collect(),
+    );
+    b.add_f32_tensor(
+        "token_embd.weight",
+        vec![VOCAB, PHI_HIDDEN],
+        host("model.embed_tokens.weight"),
+    );
+    b.add_f32_tensor(
+        "output_norm.weight",
+        vec![PHI_HIDDEN],
+        host("model.norm.weight"),
+    );
+    b.add_f32_tensor(
+        "output.weight",
+        vec![VOCAB, PHI_HIDDEN],
+        host("lm_head.weight"),
+    );
+    b.add_f32_tensor("rope_factors_short.weight", vec![2], short.to_vec());
+    b.add_f32_tensor("rope_factors_long.weight", vec![2], long.to_vec());
+    let qkv_rows = (PHI_HEADS + 2 * PHI_KV) * PHI_HEAD_DIM;
+    for l in 0..PHI_LAYERS {
+        let p = format!("model.layers.{l}");
+        let mut qkv = host(&format!("{p}.self_attn.q_proj.weight"));
+        qkv.extend(host(&format!("{p}.self_attn.k_proj.weight")));
+        qkv.extend(host(&format!("{p}.self_attn.v_proj.weight")));
+        b.add_f32_tensor(
+            format!("blk.{l}.attn_qkv.weight"),
+            vec![qkv_rows, PHI_HIDDEN],
+            qkv,
+        );
+        let (shape, data) = rows(&format!("{p}.self_attn.o_proj.weight"), PHI_HIDDEN);
+        b.add_f32_tensor(format!("blk.{l}.attn_output.weight"), shape, data);
+        b.add_f32_tensor(
+            format!("blk.{l}.attn_norm.weight"),
+            vec![PHI_HIDDEN],
+            host(&format!("{p}.input_layernorm.weight")),
+        );
+        b.add_f32_tensor(
+            format!("blk.{l}.ffn_norm.weight"),
+            vec![PHI_HIDDEN],
+            host(&format!("{p}.post_attention_layernorm.weight")),
+        );
+        // Gate then up, fused.
+        b.add_f32_tensor(
+            format!("blk.{l}.ffn_up.weight"),
+            vec![2 * PHI_FF, PHI_HIDDEN],
+            host(&format!("{p}.mlp.gate_up_proj.weight")),
+        );
+        b.add_f32_tensor(
+            format!("blk.{l}.ffn_down.weight"),
+            vec![PHI_HIDDEN, PHI_FF],
+            host(&format!("{p}.mlp.down_proj.weight")),
+        );
+    }
+    let mut from_gguf = load_gguf_bytes(b.build_to_bytes().expect("build phi3 gguf"));
+    assert_eq!(from_gguf.architecture(), ModelArchitecture::Phi);
+
+    // 12 tokens against an original context of 8: the long table applies.
+    let ids = Array::from_slice(
+        &(0..12)
+            .map(|i| (i * 5 + 1) % VOCAB as i32)
+            .collect::<Vec<_>>(),
+        &[1, 12],
+    );
+    let a = from_safetensors
+        .forward(&ids, None)
+        .expect("safetensors forward");
+    let b = from_gguf.forward(&ids, None).expect("gguf forward");
+    let n = a.size();
+    let (mut a, mut b) = (
+        a.as_dtype(Dtype::Float32.as_i32()),
+        b.as_dtype(Dtype::Float32.as_i32()),
+    );
+    let (a, b) = (a.to_f32_vec(n).unwrap(), b.to_f32_vec(n).unwrap());
+    assert!(a.iter().all(|v| v.is_finite()));
+    let worst = a
+        .iter()
+        .zip(&b)
+        .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
+    let scale = a.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
+    assert!(
+        worst / scale < 1e-5,
+        "the GGUF differs from its checkpoint by {worst:e} of {scale:e}"
+    );
+    pmetal_runtime::check_unobserved_error().expect("a runtime op threw");
+}
