@@ -1,56 +1,15 @@
 //! Loaders for the text-to-image pipeline's components: the CLIP and T5 text
 //! encoders, the VAE and the Flux transformer.
 
-use pmetal_runtime::compat::{Array, ModuleParameters, ModuleParametersExt};
+use pmetal_runtime::compat::Array;
 use std::collections::HashMap;
 
-use super::{Exemption, LoadError, LoadPolicy, assign_weights};
+use super::assign::assign_renamed;
+use super::{Exemption, LoadError, LoadPolicy};
 use crate::architectures::clip::CLIPTextModel;
 use crate::architectures::flux::FluxDiT;
 use crate::architectures::t5::T5EncoderModel;
 use crate::architectures::vae::AutoencoderKL;
-
-/// Rename a checkpoint's tensors to the model's parameter paths, check each
-/// shape against the parameter it lands on, and assign them under `policy`,
-/// which fails unless checkpoint and model account for each other.
-///
-/// `map` turns a checkpoint key and tensor into the parameter path and tensor
-/// to assign (a rename, and a transpose where the layouts differ). A key it
-/// leaves alone keeps its checkpoint name, so it reaches no parameter and is
-/// reported as unconsumed unless `policy` exempts it. Two tensors mapped onto
-/// one parameter are an error rather than a race.
-fn assign_renamed<M: ModuleParameters + ModuleParametersExt>(
-    model: &mut M,
-    weights: HashMap<String, Array>,
-    map: impl Fn(&str, Array) -> (String, Array),
-    policy: &LoadPolicy,
-) -> Result<(), LoadError> {
-    let mut renamed: HashMap<String, Array> = HashMap::with_capacity(weights.len());
-    for (key, value) in weights {
-        let (target, value) = map(&key, value);
-        if renamed.insert(target.clone(), value).is_some() {
-            return Err(LoadError::SafeTensors(format!(
-                "two checkpoint tensors map onto the parameter `{target}` (one is `{key}`)"
-            )));
-        }
-    }
-    {
-        let params = model.flatten_params();
-        for (name, value) in &renamed {
-            if let Some(param) = params.get(name.as_str())
-                && param.shape() != value.shape()
-            {
-                return Err(LoadError::ShapeMismatch {
-                    key: name.clone(),
-                    expected: param.shape().to_vec(),
-                    actual: value.shape().to_vec(),
-                });
-            }
-        }
-    }
-    assign_weights(model, renamed, policy)
-}
-
 /// The model path of a CLIP text encoder checkpoint key, `transformers`
 /// layout, with or without the `text_model.` namespace a standalone text tower
 /// is saved under.
@@ -412,7 +371,7 @@ mod tests {
     use crate::architectures::flux::FluxConfig;
     use crate::architectures::t5::{T5Config, T5EncoderModel};
     use crate::architectures::vae::VAEConfig;
-    use pmetal_runtime::compat::Dtype;
+    use pmetal_runtime::compat::{Dtype, ModuleParameters, ModuleParametersExt};
     use serde_json::Value;
     use std::collections::BTreeMap;
 

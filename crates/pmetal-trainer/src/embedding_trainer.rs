@@ -23,7 +23,7 @@
 //! let config = EmbeddingTrainerConfig::default();
 //! let mut trainer = EmbeddingTrainer::new(config);
 //!
-//! // bert_model: BertForEmbedding, tokenizer: Tokenizer, optimizer: AdamW
+//! // bert_model: BertModel, tokenizer: Tokenizer, optimizer: AdamW
 //! trainer.run(&mut bert_model, &tokenizer, &dataset, &mut optimizer)?;
 //! ```
 
@@ -168,7 +168,7 @@ pub type EmbeddingResult<T> = Result<T, EmbeddingTrainerError>;
 /// Embedding / sentence-transformer trainer.
 ///
 /// Works with any model that implements [`TrainableModel`] — most commonly
-/// [`pmetal_models::architectures::bert::BertForEmbedding`], but also
+/// [`pmetal_models::architectures::bert::BertModel`], but also
 /// decoder-only models used as asymmetric embedders.
 ///
 /// ## Causal LM Models

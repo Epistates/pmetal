@@ -1,0 +1,45 @@
+{
+  "config": {
+    "_name_or_path": "",
+    "activation": "gelu",
+    "architectures": null,
+    "attention_dropout": 0.1,
+    "bos_token_id": null,
+    "chunk_size_feed_forward": 0,
+    "dim": 32,
+    "dropout": 0.1,
+    "dtype": null,
+    "eos_token_id": null,
+    "hidden_dim": 64,
+    "id2label": {
+      "0": "LABEL_0",
+      "1": "LABEL_1"
+    },
+    "initializer_range": 0.02,
+    "is_encoder_decoder": false,
+    "label2id": {
+      "LABEL_0": 0,
+      "LABEL_1": 1
+    },
+    "max_position_embeddings": 24,
+    "model_type": "distilbert",
+    "n_heads": 4,
+    "n_layers": 2,
+    "output_attentions": false,
+    "output_hidden_states": false,
+    "pad_token_id": 0,
+    "problem_type": null,
+    "qa_dropout": 0.1,
+    "return_dict": true,
+    "seq_classif_dropout": 0.2,
+    "sinusoidal_pos_embds": false,
+    "tie_word_embeddings": true,
+    "transformers_version": "5.6.1",
+    "vocab_size": 120
+  },
+  "model_id": "synthetic",
+  "oracle": "transformers",
+  "rng_seed": 29,
+  "torch_version": "2.11.0",
+  "transformers_version": "5.6.1"
+}

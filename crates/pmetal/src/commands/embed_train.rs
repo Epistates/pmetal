@@ -18,7 +18,7 @@ pub(crate) async fn run_embed_train(
     seed: u64,
 ) -> anyhow::Result<()> {
     use pmetal_data::EmbeddingDataset;
-    use pmetal_models::architectures::bert::BertForEmbedding;
+    use pmetal_models::architectures::bert::BertModel;
     use pmetal_models::pooling::PoolingMode;
     use pmetal_runtime::compat::optimizers::{AdamWBuilder, Optimizer};
     use pmetal_trainer::embedding_trainer::{
@@ -66,13 +66,15 @@ pub(crate) async fn run_embed_train(
     let config_path = std::path::Path::new(model_path).join("config.json");
     let config_str = std::fs::read_to_string(&config_path)
         .map_err(|e| anyhow::anyhow!("Failed to read config.json: {}", e))?;
-    let mut model = BertForEmbedding::from_config_str(&config_str)
+    let mut model = BertModel::from_config_str(&config_str)
         .map_err(|e| anyhow::anyhow!("Failed to build BERT model: {}", e))?;
 
     // Load pretrained weights
     tracing::info!("Loading weights from '{}'", model_path);
-    pmetal_models::loader::load_generic_weights(&mut model, model_path)
-        .map_err(|e| anyhow::anyhow!("Failed to load weights: {:?}", e))?;
+    let weights = pmetal_models::loader::load_weights(model_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read weights: {}", e))?;
+    pmetal_models::loader::load_bert_weights(&mut model, weights)
+        .map_err(|e| anyhow::anyhow!("Failed to load weights: {}", e))?;
 
     tracing::info!("Loading dataset from '{}'", dataset_path);
     let dataset = EmbeddingDataset::from_jsonl(dataset_path)
@@ -123,11 +125,11 @@ pub(crate) async fn run_embed_train(
         epochs
     );
 
-    // For BERT we can use a DynamicLoraModel-like wrapper, but since BertForEmbedding
+    // For BERT we can use a DynamicLoraModel-like wrapper, but since BertModel
     // is not yet in the LoRA dispatch, we call into the trainer directly via the
     // generic TrainableModel bound. We use a thin adapter.
     //
-    // NOTE: BertForEmbedding implements ModuleParameters via #[derive(ModuleParameters)],
+    // NOTE: BertModel implements ModuleParameters via #[derive(ModuleParameters)],
     // but not TrainableModel (which also requires LoRA bookkeeping methods). For now,
     // we run the training loop manually, which mirrors how EmbeddingTrainer works
     // internally. The full TrainableModel impl for BERT (with LoRA) is a follow-on task.
@@ -137,7 +139,7 @@ pub(crate) async fn run_embed_train(
     let log_every = trainer.config.log_every;
 
     // Manual training loop using the encode_and_loss helpers exposed by the trainer
-    // until BertForEmbedding implements TrainableModel.
+    // until BertModel implements TrainableModel.
     use pmetal_models::pooling::{normalize_embeddings, pool};
     use pmetal_runtime::compat::{eval_params, module::ModuleParameters, nn};
     use pmetal_trainer::contrastive_loss;
@@ -235,7 +237,7 @@ pub(crate) async fn run_embed_train(
                     let labels =
                         pmetal_runtime::compat::Array::from_slice(&labels_data, &[bs as i32]);
 
-                    let loss_fn = |m: &mut BertForEmbedding,
+                    let loss_fn = |m: &mut BertModel,
                                    (ia, ma, ib, mb, lbl): (
                         &pmetal_runtime::compat::Array,
                         &pmetal_runtime::compat::Array,
@@ -360,7 +362,7 @@ pub(crate) async fn run_embed_train(
                     let (ids_p, m_p) = tok_batch!(positives);
                     let (ids_n, m_n) = tok_batch!(negatives);
 
-                    let loss_fn = |m: &mut BertForEmbedding,
+                    let loss_fn = |m: &mut BertModel,
                                    (ia, ma, ip, mp, i_n, mn): (
                         &pmetal_runtime::compat::Array,
                         &pmetal_runtime::compat::Array,
@@ -428,14 +430,15 @@ pub(crate) async fn run_embed_train(
     std::fs::create_dir_all(output_dir)
         .map_err(|e| anyhow::anyhow!("Failed to create output dir: {}", e))?;
     let output_path = std::path::Path::new(output_dir).join("model.safetensors");
-    use pmetal_runtime::compat::module::ModuleParametersExt;
     let output_path_str = output_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Non-UTF-8 output path: {}", output_path.display()))?;
-    let flattened = model.flatten_params();
-    let entries: Vec<(&str, &pmetal_runtime::compat::Array)> = flattened
+    // Under the checkpoint's own names, so `transformers`, sentence-transformers
+    // and `pmetal` load what this writes.
+    let tensors = pmetal_models::loader::bert_checkpoint_tensors(&model)?;
+    let entries: Vec<(&str, &pmetal_runtime::compat::Array)> = tensors
         .iter()
-        .map(|(name, value)| (name.as_ref(), value))
+        .map(|(name, value)| (name.as_str(), value))
         .collect();
     pmetal_runtime::compat::Array::save_safetensors(output_path_str, &entries)?;
 

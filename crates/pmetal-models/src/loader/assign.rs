@@ -231,6 +231,53 @@ pub fn assign_weights<M: ModuleParameters + ModuleParametersExt>(
     Ok(())
 }
 
+/// Rename a checkpoint's tensors to the model's parameter paths, check each
+/// shape against the parameter it lands on, and assign them under `policy`,
+/// which fails unless checkpoint and model account for each other.
+///
+/// This is [`assign_weights`] for the architectures whose checkpoints spell
+/// their parameters differently from the model (a different tree, a fused
+/// projection, a transposed convolution). `map` turns a checkpoint key and
+/// tensor into the parameter path and tensor to assign. A key it leaves alone
+/// keeps its checkpoint name, so it reaches no parameter and is reported as
+/// unconsumed unless `policy` exempts it. Two tensors mapped onto one parameter
+/// are an error rather than a race.
+///
+/// Unlike the generic loader this checks shapes: a tensor of the wrong shape
+/// for the parameter it names is a [`LoadError::ShapeMismatch`] here rather than
+/// a failure at the first forward pass.
+pub(crate) fn assign_renamed<M: ModuleParameters + ModuleParametersExt>(
+    model: &mut M,
+    weights: HashMap<String, Array>,
+    map: impl Fn(&str, Array) -> (String, Array),
+    policy: &LoadPolicy,
+) -> Result<(), LoadError> {
+    let mut renamed: HashMap<String, Array> = HashMap::with_capacity(weights.len());
+    for (key, value) in weights {
+        let (target, value) = map(&key, value);
+        if renamed.insert(target.clone(), value).is_some() {
+            return Err(LoadError::SafeTensors(format!(
+                "two checkpoint tensors map onto the parameter `{target}` (one is `{key}`)"
+            )));
+        }
+    }
+    {
+        let params = model.flatten_params();
+        for (name, value) in &renamed {
+            if let Some(param) = params.get(name.as_str())
+                && param.shape() != value.shape()
+            {
+                return Err(LoadError::ShapeMismatch {
+                    key: name.clone(),
+                    expected: param.shape().to_vec(),
+                    actual: value.shape().to_vec(),
+                });
+            }
+        }
+    }
+    assign_weights(model, renamed, policy)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -10,7 +10,6 @@ use super::{
     LoadError, dequantize_sidecar_weights, load_weights, load_weights_filtered_raw,
     unpack_mlx_quantized_weights,
 };
-use crate::architectures::bert::BertForEmbedding;
 use crate::architectures::gemma::GemmaForCausalLM;
 use crate::architectures::nemotron_h::{
     NemotronHForCausalLM, load_nemotron_weights as load_nemotron,
@@ -383,114 +382,6 @@ fn load_gemma_rms_norm_weight(
         return Err(LoadError::MissingWeight(weight_key));
     }
     Ok(())
-}
-
-/// Load weights for BERT/RoBERTa/DistilBERT models from a HuggingFace checkpoint.
-///
-/// HuggingFace BERT checkpoints use a different naming convention than PMetal's
-/// internal parameter paths.  This function maps HF names to PMetal names before
-/// loading, so standard `model.safetensors` files from the HF Hub work without
-/// any prior conversion.
-///
-/// ## Name mapping
-///
-/// | HuggingFace key pattern               | PMetal parameter path                |
-/// |---------------------------------------|--------------------------------------|
-/// | `bert.embeddings.*`                   | `model.embeddings.*`                 |
-/// | `bert.encoder.layer.{i}.*`            | `model.layers.{i}.*`                 |
-/// | `attention.self.query`                | `attention.query`                    |
-/// | `attention.self.key`                  | `attention.key`                      |
-/// | `attention.self.value`                | `attention.value`                    |
-/// | `attention.output.dense`              | `attention_output.dense`             |
-/// | `intermediate.dense`                  | `intermediate.dense`                 |
-/// | `output.dense` (FFN)                  | `output.dense`                       |
-/// | `LayerNorm` (any position)            | `layer_norm`                         |
-/// | `embeddings.position_ids`             | skipped (buffer, not a parameter)    |
-/// | `pooler.*`                            | skipped (not part of BertForEmbedding)|
-///
-/// Both `bert.` prefixed keys and bare keys (some fine-tuned checkpoints strip
-/// the top-level prefix) are handled.
-///
-/// This is BERT only, despite what this comment used to claim. A RoBERTa
-/// checkpoint prefixes every key with `roberta.`, which nothing here strips, so
-/// it matched zero parameters and failed with a message about the checkpoint
-/// rather than about the gap. `ModelArchitecture::from_model_type` no longer
-/// routes RoBERTa or DistilBERT here.
-pub fn load_bert_weights(
-    model: &mut BertForEmbedding,
-    weights: &HashMap<String, Array>,
-) -> Result<(), LoadError> {
-    let mut params = model.flatten_params_mut();
-    let mut matched: usize = 0;
-
-    for (hf_name, weight) in weights {
-        // Skip non-parameter buffers and the optional pooler head (not part of
-        // BertForEmbedding which is embeddings-only).
-        if hf_name.ends_with("position_ids")
-            || hf_name.starts_with("pooler.")
-            || hf_name.starts_with("bert.pooler.")
-        {
-            continue;
-        }
-
-        // Map the HF key to the PMetal parameter path.
-        let pmetal_name = remap_bert_weight_name(hf_name);
-
-        if let Some(param) = params.get_mut(&*pmetal_name) {
-            **param = weight.clone();
-            matched += 1;
-        }
-        // Silently skip keys that don't have a corresponding PMetal parameter
-        // (e.g. cls.predictions.*, cls.seq_relationship.* from MLM/NSP heads).
-    }
-
-    if matched == 0 {
-        return Err(LoadError::SafeTensors(
-            "BERT weight loading: no parameters matched. \
-             Verify that the checkpoint is a BERT/RoBERTa model."
-                .into(),
-        ));
-    }
-
-    tracing::info!("BERT weight loading: {matched} parameters loaded successfully");
-    Ok(())
-}
-
-/// Map a single HuggingFace BERT weight name to the corresponding PMetal
-/// parameter path.
-///
-/// Called once per key in the safetensors file; cheap string manipulation only.
-fn remap_bert_weight_name(hf_name: &str) -> String {
-    // 1. Strip the top-level `bert.` prefix emitted by the standard HF BERT
-    //    implementation (not present in some fine-tuned variants).
-    let name = hf_name.strip_prefix("bert.").unwrap_or(hf_name);
-
-    // 2. Remap `encoder.layer.{i}` → `layers.{i}` (drop "encoder." wrapper).
-    let name = if let Some(rest) = name.strip_prefix("encoder.layer.") {
-        // rest = "{i}.{...}"  e.g. "0.attention.self.query.weight"
-        format!("layers.{rest}")
-    } else {
-        name.to_string()
-    };
-
-    // 3. Remap attention sub-structure:
-    //    `attention.self.query`  → `attention.query`
-    //    `attention.self.key`    → `attention.key`
-    //    `attention.self.value`  → `attention.value`
-    //    `attention.output.dense` → `attention_output.dense`
-    let name = name
-        .replace("attention.self.query", "attention.query")
-        .replace("attention.self.key", "attention.key")
-        .replace("attention.self.value", "attention.value")
-        .replace("attention.output.dense", "attention_output.dense")
-        .replace("attention.output.LayerNorm", "attention_output.layer_norm");
-
-    // 4. Remap LayerNorm everywhere: `LayerNorm` → `layer_norm`.
-    //    This covers `embeddings.LayerNorm`, `output.LayerNorm`, etc.
-    let name = name.replace("LayerNorm", "layer_norm");
-
-    // 5. Prepend `model.` to match `BertForEmbedding { model: BertModel }`.
-    format!("model.{name}")
 }
 
 #[cfg(test)]

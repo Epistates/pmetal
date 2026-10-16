@@ -2314,9 +2314,14 @@ impl InferenceEngine {
                 let mut embed = || -> ServeResult<Vec<Vec<f32>>> {
                     let ids = Array::from_slice(&ids_flat, &[batch as i32, seq_max as i32]);
                     let mask = Array::from_slice(&mask_flat, &[batch as i32, seq_max as i32]);
+                    // An encoder attends both ways, so the padding must be
+                    // hidden or every row's embedding depends on which other
+                    // rows share its batch; a causal model's right-padding is
+                    // out of its real tokens' reach.
+                    let padding_mask = state.model.takes_padding_mask().then_some(&mask);
                     let hidden = state
                         .model
-                        .forward_hidden(&ids, None)
+                        .forward_hidden(&ids, padding_mask)
                         .map_err(ServeError::Model)?;
                     // CLS and last-token pooling keep the hidden states' dtype.
                     let pooled = pmetal_models::pooling::pool(&hidden, &mask, mode)
