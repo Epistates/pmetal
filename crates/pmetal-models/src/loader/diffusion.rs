@@ -336,8 +336,8 @@ fn flux_param_name(key: &str) -> String {
 }
 
 /// Load the FLUX.1 transformer from a `diffusers` `transformer/` checkpoint,
-/// or from an original-layout single file (`double_blocks.*`, `single_blocks.*`;
-/// see [`flux_original_to_diffusers`]).
+/// or from an original-layout single file (`double_blocks.*`, `single_blocks.*`,
+/// converted the way `diffusers`' own script does).
 ///
 /// Fails, naming the difference, unless every tensor is consumed, every
 /// parameter filled and every shape matches. A checkpoint with a guidance
