@@ -191,6 +191,9 @@ pub enum GateUp<'a> {
     },
     /// One `[E, hidden, 2 * intermediate]` projection, gate first.
     Fused(&'a LayerWeight),
+    /// An expert with no gate: one `[E, hidden, intermediate]` projection.
+    /// Both halves a caller's activation sees are that projection's output.
+    Single(&'a LayerWeight),
 }
 
 impl GateUp<'_> {
@@ -206,6 +209,10 @@ impl GateUp<'_> {
                 gate.gather_mm_from(rows, None, Some(ids), sorted),
                 up.gather_mm_from(rows, None, Some(ids), sorted),
             ),
+            Self::Single(up) => {
+                let projected = up.gather_mm_from(rows, None, Some(ids), sorted);
+                (projected.clone(), projected)
+            }
             Self::Fused(gate_up) => {
                 let both = gate_up.gather_mm_from(rows, None, Some(ids), sorted);
                 let dims: Vec<i32> = (0..both.ndim()).map(|i| both.dim(i)).collect();
@@ -240,6 +247,33 @@ pub fn switch_glu_fused(
         inds,
         scores,
         |gate, up, _| activation(gate, up),
+        grouped,
+    )
+}
+
+/// `Σ_k scores[s, k] · down(act(up(x_s)))` over each row's experts
+/// `inds[s, k]`: the routed layer of an expert with no gate (Nemotron-H's
+/// squared-ReLU MLP), through the same grouped gather matmuls as
+/// [`switch_glu`].
+///
+/// `x_flat` is `[S, hidden]`, `inds` and `scores` `[S, top_k]`, `up` and `down`
+/// stacked over a leading expert axis.
+pub fn switch_mlp(
+    x_flat: &InlineArray,
+    up: &LayerWeight,
+    down: &LayerWeight,
+    inds: &InlineArray,
+    scores: &InlineArray,
+    activation: impl Fn(&InlineArray) -> InlineArray,
+) -> InlineArray {
+    let grouped = x_flat.dim(0) * inds.dim(1) >= GROUPING_THRESHOLD;
+    switch_glu_projected(
+        x_flat,
+        &GateUp::Single(up),
+        down,
+        inds,
+        scores,
+        |projected, _, _| activation(projected),
         grouped,
     )
 }
@@ -549,6 +583,70 @@ mod tests {
         const { assert!(48 * 2 >= GROUPING_THRESHOLD && 16 * 2 < GROUPING_THRESHOLD) };
         run_dense(48);
         run_dense(16);
+    }
+
+    /// An expert with no gate: `down(relu(up(x))²)` per routed row, in f64,
+    /// on both sides of the grouping threshold.
+    #[test]
+    fn a_plain_expert_is_down_of_the_activated_up() {
+        let (experts, hidden, inter) = (5usize, 6usize, 4usize);
+        let (up, up_w) = stack(experts, hidden, inter, 4);
+        let (down, down_w) = stack(experts, inter, hidden, 5);
+        for tokens in [16usize, 48] {
+            let x: Vec<f32> = (0..tokens * hidden)
+                .map(|i| ((i * 13 % 19) as f32 - 9.0) / 5.0)
+                .collect();
+            let routes = routes(tokens, experts);
+            let scores: Vec<f32> = (0..tokens * 2)
+                .map(|i| 0.25 + (i % 3) as f32 * 0.2)
+                .collect();
+            let flat_routes: Vec<u32> = routes.iter().flatten().copied().collect();
+            let got = switch_mlp(
+                &InlineArray::from_f32_slice(&x, &[tokens as i32, hidden as i32]),
+                &LayerWeight::Dense(up_w.clone()),
+                &LayerWeight::Dense(down_w.clone()),
+                &InlineArray::from_u32_slice(&flat_routes, &[tokens as i32, 2]),
+                &InlineArray::from_f32_slice(&scores, &[tokens as i32, 2]),
+                |y| y.maximum(&InlineArray::from_f32(0.0)).square(),
+            );
+            crate::check_unobserved_error().expect("switch_mlp");
+
+            let mut want = vec![0f64; tokens * hidden];
+            let mut negative_pre_activations = 0;
+            for (s, route) in routes.iter().enumerate() {
+                for (k, &e) in route.iter().enumerate() {
+                    let e = e as usize;
+                    let pre: Vec<f64> = (0..inter)
+                        .map(|c| {
+                            (0..hidden)
+                                .map(|r| {
+                                    f64::from(x[s * hidden + r])
+                                        * f64::from(up[(e * hidden + r) * inter + c])
+                                })
+                                .sum()
+                        })
+                        .collect();
+                    negative_pre_activations += pre.iter().filter(|v| **v < 0.0).count();
+                    let act: Vec<f64> = pre.iter().map(|v| v.max(0.0).powi(2)).collect();
+                    for h in 0..hidden {
+                        let y: f64 = (0..inter)
+                            .map(|c| act[c] * f64::from(down[(e * inter + c) * hidden + h]))
+                            .sum();
+                        want[s * hidden + h] += f64::from(scores[s * 2 + k]) * y;
+                    }
+                }
+            }
+            assert!(
+                negative_pre_activations > 0,
+                "the fixture never reaches the ReLU"
+            );
+            for (i, (g, w)) in values(got, tokens * hidden).iter().zip(&want).enumerate() {
+                assert!(
+                    (f64::from(*g) - w).abs() <= 1e-4 * (1.0 + w.abs()),
+                    "{tokens} tokens, element {i}: {g} against {w}"
+                );
+            }
+        }
     }
 
     /// A packed stack with one tensor scale per expert: the scale must follow

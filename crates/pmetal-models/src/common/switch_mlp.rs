@@ -99,3 +99,68 @@ impl SwitchMlp {
         ))
     }
 }
+
+/// The routed experts of a layer whose experts have no gate: an up projection,
+/// an activation and a down projection, as Nemotron-H's squared-ReLU experts
+/// are. Stacked like [`SwitchMlp`], under the names an MLX conversion gives
+/// them (`switch_mlp.fc1`, `switch_mlp.fc2`).
+#[derive(Debug)]
+pub struct PlainSwitchMlp {
+    /// The up projection, `[experts, intermediate, in]`.
+    pub fc1: MoeLinear,
+    /// The down projection, `[experts, in, intermediate]`.
+    pub fc2: MoeLinear,
+}
+impl_module_params!(PlainSwitchMlp; fc1, fc2);
+
+impl PlainSwitchMlp {
+    /// Randomly initialised experts (lazily: a checkpoint's weights replace
+    /// the draw before anything computes it).
+    pub fn new(num_experts: i32, in_features: i32, intermediate_size: i32) -> Self {
+        let init = |from: i32, to: i32| {
+            let bound = (from as f32).sqrt().recip();
+            MoeLinear {
+                weight: pmetal_runtime::compat::random::uniform_range(
+                    -bound,
+                    bound,
+                    &[num_experts, to, from],
+                    Dtype::Float32,
+                ),
+            }
+        };
+        Self {
+            fc1: init(in_features, intermediate_size),
+            fc2: init(intermediate_size, in_features),
+        }
+    }
+
+    /// How many experts the layer holds.
+    pub fn num_experts(&self) -> i32 {
+        self.fc1.weight.dim(0)
+    }
+
+    /// `Σ_k scores[s, k] · fc2(act(fc1(x_s)))` over each row's experts
+    /// `inds[s, k]`: `x_flat` is `[S, in]`, `inds` and `scores` `[S, top_k]`
+    /// (`scores` in the dtype of `x_flat`), the result `[S, in]`.
+    pub fn forward(
+        &self,
+        x_flat: &Array,
+        inds: &Array,
+        scores: &Array,
+        activation: impl Fn(&Array) -> Array,
+    ) -> Result<Array, Exception> {
+        let weight = |linear: &MoeLinear| -> Result<LayerWeight, Exception> {
+            Ok(LayerWeight::Dense(
+                dequantize_fp8_weight_for_compute(&linear.weight)?.swap_axes(-1, -2),
+            ))
+        };
+        Ok(native_moe::switch_mlp(
+            x_flat,
+            &weight(&self.fc1)?,
+            &weight(&self.fc2)?,
+            inds,
+            scores,
+            activation,
+        ))
+    }
+}

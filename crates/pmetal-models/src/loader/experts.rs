@@ -97,6 +97,23 @@ pub fn stack_experts(
         }
     }
 
+    stack_runs(family, per_expert, &mut out, &put, |layer, proj| {
+        format!("{layer}.switch_mlp.{proj}.weight")
+    })?;
+    pmetal_runtime::check_unobserved_error()
+        .map_err(|e| Exception::custom(format!("{family}: stacking the experts failed: {e}")))?;
+    Ok(out)
+}
+
+/// Stack each `(layer, projection)` run of per-expert tensors into one tensor
+/// named `dest(layer, projection)`, naming a gap in a run.
+fn stack_runs(
+    family: &str,
+    per_expert: HashMap<(String, String), BTreeMap<usize, Array>>,
+    out: &mut HashMap<String, Array>,
+    put: &impl Fn(&mut HashMap<String, Array>, String, Array) -> Result<(), Exception>,
+    dest: impl Fn(&str, &str) -> String,
+) -> Result<(), Exception> {
     for ((layer, proj), by_index) in per_expert {
         let count = by_index.len();
         if let Some(missing) = (0..count).find(|e| !by_index.contains_key(e)) {
@@ -106,12 +123,87 @@ pub fn stack_experts(
             )));
         }
         let ordered: Vec<Array> = by_index.into_values().collect();
-        put(
-            &mut out,
-            format!("{layer}.switch_mlp.{proj}.weight"),
-            ops::stack_axis(&ordered, 0),
-        )?;
+        put(out, dest(&layer, &proj), ops::stack_axis(&ordered, 0))?;
     }
+    Ok(())
+}
+
+/// The destination of a plain (gate-less) expert projection, in an MLX
+/// conversion's names: the up projection is `fc1`, the down projection `fc2`.
+fn plain_projection(proj: &str) -> Option<&'static str> {
+    match proj {
+        "up_proj" => Some("fc1"),
+        "down_proj" => Some("fc2"),
+        _ => None,
+    }
+}
+
+/// The experts of a layer whose experts have no gate (Nemotron-H), stacked
+/// into the `mixer.switch_mlp.{fc1,fc2}` layout the model holds
+/// ([`PlainSwitchMlp`](crate::common::switch_mlp::PlainSwitchMlp)).
+///
+/// The same layouts as [`stack_experts`]: one key per expert,
+/// `mixer.experts.{e}.{up,down}_proj.weight`; transformers 5's two fused
+/// tensors, `mixer.experts.up_proj` `[experts, intermediate, hidden]` and
+/// `mixer.experts.down_proj` `[experts, hidden, intermediate]`; and the
+/// already-stacked `switch_mlp.fc1` / `fc2`, which pass through. The up
+/// projection becomes `fc1` and the down projection `fc2`.
+pub fn stack_plain_experts(
+    family: &str,
+    weights: HashMap<String, Array>,
+) -> Result<HashMap<String, Array>, Exception> {
+    let mut per_expert: HashMap<(String, String), BTreeMap<usize, Array>> = HashMap::new();
+    let mut out = HashMap::with_capacity(weights.len());
+    let put = |out: &mut HashMap<String, Array>, key: String, value: Array| match out
+        .insert(key.clone(), value)
+    {
+        None => Ok(()),
+        Some(_) => Err(Exception::custom(format!(
+            "{family}: the checkpoint holds {key} twice, in two expert layouts"
+        ))),
+    };
+
+    for (key, value) in weights {
+        // Fused: `<layer>.mixer.experts.up_proj`, with no `.weight`.
+        let fused = key
+            .rsplit_once(".mixer.experts.")
+            .and_then(|(layer, proj)| {
+                plain_projection(proj).map(|fc| format!("{layer}.mixer.switch_mlp.{fc}.weight"))
+            });
+        if let Some(dest) = fused {
+            if value.ndim() != 3 {
+                return Err(Exception::custom(format!(
+                    "{family}: {key} is {:?}, not a fused [experts, out, in]",
+                    value.shape()
+                )));
+            }
+            put(&mut out, dest, value)?;
+            continue;
+        }
+        let parsed = key.split_once(".mixer.experts.").and_then(|(layer, rest)| {
+            let (index, member) = rest.split_once('.')?;
+            let proj = member.strip_suffix(".weight")?;
+            plain_projection(proj)?;
+            Some((
+                format!("{layer}.mixer"),
+                proj.to_string(),
+                index.parse::<usize>().ok()?,
+            ))
+        });
+        match parsed {
+            Some((layer, proj, index)) => {
+                per_expert
+                    .entry((layer, proj))
+                    .or_default()
+                    .insert(index, value);
+            }
+            None => put(&mut out, key, value)?,
+        }
+    }
+    stack_runs(family, per_expert, &mut out, &put, |layer, proj| {
+        let fc = plain_projection(proj).expect("only plain projections are collected");
+        format!("{layer}.switch_mlp.{fc}.weight")
+    })?;
     pmetal_runtime::check_unobserved_error()
         .map_err(|e| Exception::custom(format!("{family}: stacking the experts failed: {e}")))?;
     Ok(out)

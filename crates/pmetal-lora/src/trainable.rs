@@ -76,11 +76,14 @@ pub trait TrainableModel: ModuleParameters {
         false
     }
 
-    /// Whether any layer carries recurrent state along the sequence (Mamba,
-    /// gated delta net). Such a layer runs straight through the boundary
-    /// between two packed sequences: the attention mask can't stop it, so the
-    /// second sequence would start from the first one's state. Training loops
-    /// must not pack these models.
+    /// Whether any layer carries recurrent state along the sequence that it
+    /// cannot reset at a packed boundary (a gated delta net). Such a layer
+    /// runs straight through the boundary between two packed sequences: the
+    /// attention mask can't stop it, so the second sequence would start from
+    /// the first one's state. Training loops must not pack these models. A
+    /// layer that resets on its own, from the position ids
+    /// ([`supports_packed_positions`](Self::supports_packed_positions)), as a
+    /// Mamba-2 layer does, does not count.
     fn has_recurrent_layers(&self) -> bool {
         false
     }

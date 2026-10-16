@@ -1,19 +1,15 @@
 //! Per-architecture checkpoint loaders that predate the generic loader: the
-//! name-by-name assignments for the dense decoders, the Qwen3-Next and
-//! NemotronH wrappers and the DeepSeek key rename.
+//! name-by-name assignments for the dense decoders, the Qwen3-Next loader and
+//! the DeepSeek key rename.
 
 use pmetal_runtime::compat::{Array, ModuleParametersExt};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use super::{
-    LoadError, dequantize_sidecar_weights, load_weights, load_weights_filtered_raw,
-    unpack_mlx_quantized_weights,
+    LoadError, dequantize_sidecar_weights, load_weights_filtered_raw, unpack_mlx_quantized_weights,
 };
 use crate::architectures::gemma::GemmaForCausalLM;
-use crate::architectures::nemotron_h::{
-    NemotronHForCausalLM, load_nemotron_weights as load_nemotron,
-};
 use crate::architectures::phi::PhiConfig;
 use crate::architectures::qwen3_next::{
     Qwen3NextConfig, Qwen3NextFeedForward, Qwen3NextForCausalLM, Qwen3NextSanitizeOptions,
@@ -55,14 +51,6 @@ fn is_qwen3_next_routed_expert_param_key(key: &str) -> bool {
 
 fn is_qwen3_next_allowed_missing_param(key: &str, options: Qwen3NextLoadOptions) -> bool {
     options.skip_routed_experts && is_qwen3_next_routed_expert_param_key(key)
-}
-
-pub fn load_nemotron_weights(
-    model: &mut NemotronHForCausalLM,
-    model_dir: impl AsRef<Path>,
-) -> Result<(), LoadError> {
-    let weights = load_weights(model_dir)?;
-    load_nemotron(model, &weights).map_err(|e| LoadError::SafeTensors(format!("{:?}", e)))
 }
 
 /// Load weights for Qwen3Next models with sanitization.

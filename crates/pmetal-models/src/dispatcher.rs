@@ -267,6 +267,11 @@ impl ModelArchitecture {
                      RMSNorm whose weight stays at its identity init of ones",
                 ),
             ]),
+            Self::NemotronH => policy.allowing_unused_tensors(&[Exemption::new(
+                "mtp.*",
+                "the multi-token-prediction head some Nemotron 3 releases bundle; the model \
+                 does not run it",
+            )]),
             _ => policy,
         }
     }
@@ -918,7 +923,6 @@ impl std::fmt::Debug for DynamicModel {
 impl DynamicModel {
     fn init_post_load_fast_paths(&mut self) -> Result<(), Exception> {
         match self {
-            Self::NemotronH(model) => model.init_stacked_moe(),
             Self::GptOss(model) => model.init_stacked_moe(),
             _ => Ok(()),
         }
@@ -1240,26 +1244,21 @@ impl DynamicModel {
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::Granite(model))
             }
-            // NemotronH uses a bespoke weight loader (`load_nemotron_weights`);
-            // `init_post_load_fast_paths` still applies once the weights are
-            // materialised.
+            // The parameter tree is the checkpoint's layout with each MoE
+            // layer's experts stacked and the convolutions in the runtime's
+            // layout; see `nemotron_h::assign_nemotron_h_weights`.
             ModelArchitecture::NemotronH => {
                 let config: NemotronHConfig = json5::from_str(&config_content)
                     .map_err(|e| Exception::custom(e.to_string()))?;
                 let mut model = NemotronHForCausalLM::new(config)?;
-                load_checked(
-                    &mut model,
-                    model_dir,
-                    &ModelArchitecture::NemotronH.load_policy(),
-                    |model| {
-                        crate::loader::load_nemotron_weights(model, model_dir)
-                            .map_err(|e| Exception::custom(e.to_string()))
-                    },
-                )?;
+                let weights =
+                    load_weights(model_dir).map_err(|e| Exception::custom(e.to_string()))?;
+                crate::architectures::nemotron_h::assign_nemotron_h_weights(&mut model, weights)
+                    .map_err(|e| {
+                        Exception::custom(e.with_quantization_hint(model_dir).to_string())
+                    })?;
                 eval_module_parameters_batched(&model)?;
-                let mut model = Self::NemotronH(model);
-                model.init_post_load_fast_paths()?;
-                Ok(model)
+                Ok(Self::NemotronH(model))
             }
             ModelArchitecture::Qwen3Next => {
                 let config = Qwen3NextConfig::from_config_json(&config_content)?;
@@ -1636,7 +1635,7 @@ impl DynamicModel {
             Self::DeepSeek(m) => m.forward(input_ids, mask, None),
             Self::Cohere(m) => m.forward(input_ids, mask, None),
             Self::Granite(m) => m.forward(input_ids, mask, None),
-            Self::NemotronH(m) => m.forward(input_ids, None),
+            Self::NemotronH(m) => m.forward(input_ids, mask),
             Self::Qwen3Next(m) => m.forward(input_ids, mask),
             Self::Qwen4Exp(m) => m.forward(input_ids, mask),
             Self::GptOss(m) => m.forward(input_ids, mask, None),
@@ -1701,12 +1700,14 @@ impl DynamicModel {
             Self::DeepSeek(m) => m.forward_with_positions(input_ids, mask, positions),
             Self::Cohere(m) => m.forward_with_positions(input_ids, mask, positions),
             Self::Granite(m) => m.forward_with_positions(input_ids, mask, positions),
+            // Its attention carries no positional encoding; the positions tell
+            // the Mamba layers where one packed sequence ends and the next
+            // begins.
+            Self::NemotronH(m) => m.forward_with_positions(input_ids, mask, positions),
             Self::GptOss(m) => m.forward_with_positions(input_ids, mask, positions),
             // Text-only, as for `forward`.
             Self::Mllama(m) => m.forward_with_positions(input_ids, mask, positions),
-            // NemotronH's attention blocks carry no positional encoding, and a
-            // packed row breaks the Mamba recurrence in a way positions cannot
-            // repair. Flux / BERT / DiffusionGemma are not causal LMs.
+            // Flux / BERT / DiffusionGemma are not causal LMs.
             other => Err(Exception::custom(format!(
                 "forward_with_positions is not implemented for {other:?}; \
                  check supports_packed_positions() before calling"
@@ -1772,11 +1773,10 @@ impl DynamicModel {
     ///
     /// [`forward_with_positions`]: Self::forward_with_positions
     pub fn supports_packed_positions(&self) -> bool {
-        // A Granite hybrid's attention layers carry no positions (NoPE), and
-        // its Mamba layers take their order from the recurrence, which no
-        // position can restart.
+        // A Granite hybrid's attention layers carry no positions (NoPE); its
+        // Mamba layers read them to reset where a packed sequence restarts.
         if let Self::Granite(m) = self {
-            return m.config.uses_rope() && !m.config.has_mamba_layers();
+            return m.config.uses_rope() || m.config.has_mamba_layers();
         }
         matches!(
             self,
@@ -1795,6 +1795,8 @@ impl DynamicModel {
                 | Self::Cohere(_)
                 | Self::GptOss(_)
                 | Self::Mllama(_)
+                // Its Mamba layers reset where the positions restart.
+                | Self::NemotronH(_)
         )
     }
 
@@ -1808,6 +1810,20 @@ impl DynamicModel {
     /// out of reach of the real tokens and needs no mask.
     pub fn takes_padding_mask(&self) -> bool {
         matches!(self, Self::Bert(_))
+    }
+
+    /// Whether some layer carries recurrent state that two sequences packed
+    /// into one row would share. The block-diagonal mask of a packed batch
+    /// only reaches attention; a recurrent layer has to reset at the
+    /// boundary itself. The Mamba-2 layers of Nemotron-H and Granite do (they
+    /// read the position ids, see [`forward_with_positions`]); the gated delta
+    /// net of Qwen 3.5 and Qwen4-Exp does not, and those models are trained on
+    /// unpacked batches.
+    ///
+    /// [`forward_with_positions`]: Self::forward_with_positions
+    pub fn has_unresettable_recurrent_layers(&self) -> bool {
+        self.create_mamba_cache().is_some()
+            && !matches!(self, Self::NemotronH(_) | Self::Granite(_))
     }
 
     /// Forward pass returning last-layer hidden states `[batch, seq, hidden]`
@@ -1910,6 +1926,7 @@ impl DynamicModel {
             Self::DeepSeek(m) => m.model.forward_with_positions(input_ids, mask, p),
             Self::Cohere(m) => m.model.forward_with_positions(input_ids, mask, p),
             Self::Granite(m) => m.model.forward_with_positions(input_ids, mask, p),
+            Self::NemotronH(m) => m.backbone.forward_with_positions(input_ids, mask, p),
             Self::GptOss(m) => m.model.forward_with_positions(input_ids, mask, p),
             Self::Mllama(m) => m
                 .language_model
@@ -2051,11 +2068,12 @@ impl DynamicModel {
             Self::DeepSeek(m) => Some(&mut m.model.grad_checkpoint),
             Self::Cohere(m) => Some(&mut m.model.grad_checkpoint),
             Self::Granite(m) => Some(&mut m.model.grad_checkpoint),
+            Self::NemotronH(m) => Some(&mut m.backbone.grad_checkpoint),
             Self::GptOss(m) => Some(&mut m.model.grad_checkpoint),
-            // Gemma 4, Qwen3-Next, Nemotron-H and Mllama are left out on
+            // Gemma 4, Qwen3-Next and Mllama are left out on
             // purpose. Each has a trunk whose layers read or write state
-            // belonging to another layer (Gemma 4's shared KV, the hybrid
-            // models' recurrent caches, Mllama's cross-attention), and a
+            // belonging to another layer (Gemma 4's shared KV, Qwen 3.5's
+            // recurrent caches, Mllama's cross-attention), and a
             // recompute would replay those side effects a second time. They
             // need the state threading through `checkpoint` as an input, not
             // just an extra call site.
@@ -2076,6 +2094,7 @@ impl DynamicModel {
             Self::DeepSeek(m) => Some(m.model.grad_checkpoint),
             Self::Cohere(m) => Some(m.model.grad_checkpoint),
             Self::Granite(m) => Some(m.model.grad_checkpoint),
+            Self::NemotronH(m) => Some(m.backbone.grad_checkpoint),
             Self::GptOss(m) => Some(m.model.grad_checkpoint),
             _ => None,
         }
@@ -2224,10 +2243,6 @@ impl DynamicModel {
 
     pub fn quantize_fp8(&mut self) -> Result<(), Exception> {
         match self {
-            // NemotronH has a bespoke implementation that operates on concrete
-            // `nn::Linear` structs and handles Mamba/attention blocks explicitly.
-            Self::NemotronH(model) => model.quantize_fp8_weights(),
-
             // Flux is a diffusion model whose weight graph is not a flat set of
             // `nn::Linear` layers reachable through a single `ModuleParameters`
             // root.  Callers should use `FluxPipeline` and quantize each
@@ -2252,6 +2267,7 @@ impl DynamicModel {
             Self::DeepSeek(m) => crate::fp8_utils::quantize_model_linears(m),
             Self::Cohere(m) => crate::fp8_utils::quantize_model_linears(m),
             Self::Granite(m) => crate::fp8_utils::quantize_model_linears(m),
+            Self::NemotronH(m) => crate::fp8_utils::quantize_model_linears(m),
             Self::Qwen3Next(m) => crate::fp8_utils::quantize_model_linears(m),
             // The n-gram tables are embeddings, which the generic pass leaves alone.
             Self::Qwen4Exp(m) => crate::fp8_utils::quantize_model_linears(m),
@@ -2453,9 +2469,8 @@ impl DynamicModel {
             Self::Granite(m) => {
                 m.forward_with_hybrid_cache_last(input_ids, mask, kv_cache, mamba_cache)
             }
-            Self::NemotronH(_) | Self::Qwen4Exp(_) => Ok(last_token_hidden(
-                &self.forward_with_hybrid_cache(input_ids, mask, kv_cache, mamba_cache)?,
-            )),
+            Self::NemotronH(m) => m.forward_with_cache_last(input_ids, mask, kv_cache, mamba_cache),
+            Self::Qwen4Exp(m) => m.forward_with_cache_last(input_ids, mask, kv_cache, mamba_cache),
             _ => self.forward_with_cache_last(input_ids, mask, kv_cache),
         }
     }
@@ -2919,47 +2934,6 @@ mod tests {
         }
     }
 
-    fn tiny_nemotron_h_config() -> NemotronHConfig {
-        NemotronHConfig {
-            model_type: "nemotron_h".to_string(),
-            vocab_size: 1000,
-            hidden_size: 128,
-            intermediate_size: 256,
-            num_hidden_layers: 4,
-            max_position_embeddings: 512,
-            num_attention_heads: 4,
-            num_key_value_heads: 2,
-            attention_bias: false,
-            head_dim: Some(32),
-            mamba_num_heads: 4,
-            mamba_head_dim: 32,
-            mamba_proj_bias: false,
-            ssm_state_size: 16,
-            conv_kernel: 4,
-            n_groups: 2,
-            time_step_limit: (0.0, f32::INFINITY),
-            time_step_min: None,
-            time_step_max: None,
-            mlp_bias: false,
-            mlp_hidden_act: "relu2".to_string(),
-            layer_norm_epsilon: 1e-5,
-            use_bias: false,
-            use_conv_bias: true,
-            tie_word_embeddings: true,
-            hybrid_override_pattern: Some("M*-E".to_string()),
-            moe_intermediate_size: Some(64),
-            moe_shared_expert_intermediate_size: None,
-            n_group: None,
-            n_routed_experts: Some(2),
-            n_shared_experts: None,
-            topk_group: None,
-            num_experts_per_tok: Some(1),
-            norm_topk_prob: None,
-            routed_scaling_factor: None,
-            rope_theta: 10000.0,
-        }
-    }
-
     fn tiny_qwen35_moe_text_config() -> Qwen3NextConfig {
         Qwen3NextConfig {
             model_type: "qwen3_5_moe_text".to_string(),
@@ -3111,20 +3085,5 @@ mod tests {
             .unwrap(),
         );
         assert!(model.requires_expert_offloading());
-    }
-
-    #[test]
-    #[serial]
-    fn nemotron_h_post_load_fast_paths_initialize_stacked_experts() {
-        let mut model =
-            DynamicModel::NemotronH(NemotronHForCausalLM::new(tiny_nemotron_h_config()).unwrap());
-        model.init_post_load_fast_paths().unwrap();
-
-        let DynamicModel::NemotronH(model) = &model else {
-            panic!("expected nemotron-h model");
-        };
-        let moe_layer = &model.backbone.layers[3].mixer;
-        assert!(moe_layer.stacked_moe_up.is_some());
-        assert!(moe_layer.stacked_moe_down.is_some());
     }
 }

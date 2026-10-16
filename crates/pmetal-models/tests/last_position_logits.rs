@@ -311,3 +311,32 @@ fn granite() {
     .unwrap();
     check("granite", DynamicModel::Granite(model));
 }
+
+/// Nemotron-H, hybrid: Mamba-2, attention, MLP and routed experts. The final
+/// norm and the head run on the last position, whichever mixers came before.
+#[test]
+#[serial]
+fn nemotron_h() {
+    random::seed(9);
+    let config = serde_json::json!({
+        "model_type": "nemotron_h",
+        "vocab_size": VOCAB,
+        "hidden_size": 32,
+        "intermediate_size": 64,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+        "mamba_num_heads": 4,
+        "mamba_head_dim": 16,
+        "ssm_state_size": 8,
+        "n_groups": 2,
+        "chunk_size": 32,
+        "hybrid_override_pattern": "M*-EM",
+        "moe_intermediate_size": 32,
+        "moe_shared_expert_intermediate_size": 32,
+        "n_routed_experts": 4,
+        "num_experts_per_tok": 2,
+    });
+    let model = DynamicModel::from_config(&config.to_string()).unwrap();
+    check("nemotron_h", model);
+}

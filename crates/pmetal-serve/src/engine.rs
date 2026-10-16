@@ -2473,44 +2473,27 @@ mod tests {
     }
 
     fn tiny_nemotron_h_config() -> NemotronHConfig {
-        NemotronHConfig {
-            model_type: "nemotron_h".to_string(),
-            vocab_size: 1000,
-            hidden_size: 128,
-            intermediate_size: 256,
-            num_hidden_layers: 4,
-            max_position_embeddings: 512,
-            num_attention_heads: 4,
-            num_key_value_heads: 2,
-            attention_bias: false,
-            head_dim: Some(32),
-            mamba_num_heads: 4,
-            mamba_head_dim: 32,
-            mamba_proj_bias: false,
-            ssm_state_size: 16,
-            conv_kernel: 4,
-            n_groups: 2,
-            time_step_limit: (0.0, f32::INFINITY),
-            time_step_min: None,
-            time_step_max: None,
-            mlp_bias: false,
-            mlp_hidden_act: "relu2".to_string(),
-            layer_norm_epsilon: 1e-5,
-            use_bias: false,
-            use_conv_bias: true,
-            tie_word_embeddings: true,
-            hybrid_override_pattern: Some("M*-E".to_string()),
-            moe_intermediate_size: Some(64),
-            moe_shared_expert_intermediate_size: None,
-            n_group: None,
-            n_routed_experts: Some(2),
-            n_shared_experts: None,
-            topk_group: None,
-            num_experts_per_tok: Some(1),
-            norm_topk_prob: None,
-            routed_scaling_factor: None,
-            rope_theta: 10000.0,
-        }
+        serde_json::from_value(serde_json::json!({
+            "vocab_size": 1000,
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "max_position_embeddings": 512,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 32,
+            "mamba_num_heads": 4,
+            "mamba_head_dim": 32,
+            "ssm_state_size": 16,
+            "n_groups": 2,
+            "chunk_size": 16,
+            "tie_word_embeddings": true,
+            "hybrid_override_pattern": "M*-E",
+            "moe_intermediate_size": 64,
+            "moe_shared_expert_intermediate_size": 96,
+            "n_routed_experts": 2,
+            "num_experts_per_tok": 1
+        }))
+        .unwrap()
     }
 
     fn tiny_llama_config() -> LlamaConfig {

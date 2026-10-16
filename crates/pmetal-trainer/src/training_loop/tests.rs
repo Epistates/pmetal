@@ -256,6 +256,98 @@ fn test_run_packed_does_not_pack_models_with_recurrent_layers() {
     );
 }
 
+/// A tiny Nemotron-H: two Mamba-2 layers, attention and an MLP, with adapters
+/// on the Mamba projections as well as attention.
+fn small_nemotron_model() -> AdaptedModel {
+    let config = serde_json::json!({
+        "model_type": "nemotron_h",
+        "vocab_size": 100,
+        "hidden_size": 32,
+        "intermediate_size": 64,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 16,
+        "mamba_num_heads": 4,
+        "mamba_head_dim": 16,
+        "ssm_state_size": 8,
+        "n_groups": 2,
+        "chunk_size": 4,
+        "hybrid_override_pattern": "M*M-",
+        "tie_word_embeddings": true,
+    });
+    let base = DynamicModel::from_config(&config.to_string()).expect("nemotron_h builds");
+    let mut lora = small_lora_config();
+    lora.target_modules
+        .extend(["in_proj".to_string(), "out_proj".to_string()]);
+    AdaptedModel::attach(base, lora).expect("attach adapters")
+}
+
+/// A Mamba-2 layer resets where the position ids restart, so the sequences
+/// of a packed row cannot see each other and Nemotron-H packs, where a gated
+/// delta net does not (above). The adapters on its Mamba projections train
+/// through the packed scan.
+#[test]
+fn test_run_packed_packs_models_whose_recurrent_layers_reset() {
+    let model = small_nemotron_model();
+    assert!(
+        !model.has_recurrent_layers(),
+        "a Mamba-2 layer resets at a packed boundary on its own"
+    );
+    let config = TrainingLoopConfig {
+        training: TrainingConfig {
+            learning_rate: 1e-2,
+            batch_size: 1,
+            gradient_accumulation_steps: 1,
+            num_epochs: 1,
+            max_steps: None,
+            max_grad_norm: 1.0,
+            ..Default::default()
+        },
+        dataloader: DataLoaderConfig {
+            batch_size: 1,
+            max_seq_len: 64,
+            shuffle: false,
+            pad_token_id: 0,
+            ..Default::default()
+        },
+        pack_max_seq_len: Some(64),
+        use_metal_flash_attention: false,
+        log_every: 1,
+        checkpoint_every: 0,
+        eval_every: 0,
+        use_jit_compilation: false,
+        use_cut_cross_entropy: false,
+        ..Default::default()
+    };
+    let samples: Vec<Sample> = (0..6)
+        .map(|i| Sample::new((0..8).map(|j| ((i * 7 + j) % 90 + 1) as u32).collect()))
+        .collect();
+    let mut training_loop = TrainingLoop::new(config);
+    let trained = training_loop
+        .run_packed(model, TrainingDataset::from_samples(samples), None, None)
+        .unwrap();
+    pmetal_runtime::check_unobserved_error().unwrap();
+    assert!(
+        training_loop.current_step() < 6,
+        "Nemotron-H should pack, took {} steps",
+        training_loop.current_step()
+    );
+
+    // The adapter on the Mamba input projection was trained: its `B`, which
+    // starts at zero, moved.
+    let params = pmetal_runtime::compat::ModuleParametersExt::flatten_params(&trained);
+    let moved = params
+        .iter()
+        .filter(|(key, _)| key.contains("mixer.in_proj") && key.contains("lora_b"))
+        .map(|(_, b)| b.abs().max(None).item::<f32>())
+        .fold(0.0f32, f32::max);
+    assert!(
+        moved > 0.0,
+        "no adapter on a Mamba projection moved ({} parameters)",
+        params.len()
+    );
+}
+
 #[test]
 fn test_run_packed_falls_back_to_standard_when_no_sequences_are_combined() {
     let config = TrainingLoopConfig {

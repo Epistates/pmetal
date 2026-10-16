@@ -8,6 +8,8 @@
 //! - [`loss`]: the LM-head loss without materializing the logits
 //! - [`mod@rope`]: rotary embeddings at contiguous or explicit positions
 //! - [`moe`]: the expert MLP and the combine step of a mixture-of-experts block
+//! - [`ssd`]: the Mamba-2 selective state space scan, chunked, and its single
+//!   step
 //! - [`training`]: the training-mode flag the model forwards read
 
 pub mod attention;
@@ -15,6 +17,7 @@ pub mod gated_delta;
 pub mod loss;
 pub mod moe;
 pub mod rope;
+pub mod ssd;
 pub mod training;
 
 pub use attention::*;
@@ -22,6 +25,7 @@ pub use gated_delta::*;
 pub use loss::*;
 pub use moe::{Expert, moe_combine};
 pub use rope::*;
+pub use ssd::*;
 pub use training::*;
 
 use crate::compat::Array;
