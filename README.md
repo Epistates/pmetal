@@ -430,7 +430,7 @@ exports DFlash draft checkpoints for the dedicated `pmetal dflash` runtime.
 
 | Family | Architecture | Variants | `model_type` values |
 |--------|-------------|----------|-------------------|
-| BERT | `Bert` | BERT, RoBERTa, XLM-RoBERTa, CamemBERT, DistilBERT | `bert`, `roberta`, `xlm-roberta`, `xlm_roberta`, `camembert`, `distilbert` |
+| BERT | `Bert` | BERT, RoBERTa, XLM-RoBERTa, CamemBERT, DistilBERT, ModernBERT | `bert`, `roberta`, `xlm-roberta`, `xlm_roberta`, `camembert`, `distilbert`, `modernbert` |
 
 ### LoRA/QLoRA Training Support
 

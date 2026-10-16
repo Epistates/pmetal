@@ -33,7 +33,7 @@ These are the `ModelArchitecture` variants. Each is detected from `config.json` 
 | `Granite` | `granite`, `granitemoe`, `granitemoeshared`, `granitemoehybrid` | Granite 3.x dense and MoE, 4.0 / 4.0-H (Mamba-2 hybrid), 4.1, 4.2 |
 | `NemotronH` | `nemotron_h` | Nemotron-H (hybrid Mamba and attention) |
 | `GptOss` | `gpt_oss` | GPT-OSS 20B, 120B (MoE) |
-| `Bert` | `bert`, `roberta`, `xlm-roberta`, `camembert`, `distilbert` | BERT, RoBERTa, XLM-RoBERTa, CamemBERT, DistilBERT (encoders; hidden states for pooling) |
+| `Bert` | `bert`, `roberta`, `xlm-roberta`, `camembert`, `distilbert`, `modernbert` | BERT, RoBERTa, XLM-RoBERTa, CamemBERT, DistilBERT, ModernBERT (encoders; hidden states for pooling) |
 | `Flux` | `flux` | Flux.1 (diffusion): detected, but built with `pipelines::FluxPipeline` rather than `DynamicModel` |
 
 ### Pipeline Components (Not Dispatched)

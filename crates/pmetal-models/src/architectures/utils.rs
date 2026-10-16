@@ -191,20 +191,34 @@ fn lowest_finite(dtype: Dtype) -> f32 {
     }
 }
 
-/// An additive attention mask from a padding mask, for bidirectional encoders.
+/// Which keys a padding mask lets a query attend to, as a boolean
+/// `[batch, 1, 1, keys]`.
 ///
-/// `attention_mask` is `[batch, keys]`, non-zero where a token is real. The
-/// result is `[batch, 1, 1, keys]` in `dtype`: `0` where a query may attend and
-/// the dtype's lowest finite value where it may not, ready to add to attention
-/// scores or hand to `fused_sdpa` as its mask.
-pub fn additive_padding_mask(attention_mask: &Array, dtype: Dtype) -> Array {
+/// `attention_mask` is `[batch, keys]`, non-zero where a token is real.
+pub fn padding_keep(attention_mask: &Array) -> Array {
     let (batch, keys) = (attention_mask.dim(0), attention_mask.dim(1));
-    let keep = attention_mask
+    attention_mask
         .as_dtype(Dtype::Int32.as_i32())
-        .gt(&Array::from_int(0));
+        .gt(&Array::from_int(0))
+        .reshape(&[batch, 1, 1, keys])
+}
+
+/// An additive attention mask from a boolean one that is true where a query
+/// may attend: `0` there and the dtype's lowest finite value elsewhere, ready
+/// to add to attention scores or hand to `fused_sdpa` as its mask.
+///
+/// Combine masks as booleans first ([`ops::logical_and`]) and convert once:
+/// two additive masks of the lowest finite value sum to `-inf`.
+pub fn additive_mask(keep: &Array, dtype: Dtype) -> Array {
     let zero = Array::from_f32(0.0).as_dtype(dtype.as_i32());
     let lowest = Array::from_f32(lowest_finite(dtype)).as_dtype(dtype.as_i32());
-    ops::where_fn(&keep, &zero, &lowest).reshape(&[batch, 1, 1, keys])
+    ops::where_fn(keep, &zero, &lowest)
+}
+
+/// An additive attention mask from a padding mask, for bidirectional encoders:
+/// `[batch, 1, 1, keys]` in `dtype` (see [`padding_keep`], [`additive_mask`]).
+pub fn additive_padding_mask(attention_mask: &Array, dtype: Dtype) -> Array {
+    additive_mask(&padding_keep(attention_mask), dtype)
 }
 
 /// Cast an additive attention mask to the query dtype, if it isn't already.

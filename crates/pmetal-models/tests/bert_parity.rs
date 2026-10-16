@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use common::{fixture_path, load_shard, ref_tensor};
 use pmetal_cache::test_utils::{ParityReport, Tolerance, max_abs_diff, print_report_table};
 use pmetal_models::architectures::bert::{BertConfig, BertModel};
+use pmetal_models::architectures::encoder::EncoderModel;
 use pmetal_models::loader::{LoadError, bert_checkpoint_tensors, load_bert_weights};
 use pmetal_runtime::compat::{Array, Dtype};
 
@@ -314,7 +315,7 @@ fn a_rows_states_do_not_depend_on_the_padding_around_it() {
 
     for family in &FAMILIES {
         let pad = (family.config)().padding_idx() as i32;
-        let mut encoder = DynamicModel::Bert(model(family));
+        let mut encoder = DynamicModel::Bert(EncoderModel::Bert(model(family)));
         assert!(encoder.takes_padding_mask());
 
         let row = [7i32, 12, 33, 8, 90];

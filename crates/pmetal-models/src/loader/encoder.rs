@@ -14,6 +14,8 @@ use std::collections::HashMap;
 use super::assign::assign_renamed;
 use super::{Exemption, LoadError, LoadPolicy};
 use crate::architectures::bert::{BertModel, EncoderFamily};
+use crate::architectures::encoder::EncoderModel;
+use crate::architectures::modernbert::ModernBertModel;
 
 /// `(model tail, checkpoint tail)` of each tensor group in an encoder layer,
 /// after `layers.{i}.` and the family's layer prefix respectively.
@@ -148,6 +150,64 @@ pub fn load_bert_weights(
         |key, value| (bert_param_name(family, key), value),
         &policy,
     )
+}
+
+/// Load a ModernBERT encoder from a `transformers` checkpoint: a bare
+/// `ModernBertModel` (as sentence-transformers saves it) or a task model whose
+/// encoder sits under `model.`. The model's parameter names are the
+/// checkpoint's, so the only rename is that prefix.
+///
+/// Fails unless every encoder tensor is consumed, every parameter filled and
+/// every shape matches; the masked-LM head, the decoder and the classification
+/// head are named exemptions.
+pub fn load_modernbert_weights(
+    model: &mut ModernBertModel,
+    weights: HashMap<String, Array>,
+) -> Result<(), LoadError> {
+    let head = |pattern: &'static str| {
+        Exemption::new(pattern, "a task head, which is not part of the encoder")
+    };
+    let policy = LoadPolicy::strict().allowing_unused_tensors(&[
+        head("head.*"),
+        head("decoder.*"),
+        head("classifier.*"),
+        head("*pooler.*"),
+    ]);
+    assign_renamed(
+        model,
+        weights,
+        |key, value| (key.strip_prefix("model.").unwrap_or(key).to_string(), value),
+        &policy,
+    )
+}
+
+/// Load whichever encoder `model` is.
+pub fn load_encoder_weights(
+    model: &mut EncoderModel,
+    weights: HashMap<String, Array>,
+) -> Result<(), LoadError> {
+    match model {
+        EncoderModel::Bert(model) => load_bert_weights(model, weights),
+        EncoderModel::ModernBert(model) => load_modernbert_weights(model, weights),
+    }
+}
+
+/// The encoder's tensors under their `transformers` names (the bare `*Model`
+/// layout, which `transformers` and sentence-transformers load directly), for
+/// whichever encoder `model` is.
+pub fn encoder_checkpoint_tensors(model: &EncoderModel) -> Result<Vec<(String, Array)>, LoadError> {
+    match model {
+        EncoderModel::Bert(model) => bert_checkpoint_tensors(model),
+        EncoderModel::ModernBert(model) => {
+            let mut tensors: Vec<(String, Array)> = model
+                .flatten_params()
+                .into_iter()
+                .map(|(name, array)| (name.to_string(), array))
+                .collect();
+            tensors.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(tensors)
+        }
+    }
 }
 
 /// The encoder's tensors under their `transformers` names (the bare `*Model`
