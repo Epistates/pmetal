@@ -29,6 +29,126 @@ impl std::fmt::Display for PoolingMode {
     }
 }
 
+/// How a sentence-transformers model turns encoder states into its embedding,
+/// as `modules.json` and the pooling module's `config.json` describe it.
+///
+/// A sentence-transformers directory is a pipeline of modules: the encoder,
+/// then a [`Pooling`](PoolingMode) module and usually a `Normalize`. The encoder
+/// alone gives per-token states; which pooling the model was trained with is
+/// written down only here, and pooling a model the wrong way (CLS for a
+/// mean-pooled model) gives embeddings that are plausible and wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentenceTransformerConfig {
+    /// Where the encoder's `config.json` and weights are, relative to the
+    /// model directory (`""` for the directory itself, or `0_Transformer`).
+    pub transformer_path: String,
+    /// The pooling the model was trained with.
+    pub pooling: PoolingMode,
+    /// Whether the pooled vector is L2-normalized (a `Normalize` module).
+    pub normalize: bool,
+    /// The longest input the model was trained for, from
+    /// `sentence_bert_config.json`.
+    pub max_seq_length: Option<usize>,
+}
+
+impl SentenceTransformerConfig {
+    /// Read `modules.json` (and what it points to) from `dir`; `None` for a
+    /// directory that is not a sentence-transformers model.
+    ///
+    /// A pipeline this crate cannot reproduce is an error naming the module,
+    /// not a partial reading: a `Dense` projection after the pooling, several
+    /// poolings concatenated, or `mean_sqrt_len_tokens` pooling would each
+    /// give embeddings that differ from the published model's.
+    pub fn from_dir(dir: &std::path::Path) -> Result<Option<Self>, Exception> {
+        let read = |path: std::path::PathBuf| -> Result<Option<serde_json::Value>, Exception> {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => serde_json::from_str(&text)
+                    .map(Some)
+                    .map_err(|e| Exception::custom(format!("{}: {e}", path.display()))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(Exception::custom(format!("{}: {e}", path.display()))),
+            }
+        };
+        let Some(modules) = read(dir.join("modules.json"))? else {
+            return Ok(None);
+        };
+        let modules = modules
+            .as_array()
+            .ok_or_else(|| Exception::custom("modules.json is not a list"))?;
+
+        let mut transformer_path = None;
+        let mut pooling = None;
+        let mut normalize = false;
+        for module in modules {
+            let kind = module["type"].as_str().unwrap_or_default();
+            let path = module["path"].as_str().unwrap_or_default();
+            match kind.rsplit('.').next().unwrap_or_default() {
+                "Transformer" => transformer_path = Some(path.to_string()),
+                "Pooling" => {
+                    let config = read(dir.join(path).join("config.json"))?.ok_or_else(|| {
+                        Exception::custom(format!(
+                            "modules.json names {path}/config.json, which is missing"
+                        ))
+                    })?;
+                    pooling = Some(Self::pooling_mode(&config)?);
+                }
+                "Normalize" => normalize = true,
+                other => {
+                    return Err(Exception::custom(format!(
+                        "sentence-transformers module {other:?} ({kind}) is not implemented; \
+                         embeddings from this pipeline would differ from the published model's"
+                    )));
+                }
+            }
+        }
+        let max_seq_length = read(dir.join("sentence_bert_config.json"))?
+            .and_then(|config| config["max_seq_length"].as_u64())
+            .map(|n| n as usize);
+        Ok(Some(Self {
+            transformer_path: transformer_path
+                .ok_or_else(|| Exception::custom("modules.json has no Transformer module"))?,
+            pooling: pooling
+                .ok_or_else(|| Exception::custom("modules.json has no Pooling module"))?,
+            normalize,
+            max_seq_length,
+        }))
+    }
+
+    /// The one pooling a pooling module's flags select.
+    fn pooling_mode(config: &serde_json::Value) -> Result<PoolingMode, Exception> {
+        let flag = |key: &str| config[key].as_bool().unwrap_or(false);
+        if flag("pooling_mode_mean_sqrt_len_tokens") {
+            return Err(Exception::custom(
+                "sentence-transformers pooling `mean_sqrt_len_tokens` is not implemented",
+            ));
+        }
+        let selected: Vec<PoolingMode> = [
+            ("pooling_mode_cls_token", PoolingMode::Cls),
+            ("pooling_mode_mean_tokens", PoolingMode::Mean),
+            ("pooling_mode_max_tokens", PoolingMode::Max),
+            ("pooling_mode_lasttoken", PoolingMode::LastToken),
+            (
+                "pooling_mode_weightedmean_tokens",
+                PoolingMode::WeightedMean,
+            ),
+        ]
+        .into_iter()
+        .filter(|(key, _)| flag(key))
+        .map(|(_, mode)| mode)
+        .collect();
+        match selected.as_slice() {
+            [mode] => Ok(*mode),
+            [] => Err(Exception::custom(
+                "the pooling module selects no pooling mode",
+            )),
+            many => Err(Exception::custom(format!(
+                "the pooling module concatenates {} poolings ({many:?}); only one is implemented",
+                many.len()
+            ))),
+        }
+    }
+}
+
 /// Pool sequence hidden states into a single embedding vector.
 ///
 /// The arithmetic runs in f32 whatever the model's dtype and the result is cast
@@ -263,6 +383,130 @@ mod tests {
         let mask = Array::from_slice(&[1i32, 1, 0, 0], &[1, 4]);
         let pooled = pool(&hidden, &mask, PoolingMode::Max).unwrap();
         assert_eq!(values(&pooled), vec![1.0]);
+    }
+
+    /// A sentence-transformers directory with the given module list, pooling
+    /// flags and (optionally) max length.
+    fn st_dir(modules: &str, pooling: &str, max_seq: Option<usize>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("modules.json"), modules).unwrap();
+        std::fs::create_dir(dir.path().join("1_Pooling")).unwrap();
+        std::fs::write(dir.path().join("1_Pooling/config.json"), pooling).unwrap();
+        if let Some(n) = max_seq {
+            std::fs::write(
+                dir.path().join("sentence_bert_config.json"),
+                format!(r#"{{"max_seq_length": {n}, "do_lower_case": false}}"#),
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    const MINILM_MODULES: &str = r#"[
+        {"idx": 0, "name": "0", "path": "", "type": "sentence_transformers.models.Transformer"},
+        {"idx": 1, "name": "1", "path": "1_Pooling", "type": "sentence_transformers.models.Pooling"},
+        {"idx": 2, "name": "2", "path": "2_Normalize", "type": "sentence_transformers.models.Normalize"}
+    ]"#;
+
+    /// The layout `sentence-transformers/all-MiniLM-L6-v2` ships: mean pooling,
+    /// then normalization, a 256-token limit.
+    #[test]
+    fn a_sentence_transformers_directory_names_its_pooling() {
+        let dir = st_dir(
+            MINILM_MODULES,
+            r#"{"word_embedding_dimension": 384, "pooling_mode_cls_token": false,
+                "pooling_mode_mean_tokens": true, "pooling_mode_max_tokens": false,
+                "pooling_mode_mean_sqrt_len_tokens": false}"#,
+            Some(256),
+        );
+        let config = SentenceTransformerConfig::from_dir(dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            config,
+            SentenceTransformerConfig {
+                transformer_path: String::new(),
+                pooling: PoolingMode::Mean,
+                normalize: true,
+                max_seq_length: Some(256),
+            }
+        );
+    }
+
+    #[test]
+    fn cls_pooling_without_a_normalize_module_and_a_transformer_subdirectory() {
+        let dir = st_dir(
+            r#"[{"idx": 0, "name": "0", "path": "0_Transformer",
+                 "type": "sentence_transformers.models.Transformer"},
+                {"idx": 1, "name": "1", "path": "1_Pooling",
+                 "type": "sentence_transformers.models.Pooling"}]"#,
+            r#"{"pooling_mode_cls_token": true}"#,
+            None,
+        );
+        let config = SentenceTransformerConfig::from_dir(dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.pooling, PoolingMode::Cls);
+        assert!(!config.normalize);
+        assert_eq!(config.transformer_path, "0_Transformer");
+        assert_eq!(config.max_seq_length, None);
+    }
+
+    #[test]
+    fn a_directory_without_modules_json_is_not_a_sentence_transformers_model() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            SentenceTransformerConfig::from_dir(dir.path()).unwrap(),
+            None
+        );
+    }
+
+    /// A pipeline this crate cannot reproduce is refused by name rather than
+    /// read as if the module were not there.
+    #[test]
+    fn pipelines_that_cannot_be_reproduced_are_refused() {
+        let dense = r#"[
+            {"idx": 0, "name": "0", "path": "", "type": "sentence_transformers.models.Transformer"},
+            {"idx": 1, "name": "1", "path": "1_Pooling", "type": "sentence_transformers.models.Pooling"},
+            {"idx": 2, "name": "2", "path": "2_Dense", "type": "sentence_transformers.models.Dense"}
+        ]"#;
+        let dir = st_dir(dense, r#"{"pooling_mode_mean_tokens": true}"#, None);
+        let err = SentenceTransformerConfig::from_dir(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("Dense"), "{err}");
+
+        for (flags, needle) in [
+            (
+                r#"{"pooling_mode_mean_tokens": true, "pooling_mode_cls_token": true}"#,
+                "concatenates",
+            ),
+            (
+                r#"{"pooling_mode_mean_sqrt_len_tokens": true}"#,
+                "mean_sqrt_len_tokens",
+            ),
+            (r#"{"pooling_mode_mean_tokens": false}"#, "no pooling mode"),
+        ] {
+            let dir = st_dir(MINILM_MODULES, flags, None);
+            let err = SentenceTransformerConfig::from_dir(dir.path()).unwrap_err();
+            assert!(err.to_string().contains(needle), "{flags}: {err}");
+        }
+    }
+
+    #[test]
+    fn last_token_and_weighted_mean_pooling_are_read() {
+        for (flag, want) in [
+            ("pooling_mode_lasttoken", PoolingMode::LastToken),
+            (
+                "pooling_mode_weightedmean_tokens",
+                PoolingMode::WeightedMean,
+            ),
+            ("pooling_mode_max_tokens", PoolingMode::Max),
+        ] {
+            let dir = st_dir(MINILM_MODULES, &format!(r#"{{"{flag}": true}}"#), None);
+            let config = SentenceTransformerConfig::from_dir(dir.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(config.pooling, want, "{flag}");
+        }
     }
 
     #[test]

@@ -22,6 +22,7 @@ mod assign;
 mod audit;
 mod checkpoint;
 mod diffusion;
+mod encoder;
 pub mod experts;
 mod families;
 mod quant;
@@ -30,6 +31,7 @@ pub use assign::{assign_weights, load_generic_weights, load_generic_weights_with
 pub use audit::{Exemption, LoadPolicy, NEVER_PARAMETERS, ParamSnapshot};
 pub use checkpoint::{WeightIndex, load_safetensors_file};
 pub use diffusion::*;
+pub use encoder::*;
 pub use families::*;
 
 pub(crate) use checkpoint::validate_shard_path;
@@ -627,6 +629,45 @@ mod tests {
         let loaded = load_weights(temp.path()).unwrap();
         assert!(loaded.contains_key("in_safetensors"));
         assert!(!loaded.contains_key("only_in_pickle"));
+    }
+
+    /// A `diffusers` pipeline names the weights of its transformer, UNet and
+    /// VAE `diffusion_pytorch_model.*`, single or sharded; only the text
+    /// encoders beside them are `model.*`. A pipeline loader that read the
+    /// first kind found no weights in the other two.
+    #[test]
+    fn diffusers_component_weights_load_single_or_sharded() {
+        let tensor = |v: f32| Array::from_slice(&[v, v], &[2]);
+
+        let single = tempdir().unwrap();
+        let mut weights = HashMap::new();
+        weights.insert("a".to_string(), tensor(1.0));
+        write_safetensors(
+            &single.path().join("diffusion_pytorch_model.safetensors"),
+            &weights,
+        )
+        .unwrap();
+        assert!(load_weights(single.path()).unwrap().contains_key("a"));
+
+        let sharded = tempdir().unwrap();
+        let mut shard = HashMap::new();
+        shard.insert("b".to_string(), tensor(2.0));
+        write_safetensors(
+            &sharded
+                .path()
+                .join("diffusion_pytorch_model-00001-of-00001.safetensors"),
+            &shard,
+        )
+        .unwrap();
+        std::fs::write(
+            sharded
+                .path()
+                .join("diffusion_pytorch_model.safetensors.index.json"),
+            r#"{"metadata": {}, "weight_map":
+                {"b": "diffusion_pytorch_model-00001-of-00001.safetensors"}}"#,
+        )
+        .unwrap();
+        assert!(load_weights(sharded.path()).unwrap().contains_key("b"));
     }
 
     #[test]

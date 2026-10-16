@@ -5,8 +5,9 @@
 
 use crate::architectures::*;
 use crate::loader::{
-    Exemption, LoadPolicy, ParamSnapshot, Qwen3NextLoadOptions, assign_weights, load_bert_weights,
-    load_generic_weights_with, load_qwen3_next_weights_with_options, load_weights,
+    Exemption, LoadPolicy, ParamSnapshot, Qwen3NextLoadOptions, assign_weights,
+    load_encoder_weights, load_generic_weights_with, load_qwen3_next_weights_with_options,
+    load_weights,
 };
 use crate::traits::{CausalLMModel, ModelConfig};
 use crate::weight_format::{GgufModelConfig, WeightFormat, WeightLoader};
@@ -361,16 +362,14 @@ impl ModelArchitecture {
             }
             "nemotron_h" | "nemotronh" | "nemotron-h" => Some(Self::NemotronH),
             "flux" | "flux-1" | "flux.1" => Some(Self::Flux),
-            // Only real BERT. `roberta`, `xlm-roberta` and `distilbert` used to
-            // map here, and none of the three can actually load:
-            // `BertConfig` has no spelling for DistilBERT's `dim` / `n_layers`
-            // / `hidden_dim`, and `remap_bert_weight_name` strips a `bert.`
-            // prefix, not `roberta.` — so a RoBERTa checkpoint matched zero
-            // parameters. RoBERTa additionally offsets its position ids past
-            // the padding index, which a prefix fix alone would get silently
-            // wrong. Claiming these here only bought a later, more confusing
-            // failure.
-            "bert" => Some(Self::Bert),
+            // The encoders `EncoderModel` computes: the BERT family (BERT,
+            // RoBERTa, DistilBERT) and ModernBERT. The BERT family shares the
+            // architecture, not the config spelling, the checkpoint prefix or
+            // the position ids (RoBERTa counts from its padding index); see
+            // `BertConfig` and `loader::bert_param_name`. ALBERT and DeBERTa
+            // are different architectures and stay refused.
+            "bert" | "roberta" | "xlm-roberta" | "xlm_roberta" | "camembert" | "distilbert"
+            | "modernbert" => Some(Self::Bert),
             _ => None,
         }
     }
@@ -471,10 +470,20 @@ impl ModelArchitecture {
             if lower.contains("flux") {
                 return Some(Self::Flux);
             }
-            // Check BERT after other checks to avoid false positives. The
-            // RoBERTa / DistilBERT exclusion mirrors `from_model_type`: their
-            // class names contain "bert" but neither is loadable here.
-            if lower.contains("bert") && !lower.contains("distilbert") && !lower.contains("roberta")
+            // The encoders `EncoderModel` computes, by class-name prefix
+            // (`BertModel`, `BertForMaskedLM`, `RobertaForSequenceClassification`,
+            // `XLMRobertaModel`, `DistilBertForMaskedLM`, `ModernBertModel`,
+            // ...). Not a substring match: "albert" and "deberta" contain "bert".
+            if [
+                "bert",
+                "roberta",
+                "xlmroberta",
+                "camembert",
+                "distilbert",
+                "modernbert",
+            ]
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
             {
                 return Some(Self::Bert);
             }
@@ -532,7 +541,15 @@ impl ModelArchitecture {
             }
             Self::GptOss => round_trip!(GptOssConfig, config_content),
             Self::Gemma4 => round_trip!(crate::architectures::gemma4::Gemma4Config, &nested),
-            Self::Bert => round_trip!(BertConfig, config_content),
+            Self::Bert => {
+                let model_type = json5::from_str::<serde_json::Value>(config_content)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                if model_type.get("model_type").and_then(|t| t.as_str()) == Some("modernbert") {
+                    round_trip!(ModernBertConfig, config_content)
+                } else {
+                    round_trip!(BertConfig, config_content)
+                }
+            }
             Self::DiffusionGemma => {
                 let parsed = crate::architectures::diffusion_gemma::parse_diffusion_gemma_config(
                     config_content,
@@ -864,7 +881,7 @@ pub enum DynamicModel {
     GptOss(GptOssForCausalLM),
     Gemma4(Gemma4ForCausalLM),
     Flux(FluxDiT),
-    Bert(BertForEmbedding),
+    Bert(EncoderModel),
     DiffusionGemma(DiffusionGemmaForBlockDiffusion),
     Mllama(MllamaForConditionalGeneration),
     Qwen4Exp(Qwen4ExpForCausalLM),
@@ -1000,7 +1017,7 @@ impl DynamicModel {
                 )
             }
             ModelArchitecture::Bert => {
-                simple_new!(BertConfig, BertForEmbedding::new, config_content, Bert)
+                Ok(Self::Bert(EncoderModel::from_config_str(config_content)?))
             }
             ModelArchitecture::DiffusionGemma => {
                 let config = crate::architectures::diffusion_gemma::parse_diffusion_gemma_config(
@@ -1360,23 +1377,16 @@ impl DynamicModel {
                 Ok(Self::Gemma4(model))
             }
             ModelArchitecture::Bert => {
-                let config: BertConfig = serde_json::from_str(&config_content)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let mut model = BertForEmbedding::new(config)?;
-                // Load weights using the HF→PMetal name remapper.  HuggingFace BERT
-                // checkpoints use paths like `bert.encoder.layer.0.attention.self.query.*`
-                // which differ from PMetal's `model.layers.0.attention.query.*`.
+                let mut model = EncoderModel::from_config_str(&config_content)?;
+                // `transformers` spells the encoder's parameters differently
+                // from the model (`encoder.layer.0.attention.self.query` for
+                // `layers.0.attention.query`); the loader maps them, and fails
+                // unless the checkpoint and the model account for each other.
                 let weights =
                     load_weights(model_dir).map_err(|e| Exception::custom(e.to_string()))?;
-                load_checked(
-                    &mut model,
-                    model_dir,
-                    &ModelArchitecture::Bert.load_policy(),
-                    |model| {
-                        load_bert_weights(model, &weights)
-                            .map_err(|e| Exception::custom(e.to_string()))
-                    },
-                )?;
+                load_encoder_weights(&mut model, weights).map_err(|e| {
+                    Exception::custom(e.with_quantization_hint(model_dir).to_string())
+                })?;
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::Bert(model))
             }
@@ -1641,7 +1651,7 @@ impl DynamicModel {
             )),
             // BERT encoder: forward returns hidden states [batch, seq, hidden], not logits.
             // Use EmbeddingTrainer::encode() / pmetal_models::pooling::pool() for embeddings.
-            Self::Bert(m) => BertForEmbedding::forward(m, input_ids, mask),
+            Self::Bert(m) => EncoderModel::forward(m, input_ids, mask),
             // DiffusionGemma is a block-autoregressive discrete-diffusion model:
             // it has no single causal next-token forward. Use
             // `as_diffusion_gemma_mut().generate(...)` for sampling, or
@@ -1788,6 +1798,18 @@ impl DynamicModel {
         )
     }
 
+    /// Whether this is an encoder-only model, whose `mask` argument is a
+    /// `[batch, seq]` padding mask (non-zero for real tokens) rather than the
+    /// additive attention mask the causal models take.
+    ///
+    /// A bidirectional encoder attends over the whole row, so a batch padded to
+    /// its longest member embeds each row differently from the same row alone
+    /// unless the padding is hidden; a causal model's right-padding is already
+    /// out of reach of the real tokens and needs no mask.
+    pub fn takes_padding_mask(&self) -> bool {
+        matches!(self, Self::Bert(_))
+    }
+
     /// Forward pass returning last-layer hidden states `[batch, seq, hidden]`
     /// — the pre-lm-head representation used for sentence embeddings and
     /// `/v1/embeddings`-style pooling endpoints.
@@ -1795,7 +1817,8 @@ impl DynamicModel {
     /// Coverage: every dense decoder arch whose `ForCausalLM` wraps a
     /// `pub model: *Model` field routes through that inner trunk. BERT's
     /// canonical `forward` already returns hidden states so it's a
-    /// pass-through. Architectures not listed here (Flux, Qwen3MoE, hybrid
+    /// pass-through (its `mask` is a padding mask, see
+    /// [`takes_padding_mask`](Self::takes_padding_mask)). Architectures not listed here (Flux, Qwen3MoE, hybrid
     /// attn+mamba variants, etc.) return a typed error — each has a
     /// non-trivial trunk exit point (MoE routing, image conditioning,
     /// dual-cache hybrid state) that the caller needs to opt into
@@ -1835,7 +1858,7 @@ impl DynamicModel {
             Self::Gemma4(m) => m.model.forward_with_cache(input_ids, mask, None),
             Self::Phi(m) => m.model.forward_with_cache(input_ids, mask, None),
             Self::Phi4(m) => m.model.forward_with_cache(input_ids, mask, None),
-            Self::Bert(m) => BertForEmbedding::forward(m, input_ids, mask),
+            Self::Bert(m) => EncoderModel::forward(m, input_ids, mask),
             // DiffusionGemma: the causal encoder trunk is the natural
             // pre-LM-head representation to pool over (the decoder denoises a
             // canvas and has no single hidden-state-per-input-token output).
@@ -1965,7 +1988,7 @@ impl DynamicModel {
                 "Flux is not a CausalLM and does not support forward_with_cache.",
             )),
             // BERT is encoder-only (no autoregressive cache) — delegate to standard forward.
-            Self::Bert(m) => BertForEmbedding::forward(m, input_ids, mask),
+            Self::Bert(m) => EncoderModel::forward(m, input_ids, mask),
             // DiffusionGemma's KV cache is internal to its encoder–decoder
             // generate loop and is not a standard causal KV cache.
             Self::DiffusionGemma(_) => Err(Exception::custom(
@@ -2607,7 +2630,7 @@ impl DynamicModel {
             Self::GptOss(m) => m.config().vocab_size,
             Self::Gemma4(m) => m.config.vocab_size,
             Self::Flux(_) => 0,
-            Self::Bert(m) => m.config().vocab_size as i32,
+            Self::Bert(m) => m.vocab_size() as i32,
             Self::DiffusionGemma(m) => m.vocab_size,
             Self::Mllama(m) => m.config.text_config.llama.vocab_size,
             Self::Qwen4Exp(m) => m.config.vocab_size,
@@ -2632,8 +2655,8 @@ impl DynamicModel {
             Self::Qwen3Next(m) => m.config().hidden_size(),
             Self::GptOss(m) => m.config().hidden_size,
             Self::Gemma4(m) => m.config.hidden_size,
-            Self::Flux(m) => m.pos_embedder.dim as i32,
-            Self::Bert(m) => m.config().hidden_size as i32,
+            Self::Flux(m) => m.config().hidden_size() as i32,
+            Self::Bert(m) => m.hidden_size() as i32,
             Self::DiffusionGemma(m) => m.encoder.config.hidden_size,
             Self::Mllama(m) => m.config.text_config.llama.hidden_size,
             Self::Qwen4Exp(m) => m.config.hidden_size,
@@ -2848,30 +2871,52 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_encoder_families_are_rejected_rather_than_routed_to_bert() {
-        assert_eq!(
-            ModelArchitecture::from_model_type("bert"),
-            Some(ModelArchitecture::Bert)
-        );
-        // Neither can load: DistilBERT's config names `dim` / `n_layers`, and
-        // RoBERTa's weights are prefixed `roberta.`, which nothing strips.
-        // Rejecting here beats matching zero parameters later.
-        assert_eq!(ModelArchitecture::from_model_type("distilbert"), None);
-        assert_eq!(ModelArchitecture::from_model_type("roberta"), None);
-        assert_eq!(ModelArchitecture::from_model_type("xlm-roberta"), None);
-        assert_eq!(
-            ModelArchitecture::from_architectures(&["DistilBertForMaskedLM".to_string()]),
-            None,
-            "the class name contains \"bert\" — the substring check must not claim it"
-        );
-        assert_eq!(
-            ModelArchitecture::from_architectures(&["RobertaForMaskedLM".to_string()]),
-            None
-        );
-        assert_eq!(
-            ModelArchitecture::from_architectures(&["BertModel".to_string()]),
-            Some(ModelArchitecture::Bert)
-        );
+    fn the_encoder_families_bert_computes_are_detected_and_lookalikes_are_not() {
+        for model_type in [
+            "bert",
+            "roberta",
+            "xlm-roberta",
+            "camembert",
+            "distilbert",
+            "modernbert",
+        ] {
+            assert_eq!(
+                ModelArchitecture::from_model_type(model_type),
+                Some(ModelArchitecture::Bert),
+                "{model_type}"
+            );
+        }
+        for class in [
+            "BertModel",
+            "BertForMaskedLM",
+            "RobertaForMaskedLM",
+            "XLMRobertaModel",
+            "CamembertModel",
+            "DistilBertForMaskedLM",
+            "ModernBertModel",
+            "ModernBertForMaskedLM",
+        ] {
+            assert_eq!(
+                ModelArchitecture::from_architectures(&[class.to_string()]),
+                Some(ModelArchitecture::Bert),
+                "{class}"
+            );
+        }
+        // Different architectures whose names contain "bert".
+        for model_type in ["albert", "deberta", "deberta-v2", "megatron-bert"] {
+            assert_eq!(
+                ModelArchitecture::from_model_type(model_type),
+                None,
+                "{model_type}"
+            );
+        }
+        for class in ["AlbertModel", "DebertaV2Model", "MegatronBertModel"] {
+            assert_eq!(
+                ModelArchitecture::from_architectures(&[class.to_string()]),
+                None,
+                "{class}: the name contains \"bert\" but the architecture differs"
+            );
+        }
     }
 
     fn tiny_nemotron_h_config() -> NemotronHConfig {

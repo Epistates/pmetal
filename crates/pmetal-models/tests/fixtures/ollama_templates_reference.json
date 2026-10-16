@@ -1,0 +1,142 @@
+{
+ "templates": {
+  "LLAMA3_CHAT": {
+   "template": "{{ if .System }}<|start_header_id|>system<|end_header_id|>\n\n{{ .System }}<|eot_id|>{{ end }}<|start_header_id|>user<|end_header_id|>\n\n{{ .Prompt }}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n{{ .Response }}<|eot_id|>",
+   "cases": [
+    {
+     "system": "You are terse.",
+     "prompt": "Hi there",
+     "go": "<|start_header_id|>system<|end_header_id|>\n\nYou are terse.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nHi there<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+     "transformers": "<|start_header_id|>system<|end_header_id|>\n\nYou are terse.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nHi there<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    },
+    {
+     "system": "",
+     "prompt": "Hi there",
+     "go": "<|start_header_id|>user<|end_header_id|>\n\nHi there<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+     "transformers": "<|start_header_id|>user<|end_header_id|>\n\nHi there<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    },
+    {
+     "system": "Answer in French. Be brief.",
+     "prompt": "What is 2+2?\nExplain.",
+     "go": "<|start_header_id|>system<|end_header_id|>\n\nAnswer in French. Be brief.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat is 2+2?\nExplain.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+     "transformers": "<|start_header_id|>system<|end_header_id|>\n\nAnswer in French. Be brief.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat is 2+2?\nExplain.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    }
+   ]
+  },
+  "QWEN3_CHAT": {
+   "template": "{{ if .System }}<|im_start|>system\n{{ .System }}<|im_end|>\n{{ end }}<|im_start|>user\n{{ .Prompt }}<|im_end|>\n<|im_start|>assistant\n{{ .Response }}<|im_end|>",
+   "cases": [
+    {
+     "system": "You are terse.",
+     "prompt": "Hi there",
+     "go": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\n",
+     "transformers": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+     "system": "",
+     "prompt": "Hi there",
+     "go": "<|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\n",
+     "transformers": "<|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+     "system": "Answer in French. Be brief.",
+     "prompt": "What is 2+2?\nExplain.",
+     "go": "<|im_start|>system\nAnswer in French. Be brief.<|im_end|>\n<|im_start|>user\nWhat is 2+2?\nExplain.<|im_end|>\n<|im_start|>assistant\n",
+     "transformers": "<|im_start|>system\nAnswer in French. Be brief.<|im_end|>\n<|im_start|>user\nWhat is 2+2?\nExplain.<|im_end|>\n<|im_start|>assistant\n"
+    }
+   ]
+  },
+  "GEMMA_INSTRUCT": {
+   "template": "<start_of_turn>user\n{{ if .System }}{{ .System }}\n\n{{ end }}{{ .Prompt }}<end_of_turn>\n<start_of_turn>model\n{{ .Response }}<end_of_turn>",
+   "cases": [
+    {
+     "system": "You are terse.",
+     "prompt": "Hi there",
+     "go": "<start_of_turn>user\nYou are terse.\n\nHi there<end_of_turn>\n<start_of_turn>model\n",
+     "transformers": "<start_of_turn>user\nYou are terse.\n\nHi there<end_of_turn>\n<start_of_turn>model\n"
+    },
+    {
+     "system": "",
+     "prompt": "Hi there",
+     "go": "<start_of_turn>user\nHi there<end_of_turn>\n<start_of_turn>model\n",
+     "transformers": "<start_of_turn>user\nHi there<end_of_turn>\n<start_of_turn>model\n"
+    },
+    {
+     "system": "Answer in French. Be brief.",
+     "prompt": "What is 2+2?\nExplain.",
+     "go": "<start_of_turn>user\nAnswer in French. Be brief.\n\nWhat is 2+2?\nExplain.<end_of_turn>\n<start_of_turn>model\n",
+     "transformers": "<start_of_turn>user\nAnswer in French. Be brief.\n\nWhat is 2+2?\nExplain.<end_of_turn>\n<start_of_turn>model\n"
+    }
+   ]
+  },
+  "MISTRAL_INSTRUCT": {
+   "template": "[INST] {{ if .System }}{{ .System }}\n\n{{ end }}{{ .Prompt }}[/INST]{{ .Response }}</s>",
+   "cases": [
+    {
+     "system": "You are terse.",
+     "prompt": "Hi there",
+     "go": "[INST] You are terse.\n\nHi there[/INST]",
+     "transformers": "[INST] You are terse.\n\nHi there[/INST]"
+    },
+    {
+     "system": "",
+     "prompt": "Hi there",
+     "go": "[INST] Hi there[/INST]",
+     "transformers": "[INST] Hi there[/INST]"
+    },
+    {
+     "system": "Answer in French. Be brief.",
+     "prompt": "What is 2+2?\nExplain.",
+     "go": "[INST] Answer in French. Be brief.\n\nWhat is 2+2?\nExplain.[/INST]",
+     "transformers": "[INST] Answer in French. Be brief.\n\nWhat is 2+2?\nExplain.[/INST]"
+    }
+   ]
+  },
+  "PHI3_INSTRUCT": {
+   "template": "{{ if .System }}<|system|>\n{{ .System }}<|end|>\n{{ end }}<|user|>\n{{ .Prompt }}<|end|>\n<|assistant|>\n{{ .Response }}<|end|>",
+   "cases": [
+    {
+     "system": "You are terse.",
+     "prompt": "Hi there",
+     "go": "<|system|>\nYou are terse.<|end|>\n<|user|>\nHi there<|end|>\n<|assistant|>\n",
+     "transformers": "<|system|>\nYou are terse.<|end|>\n<|user|>\nHi there<|end|>\n<|assistant|>\n"
+    },
+    {
+     "system": "",
+     "prompt": "Hi there",
+     "go": "<|user|>\nHi there<|end|>\n<|assistant|>\n",
+     "transformers": "<|user|>\nHi there<|end|>\n<|assistant|>\n"
+    },
+    {
+     "system": "Answer in French. Be brief.",
+     "prompt": "What is 2+2?\nExplain.",
+     "go": "<|system|>\nAnswer in French. Be brief.<|end|>\n<|user|>\nWhat is 2+2?\nExplain.<|end|>\n<|assistant|>\n",
+     "transformers": "<|system|>\nAnswer in French. Be brief.<|end|>\n<|user|>\nWhat is 2+2?\nExplain.<|end|>\n<|assistant|>\n"
+    }
+   ]
+  },
+  "DEEPSEEK_CHAT": {
+   "template": "{{ if .System }}{{ .System }}\n\n{{ end }}User: {{ .Prompt }}\n\nAssistant:{{ .Response }}<｜end▁of▁sentence｜>",
+   "cases": [
+    {
+     "system": "You are terse.",
+     "prompt": "Hi there",
+     "go": "You are terse.\n\nUser: Hi there\n\nAssistant:",
+     "transformers": "You are terse.\n\nUser: Hi there\n\nAssistant:"
+    },
+    {
+     "system": "",
+     "prompt": "Hi there",
+     "go": "User: Hi there\n\nAssistant:",
+     "transformers": "User: Hi there\n\nAssistant:"
+    },
+    {
+     "system": "Answer in French. Be brief.",
+     "prompt": "What is 2+2?\nExplain.",
+     "go": "Answer in French. Be brief.\n\nUser: What is 2+2?\nExplain.\n\nAssistant:",
+     "transformers": "Answer in French. Be brief.\n\nUser: What is 2+2?\nExplain.\n\nAssistant:"
+    }
+   ]
+  }
+ }
+}

@@ -1,35 +1,164 @@
-//! VAE (Variational Autoencoder) architectures.
+//! `AutoencoderKL`: the variational autoencoder of latent diffusion.
 //!
-//! Implementation of Flux.1 and SDXL compatible VAEs optimized for Apple Silicon.
-//! This implementation uses NHWC format for consistency with MLX standards.
-use pmetal_runtime::compat::{Array, Exception, nn};
-use pmetal_runtime::impl_module_params;
+//! The KL-regularised convolutional VAE of Rombach et al. (2022), as
+//! `diffusers`' `AutoencoderKL` defines it. FLUX, SD3 and Stable Diffusion
+//! differ only in configuration (latent width, whether the two 1x1
+//! `quant_conv`s exist, the latent scale and shift), so one implementation
+//! builds all of them from `config.json`.
+//!
+//! Images and latents are **channels-last** (`[batch, height, width,
+//! channels]`), MLX's layout; checkpoints are channels-first and the loader
+//! transposes each convolution weight once.
+//!
+//! The parameter tree reuses `diffusers`' own names (`encoder.down_blocks.0.
+//! resnets.1.conv1`, `decoder.mid_block.attentions.0.to_q`, ...), so loading
+//! needs no name table.
+//!
+//! The mid-block's single-head self-attention runs over every pixel, so at
+//! megapixel sizes its score matrix, not the activations, dominates memory;
+//! [`VAEAttentionBlock::forward`] walks the queries in chunks (each row of
+//! scores is independent) to bound it.
 
+use pmetal_runtime::compat::{Array, Exception, nn, ops};
+use pmetal_runtime::impl_module_params;
+use pmetal_runtime::nn::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 use serde::{Deserialize, Serialize};
 
-/// VAE configuration.
+/// `AutoencoderKL` configuration, with the defaults of its `diffusers` config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VAEConfig {
+    #[serde(default = "default_image_channels")]
     pub in_channels: usize,
+    #[serde(default = "default_image_channels")]
     pub out_channels: usize,
+    #[serde(default = "default_latent_channels")]
     pub latent_channels: usize,
+    /// Channels of each resolution level, highest resolution first. There is
+    /// one downsampling between consecutive levels.
+    #[serde(default = "default_block_out_channels")]
     pub block_out_channels: Vec<usize>,
+    #[serde(default = "default_layers_per_block")]
     pub layers_per_block: usize,
+    #[serde(default = "default_norm_num_groups")]
+    pub norm_num_groups: usize,
+    /// Whether the encoder's moments pass through a 1x1 `quant_conv` (SD yes,
+    /// FLUX no).
+    #[serde(default = "default_true")]
+    pub use_quant_conv: bool,
+    /// Whether the latents pass through a 1x1 `post_quant_conv` before the
+    /// decoder (SD yes, FLUX no).
+    #[serde(default = "default_true")]
+    pub use_post_quant_conv: bool,
+    /// Whether the mid-blocks carry their self-attention.
+    #[serde(default = "default_true")]
+    pub mid_block_add_attention: bool,
+    /// Latents are multiplied by this after encoding and divided by it before
+    /// decoding, to bring them to unit variance.
+    #[serde(default = "default_scaling_factor")]
+    pub scaling_factor: f32,
+    /// Subtracted before scaling when encoding, added back after unscaling
+    /// when decoding (FLUX, SD3). `None` is no shift.
+    #[serde(default)]
+    pub shift_factor: Option<f32>,
+}
+
+fn default_image_channels() -> usize {
+    3
+}
+fn default_latent_channels() -> usize {
+    4
+}
+fn default_block_out_channels() -> Vec<usize> {
+    vec![64]
+}
+fn default_layers_per_block() -> usize {
+    1
+}
+fn default_norm_num_groups() -> usize {
+    32
+}
+fn default_true() -> bool {
+    true
+}
+fn default_scaling_factor() -> f32 {
+    0.18215
 }
 
 impl Default for VAEConfig {
+    /// `diffusers`' `AutoencoderKL()` defaults.
     fn default() -> Self {
         Self {
-            in_channels: 3,
-            out_channels: 3,
-            latent_channels: 16,
-            block_out_channels: vec![128, 256, 512, 512],
-            layers_per_block: 2,
+            in_channels: default_image_channels(),
+            out_channels: default_image_channels(),
+            latent_channels: default_latent_channels(),
+            block_out_channels: default_block_out_channels(),
+            layers_per_block: default_layers_per_block(),
+            norm_num_groups: default_norm_num_groups(),
+            use_quant_conv: true,
+            use_post_quant_conv: true,
+            mid_block_add_attention: true,
+            scaling_factor: default_scaling_factor(),
+            shift_factor: None,
         }
     }
 }
 
-/// Resnet block for VAE.
+impl VAEConfig {
+    /// The 16-channel VAE of FLUX.1: four levels, no quant convs, scale 0.3611
+    /// and shift 0.1159.
+    pub fn flux() -> Self {
+        Self {
+            latent_channels: 16,
+            block_out_channels: vec![128, 256, 512, 512],
+            layers_per_block: 2,
+            use_quant_conv: false,
+            use_post_quant_conv: false,
+            scaling_factor: 0.3611,
+            shift_factor: Some(0.1159),
+            ..Self::default()
+        }
+    }
+
+    /// Reject the configurations the blocks cannot be built from.
+    fn validate(&self) -> Result<(), Exception> {
+        if self.block_out_channels.is_empty() {
+            return Err(Exception::custom("vae: block_out_channels is empty"));
+        }
+        let groups = self.norm_num_groups;
+        for &channels in &self.block_out_channels {
+            if groups == 0 || channels % groups != 0 {
+                return Err(Exception::custom(format!(
+                    "vae: {channels} channels do not divide into {groups} normalisation groups"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+const NORM_EPS: f32 = 1e-6;
+
+fn group_norm(groups: usize, channels: usize) -> Result<nn::GroupNorm, Exception> {
+    nn::GroupNormBuilder::new(groups as i32, channels as i32)
+        .eps(NORM_EPS)
+        .build()
+}
+
+fn conv(
+    inputs: usize,
+    outputs: usize,
+    kernel: i32,
+    stride: i32,
+    padding: i32,
+) -> Result<nn::Conv2d, Exception> {
+    nn::Conv2dBuilder::new(inputs as i32, outputs as i32, kernel)
+        .stride(stride)
+        .padding(padding)
+        .build()
+}
+
+/// Resnet block: two (norm, SiLU, 3x3 conv) stages and a skip connection,
+/// through a 1x1 conv when the width changes.
 #[derive(Debug)]
 pub struct ResnetBlock {
     pub norm1: nn::GroupNorm,
@@ -41,62 +170,30 @@ pub struct ResnetBlock {
 impl_module_params!(ResnetBlock; norm1, conv1, norm2, conv2, conv_shortcut);
 
 impl ResnetBlock {
-    pub fn new(in_channels: usize, out_channels: usize, groups: usize, eps: f32) -> Self {
-        let norm1 = nn::GroupNormBuilder::new(groups as i32, in_channels as i32)
-            .eps(eps)
-            .build()
-            .unwrap();
-        let conv1 = nn::Conv2dBuilder::new(in_channels as i32, out_channels as i32, 3)
-            .padding(1)
-            .build()
-            .unwrap();
-        let norm2 = nn::GroupNormBuilder::new(groups as i32, out_channels as i32)
-            .eps(eps)
-            .build()
-            .unwrap();
-        let conv2 = nn::Conv2dBuilder::new(out_channels as i32, out_channels as i32, 3)
-            .padding(1)
-            .build()
-            .unwrap();
-
-        let conv_shortcut = if in_channels != out_channels {
-            Some(
-                nn::Conv2dBuilder::new(in_channels as i32, out_channels as i32, 1)
-                    .build()
-                    .unwrap(),
-            )
-        } else {
-            None
-        };
-
-        Self {
-            norm1,
-            conv1,
-            norm2,
-            conv2,
-            conv_shortcut,
-        }
+    pub fn new(inputs: usize, outputs: usize, groups: usize) -> Result<Self, Exception> {
+        Ok(Self {
+            norm1: group_norm(groups, inputs)?,
+            conv1: conv(inputs, outputs, 3, 1, 1)?,
+            norm2: group_norm(groups, outputs)?,
+            conv2: conv(outputs, outputs, 3, 1, 1)?,
+            conv_shortcut: (inputs != outputs)
+                .then(|| conv(inputs, outputs, 1, 1, 0))
+                .transpose()?,
+        })
     }
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let mut h = self.norm1.forward(x);
-        h = nn::silu(&h);
-        h = self.conv1.forward(&h);
-        h = self.norm2.forward(&h);
-        h = nn::silu(&h);
-        h = self.conv2.forward(&h);
-
-        let residual = if let Some(ref mut shortcut) = self.conv_shortcut {
-            shortcut.forward(x)
-        } else {
-            x.clone()
+        let h = self.conv1.forward(&nn::silu(&self.norm1.forward(x)));
+        let h = self.conv2.forward(&nn::silu(&self.norm2.forward(&h)));
+        let skip = match self.conv_shortcut.as_mut() {
+            Some(shortcut) => shortcut.forward(x),
+            None => x.clone(),
         };
-
-        Ok(h.add(&residual))
+        Ok(skip.add(&h))
     }
 }
 
-/// UpSampler block for VAE.
+/// Nearest-neighbour 2x upsampling followed by a 3x3 conv.
 #[derive(Debug)]
 pub struct UpSampler {
     pub conv: nn::Conv2d,
@@ -104,31 +201,25 @@ pub struct UpSampler {
 impl_module_params!(UpSampler; conv);
 
 impl UpSampler {
-    pub fn new(channels: usize) -> Self {
-        let conv = nn::Conv2dBuilder::new(channels as i32, channels as i32, 3)
-            .padding(1)
-            .build()
-            .unwrap();
-        Self { conv }
+    pub fn new(channels: usize) -> Result<Self, Exception> {
+        Ok(Self {
+            conv: conv(channels, channels, 3, 1, 1)?,
+        })
     }
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let shape = x.shape();
-        let b = shape[0];
-        let h = shape[1];
-        let w = shape[2];
-        let c = shape[3];
-
-        // NHWC upsampling: [B, H, 1, W, 1, C] -> [B, H, 2, W, 2, C] -> [B, H*2, W*2, C]
+        let (b, h, w, c) = (x.dim(0), x.dim(1), x.dim(2), x.dim(3));
+        // [B, H, 1, W, 1, C] -> [B, H, 2, W, 2, C] -> [B, 2H, 2W, C]
         let x = x.expand_dims_axes(&[2, 4]);
-        let x = pmetal_runtime::compat::ops::broadcast_to(&x, &[b, h, 2, w, 2, c]);
-        let x = x.reshape(&[b, h * 2, w * 2, c]);
-
+        let x = ops::broadcast_to(&x, &[b, h, 2, w, 2, c]).reshape(&[b, h * 2, w * 2, c]);
         Ok(self.conv.forward(&x))
     }
 }
 
-/// DownSampler block for VAE.
+/// Stride-2 3x3 conv that pads one pixel on the bottom and right only, as
+/// `diffusers`' `Downsample2D(padding=0)` does. A symmetric padding of one
+/// samples the same stride-2 grid shifted by a pixel, which is a different
+/// image.
 #[derive(Debug)]
 pub struct DownSampler {
     pub conv: nn::Conv2d,
@@ -136,426 +227,420 @@ pub struct DownSampler {
 impl_module_params!(DownSampler; conv);
 
 impl DownSampler {
-    pub fn new(channels: usize) -> Self {
-        let conv = nn::Conv2dBuilder::new(channels as i32, channels as i32, 3)
-            .stride(2)
-            .padding(1)
-            .build()
-            .unwrap();
-        Self { conv }
+    pub fn new(channels: usize) -> Result<Self, Exception> {
+        Ok(Self {
+            conv: conv(channels, channels, 3, 2, 0)?,
+        })
     }
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        Ok(self.conv.forward(x))
+        let padded = ops::pad(x, &[(0, 0), (0, 1), (0, 1), (0, 0)], None, None);
+        Ok(self.conv.forward(&padded))
     }
 }
 
-/// Attention block for VAE.
+/// The scores one chunk of queries may form, in elements (256 MiB in f32).
+const ATTENTION_CHUNK_ELEMENTS: i64 = 1 << 26;
+
+/// The mid-block's single-head self-attention over every pixel.
 #[derive(Debug)]
 pub struct VAEAttentionBlock {
-    pub norm: nn::GroupNorm,
-    pub q: nn::Conv2d,
-    pub k: nn::Conv2d,
-    pub v: nn::Conv2d,
-    pub proj_out: nn::Conv2d,
+    pub group_norm: nn::GroupNorm,
+    pub to_q: nn::Linear,
+    pub to_k: nn::Linear,
+    pub to_v: nn::Linear,
+    /// `diffusers` keeps the output projection (and its dropout) in a list.
+    pub to_out: Vec<nn::Linear>,
 }
-impl_module_params!(VAEAttentionBlock; norm, q, k, v, proj_out);
+impl_module_params!(VAEAttentionBlock; group_norm, to_q, to_k, to_v, to_out);
 
 impl VAEAttentionBlock {
-    pub fn new(channels: usize, groups: usize, eps: f32) -> Self {
-        let norm = nn::GroupNormBuilder::new(groups as i32, channels as i32)
-            .eps(eps)
-            .build()
-            .unwrap();
-        let q = nn::Conv2dBuilder::new(channels as i32, channels as i32, 1)
-            .build()
-            .unwrap();
-        let k = nn::Conv2dBuilder::new(channels as i32, channels as i32, 1)
-            .build()
-            .unwrap();
-        let v = nn::Conv2dBuilder::new(channels as i32, channels as i32, 1)
-            .build()
-            .unwrap();
-        let proj_out = nn::Conv2dBuilder::new(channels as i32, channels as i32, 1)
-            .build()
-            .unwrap();
-
-        Self {
-            norm,
-            q,
-            k,
-            v,
-            proj_out,
-        }
+    pub fn new(channels: usize, groups: usize) -> Result<Self, Exception> {
+        let linear = || nn::LinearBuilder::new(channels as i32, channels as i32).build();
+        Ok(Self {
+            group_norm: group_norm(groups, channels)?,
+            to_q: linear()?,
+            to_k: linear()?,
+            to_v: linear()?,
+            to_out: vec![linear()?],
+        })
     }
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let b = x.dim(0);
-        let h = x.dim(1);
-        let w = x.dim(2);
-        let c = x.dim(3);
+        let tokens = x.dim(1) * x.dim(2);
+        let rows = (ATTENTION_CHUNK_ELEMENTS / i64::from(tokens)).max(1) as i32;
+        self.forward_in_chunks(x, rows)
+    }
 
-        let residual = x;
-        let h_norm = self.norm.forward(x);
+    /// [`forward`](Self::forward) with at most `rows` queries scored against
+    /// the keys at a time.
+    pub fn forward_in_chunks(&mut self, x: &Array, rows: i32) -> Result<Array, Exception> {
+        let (b, h, w, c) = (x.dim(0), x.dim(1), x.dim(2), x.dim(3));
+        let tokens = h * w;
+        let normed = self.group_norm.forward(x).reshape(&[b, tokens, c]);
+        let head = |t: Array| t.reshape(&[b, 1, tokens, c]);
+        let q = head(self.to_q.forward(&normed));
+        let k = head(self.to_k.forward(&normed));
+        let v = head(self.to_v.forward(&normed));
 
-        let q = self.q.forward(&h_norm);
-        let k = self.k.forward(&h_norm);
-        let v = self.v.forward(&h_norm);
+        let config = FusedAttentionConfig::new(1, 1, c).with_mask_type(AttentionMaskType::None);
+        let out = if rows >= tokens {
+            fused_sdpa(&q, &k, &v, &config, None)?
+        } else {
+            // Every query row's softmax is its own, so walking the queries in
+            // chunks gives the whole attention's rows exactly, with scores of
+            // `rows x tokens` at a time.
+            let mut chunks = Vec::with_capacity((tokens / rows + 1) as usize);
+            let mut start = 0;
+            while start < tokens {
+                let end = (start + rows).min(tokens);
+                let queries = ops::slice_axis(&q, 2, start, end);
+                chunks.push(fused_sdpa(&queries, &k, &v, &config, None)?);
+                start = end;
+            }
+            ops::concatenate_axis(&chunks.iter().collect::<Vec<_>>(), 2)
+        };
 
-        // NHWC attention: flatten H*W into sequence dimension
-        let q = q.reshape(&[b, h * w, c]).expand_dims_axes(&[1]);
-        let k = k.reshape(&[b, h * w, c]).expand_dims_axes(&[1]);
-        let v = v.reshape(&[b, h * w, c]).expand_dims_axes(&[1]);
-
-        let scale = 1.0 / (c as f32).sqrt();
-        let attn_out =
-            pmetal_runtime::compat::fast::scaled_dot_product_attention(&q, &k, &v, scale, "");
-
-        let attn_out = attn_out.squeeze_axes(&[1]).reshape(&[b, h, w, c]);
-        let out = self.proj_out.forward(&attn_out);
-
-        Ok(residual.add(&out))
+        let out = out.reshape(&[b, tokens, c]);
+        let out = self
+            .to_out
+            .first_mut()
+            .ok_or_else(|| Exception::custom("vae: attention has no output projection"))?
+            .forward(&out)
+            .reshape(&[b, h, w, c]);
+        Ok(x.add(&out))
     }
 }
 
-/// Flux VAE Encoder.
+/// resnet, optional attention, resnet.
 #[derive(Debug)]
-pub struct FluxVAEEncoder {
+pub struct MidBlock {
+    pub resnets: Vec<ResnetBlock>,
+    pub attentions: Vec<VAEAttentionBlock>,
+}
+impl_module_params!(MidBlock; resnets, attentions);
+
+impl MidBlock {
+    pub fn new(channels: usize, groups: usize, attention: bool) -> Result<Self, Exception> {
+        Ok(Self {
+            resnets: vec![
+                ResnetBlock::new(channels, channels, groups)?,
+                ResnetBlock::new(channels, channels, groups)?,
+            ],
+            attentions: if attention {
+                vec![VAEAttentionBlock::new(channels, groups)?]
+            } else {
+                Vec::new()
+            },
+        })
+    }
+
+    pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        let mut h = self.resnets[0].forward(x)?;
+        if let Some(attention) = self.attentions.first_mut() {
+            h = attention.forward(&h)?;
+        }
+        self.resnets[1].forward(&h)
+    }
+}
+
+/// A resolution level of the encoder: resnets, then a downsampler on all but
+/// the last level.
+#[derive(Debug)]
+pub struct DownBlock {
+    pub resnets: Vec<ResnetBlock>,
+    pub downsamplers: Vec<DownSampler>,
+}
+impl_module_params!(DownBlock; resnets, downsamplers);
+
+impl DownBlock {
+    fn new(
+        inputs: usize,
+        outputs: usize,
+        layers: usize,
+        groups: usize,
+        downsample: bool,
+    ) -> Result<Self, Exception> {
+        let resnets = (0..layers)
+            .map(|i| ResnetBlock::new(if i == 0 { inputs } else { outputs }, outputs, groups))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            resnets,
+            downsamplers: if downsample {
+                vec![DownSampler::new(outputs)?]
+            } else {
+                Vec::new()
+            },
+        })
+    }
+
+    pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        let mut h = x.clone();
+        for resnet in &mut self.resnets {
+            h = resnet.forward(&h)?;
+        }
+        for downsampler in &mut self.downsamplers {
+            h = downsampler.forward(&h)?;
+        }
+        Ok(h)
+    }
+}
+
+/// A resolution level of the decoder: resnets, then an upsampler on all but
+/// the last level.
+#[derive(Debug)]
+pub struct UpBlock {
+    pub resnets: Vec<ResnetBlock>,
+    pub upsamplers: Vec<UpSampler>,
+}
+impl_module_params!(UpBlock; resnets, upsamplers);
+
+impl UpBlock {
+    fn new(
+        inputs: usize,
+        outputs: usize,
+        layers: usize,
+        groups: usize,
+        upsample: bool,
+    ) -> Result<Self, Exception> {
+        let resnets = (0..layers)
+            .map(|i| ResnetBlock::new(if i == 0 { inputs } else { outputs }, outputs, groups))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            resnets,
+            upsamplers: if upsample {
+                vec![UpSampler::new(outputs)?]
+            } else {
+                Vec::new()
+            },
+        })
+    }
+
+    pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        let mut h = x.clone();
+        for resnet in &mut self.resnets {
+            h = resnet.forward(&h)?;
+        }
+        for upsampler in &mut self.upsamplers {
+            h = upsampler.forward(&h)?;
+        }
+        Ok(h)
+    }
+}
+
+/// Image to moments (`2 * latent_channels` channels: mean, then log-variance).
+#[derive(Debug)]
+pub struct VAEEncoder {
     pub conv_in: nn::Conv2d,
-
-    pub down_1_0: ResnetBlock,
-    pub down_1_1: ResnetBlock,
-
-    pub down_2_0: ResnetBlock,
-    pub down_2_1: ResnetBlock,
-    pub down_2_sampler: DownSampler,
-
-    pub down_3_0: ResnetBlock,
-    pub down_3_1: ResnetBlock,
-    pub down_3_sampler: DownSampler,
-
-    pub down_4_0: ResnetBlock,
-    pub down_4_1: ResnetBlock,
-    pub down_4_sampler: DownSampler,
-
-    pub mid_block_1: ResnetBlock,
-    pub mid_attn: VAEAttentionBlock,
-    pub mid_block_2: ResnetBlock,
-
-    pub norm_out: nn::GroupNorm,
+    pub down_blocks: Vec<DownBlock>,
+    pub mid_block: MidBlock,
+    pub conv_norm_out: nn::GroupNorm,
     pub conv_out: nn::Conv2d,
 }
-impl_module_params!(FluxVAEEncoder; conv_in, down_1_0, down_1_1, down_2_0, down_2_1, down_2_sampler, down_3_0, down_3_1, down_3_sampler, down_4_0, down_4_1, down_4_sampler, mid_block_1, mid_attn, mid_block_2, norm_out, conv_out);
+impl_module_params!(VAEEncoder; conv_in, down_blocks, mid_block, conv_norm_out, conv_out);
 
-impl Default for FluxVAEEncoder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl FluxVAEEncoder {
-    pub fn new() -> Self {
-        let conv_in = nn::Conv2dBuilder::new(3, 128, 3)
-            .padding(1)
-            .build()
-            .unwrap();
-
-        let down_1_0 = ResnetBlock::new(128, 128, 32, 1e-6);
-        let down_1_1 = ResnetBlock::new(128, 128, 32, 1e-6);
-
-        let down_2_sampler = DownSampler::new(128);
-        let down_2_0 = ResnetBlock::new(128, 256, 32, 1e-6);
-        let down_2_1 = ResnetBlock::new(256, 256, 32, 1e-6);
-
-        let down_3_sampler = DownSampler::new(256);
-        let down_3_0 = ResnetBlock::new(256, 512, 32, 1e-6);
-        let down_3_1 = ResnetBlock::new(512, 512, 32, 1e-6);
-
-        let down_4_sampler = DownSampler::new(512);
-        let down_4_0 = ResnetBlock::new(512, 512, 32, 1e-6);
-        let down_4_1 = ResnetBlock::new(512, 512, 32, 1e-6);
-
-        let mid_block_1 = ResnetBlock::new(512, 512, 32, 1e-6);
-        let mid_attn = VAEAttentionBlock::new(512, 32, 1e-6);
-        let mid_block_2 = ResnetBlock::new(512, 512, 32, 1e-6);
-
-        let norm_out = nn::GroupNormBuilder::new(32, 512)
-            .eps(1e-6)
-            .build()
-            .unwrap();
-        let conv_out = nn::Conv2dBuilder::new(512, 32, 3)
-            .padding(1)
-            .build()
-            .unwrap();
-
-        Self {
-            conv_in,
-            down_1_0,
-            down_1_1,
-            down_2_0,
-            down_2_1,
-            down_2_sampler,
-            down_3_0,
-            down_3_1,
-            down_3_sampler,
-            down_4_0,
-            down_4_1,
-            down_4_sampler,
-            mid_block_1,
-            mid_attn,
-            mid_block_2,
-            norm_out,
-            conv_out,
+impl VAEEncoder {
+    pub fn new(config: &VAEConfig) -> Result<Self, Exception> {
+        let widths = &config.block_out_channels;
+        let groups = config.norm_num_groups;
+        let mut previous = widths[0];
+        let mut down_blocks = Vec::with_capacity(widths.len());
+        for (i, &width) in widths.iter().enumerate() {
+            down_blocks.push(DownBlock::new(
+                previous,
+                width,
+                config.layers_per_block,
+                groups,
+                i + 1 < widths.len(),
+            )?);
+            previous = width;
         }
+        let last = widths[widths.len() - 1];
+        Ok(Self {
+            conv_in: conv(config.in_channels, widths[0], 3, 1, 1)?,
+            down_blocks,
+            mid_block: MidBlock::new(last, groups, config.mid_block_add_attention)?,
+            conv_norm_out: group_norm(groups, last)?,
+            conv_out: conv(last, 2 * config.latent_channels, 3, 1, 1)?,
+        })
     }
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let mut h = self.conv_in.forward(x);
-
-        h = self.down_1_0.forward(&h)?;
-        h = self.down_1_1.forward(&h)?;
-
-        h = self.down_2_sampler.forward(&h)?;
-        h = self.down_2_0.forward(&h)?;
-        h = self.down_2_1.forward(&h)?;
-
-        h = self.down_3_sampler.forward(&h)?;
-        h = self.down_3_0.forward(&h)?;
-        h = self.down_3_1.forward(&h)?;
-
-        h = self.down_4_sampler.forward(&h)?;
-        h = self.down_4_0.forward(&h)?;
-        h = self.down_4_1.forward(&h)?;
-
-        h = self.mid_block_1.forward(&h)?;
-        h = self.mid_attn.forward(&h)?;
-        h = self.mid_block_2.forward(&h)?;
-
-        h = self.norm_out.forward(&h);
-        h = nn::silu(&h);
-        h = self.conv_out.forward(&h);
-
-        Ok(h)
+        for block in &mut self.down_blocks {
+            h = block.forward(&h)?;
+        }
+        h = self.mid_block.forward(&h)?;
+        Ok(self
+            .conv_out
+            .forward(&nn::silu(&self.conv_norm_out.forward(&h))))
     }
 }
 
-/// Flux VAE Decoder.
+/// Latents to image.
 #[derive(Debug)]
-pub struct FluxVAEDecoder {
+pub struct VAEDecoder {
     pub conv_in: nn::Conv2d,
-    pub mid_block_1: ResnetBlock,
-    pub mid_attn: VAEAttentionBlock,
-    pub mid_block_2: ResnetBlock,
-
-    pub up_1_0: ResnetBlock,
-    pub up_1_1: ResnetBlock,
-    pub up_1_2: ResnetBlock,
-    pub up_1_sampler: UpSampler,
-
-    pub up_2_0: ResnetBlock,
-    pub up_2_1: ResnetBlock,
-    pub up_2_2: ResnetBlock,
-    pub up_2_sampler: UpSampler,
-
-    pub up_3_0: ResnetBlock,
-    pub up_3_1: ResnetBlock,
-    pub up_3_2: ResnetBlock,
-    pub up_3_sampler: UpSampler,
-
-    pub up_4_0: ResnetBlock,
-    pub up_4_1: ResnetBlock,
-    pub up_4_2: ResnetBlock,
-
-    pub norm_out: nn::GroupNorm,
+    pub mid_block: MidBlock,
+    pub up_blocks: Vec<UpBlock>,
+    pub conv_norm_out: nn::GroupNorm,
     pub conv_out: nn::Conv2d,
 }
-impl_module_params!(FluxVAEDecoder; conv_in, mid_block_1, mid_attn, mid_block_2, up_1_0, up_1_1, up_1_2, up_1_sampler, up_2_0, up_2_1, up_2_2, up_2_sampler, up_3_0, up_3_1, up_3_2, up_3_sampler, up_4_0, up_4_1, up_4_2, norm_out, conv_out);
+impl_module_params!(VAEDecoder; conv_in, mid_block, up_blocks, conv_norm_out, conv_out);
 
-impl Default for FluxVAEDecoder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl FluxVAEDecoder {
-    pub fn new() -> Self {
-        let conv_in = nn::Conv2dBuilder::new(16, 512, 3)
-            .padding(1)
-            .build()
-            .unwrap();
-
-        let mid_block_1 = ResnetBlock::new(512, 512, 32, 1e-6);
-        let mid_attn = VAEAttentionBlock::new(512, 32, 1e-6);
-        let mid_block_2 = ResnetBlock::new(512, 512, 32, 1e-6);
-
-        let up_1_0 = ResnetBlock::new(512, 512, 32, 1e-6);
-        let up_1_1 = ResnetBlock::new(512, 512, 32, 1e-6);
-        let up_1_2 = ResnetBlock::new(512, 512, 32, 1e-6);
-        let up_1_sampler = UpSampler::new(512);
-
-        let up_2_0 = ResnetBlock::new(512, 512, 32, 1e-6);
-        let up_2_1 = ResnetBlock::new(512, 512, 32, 1e-6);
-        let up_2_2 = ResnetBlock::new(512, 512, 32, 1e-6);
-        let up_2_sampler = UpSampler::new(512);
-
-        let up_3_0 = ResnetBlock::new(512, 256, 32, 1e-6);
-        let up_3_1 = ResnetBlock::new(256, 256, 32, 1e-6);
-        let up_3_2 = ResnetBlock::new(256, 256, 32, 1e-6);
-        let up_3_sampler = UpSampler::new(256);
-
-        let up_4_0 = ResnetBlock::new(256, 128, 32, 1e-6);
-        let up_4_1 = ResnetBlock::new(128, 128, 32, 1e-6);
-        let up_4_2 = ResnetBlock::new(128, 128, 32, 1e-6);
-
-        let norm_out = nn::GroupNormBuilder::new(32, 128)
-            .eps(1e-6)
-            .build()
-            .unwrap();
-        let conv_out = nn::Conv2dBuilder::new(128, 3, 3)
-            .padding(1)
-            .build()
-            .unwrap();
-
-        Self {
-            conv_in,
-            mid_block_1,
-            mid_attn,
-            mid_block_2,
-            up_1_0,
-            up_1_1,
-            up_1_2,
-            up_1_sampler,
-            up_2_0,
-            up_2_1,
-            up_2_2,
-            up_2_sampler,
-            up_3_0,
-            up_3_1,
-            up_3_2,
-            up_3_sampler,
-            up_4_0,
-            up_4_1,
-            up_4_2,
-            norm_out,
-            conv_out,
+impl VAEDecoder {
+    pub fn new(config: &VAEConfig) -> Result<Self, Exception> {
+        let widths: Vec<usize> = config.block_out_channels.iter().rev().copied().collect();
+        let groups = config.norm_num_groups;
+        let mut previous = widths[0];
+        let mut up_blocks = Vec::with_capacity(widths.len());
+        for (i, &width) in widths.iter().enumerate() {
+            up_blocks.push(UpBlock::new(
+                previous,
+                width,
+                config.layers_per_block + 1,
+                groups,
+                i + 1 < widths.len(),
+            )?);
+            previous = width;
         }
+        let first = config.block_out_channels[0];
+        Ok(Self {
+            conv_in: conv(config.latent_channels, widths[0], 3, 1, 1)?,
+            mid_block: MidBlock::new(widths[0], groups, config.mid_block_add_attention)?,
+            up_blocks,
+            conv_norm_out: group_norm(groups, first)?,
+            conv_out: conv(first, config.out_channels, 3, 1, 1)?,
+        })
     }
 
     pub fn forward(&mut self, z: &Array) -> Result<Array, Exception> {
-        let mut h = self.conv_in.forward(z);
-
-        h = self.mid_block_1.forward(&h)?;
-        h = self.mid_attn.forward(&h)?;
-        h = self.mid_block_2.forward(&h)?;
-
-        h = self.up_1_0.forward(&h)?;
-        h = self.up_1_1.forward(&h)?;
-        h = self.up_1_2.forward(&h)?;
-        h = self.up_1_sampler.forward(&h)?;
-
-        h = self.up_2_0.forward(&h)?;
-        h = self.up_2_1.forward(&h)?;
-        h = self.up_2_2.forward(&h)?;
-        h = self.up_2_sampler.forward(&h)?;
-
-        h = self.up_3_0.forward(&h)?;
-        h = self.up_3_1.forward(&h)?;
-        h = self.up_3_2.forward(&h)?;
-        h = self.up_3_sampler.forward(&h)?;
-
-        h = self.up_4_0.forward(&h)?;
-        h = self.up_4_1.forward(&h)?;
-        h = self.up_4_2.forward(&h)?;
-
-        h = self.norm_out.forward(&h);
-        h = nn::silu(&h);
-        h = self.conv_out.forward(&h);
-
-        Ok(h)
+        let mut h = self.mid_block.forward(&self.conv_in.forward(z))?;
+        for block in &mut self.up_blocks {
+            h = block.forward(&h)?;
+        }
+        Ok(self
+            .conv_out
+            .forward(&nn::silu(&self.conv_norm_out.forward(&h))))
     }
 }
 
-/// Flux VAE model.
+/// The mean and log-variance of the latent distribution an image encodes to.
+#[derive(Debug, Clone)]
+pub struct LatentDistribution {
+    /// `[batch, height / 2^(levels-1), width / 2^(levels-1), latent_channels]`.
+    pub mean: Array,
+    /// Clamped to `[-30, 20]` as `DiagonalGaussianDistribution` does.
+    pub logvar: Array,
+}
+
+impl LatentDistribution {
+    /// A draw `mean + exp(logvar / 2) * eps`, `eps ~ N(0, 1)`.
+    pub fn sample(&self) -> Array {
+        let std = self.logvar.mul_scalar(0.5).exp();
+        let noise = pmetal_runtime::compat::random::normal(self.mean.shape(), self.mean.dtype());
+        self.mean.add(&std.multiply(&noise))
+    }
+}
+
+/// `AutoencoderKL`.
 #[derive(Debug)]
-pub struct FluxVAE {
-    pub encoder: Option<FluxVAEEncoder>,
-    pub decoder: FluxVAEDecoder,
+pub struct AutoencoderKL {
+    pub encoder: VAEEncoder,
+    pub decoder: VAEDecoder,
+    pub quant_conv: Option<nn::Conv2d>,
+    pub post_quant_conv: Option<nn::Conv2d>,
+    /// Model configuration (not a parameter).
+    pub config: VAEConfig,
 }
-impl_module_params!(FluxVAE; encoder, decoder);
+impl_module_params!(AutoencoderKL; encoder, decoder, quant_conv, post_quant_conv);
 
-impl FluxVAE {
-    pub const SCALING_FACTOR: f32 = 0.3611;
-    pub const SHIFT_FACTOR: f32 = 0.1159;
-
-    pub fn new(_config: VAEConfig) -> Self {
-        Self {
-            encoder: Some(FluxVAEEncoder::new()),
-            decoder: FluxVAEDecoder::new(),
-        }
+impl AutoencoderKL {
+    pub fn new(config: VAEConfig) -> Result<Self, Exception> {
+        config.validate()?;
+        let latent = config.latent_channels;
+        Ok(Self {
+            encoder: VAEEncoder::new(&config)?,
+            decoder: VAEDecoder::new(&config)?,
+            quant_conv: config
+                .use_quant_conv
+                .then(|| conv(2 * latent, 2 * latent, 1, 1, 0))
+                .transpose()?,
+            post_quant_conv: config
+                .use_post_quant_conv
+                .then(|| conv(latent, latent, 1, 1, 0))
+                .transpose()?,
+            config,
+        })
     }
 
-    /// Encode an image into latents.
-    ///
-    /// # Arguments
-    /// * `x` - Input image [B, H, W, 3] in range [-1, 1]
-    /// * `sample` - Whether to sample from the distribution or return the mean
+    pub fn config(&self) -> &VAEConfig {
+        &self.config
+    }
+
+    /// The latent distribution of an image batch `x` (`[batch, height, width,
+    /// in_channels]`, in `[-1, 1]`), before any scaling.
+    pub fn encode_distribution(&mut self, x: &Array) -> Result<LatentDistribution, Exception> {
+        let mut moments = self.encoder.forward(x)?;
+        if let Some(quant_conv) = self.quant_conv.as_mut() {
+            moments = quant_conv.forward(&moments);
+        }
+        let channels = self.config.latent_channels as i32;
+        let mean = ops::slice_last_to(&moments, channels);
+        let logvar = ops::slice_last_from(&moments, channels);
+        let logvar = ops::clip(
+            &logvar,
+            Some(&Array::scalar_like(-30.0, &logvar)),
+            Some(&Array::scalar_like(20.0, &logvar)),
+        );
+        Ok(LatentDistribution { mean, logvar })
+    }
+
+    /// Encode an image batch to the latents a diffusion model works in:
+    /// `(z - shift_factor) * scaling_factor`, with `z` the distribution's mean
+    /// or, if `sample`, a draw from it.
     pub fn encode(&mut self, x: &Array, sample: bool) -> Result<Array, Exception> {
-        let encoder = self
-            .encoder
-            .as_mut()
-            .ok_or_else(|| Exception::custom("Encoder not initialized"))?;
-        let h = encoder.forward(x)?;
-
-        // Output is 32 channels: [mean (16), logvar (16)]
-        let mean = pmetal_runtime::compat::ops::slice_last_to(&h, 16);
-
-        if sample {
-            let logvar = pmetal_runtime::compat::ops::slice_last_from(&h, 16);
-            // Clamp logvar to prevent numerical overflow in exp()
-            let logvar = pmetal_runtime::compat::ops::clip(
-                &logvar,
-                Some(&Array::from_f32(-30.0)),
-                Some(&Array::from_f32(20.0)),
-            );
-            let std = logvar.multiply(&Array::from_f32(0.5)).exp();
-            let noise = pmetal_runtime::compat::random::normal(mean.shape(), mean.dtype());
-            let z = mean.add(&std.multiply(&noise));
-            Ok(z.subtract(&Array::from_f32(Self::SHIFT_FACTOR))
-                .multiply(&Array::from_f32(Self::SCALING_FACTOR)))
+        let distribution = self.encode_distribution(x)?;
+        let z = if sample {
+            distribution.sample()
         } else {
-            Ok(mean
-                .subtract(&Array::from_f32(Self::SHIFT_FACTOR))
-                .multiply(&Array::from_f32(Self::SCALING_FACTOR)))
+            distribution.mean
+        };
+        Ok(self.scale_latents(&z))
+    }
+
+    /// `(z - shift_factor) * scaling_factor`.
+    pub fn scale_latents(&self, z: &Array) -> Array {
+        let shifted = match self.config.shift_factor {
+            Some(shift) => z.sub_scalar(shift),
+            None => z.clone(),
+        };
+        shifted.mul_scalar(self.config.scaling_factor)
+    }
+
+    /// The inverse of [`scale_latents`](Self::scale_latents):
+    /// `z / scaling_factor + shift_factor`.
+    pub fn unscale_latents(&self, z: &Array) -> Array {
+        let unscaled = z.div_scalar(self.config.scaling_factor);
+        match self.config.shift_factor {
+            Some(shift) => unscaled.add_scalar(shift),
+            None => unscaled,
         }
     }
 
-    pub fn decode(&mut self, z: &Array) -> Result<Array, Exception> {
-        let z = z
-            .divide(&Array::from_f32(Self::SCALING_FACTOR))
-            .add(&Array::from_f32(Self::SHIFT_FACTOR));
+    /// Decode raw (unscaled) latents to an image batch.
+    pub fn decode_raw(&mut self, z: &Array) -> Result<Array, Exception> {
+        let z = match self.post_quant_conv.as_mut() {
+            Some(post_quant_conv) => post_quant_conv.forward(z),
+            None => z.clone(),
+        };
         self.decoder.forward(&z)
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pmetal_runtime::compat::ops::zeros;
-
-    #[test]
-    fn test_flux_vae_roundtrip() {
-        let config = VAEConfig::default();
-        let mut vae = FluxVAE::new(config);
-
-        // Dummy input image: [1, 64, 64, 3]
-        let x = zeros(&[1, 64, 64, 3], pmetal_runtime::compat::Dtype::Float32);
-
-        // Encode
-        let z = vae.encode(&x, false).unwrap();
-        assert_eq!(z.shape(), &[1, 8, 8, 16]); // 64/8 = 8
-
-        // Decode
-        let x_hat = vae.decode(&z).unwrap();
-        assert_eq!(x_hat.shape(), &[1, 64, 64, 3]);
+    /// Decode the latents of a diffusion model (see
+    /// [`encode`](Self::encode)) to an image batch in `[-1, 1]`.
+    pub fn decode(&mut self, z: &Array) -> Result<Array, Exception> {
+        let raw = self.unscale_latents(z);
+        self.decode_raw(&raw)
     }
 }

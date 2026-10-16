@@ -49,15 +49,29 @@ pub(crate) struct Checkpoint {
 }
 
 /// The files that name a checkpoint, in the order they are preferred.
-const CANDIDATES: [(&str, &str, FileFormat); 2] = [
+///
+/// `diffusion_pytorch_model.*` is what `diffusers` names the weights of a
+/// pipeline's transformer, UNet and VAE; the text encoders next to them are
+/// `model.*`.
+const CANDIDATES: [(&str, &str, FileFormat); 4] = [
     (
         "model.safetensors",
         "model.safetensors.index.json",
         FileFormat::Safetensors,
     ),
     (
+        "diffusion_pytorch_model.safetensors",
+        "diffusion_pytorch_model.safetensors.index.json",
+        FileFormat::Safetensors,
+    ),
+    (
         "pytorch_model.bin",
         "pytorch_model.bin.index.json",
+        FileFormat::PyTorch,
+    ),
+    (
+        "diffusion_pytorch_model.bin",
+        "diffusion_pytorch_model.bin.index.json",
         FileFormat::PyTorch,
     ),
 ];
@@ -67,7 +81,8 @@ fn no_weights(dir: &Path) -> LoadError {
         std::io::ErrorKind::NotFound,
         format!(
             "No weights found in {}: expected model.safetensors, \
-             model.safetensors.index.json, pytorch_model.bin or \
+             model.safetensors.index.json, diffusion_pytorch_model.safetensors, \
+             diffusion_pytorch_model.safetensors.index.json, pytorch_model.bin or \
              pytorch_model.bin.index.json",
             dir.display()
         ),

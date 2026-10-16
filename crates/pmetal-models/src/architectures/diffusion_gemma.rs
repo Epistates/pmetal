@@ -1254,19 +1254,31 @@ impl DiffusionGemmaForBlockDiffusion {
         let vocab = self.vocab_size;
         let max_new_canvases = (config.max_new_tokens + canvas - 1) / canvas;
         let mut draws = 0u64;
-        let mut next_key = || {
+        // The index of the next random draw of this generation.
+        let mut next_draw = || {
             draws += 1;
-            pmetal_runtime::decode::draw_key(seed, draws - 1)
+            draws - 1
         };
-        let uniform_canvas =
-            |key: &Array| random::randint(0, vocab, &[1, canvas], Dtype::Int32, Some(key));
+        let uniform_canvas = |draw: u64| {
+            let key = pmetal_runtime::decode::draw_key(seed, draw);
+            random::randint(0, vocab, &[1, canvas], Dtype::Int32, Some(&key))
+        };
+        // The proposal is a plain categorical draw per canvas position from the
+        // already-tempered logits: the step's temperature is the *linear
+        // schedule* applied above, so the sampler's own temperature is 1 and no
+        // top-k, top-p or min-p filter applies (the reference proposes with
+        // `multinomial(softmax(processed_logits))`).
+        let proposal = pmetal_runtime::decode::SamplingParams {
+            seed: Some(seed),
+            ..pmetal_runtime::decode::SamplingParams::new(1.0)
+        };
 
         let mut sequence = input_ids.clone();
         for _block in 0..max_new_canvases {
             let (_enc_hidden, kvs_full) = self.encoder.forward(&sequence)?;
             let kvs = self.truncate_sliding_kvs(kvs_full);
 
-            let mut current = uniform_canvas(&next_key());
+            let mut current = uniform_canvas(next_draw());
             let mut argmax_canvas = current.clone();
             let mut sc_logits: Option<Array> = None;
             let mut stopper = StableConfidentStopper::new(
@@ -1288,15 +1300,21 @@ impl DiffusionGemmaForBlockDiffusion {
                     .as_dtype(pmetal_runtime::compat::Dtype::Int32.as_i32());
 
                 // Multinomial proposal: categorical over processed logits is
-                // equivalent to multinomial over softmax(processed).
-                let denoiser = random::categorical(&processed, -1, Some(&next_key()))
-                    .as_dtype(Dtype::Int32.as_i32());
+                // equivalent to multinomial over softmax(processed). The
+                // runtime's sampler draws it, with the generation's seed.
+                let denoiser = pmetal_runtime::decode::sample_token(
+                    &processed.reshape(&[canvas, vocab]),
+                    &proposal,
+                    next_draw(),
+                )
+                .reshape(&[1, canvas])
+                .as_dtype(Dtype::Int32.as_i32());
 
                 let (accepted, mask) =
                     entropy_bound_accept(&processed, &current, &denoiser, config.entropy_bound);
                 // Renoise: rejected positions get fresh uniform tokens.
                 let renoise_mask = ops::logical_not(&mask);
-                let random_canvas = uniform_canvas(&next_key());
+                let random_canvas = uniform_canvas(next_draw());
                 current = ops::where_fn(&renoise_mask, &random_canvas, &accepted);
 
                 let stop = stopper.should_stop(&argmax_canvas, &processed);
@@ -1798,6 +1816,10 @@ pub fn load_diffusion_gemma_weights(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const GOLDEN_TOKENS: [i32; 21] = [
+        1, 2, 3, 4, 5, 44, 58, 12, 25, 3, 9, 52, 41, 43, 52, 37, 24, 48, 2, 37, 43,
+    ];
     use serial_test::serial;
 
     fn tiny_config() -> DiffusionGemmaTextConfig {
@@ -2233,6 +2255,34 @@ mod tests {
             va, vb,
             "generation must be deterministic under a fixed seed"
         );
+    }
+
+    /// The tokens a seeded generation produces from a seeded tiny model are a
+    /// fixed sequence: the denoiser's proposal is the runtime sampler's draw
+    /// (see `generate`), and this pins that the draws are the ones the
+    /// hand-written categorical made before it took that path.
+    #[test]
+    #[serial]
+    fn a_seeded_generation_is_a_fixed_token_sequence() {
+        use pmetal_runtime::compat::random;
+
+        random::seed(7);
+        let cfg = tiny_config();
+        let mut model = DiffusionGemmaForBlockDiffusion::new(cfg.clone()).unwrap();
+        let prompt = Array::from_slice(&[1i32, 2, 3, 4, 5], &[1, 5]);
+        let gen_cfg = DiffusionGemmaGenerationConfig {
+            max_new_tokens: 2 * cfg.canvas_length,
+            max_denoising_steps: 4,
+            eos_token_ids: vec![],
+            ..Default::default()
+        };
+        let out = model
+            .generate(&prompt, &gen_cfg, 42)
+            .unwrap()
+            .as_type::<i32>();
+        out.eval();
+        let tokens = out.as_slice::<i32>().to_vec();
+        assert_eq!(tokens, GOLDEN_TOKENS);
     }
 
     /// A seed is a function of itself alone: other draws on the thread

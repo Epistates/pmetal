@@ -22,6 +22,7 @@ use std::path::Path;
 
 use pmetal_runtime::compat::{Array, Dtype, Exception, ModuleParametersExt, Param, nn, ops};
 use pmetal_runtime::impl_module_params;
+use pmetal_runtime::nn::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 use serde::{Deserialize, Serialize};
 
 use super::DecisionError;
@@ -100,20 +101,18 @@ impl MultiheadAttention {
     }
 
     /// Attend `query` `[batch, lq, width]` over `key`/`value` `[batch, lk, width]`.
-    pub fn forward(&self, query: &Array, key: &Array, value: &Array) -> Array {
+    pub fn forward(&self, query: &Array, key: &Array, value: &Array) -> Result<Array, Exception> {
         let q = self.split_heads(&self.project(query, 0));
         let k = self.split_heads(&self.project(key, 1));
         let v = self.split_heads(&self.project(value, 2));
-        let head_dim = (self.width / self.heads) as f32;
-        let scores = q
-            .matmul(&k.transpose_axes(&[0, 1, 3, 2]))
-            .multiply(&Array::from_f32(head_dim.sqrt().recip()));
-        let attended = ops::softmax_axis(&scores, -1).matmul(&v);
+        let config = FusedAttentionConfig::new(self.heads, self.heads, self.width / self.heads)
+            .with_mask_type(AttentionMaskType::None);
+        let attended = fused_sdpa(&q, &k, &v, &config, None)?;
         let (batch, len) = (query.dim(0), query.dim(1));
         let merged = attended
             .transpose_axes(&[0, 2, 1, 3])
             .reshape(&[batch, len, self.width]);
-        self.out_proj.forward(&merged)
+        Ok(self.out_proj.forward(&merged))
     }
 }
 
@@ -152,18 +151,18 @@ impl EvidenceRoutingLayer {
         })
     }
 
-    pub fn forward(&self, queries: &Array, memory: &Array) -> Array {
+    pub fn forward(&self, queries: &Array, memory: &Array) -> Result<Array, Exception> {
         let memory = self.memory_norm.forward(memory);
         let routed = self
             .attention
-            .forward(&self.query_norm.forward(queries), &memory, &memory);
+            .forward(&self.query_norm.forward(queries), &memory, &memory)?;
         let queries = queries.add(&routed);
         let update = gelu_mlp(
             &self.feedforward_in,
             &self.feedforward_out,
             &self.feedforward_norm.forward(&queries),
         );
-        queries.add(&update)
+        Ok(queries.add(&update))
     }
 }
 
@@ -196,16 +195,16 @@ impl SchemaDecoderLayer {
         })
     }
 
-    pub fn forward(&self, fields: &Array, memory: &Array) -> Array {
+    pub fn forward(&self, fields: &Array, memory: &Array) -> Result<Array, Exception> {
         let normed = self.norm1.forward(fields);
-        let fields = fields.add(&self.self_attn.forward(&normed, &normed, &normed));
+        let fields = fields.add(&self.self_attn.forward(&normed, &normed, &normed)?);
         let fields = fields.add(&self.multihead_attn.forward(
             &self.norm2.forward(&fields),
             memory,
             memory,
-        ));
+        )?);
         let update = gelu_mlp(&self.linear1, &self.linear2, &self.norm3.forward(&fields));
-        fields.add(&update)
+        Ok(fields.add(&update))
     }
 }
 
@@ -444,7 +443,7 @@ impl JointSchemaHead {
             )
             .expand_dims(0);
         for layer in &self.evidence_layers {
-            routed = layer.forward(&routed, &memory);
+            routed = layer.forward(&routed, &memory)?;
         }
         let routed = routed.squeeze(0);
 
@@ -479,7 +478,7 @@ impl JointSchemaHead {
             )
             .expand_dims(0);
         for layer in &self.layers {
-            fields = layer.forward(&fields, &memory);
+            fields = layer.forward(&fields, &memory)?;
         }
         let fields = self.field_norm.forward(&fields.squeeze(0));
 
