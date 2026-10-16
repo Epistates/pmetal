@@ -46,8 +46,18 @@ fn check(dtype: Dtype, tolerance: Tolerance, decoded_tolerance: Tolerance) {
     pmetal_runtime::check_unobserved_error().expect("no runtime op failed");
 
     let reports = [
-        ParityReport::compute("mean", &distribution.mean, ref_tensor(&reference, "mean"), tolerance),
-        ParityReport::compute("logvar", &distribution.logvar, ref_tensor(&reference, "logvar"), tolerance),
+        ParityReport::compute(
+            "mean",
+            &distribution.mean,
+            ref_tensor(&reference, "mean"),
+            tolerance,
+        ),
+        ParityReport::compute(
+            "logvar",
+            &distribution.logvar,
+            ref_tensor(&reference, "logvar"),
+            tolerance,
+        ),
         ParityReport::compute(
             "decoded",
             &decoded,

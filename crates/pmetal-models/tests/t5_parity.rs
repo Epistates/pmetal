@@ -42,7 +42,9 @@ fn model(variant: &str, feed_forward_proj: &str) -> T5EncoderModel {
 }
 
 fn reference(variant: &str) -> HashMap<String, Array> {
-    load_shard(&fixture_path(&format!("t5_{variant}_reference.safetensors")))
+    load_shard(&fixture_path(&format!(
+        "t5_{variant}_reference.safetensors"
+    )))
 }
 
 fn compare(name: &str, got: &Array, want: &Array, tolerance: f32) -> ParityReport {

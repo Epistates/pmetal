@@ -1,7 +1,7 @@
 //! Loaders for the text-to-image pipeline's components: the CLIP and T5 text
 //! encoders, the VAE and the Flux transformer.
 
-use pmetal_runtime::compat::{Array, ModuleParameters, ModuleParametersExt, nn};
+use pmetal_runtime::compat::{Array, ModuleParameters, ModuleParametersExt};
 use std::collections::HashMap;
 
 use super::{Exemption, LoadError, LoadPolicy, assign_weights};
@@ -111,7 +111,12 @@ pub fn load_clip_weights(
             "the projection of a full CLIP checkpoint; a CLIPTextModel pools without it",
         )]);
     }
-    assign_renamed(model, weights, |key, value| (clip_param_name(key), value), &policy)
+    assign_renamed(
+        model,
+        weights,
+        |key, value| (clip_param_name(key), value),
+        &policy,
+    )
 }
 
 /// The model path of a T5 encoder checkpoint key, `transformers` layout.
@@ -169,7 +174,12 @@ pub fn load_t5_weights(
             "the language-model head of a full T5 checkpoint; this model is the encoder",
         ),
     ]);
-    assign_renamed(model, weights, |key, value| (t5_param_name(key), value), &policy)
+    assign_renamed(
+        model,
+        weights,
+        |key, value| (t5_param_name(key), value),
+        &policy,
+    )
 }
 
 /// Map a `diffusers` `AutoencoderKL` tensor onto the model's parameter and
@@ -220,274 +230,335 @@ pub fn load_vae_weights(
     assign_renamed(model, weights, vae_tensor, &LoadPolicy::strict())
 }
 
-pub fn load_flux_weights(
-    model: &mut FluxDiT,
-    weights: &HashMap<String, Array>,
-) -> Result<(), LoadError> {
-    for (name, weight) in weights {
-        let name = if let Some(stripped) = name.strip_prefix("model.diffusion_model.") {
-            stripped
-        } else {
-            name
-        };
+/// Rows `[start, end)` of `a`, along the first axis.
+fn rows(a: &Array, start: i32, end: i32) -> Array {
+    pmetal_runtime::compat::ops::slice_axis(a, 0, start, end)
+}
 
-        if name.starts_with("double_blocks.") {
-            let parts: Vec<&str> = name.split('.').collect();
-            let idx = parts[1].parse::<usize>().map_err(|_| {
-                LoadError::SafeTensors(format!("Invalid block index in key: {}", name))
-            })?;
-            if idx >= model.blocks.len() {
-                continue;
+/// Rewrite an original-layout (Black Forest Labs, as in the single-file
+/// `flux1-*.safetensors` releases and ComfyUI) FLUX transformer checkpoint as
+/// `diffusers`' tensors, the way `diffusers`' `convert_flux_to_diffusers.py`
+/// does: fused `qkv` and `linear1` projections split into their parts, the
+/// final layer's scale and shift (stored shift first) swapped, and the names
+/// mapped. A key the mapping does not know is left as it is, so the load
+/// reports it.
+fn flux_original_to_diffusers(
+    weights: HashMap<String, Array>,
+    hidden: i32,
+) -> HashMap<String, Array> {
+    let mlp = 4 * hidden;
+    let mut out = HashMap::with_capacity(weights.len() + 8 * 38);
+    for (key, value) in weights {
+        let name = key.strip_prefix("model.diffusion_model.").unwrap_or(&key);
+        let (head, tail) = name.split_once('.').unwrap_or((name, ""));
+        match head {
+            "time_in" | "vector_in" | "guidance_in" => {
+                let embedder = match head {
+                    "time_in" => "timestep_embedder",
+                    "vector_in" => "text_embedder",
+                    _ => "guidance_embedder",
+                };
+                let mapped = tail.replacen("in_layer.", "linear_1.", 1).replacen(
+                    "out_layer.",
+                    "linear_2.",
+                    1,
+                );
+                out.insert(format!("time_text_embed.{embedder}.{mapped}"), value);
             }
-            let sub_path = parts[2..].join(".");
-
-            match sub_path.as_str() {
-                "img_mod.lin.weight" => {
-                    model.blocks[idx].norm1_a.linear.weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
-                }
-                "img_mod.lin.bias" => {
-                    model.blocks[idx].norm1_a.linear.bias =
-                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                }
-                "txt_mod.lin.weight" => {
-                    model.blocks[idx].norm1_b.linear.weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
-                }
-                "txt_mod.lin.bias" => {
-                    model.blocks[idx].norm1_b.linear.bias =
-                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                }
-
-                "img_attn.qkv.weight" => {
-                    model.blocks[idx].attn.a_to_qkv.weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
-                }
-                "img_attn.qkv.bias" => {
-                    model.blocks[idx].attn.a_to_qkv.bias =
-                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                }
-                "txt_attn.qkv.weight" => {
-                    model.blocks[idx].attn.b_to_qkv.weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
-                }
-                "txt_attn.qkv.bias" => {
-                    model.blocks[idx].attn.b_to_qkv.bias =
-                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                }
-
-                "img_attn.norm.query_norm.scale" => {
-                    model.blocks[idx].attn.norm_q_a.weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
-                }
-                "img_attn.norm.key_norm.scale" => {
-                    model.blocks[idx].attn.norm_k_a.weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
-                }
-                "txt_attn.norm.query_norm.scale" => {
-                    model.blocks[idx].attn.norm_q_b.weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
-                }
-                "txt_attn.norm.key_norm.scale" => {
-                    model.blocks[idx].attn.norm_k_b.weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
-                }
-
-                "img_attn.proj.weight" => {
-                    model.blocks[idx].attn.a_to_out.weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
-                }
-                "img_attn.proj.bias" => {
-                    model.blocks[idx].attn.a_to_out.bias =
-                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                }
-                "txt_attn.proj.weight" => {
-                    model.blocks[idx].attn.b_to_out.weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
-                }
-                "txt_attn.proj.bias" => {
-                    model.blocks[idx].attn.b_to_out.bias =
-                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                }
-
-                "img_mlp.0.weight" => {
-                    model.blocks[idx].ff_a[0].weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
-                }
-                "img_mlp.0.bias" => {
-                    model.blocks[idx].ff_a[0].bias =
-                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                }
-                "img_mlp.2.weight" => {
-                    model.blocks[idx].ff_a[1].weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
-                }
-                "img_mlp.2.bias" => {
-                    model.blocks[idx].ff_a[1].bias =
-                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                }
-
-                "txt_mlp.0.weight" => {
-                    model.blocks[idx].ff_b[0].weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
-                }
-                "txt_mlp.0.bias" => {
-                    model.blocks[idx].ff_b[0].bias =
-                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                }
-                "txt_mlp.2.weight" => {
-                    model.blocks[idx].ff_b[1].weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
-                }
-                "txt_mlp.2.bias" => {
-                    model.blocks[idx].ff_b[1].bias =
-                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                }
-                _ => {}
+            "txt_in" => {
+                out.insert(format!("context_embedder.{tail}"), value);
             }
-        } else if name.starts_with("single_blocks.") {
-            let parts: Vec<&str> = name.split('.').collect();
-            let idx = parts[1].parse::<usize>().map_err(|_| {
-                LoadError::SafeTensors(format!("Invalid block index in key: {}", name))
-            })?;
-            if idx >= model.single_blocks.len() {
-                continue;
+            "img_in" => {
+                out.insert(format!("x_embedder.{tail}"), value);
             }
-            let sub_path = parts[2..].join(".");
-
-            match sub_path.as_str() {
-                "modulation.lin.weight" => {
-                    model.single_blocks[idx].norm.linear.weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
+            "final_layer" => {
+                if let Some(rest) = tail.strip_prefix("linear.") {
+                    out.insert(format!("proj_out.{rest}"), value);
+                } else if let Some(rest) = tail.strip_prefix("adaLN_modulation.1.") {
+                    // Stored (shift, scale); `diffusers` reads (scale, shift).
+                    let half = value.dim(0) / 2;
+                    let swapped = pmetal_runtime::compat::ops::concatenate_axis(
+                        &[&rows(&value, half, 2 * half), &rows(&value, 0, half)],
+                        0,
+                    );
+                    out.insert(format!("norm_out.linear.{rest}"), swapped);
+                } else {
+                    out.insert(key.clone(), value);
                 }
-                "modulation.lin.bias" => {
-                    model.single_blocks[idx].norm.linear.bias =
-                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                }
-                "linear1.weight" => {
-                    model.single_blocks[idx].to_qkv_mlp.weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
-                }
-                "linear1.bias" => {
-                    model.single_blocks[idx].to_qkv_mlp.bias =
-                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                }
-                "linear2.weight" => {
-                    model.single_blocks[idx].proj_out.weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
-                }
-                "linear2.bias" => {
-                    model.single_blocks[idx].proj_out.bias =
-                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                }
-                "norm.query_norm.scale" => {
-                    model.single_blocks[idx].norm_q_a.weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
-                }
-                "norm.key_norm.scale" => {
-                    model.single_blocks[idx].norm_k_a.weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
-                }
-                _ => {}
             }
-        } else {
-            match name {
-                "time_in.in_layer.weight" => {
-                    model.time_embedder.linear_1.weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
-                }
-                "time_in.in_layer.bias" => {
-                    model.time_embedder.linear_1.bias =
-                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                }
-                "time_in.out_layer.weight" => {
-                    model.time_embedder.linear_2.weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
-                }
-                "time_in.out_layer.bias" => {
-                    model.time_embedder.linear_2.bias =
-                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                }
-
-                "txt_in.weight" => {
-                    model.context_embedder.weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
-                }
-                "txt_in.bias" => {
-                    model.context_embedder.bias =
-                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                }
-
-                "vector_in.in_layer.weight" => {
-                    model.pooled_text_embedder[0].weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
-                }
-                "vector_in.in_layer.bias" => {
-                    model.pooled_text_embedder[0].bias =
-                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                }
-                "vector_in.out_layer.weight" => {
-                    model.pooled_text_embedder[1].weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
-                }
-                "vector_in.out_layer.bias" => {
-                    model.pooled_text_embedder[1].bias =
-                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                }
-
-                "guidance_in.in_layer.weight" => {
-                    if let Some(ref mut ge) = model.guidance_embedder {
-                        ge.linear_1.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone());
+            "double_blocks" | "single_blocks" => {
+                let Some((index, rest)) = tail.split_once('.') else {
+                    out.insert(key.clone(), value);
+                    continue;
+                };
+                let double = head == "double_blocks";
+                let block = if double {
+                    format!("transformer_blocks.{index}")
+                } else {
+                    format!("single_transformer_blocks.{index}")
+                };
+                // Three equal parts of a fused projection, then the rest.
+                let mut split = |names: &[&str], suffix: &str, value: &Array| {
+                    for (i, part) in names.iter().enumerate() {
+                        let (from, to) = (i as i32 * hidden, (i as i32 + 1) * hidden);
+                        out.insert(format!("{block}.{part}.{suffix}"), rows(value, from, to));
                     }
+                };
+                if let Some(s) = rest.strip_prefix("img_attn.qkv.").filter(|_| double) {
+                    split(&["attn.to_q", "attn.to_k", "attn.to_v"], s, &value);
+                } else if let Some(s) = rest.strip_prefix("txt_attn.qkv.").filter(|_| double) {
+                    split(
+                        &["attn.add_q_proj", "attn.add_k_proj", "attn.add_v_proj"],
+                        s,
+                        &value,
+                    );
+                } else if let Some(s) = rest.strip_prefix("linear1.").filter(|_| !double) {
+                    split(&["attn.to_q", "attn.to_k", "attn.to_v"], s, &value);
+                    out.insert(
+                        format!("{block}.proj_mlp.{s}"),
+                        rows(&value, 3 * hidden, 3 * hidden + mlp),
+                    );
+                } else {
+                    let table: &[(&str, &str)] = if double {
+                        &[
+                            ("img_mod.lin.", "norm1.linear."),
+                            ("txt_mod.lin.", "norm1_context.linear."),
+                            ("img_attn.norm.query_norm.scale", "attn.norm_q.weight"),
+                            ("img_attn.norm.key_norm.scale", "attn.norm_k.weight"),
+                            ("txt_attn.norm.query_norm.scale", "attn.norm_added_q.weight"),
+                            ("txt_attn.norm.key_norm.scale", "attn.norm_added_k.weight"),
+                            ("img_attn.proj.", "attn.to_out.0."),
+                            ("txt_attn.proj.", "attn.to_add_out."),
+                            ("img_mlp.0.", "ff.net.0.proj."),
+                            ("img_mlp.2.", "ff.net.2."),
+                            ("txt_mlp.0.", "ff_context.net.0.proj."),
+                            ("txt_mlp.2.", "ff_context.net.2."),
+                        ]
+                    } else {
+                        &[
+                            ("modulation.lin.", "norm.linear."),
+                            ("norm.query_norm.scale", "attn.norm_q.weight"),
+                            ("norm.key_norm.scale", "attn.norm_k.weight"),
+                            ("linear2.", "proj_out."),
+                        ]
+                    };
+                    let mapped = table.iter().find_map(|(old, new)| {
+                        rest.strip_prefix(old).map(|s| format!("{block}.{new}{s}"))
+                    });
+                    out.insert(mapped.unwrap_or_else(|| key.clone()), value);
                 }
-                "guidance_in.in_layer.bias" => {
-                    if let Some(ref mut ge) = model.guidance_embedder {
-                        ge.linear_1.bias =
-                            pmetal_runtime::compat::module::Param::new(Some(weight.clone()));
-                    }
-                }
-                "guidance_in.out_layer.weight" => {
-                    if let Some(ref mut ge) = model.guidance_embedder {
-                        ge.linear_2.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone());
-                    }
-                }
-                "guidance_in.out_layer.bias" => {
-                    if let Some(ref mut ge) = model.guidance_embedder {
-                        ge.linear_2.bias =
-                            pmetal_runtime::compat::module::Param::new(Some(weight.clone()));
-                    }
-                }
-
-                "img_in.weight" => {
-                    model.x_embedder.weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
-                }
-                "img_in.bias" => {
-                    model.x_embedder.bias =
-                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                }
-
-                "final_layer.adaLN_modulation.1.weight" => {
-                    model.final_norm_out.linear.weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
-                }
-                "final_layer.adaLN_modulation.1.bias" => {
-                    model.final_norm_out.linear.bias =
-                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                }
-                "final_layer.linear.weight" => {
-                    model.final_proj_out.weight =
-                        pmetal_runtime::compat::module::Param::new(weight.clone())
-                }
-                "final_layer.linear.bias" => {
-                    model.final_proj_out.bias =
-                        pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                }
-                _ => {}
+            }
+            _ => {
+                out.insert(key.clone(), value);
             }
         }
     }
-    Ok(())
+    out
+}
+
+/// The model path of a `diffusers` FLUX transformer tensor: the same name,
+/// except that the feed-forwards' `net.0.proj` and `net.2` are `proj_in` and
+/// `proj_out`.
+fn flux_param_name(key: &str) -> String {
+    for feed_forward in ["ff", "ff_context"] {
+        let marker = format!(".{feed_forward}.net.");
+        if let Some(at) = key.find(&marker) {
+            let head = &key[..at + marker.len() - "net.".len()];
+            let tail = &key[at + marker.len()..];
+            if let Some(rest) = tail.strip_prefix("0.proj.") {
+                return format!("{head}proj_in.{rest}");
+            }
+            if let Some(rest) = tail.strip_prefix("2.") {
+                return format!("{head}proj_out.{rest}");
+            }
+        }
+    }
+    key.to_string()
+}
+
+/// Load the FLUX.1 transformer from a `diffusers` `transformer/` checkpoint,
+/// or from an original-layout single file (`double_blocks.*`, `single_blocks.*`;
+/// see [`flux_original_to_diffusers`]).
+///
+/// Fails, naming the difference, unless every tensor is consumed, every
+/// parameter filled and every shape matches. A checkpoint with a guidance
+/// embedder into a model built without one (or the reverse) is such a
+/// difference.
+pub fn load_flux_weights(
+    model: &mut FluxDiT,
+    weights: HashMap<String, Array>,
+) -> Result<(), LoadError> {
+    let original = weights.keys().any(|key| {
+        let key = key.strip_prefix("model.diffusion_model.").unwrap_or(key);
+        key.starts_with("double_blocks.") || key.starts_with("single_blocks.")
+    });
+    let weights = if original {
+        flux_original_to_diffusers(weights, model.config.hidden_size() as i32)
+    } else {
+        weights
+    };
+    assign_renamed(
+        model,
+        weights,
+        |key, value| (flux_param_name(key), value),
+        &LoadPolicy::strict(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::architectures::clip::{CLIPConfig, CLIPTextModel};
+    use crate::architectures::flux::FluxConfig;
+    use crate::architectures::t5::{T5Config, T5EncoderModel};
+    use crate::architectures::vae::VAEConfig;
+    use pmetal_runtime::compat::Dtype;
+    use serde_json::Value;
+    use std::collections::BTreeMap;
+
+    /// The tensor names and shapes of the released FLUX.1-dev components, read
+    /// from their safetensors headers.
+    fn released(component: &str) -> BTreeMap<String, Vec<i32>> {
+        let all: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/flux_dev_layout.json"))
+                .expect("fixture parses");
+        all[component]
+            .as_object()
+            .expect("component")
+            .iter()
+            .map(|(name, entry)| {
+                let shape = entry["shape"]
+                    .as_array()
+                    .expect("shape")
+                    .iter()
+                    .map(|d| d.as_i64().expect("dim") as i32)
+                    .collect();
+                (name.clone(), shape)
+            })
+            .collect()
+    }
+
+    /// What `load_*_weights` would assign: the released tensors after the
+    /// loader's rename and layout change, as `name -> shape`. No tensor is
+    /// ever read, so a model of any size can be checked.
+    fn assigned(
+        released: &BTreeMap<String, Vec<i32>>,
+        map: impl Fn(&str, Array) -> (String, Array),
+        exempt: impl Fn(&str) -> bool,
+    ) -> BTreeMap<String, Vec<i32>> {
+        released
+            .iter()
+            .filter(|(name, _)| !exempt(name))
+            .map(|(name, shape)| {
+                let (target, tensor) = map(name, ops_zeros(shape));
+                (target, tensor.shape().to_vec())
+            })
+            .collect()
+    }
+
+    fn ops_zeros(shape: &[i32]) -> Array {
+        pmetal_runtime::compat::ops::zeros(shape, Dtype::Bfloat16)
+    }
+
+    fn parameters<M: ModuleParameters + ModuleParametersExt>(
+        model: &M,
+    ) -> BTreeMap<String, Vec<i32>> {
+        model
+            .flatten_params()
+            .into_iter()
+            .map(|(name, array)| (name.to_string(), array.shape().to_vec()))
+            .collect()
+    }
+
+    fn assert_same(
+        what: &str,
+        assigned: BTreeMap<String, Vec<i32>>,
+        model: BTreeMap<String, Vec<i32>>,
+    ) {
+        let unfilled: Vec<_> = model
+            .keys()
+            .filter(|k| !assigned.contains_key(*k))
+            .take(5)
+            .collect();
+        let unused: Vec<_> = assigned
+            .keys()
+            .filter(|k| !model.contains_key(*k))
+            .take(5)
+            .collect();
+        assert!(
+            unfilled.is_empty() && unused.is_empty(),
+            "{what}: parameters no released tensor fills {unfilled:?}; released tensors no parameter takes {unused:?}"
+        );
+        for (name, shape) in &model {
+            assert_eq!(&assigned[name], shape, "{what}: {name}");
+        }
+    }
+
+    // The four tests below build the *released-size* models without
+    // evaluating them: parameters are lazy, so only names and shapes exist.
+
+    #[test]
+    fn the_released_flux_transformer_layout_loads() {
+        let model = crate::architectures::flux::FluxDiT::new(FluxConfig {
+            guidance_embeds: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_same(
+            "FLUX.1-dev transformer",
+            assigned(
+                &released("transformer"),
+                |k, v| (flux_param_name(k), v),
+                |_| false,
+            ),
+            parameters(&model),
+        );
+    }
+
+    #[test]
+    fn the_released_clip_layout_loads() {
+        let model = CLIPTextModel::new(CLIPConfig::clip_vit_l_14()).unwrap();
+        assert_same(
+            "CLIP-L text encoder",
+            assigned(
+                &released("text_encoder"),
+                |k, v| (clip_param_name(k), v),
+                |name| name.ends_with("position_ids"),
+            ),
+            parameters(&model),
+        );
+    }
+
+    #[test]
+    fn the_released_t5_xxl_layout_loads() {
+        let model = T5EncoderModel::new(T5Config {
+            d_model: 4096,
+            d_ff: 10240,
+            d_kv: 64,
+            num_layers: 24,
+            num_heads: 64,
+            feed_forward_proj: "gated-gelu".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_same(
+            "T5-XXL encoder",
+            assigned(
+                &released("text_encoder_2"),
+                |k, v| (t5_param_name(k), v),
+                |_| false,
+            ),
+            parameters(&model),
+        );
+    }
+
+    #[test]
+    fn the_released_flux_vae_layout_loads() {
+        let model = AutoencoderKL::new(VAEConfig::flux()).unwrap();
+        assert_same(
+            "FLUX.1 VAE",
+            assigned(&released("vae"), vae_tensor, |_| false),
+            parameters(&model),
+        );
+    }
 }

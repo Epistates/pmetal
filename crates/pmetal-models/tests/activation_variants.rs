@@ -107,7 +107,7 @@ fn clip_mlp_distinguishes_all_three_gelus() {
             hidden_act: hidden_act.to_string(),
             ..Default::default()
         };
-        let mut mlp = CLIPMLP::new(&config);
+        let mut mlp = CLIPMLP::new(&config).expect("CLIPMLP::new");
         make_identity(&mut mlp.fc1);
         make_identity(&mut mlp.fc2);
 

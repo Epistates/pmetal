@@ -1,0 +1,58 @@
+{
+  "guidance": 3.5,
+  "height": 32,
+  "model_id": "synthetic",
+  "oracle": "transformers",
+  "scheduler": {
+    "base_image_seq_len": 256,
+    "base_shift": 0.5,
+    "max_image_seq_len": 4096,
+    "max_shift": 1.15,
+    "shift": 3.0,
+    "use_dynamic_shifting": true
+  },
+  "steps": 3,
+  "torch_version": "2.11.0",
+  "transformer": {
+    "attention_head_dim": 16,
+    "axes_dims_rope": [
+      4,
+      6,
+      6
+    ],
+    "guidance_embeds": true,
+    "in_channels": 16,
+    "joint_attention_dim": 32,
+    "num_attention_heads": 2,
+    "num_layers": 1,
+    "num_single_layers": 1,
+    "patch_size": 1,
+    "pooled_projection_dim": 24
+  },
+  "transformers_version": "5.6.1",
+  "vae": {
+    "block_out_channels": [
+      8,
+      16
+    ],
+    "down_block_types": [
+      "DownEncoderBlock2D",
+      "DownEncoderBlock2D"
+    ],
+    "in_channels": 3,
+    "latent_channels": 4,
+    "layers_per_block": 1,
+    "norm_num_groups": 4,
+    "out_channels": 3,
+    "sample_size": 32,
+    "scaling_factor": 0.3611,
+    "shift_factor": 0.1159,
+    "up_block_types": [
+      "UpDecoderBlock2D",
+      "UpDecoderBlock2D"
+    ],
+    "use_post_quant_conv": false,
+    "use_quant_conv": false
+  },
+  "width": 48
+}

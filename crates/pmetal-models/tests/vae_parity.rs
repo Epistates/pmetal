@@ -213,9 +213,7 @@ fn the_pre_0_14_attention_layout_loads() {
     let reference = reference("flux_like");
     let mut vae = AutoencoderKL::new(flux_like()).expect("model builds");
     load_vae_weights(&mut vae, old).expect("legacy attention loads");
-    let decoded = vae
-        .decode_raw(ref_tensor(&reference, "z"))
-        .expect("decode");
+    let decoded = vae.decode_raw(ref_tensor(&reference, "z")).expect("decode");
     let gap = max_abs_diff(&decoded, ref_tensor(&reference, "decoded"));
     assert!(gap < 1e-4, "legacy layout decodes {gap:.2e} off");
 }
@@ -241,7 +239,10 @@ fn loading_is_strict() {
     let mut vae = AutoencoderKL::new(flux_like()).unwrap();
     let err = load_vae_weights(&mut vae, weights("sd_like")).expect_err("wrong layout");
     assert!(
-        matches!(err, LoadError::ShapeMismatch { .. } | LoadError::Incomplete { .. }),
+        matches!(
+            err,
+            LoadError::ShapeMismatch { .. } | LoadError::Incomplete { .. }
+        ),
         "{err}"
     );
 }

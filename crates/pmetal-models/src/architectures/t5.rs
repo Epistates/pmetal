@@ -145,7 +145,11 @@ impl Default for T5Config {
 /// share the last. The logarithm runs in f32 and truncates toward zero, as the
 /// reference's `.to(torch.long)` does, so bucket boundaries land on the same
 /// offsets.
-fn relative_position_bucket(relative_position: i64, num_buckets: usize, max_distance: usize) -> i32 {
+fn relative_position_bucket(
+    relative_position: i64,
+    num_buckets: usize,
+    max_distance: usize,
+) -> i32 {
     let half = (num_buckets / 2) as i64;
     let offset = if relative_position > 0 { half } else { 0 };
     let distance = relative_position.abs();
@@ -262,7 +266,11 @@ impl T5FeedForward {
                 activate(self.act, &wi_0.forward(x)).multiply(&wi_1.forward(x))
             }
             (Some(wi), _, _) => activate(self.act, &wi.forward(x)),
-            _ => return Err(Exception::custom("t5: feed-forward has no input projection")),
+            _ => {
+                return Err(Exception::custom(
+                    "t5: feed-forward has no input projection",
+                ));
+            }
         };
         Ok(self.wo.forward(&hidden))
     }
@@ -461,7 +469,10 @@ mod tests {
     #[test]
     fn buckets_split_exact_and_logarithmic_ranges() {
         let bucket = |rp| relative_position_bucket(rp, 32, 128);
-        assert_eq!([bucket(0), bucket(-1), bucket(-7), bucket(-8)], [0, 1, 7, 8]);
+        assert_eq!(
+            [bucket(0), bucket(-1), bucket(-7), bucket(-8)],
+            [0, 1, 7, 8]
+        );
         assert_eq!([bucket(1), bucket(7), bucket(8)], [17, 23, 24]);
         assert_eq!([bucket(-40), bucket(-90), bucket(-127)], [12, 14, 15]);
         assert_eq!([bucket(500), bucket(-500)], [31, 15]);

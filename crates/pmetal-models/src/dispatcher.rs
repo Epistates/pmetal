@@ -2632,7 +2632,7 @@ impl DynamicModel {
             Self::Qwen3Next(m) => m.config().hidden_size(),
             Self::GptOss(m) => m.config().hidden_size,
             Self::Gemma4(m) => m.config.hidden_size,
-            Self::Flux(m) => m.pos_embedder.dim as i32,
+            Self::Flux(m) => m.config().hidden_size() as i32,
             Self::Bert(m) => m.config().hidden_size as i32,
             Self::DiffusionGemma(m) => m.encoder.config.hidden_size,
             Self::Mllama(m) => m.config.text_config.llama.hidden_size,

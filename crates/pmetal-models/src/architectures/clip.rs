@@ -7,7 +7,7 @@
 //! vector (the `CLIP-L` text tower), and Stable Diffusion on the penultimate
 //! layer's states, so both are returned.
 
-use pmetal_runtime::compat::ops::{argmax_axis, arange, broadcast_to, take_along_axis};
+use pmetal_runtime::compat::ops::{arange, argmax_axis, broadcast_to, take_along_axis};
 use pmetal_runtime::compat::{Array, Dtype, Exception, nn};
 use pmetal_runtime::impl_module_params;
 use pmetal_runtime::nn::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};

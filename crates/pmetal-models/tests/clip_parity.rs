@@ -70,7 +70,8 @@ fn model(variant: &str, config: CLIPConfig) -> CLIPTextModel {
 }
 
 fn report(name: &str, got: &Array, want: &Array) -> ParityReport {
-    let report = ParityReport::compute_with_per_position(name, got, want, Tolerance::new(2e-5, 2e-5));
+    let report =
+        ParityReport::compute_with_per_position(name, got, want, Tolerance::new(2e-5, 2e-5));
     print_report_table(std::slice::from_ref(&report));
     report
 }
@@ -153,7 +154,7 @@ fn a_bf16_tower_stays_in_bf16() {
 #[test]
 fn a_sequence_longer_than_the_positions_is_an_error() {
     let mut model = model("legacy", legacy_config());
-    let ids = Array::from_slice(&vec![1i32; 17], &[1, 17]);
+    let ids = Array::from_slice(&[1i32; 17], &[1, 17]);
     let err = model.forward(&ids).expect_err("17 > 16 positions");
     assert!(err.to_string().contains("17"), "{err}");
 }
@@ -205,7 +206,11 @@ fn a_position_table_of_the_wrong_shape_is_an_error() {
 #[test]
 fn a_full_clip_checkpoint_loads_its_text_tower() {
     let mut full: HashMap<String, Array> = weights("projected");
-    for name in ["vision_model.embeddings.class_embedding", "visual_projection.weight", "logit_scale"] {
+    for name in [
+        "vision_model.embeddings.class_embedding",
+        "visual_projection.weight",
+        "logit_scale",
+    ] {
         full.insert(name.into(), Array::from_slice(&[1.0f32], &[1]));
     }
     let mut m = CLIPTextModel::with_projection(projected_config()).unwrap();
