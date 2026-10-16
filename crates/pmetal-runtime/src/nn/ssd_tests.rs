@@ -76,11 +76,13 @@ fn step_size(c: &Case, raw: f64, head: usize) -> f64 {
 }
 
 /// `(y [B,L,H,P], final state [B,H,P,N])`, token by token in float64. `group`
-/// maps a head to the group it reads.
+/// maps a head to the group it reads. Where `segments` (`[B, L]`) changes the
+/// state is reset to zero, as if each run of equal numbers were scanned alone.
 fn reference_with(
     c: &Case,
     state: Option<&[f64]>,
     group: impl Fn(usize) -> usize,
+    segments: Option<&[i32]>,
 ) -> (Vec<f64>, Vec<f64>) {
     let (b, l, h, p, g, n) = (c.b, c.l, c.h, c.p, c.g, c.n);
     let mut s = state.map_or_else(|| vec![0.0; b * h * p * n], <[f64]>::to_vec);
@@ -90,6 +92,12 @@ fn reference_with(
             let base = (bi * h + hi) * p * n;
             let gi = group(hi);
             for t in 0..l {
+                if let Some(seg) = segments
+                    && t > 0
+                    && seg[bi * l + t] != seg[bi * l + t - 1]
+                {
+                    s[base..base + p * n].fill(0.0);
+                }
                 let dt = step_size(c, c.dt[(bi * l + t) * h + hi], hi);
                 let decay = (-dt * c.a_log[hi].exp()).exp();
                 let xo = ((bi * l + t) * h + hi) * p;
@@ -111,7 +119,13 @@ fn reference_with(
 /// Heads read contiguous groups: head `h` of `H` reads group `h / (H / G)`.
 fn reference(c: &Case, state: Option<&[f64]>) -> (Vec<f64>, Vec<f64>) {
     let per = c.h / c.g;
-    reference_with(c, state, move |h| h / per)
+    reference_with(c, state, move |h| h / per, None)
+}
+
+/// [`reference`] with the state reset where `segments` changes.
+fn reference_segmented(c: &Case, state: Option<&[f64]>, segments: &[i32]) -> (Vec<f64>, Vec<f64>) {
+    let per = c.h / c.g;
+    reference_with(c, state, move |h| h / per, Some(segments))
 }
 
 struct Fields {
@@ -223,7 +237,7 @@ fn heads_read_contiguous_groups_and_the_fixture_can_tell() {
     let c = case((1, 12, 4, 3, 2, 4), 5, (0.0, f32::INFINITY));
     // Tiled instead: head h reads group h mod G.
     let (contiguous, _) = reference(&c, None);
-    let (tiled, _) = reference_with(&c, None, |h| h % 2);
+    let (tiled, _) = reference_with(&c, None, |h| h % 2, None);
     let apart = contiguous
         .iter()
         .zip(&tiled)
@@ -398,6 +412,159 @@ fn the_scan_differentiates_through_the_step_size_limits() {
 fn the_step_differentiates_like_the_recurrence() {
     let c = case((2, 1, 4, 3, 2, 4), 10, (0.0, f32::INFINITY));
     gradient_check("step", &c, 1, true);
+}
+
+// ---------------------------------------------------------------------------
+// Packed rows
+// ---------------------------------------------------------------------------
+
+/// Sequence numbers for rows packed from the given sequence lengths.
+fn segment_ids(rows: &[&[usize]]) -> Vec<i32> {
+    rows.iter()
+        .flat_map(|lengths| {
+            lengths
+                .iter()
+                .enumerate()
+                .flat_map(|(n, &len)| std::iter::repeat_n(n as i32 * 3 + 1, len))
+        })
+        .collect()
+}
+
+fn scan_segmented(
+    c: &Case,
+    f: &Fields,
+    with_state: bool,
+    chunk: i32,
+    ids: &[i32],
+) -> (Array, Array) {
+    let segments = Array::from_i32_slice(ids).reshape(&[c.b as i32, c.l as i32]);
+    ssd_scan_segmented(
+        &f.x,
+        &f.dt,
+        &f.b,
+        &f.c,
+        SsdParams {
+            a_log: &f.a_log,
+            d: &f.d,
+            dt_bias: &f.dt_bias,
+            dt_min: c.dt_min,
+            dt_max: c.dt_max,
+        },
+        with_state.then_some(&f.state),
+        chunk,
+        &segments,
+    )
+    .unwrap()
+}
+
+fn check_segmented(what: &str, c: &Case, with_state: bool, chunk: i32, ids: &[i32]) {
+    let f = fields(c);
+    let (y, s) = scan_segmented(c, &f, with_state, chunk, ids);
+    drain();
+    let (ry, rs) = reference_segmented(c, with_state.then_some(c.state.as_slice()), ids);
+    assert_close(&format!("{what}: output"), &vec_of(&y), &ry, 2e-5);
+    assert_close(&format!("{what}: final state"), &vec_of(&s), &rs, 2e-5);
+}
+
+#[test]
+#[serial]
+fn packed_sequences_scan_as_if_each_were_alone() {
+    // Boundaries inside a chunk, on a chunk edge and one chunk long, in two
+    // rows that are cut differently.
+    let c = case((2, 20, 4, 3, 2, 4), 13, (0.0, f32::INFINITY));
+    let ids = segment_ids(&[&[5, 3, 8, 4], &[2, 9, 9]]);
+    for chunk in [1, 3, 4, 8, 20, 64] {
+        check_segmented(&format!("chunk {chunk}"), &c, false, chunk, &ids);
+        check_segmented(
+            &format!("chunk {chunk}, from a state"),
+            &c,
+            true,
+            chunk,
+            &ids,
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn a_packed_row_longer_than_one_pass_resets_across_the_pass_edge() {
+    let c = case((1, 70, 2, 3, 1, 3), 14, (0.0, f32::INFINITY));
+    assert!(c.l > 2 * MAX_CHUNKS_PER_PASS as usize);
+    // A boundary exactly on the first pass's edge (64 tokens at chunk 2) and
+    // others before and after it.
+    for lengths in [&[13usize, 30, 27][..], &[64, 6][..], &[1, 63, 6][..]] {
+        let ids = segment_ids(&[lengths]);
+        check_segmented(&format!("{lengths:?}"), &c, true, 2, &ids);
+    }
+}
+
+#[test]
+#[serial]
+fn the_fixture_can_tell_a_reset_from_a_carried_state() {
+    let c = case((1, 20, 4, 3, 2, 4), 15, (0.0, f32::INFINITY));
+    let ids = segment_ids(&[&[7, 6, 7]]);
+    let (packed, _) = reference_segmented(&c, None, &ids);
+    let (carried, _) = reference(&c, None);
+    let apart = packed
+        .iter()
+        .zip(&carried)
+        .map(|(p, q)| (p - q).abs())
+        .fold(0.0, f64::max);
+    assert!(apart > 0.1, "a reset changes nothing here ({apart})");
+    // Unsegmented, the scan carries the state through the boundary.
+    check_scan("unsegmented", &c, false, 5);
+}
+
+#[test]
+#[serial]
+fn the_segmented_scan_differentiates_like_the_recurrence() {
+    let c = case((2, 11, 4, 3, 2, 4), 16, (0.0, f32::INFINITY));
+    let ids = segment_ids(&[&[4, 3, 4], &[11]]);
+    let segments = Array::from_i32_slice(&ids).reshape(&[2, 11]);
+    let mut rng = Rng(0xFACE);
+    let wy: Vec<f64> = (0..c.b * c.l * c.h * c.p)
+        .map(|_| round32(rng.normal()))
+        .collect();
+    let ws: Vec<f64> = (0..c.b * c.h * c.p * c.n)
+        .map(|_| round32(rng.normal()))
+        .collect();
+    let wy_arr = arr(&wy, &[c.b, c.l, c.h, c.p]);
+    let ws_arr = arr(&ws, &[c.b, c.h, c.p, c.n]);
+    check_gradient(
+        "segmented scan",
+        &NAMES,
+        &bases(&c),
+        &shapes(&c),
+        |a: &[Array]| {
+            let params = SsdParams {
+                a_log: &a[4],
+                d: &a[5],
+                dt_bias: &a[6],
+                dt_min: 0.0,
+                dt_max: f32::INFINITY,
+            };
+            let (y, s) = ssd_scan_segmented(
+                &a[0],
+                &a[1],
+                &a[2],
+                &a[3],
+                params,
+                Some(&a[7]),
+                4,
+                &segments,
+            )
+            .unwrap();
+            y.multiply(&wy_arr)
+                .sum_all()
+                .add(&s.multiply(&ws_arr).sum_all())
+        },
+        |v: &[Vec<f64>]| {
+            let c = with_bases(&c, v.to_vec());
+            let (y, s) = reference_segmented(&c, Some(&c.state), &ids);
+            dot(&y, &wy) + dot(&s, &ws)
+        },
+        2e-4,
+    );
 }
 
 // ---------------------------------------------------------------------------

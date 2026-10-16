@@ -174,6 +174,63 @@ pub fn ssd_scan(
     state: Option<&Array>,
     chunk_size: i32,
 ) -> Result<(Array, Array), Exception> {
+    scan(x, dt, b, c, params, state, chunk_size, None)
+}
+
+/// [`ssd_scan`] over several sequences packed into one row: `segments`
+/// `[B, L]` (integers) numbers the sequence each token belongs to, a
+/// sequence being a run of equal numbers. The state is reset where the number
+/// changes, so a token sees none of the tokens of the sequences before its
+/// own, as if each had been scanned alone; `state`, when given, is the state
+/// the row's first sequence continues from, and the state returned is the one
+/// after the row's last token.
+///
+/// The attention mask of a packed row cannot reach a recurrent layer, which
+/// is why one needs this.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the recurrence's inputs, one per tensor"
+)]
+pub fn ssd_scan_segmented(
+    x: &Array,
+    dt: &Array,
+    b: &Array,
+    c: &Array,
+    params: SsdParams<'_>,
+    state: Option<&Array>,
+    chunk_size: i32,
+    segments: &Array,
+) -> Result<(Array, Array), Exception> {
+    if segments.shape() != [x.dim(0), x.dim(1)] {
+        return Err(Exception::custom(format!(
+            "ssd_scan_segmented: segments {:?} for x {:?}",
+            segments.shape(),
+            x.shape()
+        )));
+    }
+    scan(
+        x,
+        dt,
+        b,
+        c,
+        params,
+        state,
+        chunk_size,
+        Some(&segments.as_dtype(Dtype::Int32.as_i32())),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan(
+    x: &Array,
+    dt: &Array,
+    b: &Array,
+    c: &Array,
+    params: SsdParams<'_>,
+    state: Option<&Array>,
+    chunk_size: i32,
+    segments: Option<&Array>,
+) -> Result<(Array, Array), Exception> {
     check_shapes(x, dt, b, c)?;
     let (bsz, l, h, p) = (x.dim(0), x.dim(1), x.dim(2), x.dim(3));
     let (g, n) = (b.dim(2), b.dim(3));
@@ -197,6 +254,12 @@ pub fn ssd_scan(
     while start < l {
         let end = (start + pass_len).min(l);
         let piece = |a: &Array| ops::slice_axis(a, 1, start, end);
+        // The state a pass starts from belongs to the sequence of the token
+        // before it (the row's first, for the first pass).
+        let pass_segments = segments.map(|s| PassSegments {
+            ids: piece(s),
+            carried: ops::slice_axis(s, 1, (start - 1).max(0), start.max(1)).reshape(&[bsz]),
+        });
         let (y, next) = ssd_pass(
             &piece(&xdt),
             &piece(&da),
@@ -205,6 +268,7 @@ pub fn ssd_scan(
             state.as_ref(),
             chunk,
             (bsz, h, p, g, n),
+            pass_segments.as_ref(),
         )?;
         outputs.push(y);
         state = Some(next);
@@ -222,10 +286,79 @@ pub fn ssd_scan(
     Ok((y.add(&skip), state))
 }
 
+/// The sequence numbers of one pass's tokens, and the number of the sequence
+/// the state the pass starts from belongs to.
+struct PassSegments {
+    /// `[B, L]`, `int32`.
+    ids: Array,
+    /// `[B]`, `int32`.
+    carried: Array,
+}
+
+/// Which pairs of positions, chunks and states may exchange state, as 0/1
+/// factors that broadcast against the pass's `[B, G, r, ...]` tensors.
+struct SegmentMasks {
+    /// Position `j` feeds position `i` of its chunk: `[B, 1, 1, chunks, Q, Q]`.
+    within: Array,
+    /// Position `j` is in the sequence its chunk ends in, so it reaches the
+    /// state the chunk hands on: `[B, 1, 1, chunks, Q]`.
+    to_end: Array,
+    /// Entry `j` of the states `[carried, chunk 0, chunk 1, ...]` still
+    /// reaches the state after entry `i`: `[B, 1, 1, steps, steps]`.
+    between: Array,
+    /// Position `i` is in the sequence of the state entering its chunk:
+    /// `[B, 1, 1, chunks, Q, 1]`.
+    from_state: Array,
+}
+
+impl SegmentMasks {
+    fn new(segments: &PassSegments, chunks: i32, q: i32, pad: i32) -> Self {
+        let f32 = Dtype::Float32.as_i32();
+        let bsz = segments.ids.dim(0);
+        let l = segments.ids.dim(1);
+        // The padding at the end continues the last sequence: it is inert.
+        let ids = if pad == 0 {
+            segments.ids.clone()
+        } else {
+            let tail = ops::slice_axis(&segments.ids, 1, l - 1, l).broadcast_to(&[bsz, pad]);
+            ops::concatenate_axis(&[&segments.ids, &tail], 1)
+        }
+        .reshape(&[bsz, chunks, q]);
+
+        let within = ops::expand_dims(&ids, -1)
+            .equal(&ops::expand_dims(&ids, -2))
+            .as_dtype(f32); // [B, chunks, Q, Q]
+        let last = ops::slice_axis(&ids, 2, q - 1, q); // [B, chunks, 1]
+        let to_end = ids.equal(&last).as_dtype(f32); // [B, chunks, Q]
+
+        // The sequence of each state in `[carried, chunk 0, chunk 1, ...]`.
+        let owners = ops::concatenate_axis(
+            &[
+                &segments.carried.reshape(&[bsz, 1]),
+                &last.reshape(&[bsz, chunks]),
+            ],
+            1,
+        ); // [B, steps]
+        let between = ops::expand_dims(&owners, -1)
+            .equal(&ops::expand_dims(&owners, -2))
+            .as_dtype(f32); // [B, steps, steps]
+        let entering = ops::slice_axis(&owners, 1, 0, chunks); // [B, chunks]
+        let from_state = ids.equal(&ops::expand_dims(&entering, -1)).as_dtype(f32); // [B, chunks, Q]
+
+        Self {
+            within: within.reshape(&[bsz, 1, 1, chunks, q, q]),
+            to_end: to_end.reshape(&[bsz, 1, 1, chunks, q]),
+            between: between.reshape(&[bsz, 1, 1, chunks + 1, chunks + 1]),
+            from_state: from_state.reshape(&[bsz, 1, 1, chunks, q, 1]),
+        }
+    }
+}
+
 /// One pass of at most [`MAX_CHUNKS_PER_PASS`] chunks, without the skip
 /// connection: `xdt` is `x · dt`, `da` is `dt · A`. The head axis is held as
 /// `[G, r]` (group, head within the group) throughout, so `B` and `C` stay
 /// per group and broadcast over `r`.
+#[allow(clippy::too_many_arguments)]
 fn ssd_pass(
     xdt: &Array,
     da: &Array,
@@ -234,12 +367,14 @@ fn ssd_pass(
     state: Option<&Array>,
     chunk: i32,
     (bsz, h, p, g, n): (i32, i32, i32, i32, i32),
+    segments: Option<&PassSegments>,
 ) -> Result<(Array, Array), Exception> {
     let r = h / g;
     let l = xdt.dim(1);
     let q = chunk.min(l);
     let pad = (q - l % q) % q;
     let chunks = (l + pad) / q;
+    let masks = segments.map(|s| SegmentMasks::new(s, chunks, q, pad));
 
     // Zero padding is inert: no decay (`da = 0`), no input (`xdt = 0`, and
     // `B` of zero), so the state after the padding is the state before it.
@@ -284,6 +419,10 @@ fn ssd_pass(
             .subtract(&ops::expand_dims(&acum, -2))
             .add(&masked),
     ); // [B, G, r, chunks, Q, Q]
+    let within = match &masks {
+        Some(m) => within.multiply(&m.within),
+        None => within,
+    };
     let scores = ops::expand_dims(&ops::matmul(&c, &b_t), 2); // [B, G, 1, chunks, Q, Q]
     let y_within = ops::matmul(&scores.multiply(&within), &xdt);
 
@@ -291,6 +430,10 @@ fn ssd_pass(
     //    Σ_j exp(acum_last - acum_j) xdt_j ⊗ B_j.
     let last = acum.slice(&[0, 0, 0, 0, q - 1], &[bsz, g, r, chunks, q]); // [B, G, r, chunks, 1]
     let to_end = ops::exp(&last.subtract(&acum));
+    let to_end = match &masks {
+        Some(m) => to_end.multiply(&m.to_end),
+        None => to_end,
+    };
     let weighted = xdt.multiply(&ops::expand_dims(&to_end, -1));
     let added = ops::matmul(
         &weighted.transpose_axes(&[0, 1, 2, 3, 5, 4]),
@@ -318,6 +461,10 @@ fn ssd_pass(
             .subtract(&ops::expand_dims(&running, -2))
             .add(&upper_mask),
     ); // [B, G, r, steps, steps]
+    let between = match &masks {
+        Some(m) => between.multiply(&m.between),
+        None => between,
+    };
     let entering = ops::matmul(&between, &all).reshape(&[bsz, g, r, steps, p, n]);
     let into_chunks = entering.slice(&[0, 0, 0, 0, 0, 0], &[bsz, g, r, chunks, p, n]);
     let final_state = entering
@@ -331,6 +478,10 @@ fn ssd_pass(
         &into_chunks.transpose_axes(&[0, 1, 2, 3, 5, 4]),
     ); // [B, G, r, chunks, Q, P]
     let y_state = from_state.multiply(&ops::expand_dims(&ops::exp(&acum), -1));
+    let y_state = match &masks {
+        Some(m) => y_state.multiply(&m.from_state),
+        None => y_state,
+    };
 
     let y = y_within
         .add(&y_state)
