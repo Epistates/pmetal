@@ -39,7 +39,18 @@ fn build_tiny_llama_gguf() -> Vec<u8> {
 /// how a GGUF says its head is tied to the embedding) and the `attn_q.weight`
 /// rows exactly as written, i.e. already in the GGUF converter's permuted order.
 fn build_llama_gguf(head: Option<Vec<f32>>, q_as_stored: Vec<f32>) -> Vec<u8> {
+    build_llama_gguf_with(head, q_as_stored, |_| {})
+}
+
+/// [`build_llama_gguf`] with a hook on the builder, for the metadata and
+/// tensors a particular file adds (`rope_freqs`, `rope.scaling.*`).
+fn build_llama_gguf_with(
+    head: Option<Vec<f32>>,
+    q_as_stored: Vec<f32>,
+    extra: impl FnOnce(&mut GgufBuilder),
+) -> Vec<u8> {
     let mut b = GgufBuilder::with_model("llama", "tiny-llama-test");
+    extra(&mut b);
 
     b.add_u32("llama.embedding_length", HIDDEN as u32);
     b.add_u32("llama.block_count", LAYERS as u32);
@@ -246,4 +257,151 @@ fn llama_gguf_query_rows_are_loaded_in_hugging_face_order() {
         param(&model, "model.layers.0.self_attn.q_proj.weight"),
         want
     );
+}
+
+/// Llama 3.x GGUFs carry their banded RoPE scaling as a `rope_freqs` tensor of
+/// per-frequency divisors, which the loader used to set aside with a warning:
+/// positions past the original context then rotated at the unscaled
+/// frequencies. The loaded model's frequencies are the ones `rope_type:
+/// "llama3"` computes, the factors are written here from the converter's
+/// recipe rather than the loader's, and the logits move with them.
+#[test]
+fn a_gguf_rope_freqs_tensor_is_the_models_rope_scaling() {
+    use pmetal_runtime::rope::Rotary;
+
+    let (factor, low, high, original) = (8.0f64, 1.0f64, 4.0f64, 128.0f64);
+    let plain = Rotary::plain(HEAD_DIM as i32, HEAD_DIM as i32, 10_000.0);
+    let factors: Vec<f32> = plain
+        .inverse_frequencies(0)
+        .iter()
+        .map(|&f| {
+            let wavelength = 2.0 * std::f64::consts::PI / f as f64;
+            (if wavelength < original / high {
+                1.0
+            } else if wavelength > original / low {
+                factor
+            } else {
+                let smooth = (original / wavelength - low) / (high - low);
+                1.0 / ((1.0 - smooth) / factor + smooth)
+            }) as f32
+        })
+        .collect();
+    assert!(
+        factors.iter().any(|f| *f > 1.0) && factors.contains(&1.0),
+        "the test needs both bands: {factors:?}"
+    );
+
+    let scaled_bytes = build_llama_gguf_with(
+        Some(ramp(VOCAB, HIDDEN, 1.0)),
+        ramp(HEADS * HEAD_DIM, HIDDEN, 0.5),
+        |b| {
+            b.add_f32_tensor("rope_freqs.weight", vec![HEAD_DIM / 2], factors.clone());
+        },
+    );
+    let mut scaled = load_gguf_bytes(scaled_bytes);
+    let mut unscaled = load_gguf_bytes(build_tiny_llama_gguf());
+
+    let DynamicModel::Llama(model) = &scaled else {
+        panic!("a Llama GGUF loads as Llama");
+    };
+    let got = model.model.layers[0]
+        .self_attn
+        .rotary
+        .inverse_frequencies(0);
+    let want = Rotary::from_config(
+        HEAD_DIM as i32,
+        pmetal_runtime::rope::RopeConfig::from_json(&serde_json::json!({
+            "rope_theta": 10_000.0,
+            "rope_scaling": {"rope_type": "llama3", "factor": factor,
+                "low_freq_factor": low, "high_freq_factor": high,
+                "original_max_position_embeddings": original},
+        })),
+        10_000.0,
+        1.0,
+    )
+    .expect("llama3 parses")
+    .inverse_frequencies(0);
+    assert_eq!(got.len(), want.len());
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        assert!(
+            (g - w).abs() <= 1e-6 * w.abs() + 1e-9,
+            "frequency {i}: {g} against {w}"
+        );
+    }
+
+    // The scaling reaches the logits.
+    let ids = Array::from_slice(&[1i32, 2, 3, 4, 5, 6], &[1, 6]);
+    let a = scaled.forward(&ids, None).expect("scaled forward");
+    let b = unscaled.forward(&ids, None).expect("unscaled forward");
+    let (mut a, mut b) = (
+        a.as_dtype(Dtype::Float32.as_i32()),
+        b.as_dtype(Dtype::Float32.as_i32()),
+    );
+    let n = a.size();
+    let (a, b) = (a.to_f32_vec(n).unwrap(), b.to_f32_vec(n).unwrap());
+    assert!(a.iter().all(|v| v.is_finite()));
+    let moved = a
+        .iter()
+        .zip(&b)
+        .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
+    assert!(
+        moved > 1e-4,
+        "rope_freqs moved the logits by only {moved:e}"
+    );
+    pmetal_runtime::check_unobserved_error().expect("a runtime op threw");
+}
+
+/// `rope.scaling.*` metadata is a `rope_scaling` dict; a type the loader does
+/// not know is refused, and so is a file with metadata and a tensor both.
+#[test]
+fn gguf_rope_scaling_metadata_is_read_and_unknown_types_are_refused() {
+    use pmetal_runtime::rope::RopeScaling;
+
+    let linear = load_gguf_bytes(build_llama_gguf_with(
+        Some(ramp(VOCAB, HIDDEN, 1.0)),
+        ramp(HEADS * HEAD_DIM, HIDDEN, 0.5),
+        |b| {
+            b.add_string("llama.rope.scaling.type", "linear");
+            b.add_f32("llama.rope.scaling.factor", 4.0);
+        },
+    ));
+    let DynamicModel::Llama(model) = &linear else {
+        panic!("llama");
+    };
+    assert_eq!(
+        model.model.layers[0].self_attn.rotary.rotary().scaling,
+        RopeScaling::Linear { factor: 4.0 }
+    );
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("model.gguf");
+    std::fs::write(
+        &path,
+        build_llama_gguf_with(
+            Some(ramp(VOCAB, HIDDEN, 1.0)),
+            ramp(HEADS * HEAD_DIM, HIDDEN, 0.5),
+            |b| {
+                b.add_string("llama.rope.scaling.type", "longrope");
+            },
+        ),
+    )
+    .unwrap();
+    let err = DynamicModel::load(&path).err().expect("refused");
+    assert!(err.to_string().contains("longrope"), "{err}");
+
+    std::fs::write(
+        &path,
+        build_llama_gguf_with(
+            Some(ramp(VOCAB, HIDDEN, 1.0)),
+            ramp(HEADS * HEAD_DIM, HIDDEN, 0.5),
+            |b| {
+                b.add_string("llama.rope.scaling.type", "linear");
+                b.add_f32("llama.rope.scaling.factor", 2.0);
+                b.add_f32_tensor("rope_freqs.weight", vec![HEAD_DIM / 2], vec![1.0; 4]);
+            },
+        ),
+    )
+    .unwrap();
+    let err = DynamicModel::load(&path).err().expect("refused");
+    assert!(err.to_string().contains("rope_freqs"), "{err}");
 }

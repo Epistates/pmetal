@@ -31,7 +31,7 @@ use crate::compat::{Array, Dtype, ops};
 
 /// The `rope_type` spellings [`RopeScaling::from_params`] accepts.
 pub const SUPPORTED_ROPE_TYPES: &str = "\"default\", \"linear\", \"dynamic\", \"yarn\", \
-     \"longrope\", \"llama3\", \"proportional\"";
+     \"longrope\", \"llama3\", \"proportional\", \"frequency_factors\"";
 
 /// transformers' YaRN `get_mscale`: `0.1 * mscale * ln(scale) + 1`, and 1 for
 /// `scale <= 1`.
@@ -130,6 +130,13 @@ pub enum RopeScaling {
         /// Divisor of every frequency (default 1).
         factor: f64,
     },
+    /// Per-frequency divisors fixed in the checkpoint: the `rope_freqs`
+    /// tensor a GGUF converter precomputes for the scaled-RoPE families (Llama
+    /// 3.x's bands). Frequency `i` is the plain one divided by `factors[i]`.
+    FrequencyFactors {
+        /// One divisor per rotated frequency, `dims / 2` of them.
+        factors: Vec<f64>,
+    },
 }
 
 impl RopeScaling {
@@ -143,6 +150,7 @@ impl RopeScaling {
             Self::LongRope(_) => "longrope",
             Self::Llama3(_) => "llama3",
             Self::Proportional { .. } => "proportional",
+            Self::FrequencyFactors { .. } => "frequency_factors",
         }
     }
 
@@ -290,6 +298,19 @@ impl RopeScaling {
             "proportional" => Self::Proportional {
                 factor: num("factor").unwrap_or(1.0),
             },
+            "frequency_factors" => {
+                let factors = p
+                    .get("factors")
+                    .and_then(Value::as_array)
+                    .and_then(|a| a.iter().map(Value::as_f64).collect::<Option<Vec<_>>>())
+                    .ok_or("rope_type \"frequency_factors\" needs `factors`, a list of numbers")?;
+                if let Some(bad) = factors.iter().find(|f| !(f.is_finite() && **f > 0.0)) {
+                    return Err(format!(
+                        "rope_type \"frequency_factors\": factor {bad} must be positive"
+                    ));
+                }
+                Self::FrequencyFactors { factors }
+            }
             other => {
                 return Err(format!(
                     "rope_type {other:?} is not supported; supported: {SUPPORTED_ROPE_TYPES}"
@@ -461,6 +482,16 @@ impl Rotary {
                 self.head_dim, self.partial_rotary_factor, self.dims
             ));
         }
+        if let RopeScaling::FrequencyFactors { factors } = &self.scaling {
+            let half = (self.dims / 2) as usize;
+            if factors.len() != half {
+                return Err(format!(
+                    "frequency_factors has {} entries; {} rotary dims need {half}",
+                    factors.len(),
+                    self.dims
+                ));
+            }
+        }
         if let RopeScaling::LongRope(l) = &self.scaling {
             let half = (self.dims / 2) as usize;
             for (name, f) in [
@@ -551,6 +582,11 @@ impl Rotary {
                     .collect()
             }
             RopeScaling::Llama3(l) => llama3_inverse_frequencies(l, &pos_freqs()),
+            RopeScaling::FrequencyFactors { factors } => pos_freqs()
+                .iter()
+                .zip(factors)
+                .map(|(p, &f)| (1.0 / p) / f as f32)
+                .collect(),
             RopeScaling::Proportional { factor } => {
                 // `rope_angles = int(partial * head_dim // 2)` frequencies at
                 // `theta^(2i / head_dim)`, then zeros.

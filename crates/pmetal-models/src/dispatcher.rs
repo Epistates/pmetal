@@ -1519,16 +1519,19 @@ impl DynamicModel {
         // default to tied, so left alone every untied head was dropped and the
         // embedding matrix was used in its place.
         let tied = !weights.contains_key("lm_head.weight");
-        let policy = LoadPolicy::strict().allowing_unused_tensors(&[Exemption::new(
-            "rope_freqs.weight",
-            "the GGUF converter's precomputed RoPE frequency factors (Llama 3.x scaling); \
-             the config's own rope settings are used instead, see the warning below",
-        )]);
-        if weights.contains_key("rope_freqs.weight") {
-            tracing::warn!(
-                "this GGUF carries precomputed RoPE frequency factors, which pmetal does not apply; \
-                 positions beyond the original context window will not match the reference"
-            );
+        let policy = LoadPolicy::strict();
+        // The converter's precomputed RoPE frequency factors (Llama 3.x's
+        // banded scaling) are the model's rotary scaling: part of the config,
+        // not a weight.
+        let mut gguf_config = gguf_config;
+        if let Some(mut factors) = weights.remove("rope_freqs.weight") {
+            let count = factors.size();
+            let factors = factors
+                .to_f32_vec(count)
+                .ok_or_else(|| Exception::custom("GGUF: could not read rope_freqs.weight"))?;
+            gguf_config
+                .set_rope_frequency_factors(&factors)
+                .map_err(|e| Exception::custom(format!("GGUF: {e}")))?;
         }
 
         match arch {

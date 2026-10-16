@@ -410,9 +410,34 @@ pub struct GgufModelConfig {
     pub max_position_embeddings: i32,
     /// Head dimension (if specified)
     pub head_dim: Option<i32>,
+    /// RoPE scaling in the `rope_scaling` dict form a `config.json` states it:
+    /// from the file's `rope.scaling.*` metadata, or the `rope_freqs` tensor
+    /// ([`set_rope_frequency_factors`](Self::set_rope_frequency_factors)).
+    pub rope_scaling: Option<serde_json::Value>,
 }
 
 impl GgufModelConfig {
+    /// Apply the GGUF `rope_freqs` tensor, the per-frequency divisors a
+    /// converter precomputes for Llama 3.x's banded scaling.
+    ///
+    /// The tensor replaces what the file's scaling metadata says; a file that
+    /// states a scaling of its own as well would have two to apply, and gets an
+    /// error rather than one of them.
+    pub fn set_rope_frequency_factors(&mut self, factors: &[f32]) -> Result<(), WeightFormatError> {
+        if self.rope_scaling.is_some() {
+            return Err(WeightFormatError::Gguf(
+                "the file carries both a rope_freqs tensor and rope.scaling metadata; \
+                 applying one of them would be a guess"
+                    .into(),
+            ));
+        }
+        self.rope_scaling = Some(serde_json::json!({
+            "rope_type": "frequency_factors",
+            "factors": factors,
+        }));
+        Ok(())
+    }
+
     /// Resolve a GGUF path (file or directory) and extract its model config
     /// from metadata. Keeps GGUF path resolution encapsulated in this module
     /// so callers (e.g. the inference dispatcher) need only a path.
@@ -448,6 +473,32 @@ impl GgufModelConfig {
                 Some(pmetal_gguf::MetadataValue::Float32(v)) => Some(*v),
                 Some(pmetal_gguf::MetadataValue::Float64(v)) => Some(*v as f32),
                 _ => None,
+            }
+        };
+
+        // `rope.scaling.*`: linear and YaRN are what a `rope_scaling` dict
+        // states; a type this loader does not know is an error, because the
+        // positions past the original context would be wrong without a word.
+        let rope_scaling = match content.get_str(&format!("{arch}.rope.scaling.type")) {
+            None | Some("none") | Some("") => None,
+            Some(kind @ ("linear" | "yarn")) => {
+                let factor = get_f32("rope.scaling.factor").ok_or_else(|| {
+                    WeightFormatError::Gguf(format!(
+                        "{arch}.rope.scaling.type is {kind:?} but {arch}.rope.scaling.factor is \
+                         missing"
+                    ))
+                })?;
+                let mut dict = serde_json::json!({ "rope_type": kind, "factor": factor });
+                if let Some(original) = get_u32("rope.scaling.original_context_length") {
+                    dict["original_max_position_embeddings"] = original.into();
+                }
+                Some(dict)
+            }
+            Some(other) => {
+                return Err(WeightFormatError::Gguf(format!(
+                    "{arch}.rope.scaling.type {other:?} is not supported (linear, yarn and none \
+                     are)"
+                )));
             }
         };
 
@@ -505,6 +556,7 @@ impl GgufModelConfig {
             rope_theta,
             max_position_embeddings,
             head_dim,
+            rope_scaling,
         })
     }
 
@@ -521,6 +573,7 @@ impl GgufModelConfig {
             max_position_embeddings: self.max_position_embeddings,
             rms_norm_eps: self.rms_norm_eps,
             rope_theta: self.rope_theta,
+            rope_scaling: self.rope_scaling.clone(),
             ..Default::default()
         }
     }
@@ -542,6 +595,7 @@ impl GgufModelConfig {
             max_position_embeddings: self.max_position_embeddings,
             rms_norm_eps: self.rms_norm_eps,
             rope_theta: self.rope_theta,
+            rope_scaling: self.rope_scaling.clone(),
             ..Default::default()
         }
     }
@@ -562,6 +616,7 @@ impl GgufModelConfig {
             max_position_embeddings: self.max_position_embeddings,
             rms_norm_eps: self.rms_norm_eps,
             rope_theta: self.rope_theta,
+            rope_scaling: self.rope_scaling.clone(),
             ..Default::default()
         }
     }
@@ -579,6 +634,7 @@ impl GgufModelConfig {
             max_position_embeddings: self.max_position_embeddings,
             rms_norm_eps: self.rms_norm_eps,
             rope_theta: self.rope_theta,
+            rope_scaling: self.rope_scaling.clone(),
             ..Default::default()
         }
     }

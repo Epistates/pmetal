@@ -285,3 +285,73 @@ fn fixed_kernels_exist_wherever_a_compiled_graph_can_replay() {
     assert!(k.periods.is_none());
     crate::check_unobserved_error().unwrap();
 }
+
+/// A GGUF converter writes Llama 3's bands as a `rope_freqs` tensor of
+/// per-frequency divisors: 1 above the high-frequency boundary, the factor
+/// below the low-frequency one, and a smooth blend between. Dividing the
+/// plain frequencies by it gives the bands `rope_type: "llama3"` computes.
+#[test]
+fn frequency_factors_reproduce_the_llama3_bands() {
+    let (head_dim, theta) = (64, 500_000.0f64);
+    let (factor, low, high, original) = (32.0f64, 1.0f64, 4.0f64, 8192.0f64);
+    let plain = Rotary::plain(head_dim, head_dim, theta);
+    let factors: Vec<f64> = plain
+        .inverse_frequencies(0)
+        .iter()
+        .map(|&f| {
+            let wavelength = 2.0 * std::f64::consts::PI / f as f64;
+            if wavelength < original / high {
+                1.0
+            } else if wavelength > original / low {
+                factor
+            } else {
+                let smooth = (original / wavelength - low) / (high - low);
+                1.0 / ((1.0 - smooth) / factor + smooth)
+            }
+        })
+        .collect();
+    let from_tensor = rotary(
+        json!({"rope_theta": theta,
+               "rope_scaling": {"rope_type": "frequency_factors", "factors": factors}}),
+        head_dim,
+    )
+    .unwrap();
+    let from_bands = rotary(
+        json!({"rope_theta": theta, "max_position_embeddings": 131072,
+               "rope_scaling": {"rope_type": "llama3", "factor": factor,
+                   "low_freq_factor": low, "high_freq_factor": high,
+                   "original_max_position_embeddings": original}}),
+        head_dim,
+    )
+    .unwrap();
+    let (a, b) = (
+        from_tensor.inverse_frequencies(0),
+        from_bands.inverse_frequencies(0),
+    );
+    assert_eq!(a.len(), 32);
+    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+        assert!(
+            (x - y).abs() <= 1e-6 * y.abs().max(1e-12) + 1e-9,
+            "frequency {i}: {x} against {y}"
+        );
+    }
+    // The bands are not the identity, or this proves nothing.
+    let plain = plain.inverse_frequencies(0);
+    assert!(a.iter().zip(&plain).any(|(x, p)| (x / p - 1.0).abs() > 0.5));
+}
+
+#[test]
+fn frequency_factors_must_match_the_rotated_dimensions() {
+    let err = rotary(
+        json!({"rope_scaling": {"rope_type": "frequency_factors", "factors": vec![1.0; 5]}}),
+        64,
+    )
+    .unwrap_err();
+    assert!(err.contains("5 entries") && err.contains("32"), "{err}");
+    let err = rotary(
+        json!({"rope_scaling": {"rope_type": "frequency_factors", "factors": vec![0.0; 32]}}),
+        64,
+    )
+    .unwrap_err();
+    assert!(err.contains("positive"), "{err}");
+}
