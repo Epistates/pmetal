@@ -546,11 +546,6 @@ fn tiny_qwen3_moe_config() -> Qwen3MoEConfig {
 fn fused_vs_serial_qwen3_moe_single_token() {
     let config = tiny_qwen3_moe_config();
     let mut model = Qwen3MoE::new(config.clone()).unwrap();
-    // Eagerly populate stacked expert cache so both paths hit the same
-    // stacked-routing kernel; otherwise the first forward builds the cache
-    // while the second reuses it, which does not change numerics but keeps
-    // the parity invariant obvious.
-    model.init_stacked_moe().unwrap();
 
     let input = Array::from_i32_slice(&[9_i32]).reshape(&[1, 1]);
     let max_seq = config.max_position_embeddings as usize;
@@ -580,7 +575,6 @@ fn fused_vs_serial_qwen3_moe_single_token() {
 fn fused_vs_serial_qwen3_moe_multi_step() {
     let config = tiny_qwen3_moe_config();
     let mut model = Qwen3MoE::new(config.clone()).unwrap();
-    model.init_stacked_moe().unwrap();
 
     let max_seq = config.max_position_embeddings as usize;
     let hkv = config.num_kv_heads() as usize;
@@ -905,9 +899,10 @@ fn tiny_cohere_config() -> CohereConfig {
         layer_norm_eps: 1e-5,
         logit_scale: 0.0625,
         tie_word_embeddings: false,
-        use_sliding_window: false,
-        sliding_window: 4096,
-        global_attention_layers: None,
+        model_type: "cohere".to_string(),
+        use_qk_norm: false,
+        sliding_window: None,
+        layer_types: Vec::new(),
         rope_scaling: None,
         rope_parameters: None,
     }

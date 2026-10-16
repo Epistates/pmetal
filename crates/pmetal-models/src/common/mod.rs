@@ -8,10 +8,13 @@
 //! one implementation of every scaling type.
 
 pub mod batched_attention;
+pub mod local_attention;
 pub mod rotary;
+pub mod switch_mlp;
 
 pub use batched_attention::{
     BatchedGqaAttnCfg, batched_gqa_attn, batched_parallel_block, batched_perinorm_layer,
     batched_prenorm_layer,
 };
+pub use local_attention::{layer_is_sliding, windowed_mask};
 pub use rotary::rotary_embedding;

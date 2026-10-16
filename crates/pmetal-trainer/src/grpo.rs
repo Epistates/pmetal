@@ -1214,7 +1214,7 @@ impl GrpoTrainer {
             .generate(
                 |input, cache| {
                     model
-                        .forward_with_cache(input, None, Some(cache))
+                        .forward_with_cache_last(input, None, Some(cache))
                         .map_err(|e| Exception::custom(e.to_string()))
                 },
                 prompt_tokens,

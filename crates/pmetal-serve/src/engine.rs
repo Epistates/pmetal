@@ -688,7 +688,7 @@ fn continuous_step(state: &mut EngineState) -> Background {
      -> Result<Array, pmetal_runtime::compat::Exception> {
         let input = Array::from_u32_slice(tokens, &[1, tokens.len() as i32])
             .as_dtype(Dtype::Int32.as_i32());
-        model.forward_with_hybrid_cache(&input, None, Some(cache), recurrent)
+        model.forward_with_hybrid_cache_last(&input, None, Some(cache), recurrent)
     };
     match pump.tick(&mut forward) {
         Ok(Tick::Ran) => Background::Busy,
@@ -1778,7 +1778,7 @@ impl InferenceEngine {
         mamba_cache: Option<&mut MambaCache>,
     ) -> Result<Array, pmetal_runtime::compat::Exception> {
         match media {
-            None => model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache),
+            None => model.forward_with_hybrid_cache_last(input, None, Some(cache), mamba_cache),
             Some(MediaForward::Qwen3_5 { next_position, .. }) => {
                 let qwen = model.as_qwen3_next_mut().ok_or_else(|| {
                     pmetal_runtime::compat::Exception::custom("not a Qwen 3.5-family model")

@@ -17,6 +17,7 @@ use pmetal_cache::kv_cache::{
 use pmetal_runtime::compat::{
     Array, Dtype, Exception, Module, ModuleParameters, ModuleParametersExt, nn, ops,
 };
+use pmetal_runtime::decode::last_token_hidden;
 use std::path::Path;
 
 const PARAM_EVAL_BATCH_SIZE: usize = 128;
@@ -55,6 +56,23 @@ fn load_checked<M: ModuleParametersExt, T>(
         .require_complete(model, policy, Vec::new())
         .map_err(|e| Exception::custom(e.with_quantization_hint(model_dir).to_string()))?;
     Ok(out)
+}
+
+/// Load a checkpoint into a routed-expert model: its experts stacked into the
+/// `mlp.switch_mlp` layout the model holds
+/// ([`stack_experts`](crate::loader::experts::stack_experts)), then assigned
+/// under `policy`, which fails unless checkpoint and model account for each
+/// other.
+fn load_with_stacked_experts<M: ModuleParametersExt>(
+    family: &str,
+    model: &mut M,
+    model_dir: &Path,
+    policy: &LoadPolicy,
+) -> Result<(), Exception> {
+    let weights = load_weights(model_dir).map_err(|e| Exception::custom(e.to_string()))?;
+    let weights = crate::loader::experts::stack_experts(family, weights)?;
+    assign_weights(model, weights, policy)
+        .map_err(|e| Exception::custom(e.with_quantization_hint(model_dir).to_string()))
 }
 
 /// Rewrite the bare `Infinity` / `NaN` literals some released configs contain
@@ -721,28 +739,6 @@ macro_rules! simple_load {
     }};
 }
 
-/// Same as `simple_load!` but additionally calls `init_post_load_fast_paths()`
-/// on the wrapped `DynamicModel` before returning — required for MoE
-/// architectures (Qwen3MoE, DeepSeek, NemotronH, GptOss) that materialise
-/// stacked expert weights after the base load.
-macro_rules! simple_load_moe {
-    ($config_ty:ty, $new:expr, $content:expr, $model_dir:expr, $variant:ident) => {{
-        let config: $config_ty =
-            json5::from_str($content).map_err(|e| Exception::custom(e.to_string()))?;
-        let mut model = ($new)(config)?;
-        load_generic_weights_with(
-            &mut model,
-            $model_dir,
-            &ModelArchitecture::$variant.load_policy(),
-        )
-        .map_err(|e| Exception::custom(e.to_string()))?;
-        eval_module_parameters_batched(&model)?;
-        let mut model = Self::$variant(model);
-        model.init_post_load_fast_paths()?;
-        Ok(model)
-    }};
-}
-
 /// An LM head in the form cut cross-entropy computes a loss from: the logits
 /// of hidden states `h` are `softcap(logit_scale · (h·Wᵀ + b))`, never
 /// materialised. See [`DynamicModel::lm_head`].
@@ -905,7 +901,6 @@ impl std::fmt::Debug for DynamicModel {
 impl DynamicModel {
     fn init_post_load_fast_paths(&mut self) -> Result<(), Exception> {
         match self {
-            Self::Qwen3MoE(model) => model.init_stacked_moe(),
             Self::NemotronH(model) => model.init_stacked_moe(),
             Self::GptOss(model) => model.init_stacked_moe(),
             _ => Ok(()),
@@ -1098,13 +1093,23 @@ impl DynamicModel {
                 model_dir,
                 Qwen3
             ),
-            ModelArchitecture::Qwen3MoE => simple_load_moe!(
-                Qwen3MoEConfig,
-                Qwen3MoE::new,
-                &config_content,
-                model_dir,
-                Qwen3MoE
-            ),
+            // The parameter tree is the checkpoint's layout with each layer's
+            // experts stacked: a released checkpoint's expert-per-key tensors
+            // and transformers 5's fused `gate_up_proj` are stacked at load,
+            // an MLX conversion's `mlp.switch_mlp` is held as it is.
+            ModelArchitecture::Qwen3MoE => {
+                let config: Qwen3MoEConfig = json5::from_str(&config_content)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                let mut model = Qwen3MoE::new(config)?;
+                load_with_stacked_experts(
+                    "qwen3_moe",
+                    &mut model,
+                    model_dir,
+                    &ModelArchitecture::Qwen3MoE.load_policy(),
+                )?;
+                eval_module_parameters_batched(&model)?;
+                Ok(Self::Qwen3MoE(model))
+            }
             ModelArchitecture::Gemma => {
                 let config = parse_gemma_config(&config_content)?;
                 let mut model = GemmaForCausalLM::new(config)?;
@@ -1192,12 +1197,7 @@ impl DynamicModel {
                     ));
                 }
                 let mut model = DeepSeek::new(config)?;
-                let weights = crate::loader::load_weights(model_dir)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let weights = crate::architectures::deepseek::stack_experts(weights)?;
-                assign_weights(&mut model, weights, &policy).map_err(|e| {
-                    Exception::custom(e.with_quantization_hint(model_dir).to_string())
-                })?;
+                load_with_stacked_experts("deepseek", &mut model, model_dir, &policy)?;
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::DeepSeek(model))
             }
@@ -1223,9 +1223,9 @@ impl DynamicModel {
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::Granite(model))
             }
-            // NemotronH uses a bespoke weight loader (load_nemotron_weights) so we
-            // can't route through simple_load_moe!, but the init_post_load_fast_paths
-            // step still applies after weights are materialised.
+            // NemotronH uses a bespoke weight loader (`load_nemotron_weights`);
+            // `init_post_load_fast_paths` still applies once the weights are
+            // materialised.
             ModelArchitecture::NemotronH => {
                 let config: NemotronHConfig = json5::from_str(&config_content)
                     .map_err(|e| Exception::custom(e.to_string()))?;
@@ -1519,16 +1519,19 @@ impl DynamicModel {
         // default to tied, so left alone every untied head was dropped and the
         // embedding matrix was used in its place.
         let tied = !weights.contains_key("lm_head.weight");
-        let policy = LoadPolicy::strict().allowing_unused_tensors(&[Exemption::new(
-            "rope_freqs.weight",
-            "the GGUF converter's precomputed RoPE frequency factors (Llama 3.x scaling); \
-             the config's own rope settings are used instead, see the warning below",
-        )]);
-        if weights.contains_key("rope_freqs.weight") {
-            tracing::warn!(
-                "this GGUF carries precomputed RoPE frequency factors, which pmetal does not apply; \
-                 positions beyond the original context window will not match the reference"
-            );
+        let policy = LoadPolicy::strict();
+        // The converter's precomputed RoPE frequency factors (Llama 3.x's
+        // banded scaling) are the model's rotary scaling: part of the config,
+        // not a weight.
+        let mut gguf_config = gguf_config;
+        if let Some(mut factors) = weights.remove("rope_freqs.weight") {
+            let count = factors.size();
+            let factors = factors
+                .to_f32_vec(count)
+                .ok_or_else(|| Exception::custom("GGUF: could not read rope_freqs.weight"))?;
+            gguf_config
+                .set_rope_frequency_factors(&factors)
+                .map_err(|e| Exception::custom(format!("GGUF: {e}")))?;
         }
 
         match arch {
@@ -1570,11 +1573,41 @@ impl DynamicModel {
                     .map_err(|e| Exception::custom(e.to_string()))?;
                 Ok(Self::Mistral(model))
             }
+            ModelArchitecture::Phi | ModelArchitecture::Phi4 => {
+                // LongRoPE's two factor tables ride beside the weights.
+                let mut table = |name: &str| -> Result<Option<Vec<f32>>, Exception> {
+                    weights
+                        .remove(name)
+                        .map(|mut t| {
+                            let n = t.size();
+                            t.to_f32_vec(n).ok_or_else(|| {
+                                Exception::custom(format!("GGUF: could not read {name}"))
+                            })
+                        })
+                        .transpose()
+                };
+                let short = table("rope_factors_short.weight")?;
+                let long = table("rope_factors_long.weight")?;
+                gguf_config
+                    .set_longrope_factors(short.as_deref(), long.as_deref())
+                    .map_err(|e| Exception::custom(format!("GGUF: {e}")))?;
+                let mut config = gguf_config.to_phi_config();
+                config.tie_word_embeddings = tied;
+
+                crate::weight_format::name_phi3_fused_tensors(&mut weights);
+                crate::loader::split_phi_fused_qkv(&mut weights, &config);
+                let mut model = PhiForCausalLM::new(config)?;
+                assign_weights(&mut model, weights, &policy)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                Ok(if arch == ModelArchitecture::Phi4 {
+                    Self::Phi4(model)
+                } else {
+                    Self::Phi(model)
+                })
+            }
             other => Err(Exception::custom(format!(
                 "GGUF inference loading is not yet implemented for {other} \
-                 (supported: dense Llama, Qwen2, Qwen3, Mistral). Phi-3 GGUFs fuse the \
-                 attention and MLP projections and carry LongRoPE factors, none of which \
-                 the loader reads yet."
+                 (supported: dense Llama, Qwen2, Qwen3, Mistral, Phi-3)."
             ))),
         }
     }
@@ -1862,6 +1895,36 @@ impl DynamicModel {
                 "forward_hidden_with_positions is not implemented for {other:?}; \
                  check supports_packed_positions() before calling"
             ))),
+        }
+    }
+
+    /// [`forward_with_cache`](Self::forward_with_cache) returning the last
+    /// position's logits, `[B, 1, vocab]`, for a caller that samples from them
+    /// alone: a prefill, or a decode step.
+    ///
+    /// The LM head runs on that one position where the architecture has this
+    /// path (Llama, Qwen 2/3, Qwen3-MoE, Mistral, Phi, Cohere, Granite); the
+    /// others compute every position's logits and slice, which is the same
+    /// numbers at the cost of the `[B, T, vocab]` allocation. The cache is
+    /// filled as the full forward fills it.
+    pub fn forward_with_cache_last(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, Exception> {
+        match self {
+            Self::Llama(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::Qwen2(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::Qwen3(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::Qwen3MoE(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::Cohere(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::Granite(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::Mistral(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::Phi(m) | Self::Phi4(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            _ => Ok(last_token_hidden(
+                &self.forward_with_cache(input_ids, mask, cache)?,
+            )),
         }
     }
 
@@ -2351,9 +2414,10 @@ impl DynamicModel {
 
     /// [`forward_with_hybrid_cache`](Self::forward_with_hybrid_cache) returning
     /// the last position's logits, `[B, 1, vocab]`, for a caller that samples
-    /// from them alone: a prefill, or a decode step. Qwen 3.5 runs its head on
-    /// that one position; the other architectures compute every position's and
-    /// slice.
+    /// from them alone: a prefill, or a decode step. Qwen 3.5, Granite and the
+    /// architectures of [`forward_with_cache_last`](Self::forward_with_cache_last)
+    /// run their head on that one position; the others compute every position's
+    /// and slice.
     pub fn forward_with_hybrid_cache_last(
         &mut self,
         input_ids: &Array,
@@ -2361,12 +2425,16 @@ impl DynamicModel {
         kv_cache: Option<&mut KVCache>,
         mamba_cache: Option<&mut MambaCache>,
     ) -> Result<Array, Exception> {
-        if let Self::Qwen3Next(m) = self {
-            return m.forward_with_cache_last(input_ids, mask, kv_cache, mamba_cache);
+        match self {
+            Self::Qwen3Next(m) => m.forward_with_cache_last(input_ids, mask, kv_cache, mamba_cache),
+            Self::Granite(m) => {
+                m.forward_with_hybrid_cache_last(input_ids, mask, kv_cache, mamba_cache)
+            }
+            Self::NemotronH(_) | Self::Qwen4Exp(_) => Ok(last_token_hidden(
+                &self.forward_with_hybrid_cache(input_ids, mask, kv_cache, mamba_cache)?,
+            )),
+            _ => self.forward_with_cache_last(input_ids, mask, kv_cache),
         }
-        let logits = self.forward_with_hybrid_cache(input_ids, mask, kv_cache, mamba_cache)?;
-        let (b, t, v) = (logits.dim(0), logits.dim(1), logits.dim(2));
-        Ok(logits.slice(&[0, t - 1, 0], &[b, t, v]))
     }
 
     /// Whether this architecture has a fused `[N, 1]` batched-decode
@@ -2425,7 +2493,12 @@ impl DynamicModel {
             // Cohere: parallel decoder block via `batched_parallel_block`.
             // Sliding-window-with-non-global-layers configs need a per-layer
             // sliding overlay; defer those to a follow-up.
-            Self::Cohere(m) => !m.config.use_sliding_window && m.has_scalar_rope(),
+            Self::Cohere(m) => {
+                // The fused block is one global, rotated, un-normalized
+                // attention shape: Cohere2 layers and Command R+'s query/key
+                // norm take the serial path.
+                !m.config.has_cohere2_layers() && !m.config.use_qk_norm && m.has_scalar_rope()
+            }
             // Granite: plain `granite` configs route through
             // `batched_prenorm_layer`. The MoE and hybrid families (experts,
             // shared MLP, Mamba state) stay on serial.
@@ -2801,24 +2874,6 @@ mod tests {
         );
     }
 
-    fn tiny_qwen3_moe_config() -> Qwen3MoEConfig {
-        Qwen3MoEConfig {
-            hidden_size: 32,
-            intermediate_size: 64,
-            moe_intermediate_size: Some(32),
-            num_hidden_layers: 2,
-            num_attention_heads: 2,
-            num_key_value_heads: Some(1),
-            head_dim: 16,
-            vocab_size: 100,
-            num_experts: 4,
-            num_experts_per_tok: 2,
-            decoder_sparse_step: 1,
-            tie_word_embeddings: true,
-            ..Default::default()
-        }
-    }
-
     fn tiny_nemotron_h_config() -> NemotronHConfig {
         NemotronHConfig {
             model_type: "nemotron_h".to_string(),
@@ -3011,21 +3066,6 @@ mod tests {
             .unwrap(),
         );
         assert!(model.requires_expert_offloading());
-    }
-
-    #[test]
-    #[serial]
-    fn qwen3_moe_post_load_fast_paths_initialize_stacked_experts() {
-        let mut model = DynamicModel::Qwen3MoE(Qwen3MoE::new(tiny_qwen3_moe_config()).unwrap());
-        model.init_post_load_fast_paths().unwrap();
-
-        let DynamicModel::Qwen3MoE(model) = &model else {
-            panic!("expected qwen3-moe model");
-        };
-        let Qwen3MoEFeedForward::MoE(moe) = &model.model.layers[0].ffn else {
-            panic!("expected moe layer");
-        };
-        assert!(moe.has_stacked_moe());
     }
 
     #[test]

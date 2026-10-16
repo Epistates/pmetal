@@ -21,6 +21,7 @@
 //! [`GraniteConfig::validate`].
 
 use pmetal_runtime::compat::{Array, Exception, Module, ModuleParameters, ModuleParametersExt, nn};
+use pmetal_runtime::decode::last_token_hidden;
 use pmetal_runtime::impl_module_params;
 
 use pmetal_cache::kv_cache::{KVCache, MambaCache};
@@ -1184,6 +1185,35 @@ impl GraniteForCausalLM {
             self.model
                 .forward_with_hybrid_cache(input_ids, mask, cache, mamba_cache)?;
         self.project_logits(&hidden_states)
+    }
+
+    /// [`forward_with_cache`](Self::forward_with_cache) returning the last
+    /// position's logits, `[B, 1, vocab]`: the LM head runs on one hidden state
+    /// per sequence instead of every prompt token's, for a caller that samples
+    /// from the last position alone (a prefill, a decode step).
+    pub fn forward_with_cache_last(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, Exception> {
+        let hidden_states = self.model.forward_with_cache(input_ids, mask, cache)?;
+        self.project_logits(&last_token_hidden(&hidden_states))
+    }
+
+    /// [`forward_with_hybrid_cache`](Self::forward_with_hybrid_cache) returning
+    /// the last position's logits, `[B, 1, vocab]`.
+    pub fn forward_with_hybrid_cache_last(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+        mamba_cache: Option<&mut MambaCache>,
+    ) -> Result<Array, Exception> {
+        let hidden_states =
+            self.model
+                .forward_with_hybrid_cache(input_ids, mask, cache, mamba_cache)?;
+        self.project_logits(&last_token_hidden(&hidden_states))
     }
 
     /// Forward pass with one rotary position per token; see

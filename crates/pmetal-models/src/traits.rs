@@ -3,8 +3,6 @@
 //! This module defines the common interfaces that all model architectures implement,
 //! enabling extensible model support with static dispatch.
 
-use std::collections::HashMap;
-
 use pmetal_runtime::compat::{Array, Exception};
 
 /// Configuration common to all causal LM architectures.
@@ -71,8 +69,8 @@ pub trait CausalLMModel {
 
     /// Create a new model from configuration.
     ///
-    /// Initializes the model with random weights. Use `load_weights`
-    /// to load pretrained weights after construction.
+    /// Initializes the model with random weights; [`DynamicModel::load`](crate::DynamicModel::load)
+    /// builds one from a checkpoint, auditing that every tensor is accounted for.
     fn new(config: Self::Config) -> Result<Self, Exception>
     where
         Self: Sized;
@@ -89,14 +87,6 @@ pub trait CausalLMModel {
 
     /// Get model configuration.
     fn config(&self) -> &Self::Config;
-
-    /// Load weights from a HashMap of tensors.
-    ///
-    /// The keys should match the model's parameter names in HuggingFace format:
-    /// - `model.embed_tokens.weight`
-    /// - `model.layers.{i}.self_attn.q_proj.weight`
-    /// - etc.
-    fn load_weights(&mut self, weights: &HashMap<String, Array>) -> Result<(), Exception>;
 
     /// Evaluate all parameters to materialize them on device.
     fn eval(&self) -> Result<(), Exception>;
