@@ -20,6 +20,7 @@ use crate::decoder_layer::{
 };
 use pmetal_runtime::compat::nn::{Embedding, Linear};
 use pmetal_runtime::compat::{Array, Exception, Module, Param, nn};
+use pmetal_runtime::decode::last_token_hidden;
 use pmetal_runtime::impl_module_params;
 
 use pmetal_cache::kv_cache::KVCache;
@@ -32,7 +33,6 @@ use pmetal_runtime::rope::{RopeConfig, RotaryEmbedding};
 use crate::architectures::utils::{Activation, resolve_activation};
 use crate::checkpointing::checkpointed_layer;
 use crate::traits::{CausalLMModel, ModelConfig};
-use std::collections::HashMap;
 
 /// Phi model configuration.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -168,102 +168,6 @@ impl PhiConfig {
             partial_rotary_factor: 1.0,
             rms_norm_eps: 1e-5,
             qkv_bias: false,
-            hidden_act: PhiActivation::SwiGLU,
-            sliding_window: None,
-            layer_norm_type: LayerNormType::RmsNorm,
-            original_max_position_embeddings: None,
-            rope_scaling: None,
-            tie_word_embeddings: false,
-        }
-    }
-
-    /// Phi-3-mini-128k configuration (3.8B, 128K context).
-    pub fn phi3_mini_128k() -> Self {
-        Self {
-            model_type: "phi3".to_string(),
-            vocab_size: 32064,
-            hidden_size: 3072,
-            intermediate_size: 8192,
-            num_hidden_layers: 32,
-            num_attention_heads: 32,
-            num_key_value_heads: 32,
-            max_position_embeddings: 131072,
-            rope_theta: 10000.0,
-            partial_rotary_factor: 0.5,
-            rms_norm_eps: 1e-5,
-            qkv_bias: false,
-            hidden_act: PhiActivation::SwiGLU,
-            sliding_window: None,
-            layer_norm_type: LayerNormType::RmsNorm,
-            original_max_position_embeddings: Some(4096),
-            rope_scaling: None, // SuRoPE handled separately
-            tie_word_embeddings: false,
-        }
-    }
-
-    /// Phi-3.5-mini configuration (3.8B, 128K context).
-    pub fn phi35_mini() -> Self {
-        Self {
-            model_type: "phi3".to_string(),
-            vocab_size: 32064,
-            hidden_size: 3072,
-            intermediate_size: 8192,
-            num_hidden_layers: 32,
-            num_attention_heads: 32,
-            num_key_value_heads: 32,
-            max_position_embeddings: 131072,
-            rope_theta: 10000.0,
-            partial_rotary_factor: 0.5,
-            rms_norm_eps: 1e-5,
-            qkv_bias: false,
-            hidden_act: PhiActivation::SwiGLU,
-            sliding_window: None,
-            layer_norm_type: LayerNormType::RmsNorm,
-            original_max_position_embeddings: Some(4096),
-            rope_scaling: None,
-            tie_word_embeddings: false,
-        }
-    }
-
-    /// Phi-3-medium configuration (14B, 4K context).
-    pub fn phi3_medium() -> Self {
-        Self {
-            model_type: "phi3".to_string(),
-            vocab_size: 32064,
-            hidden_size: 5120,
-            intermediate_size: 17920,
-            num_hidden_layers: 40,
-            num_attention_heads: 40,
-            num_key_value_heads: 10,
-            max_position_embeddings: 4096,
-            rope_theta: 10000.0,
-            partial_rotary_factor: 0.4,
-            rms_norm_eps: 1e-5,
-            qkv_bias: false,
-            hidden_act: PhiActivation::SwiGLU,
-            sliding_window: None,
-            layer_norm_type: LayerNormType::RmsNorm,
-            original_max_position_embeddings: None,
-            rope_scaling: None,
-            tie_word_embeddings: false,
-        }
-    }
-
-    /// Phi-4 configuration (14B, 16K context).
-    pub fn phi4() -> Self {
-        Self {
-            model_type: "phi3".to_string(),
-            vocab_size: 100352,
-            hidden_size: 5120,
-            intermediate_size: 17920,
-            num_hidden_layers: 40,
-            num_attention_heads: 40,
-            num_key_value_heads: 10,
-            max_position_embeddings: 16384,
-            rope_theta: 250000.0,
-            partial_rotary_factor: 0.4,
-            rms_norm_eps: 1e-5,
-            qkv_bias: true,
             hidden_act: PhiActivation::SwiGLU,
             sliding_window: None,
             layer_norm_type: LayerNormType::RmsNorm,
@@ -794,6 +698,20 @@ impl PhiForCausalLM {
         self.project_logits(&hidden)
     }
 
+    /// [`forward_with_cache`](Self::forward_with_cache) returning the last
+    /// position's logits, `[B, 1, vocab]`: the LM head runs on one hidden state
+    /// per sequence instead of every prompt token's, for a caller that samples
+    /// from the last position alone (a prefill, a decode step).
+    pub fn forward_with_cache_last(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, Exception> {
+        let hidden = self.model.forward_with_cache(input_ids, mask, cache)?;
+        self.project_logits(&last_token_hidden(&hidden))
+    }
+
     /// Forward pass with one rotary position per token; see
     /// `forward_with_positions` on the inner model.
     pub fn forward_with_positions(
@@ -955,11 +873,6 @@ impl CausalLMModel for PhiForCausalLM {
         Self::config(self)
     }
 
-    fn load_weights(&mut self, weights: &HashMap<String, Array>) -> Result<(), Exception> {
-        crate::loader::load_phi_weights(self, weights)
-            .map_err(|e: crate::loader::LoadError| Exception::custom(e.to_string()))
-    }
-
     fn eval(&self) -> Result<(), Exception> {
         pmetal_runtime::compat::ModuleParametersExt::eval(self)
     }
@@ -1011,11 +924,7 @@ mod tests {
     fn phi_longrope_matches_transformers_oracle() {
         let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.push("tests/fixtures/phi_surope_reference.safetensors");
-        let shard: std::collections::HashMap<String, Array> =
-            pmetal_runtime::inline_array::load_safetensors_shard(path.to_str().unwrap())
-                .expect("load surope fixture")
-                .into_iter()
-                .collect();
+        let shard = crate::loader::load_safetensors_file(&path).expect("load surope fixture");
         let x = shard.get("x").expect("x").clone();
         let y_ref = shard.get("y").expect("y").clone();
         let mut long_factor_arr = shard.get("long_factor").expect("long_factor").clone();
@@ -1070,7 +979,7 @@ mod tests {
     }
 
     #[test]
-    fn test_phi_config_presets() {
+    fn test_phi3_mini_config_is_full_rotary() {
         let mini = PhiConfig::phi3_mini();
         assert_eq!(mini.hidden_size, 3072);
         assert_eq!(mini.num_hidden_layers, 32);
@@ -1081,14 +990,6 @@ mod tests {
         // preset claimed 0.5, which is what halved RoPE on every real Phi-3
         // checkpoint pmetal loaded.
         assert_eq!(mini.rope_dim(), 96);
-
-        let medium = PhiConfig::phi3_medium();
-        assert_eq!(medium.hidden_size, 5120);
-        assert_eq!(medium.num_key_value_heads, 10); // GQA
-
-        let phi4 = PhiConfig::phi4();
-        // assert_eq!(phi4.vocab_size, 100352); // Some versions might vary
-        assert!(phi4.qkv_bias);
     }
 
     #[test]
@@ -1273,14 +1174,5 @@ mod tests {
         logits.eval().unwrap();
 
         assert_eq!(logits.shape(), &[1, 1, 1000]);
-    }
-
-    #[test]
-    fn test_phi4_config() {
-        let config = PhiConfig::phi4();
-        assert_eq!(config.vocab_size, 100352);
-        assert!(config.qkv_bias);
-        assert_eq!(config.rope_theta, 250000.0);
-        assert_eq!(config.partial_rotary_factor, 0.4);
     }
 }

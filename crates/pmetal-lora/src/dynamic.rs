@@ -219,6 +219,23 @@ impl DynamicLoraModel {
             .forward_with_hybrid_cache(input_ids, mask, kv_cache, mamba_cache)
             .map_err(LoraError::Mlx)
     }
+
+    /// [`forward_with_hybrid_cache`](Self::forward_with_hybrid_cache) returning
+    /// the last position's logits, `[B, 1, vocab]`: the head runs on one hidden
+    /// state per sequence where the architecture allows, adapters on it
+    /// included.
+    pub fn forward_with_hybrid_cache_last(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        kv_cache: Option<&mut KVCache>,
+        mamba_cache: Option<&mut pmetal_cache::kv_cache::MambaCache>,
+    ) -> Result<Array, LoraError> {
+        self.inner
+            .model_mut()
+            .forward_with_hybrid_cache_last(input_ids, mask, kv_cache, mamba_cache)
+            .map_err(LoraError::Mlx)
+    }
 }
 
 impl pmetal_runtime::compat::ModuleParameters for DynamicLoraModel {
@@ -342,6 +359,15 @@ impl TrainableModel for DynamicLoraModel {
         cache: Option<&mut KVCache>,
     ) -> Result<Array, LoraError> {
         TrainableModel::forward_with_cache(&mut self.inner, input_ids, mask, cache)
+    }
+
+    fn forward_with_cache_last(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, LoraError> {
+        TrainableModel::forward_with_cache_last(&mut self.inner, input_ids, mask, cache)
     }
 
     fn create_cache(&self, max_seq_len: usize) -> Option<KVCache> {

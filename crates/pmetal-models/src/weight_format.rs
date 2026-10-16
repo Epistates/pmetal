@@ -410,9 +410,40 @@ pub struct GgufModelConfig {
     pub max_position_embeddings: i32,
     /// Head dimension (if specified)
     pub head_dim: Option<i32>,
+    /// Channels the rotation spans (`rope.dimension_count`): the head for a
+    /// full-rotary model, a fraction of it for Phi-4-mini's partial one.
+    pub rope_dimension_count: Option<i32>,
+    /// The pretraining context the scaled frequencies are defined against
+    /// (`rope.scaling.original_context_length`).
+    pub original_context_length: Option<i32>,
+    /// RoPE scaling in the `rope_scaling` dict form a `config.json` states it:
+    /// from the file's `rope.scaling.*` metadata, or the `rope_freqs` tensor
+    /// ([`set_rope_frequency_factors`](Self::set_rope_frequency_factors)).
+    pub rope_scaling: Option<serde_json::Value>,
 }
 
 impl GgufModelConfig {
+    /// Apply the GGUF `rope_freqs` tensor, the per-frequency divisors a
+    /// converter precomputes for Llama 3.x's banded scaling.
+    ///
+    /// The tensor replaces what the file's scaling metadata says; a file that
+    /// states a scaling of its own as well would have two to apply, and gets an
+    /// error rather than one of them.
+    pub fn set_rope_frequency_factors(&mut self, factors: &[f32]) -> Result<(), WeightFormatError> {
+        if self.rope_scaling.is_some() {
+            return Err(WeightFormatError::Gguf(
+                "the file carries both a rope_freqs tensor and rope.scaling metadata; \
+                 applying one of them would be a guess"
+                    .into(),
+            ));
+        }
+        self.rope_scaling = Some(serde_json::json!({
+            "rope_type": "frequency_factors",
+            "factors": factors,
+        }));
+        Ok(())
+    }
+
     /// Resolve a GGUF path (file or directory) and extract its model config
     /// from metadata. Keeps GGUF path resolution encapsulated in this module
     /// so callers (e.g. the inference dispatcher) need only a path.
@@ -448,6 +479,36 @@ impl GgufModelConfig {
                 Some(pmetal_gguf::MetadataValue::Float32(v)) => Some(*v),
                 Some(pmetal_gguf::MetadataValue::Float64(v)) => Some(*v as f32),
                 _ => None,
+            }
+        };
+
+        // `rope.scaling.*`: linear and YaRN are what a `rope_scaling` dict
+        // states; a type this loader does not know is an error, because the
+        // positions past the original context would be wrong without a word.
+        let rope_scaling = match content.get_str(&format!("{arch}.rope.scaling.type")) {
+            None | Some("none") | Some("") => None,
+            // LongRoPE's factors are tensors, not metadata: the dict stays
+            // incomplete here (the Phi loader completes it from the tensors) and
+            // a family that cannot read it is refused by the missing factors.
+            Some("longrope") => Some(serde_json::json!({ "rope_type": "longrope" })),
+            Some(kind @ ("linear" | "yarn")) => {
+                let factor = get_f32("rope.scaling.factor").ok_or_else(|| {
+                    WeightFormatError::Gguf(format!(
+                        "{arch}.rope.scaling.type is {kind:?} but {arch}.rope.scaling.factor is \
+                         missing"
+                    ))
+                })?;
+                let mut dict = serde_json::json!({ "rope_type": kind, "factor": factor });
+                if let Some(original) = get_u32("rope.scaling.original_context_length") {
+                    dict["original_max_position_embeddings"] = original.into();
+                }
+                Some(dict)
+            }
+            Some(other) => {
+                return Err(WeightFormatError::Gguf(format!(
+                    "{arch}.rope.scaling.type {other:?} is not supported (linear, yarn and none \
+                     are)"
+                )));
             }
         };
 
@@ -493,6 +554,10 @@ impl GgufModelConfig {
             .or_else(|| get_u32("rope.dimension_count"))
             .map(|v| v as i32);
 
+        let rope_dimension_count = get_u32("rope.dimension_count").map(|v| v as i32);
+        let original_context_length =
+            get_u32("rope.scaling.original_context_length").map(|v| v as i32);
+
         Ok(Self {
             architecture: arch,
             hidden_size,
@@ -505,6 +570,9 @@ impl GgufModelConfig {
             rope_theta,
             max_position_embeddings,
             head_dim,
+            rope_dimension_count,
+            original_context_length,
+            rope_scaling,
         })
     }
 
@@ -521,6 +589,7 @@ impl GgufModelConfig {
             max_position_embeddings: self.max_position_embeddings,
             rms_norm_eps: self.rms_norm_eps,
             rope_theta: self.rope_theta,
+            rope_scaling: self.rope_scaling.clone(),
             ..Default::default()
         }
     }
@@ -542,6 +611,7 @@ impl GgufModelConfig {
             max_position_embeddings: self.max_position_embeddings,
             rms_norm_eps: self.rms_norm_eps,
             rope_theta: self.rope_theta,
+            rope_scaling: self.rope_scaling.clone(),
             ..Default::default()
         }
     }
@@ -562,7 +632,63 @@ impl GgufModelConfig {
             max_position_embeddings: self.max_position_embeddings,
             rms_norm_eps: self.rms_norm_eps,
             rope_theta: self.rope_theta,
+            rope_scaling: self.rope_scaling.clone(),
             ..Default::default()
+        }
+    }
+
+    /// Complete a Phi-3 LongRoPE scaling with the `rope_factors_short` and
+    /// `rope_factors_long` tensors the converter writes beside the weights.
+    ///
+    /// A model with neither has no scaling to complete; one tensor without the
+    /// other is an error.
+    pub fn set_longrope_factors(
+        &mut self,
+        short: Option<&[f32]>,
+        long: Option<&[f32]>,
+    ) -> Result<(), WeightFormatError> {
+        let (short, long) = match (short, long) {
+            (None, None) => return Ok(()),
+            (Some(short), Some(long)) => (short, long),
+            _ => {
+                return Err(WeightFormatError::Gguf(
+                    "the file has only one of rope_factors_short and rope_factors_long".into(),
+                ));
+            }
+        };
+        let mut dict = serde_json::json!({
+            "rope_type": "longrope",
+            "short_factor": short,
+            "long_factor": long,
+        });
+        if let Some(original) = self.original_context_length {
+            dict["original_max_position_embeddings"] = original.into();
+        }
+        self.rope_scaling = Some(dict);
+        Ok(())
+    }
+
+    /// Convert to Phi-3 / Phi-4-mini config.
+    ///
+    /// `rope.dimension_count` is the rotated width, so the head is
+    /// `hidden / heads` and the partial rotary factor their ratio.
+    pub fn to_phi_config(&self) -> crate::architectures::phi::PhiConfig {
+        let head_dim = (self.hidden_size / self.num_attention_heads.max(1)).max(1);
+        let rope_dim = self.rope_dimension_count.unwrap_or(head_dim);
+        crate::architectures::phi::PhiConfig {
+            vocab_size: self.vocab_size,
+            hidden_size: self.hidden_size,
+            intermediate_size: self.intermediate_size,
+            num_hidden_layers: self.num_hidden_layers,
+            num_attention_heads: self.num_attention_heads,
+            num_key_value_heads: self.num_kv_heads.unwrap_or(self.num_attention_heads),
+            max_position_embeddings: self.max_position_embeddings,
+            rope_theta: self.rope_theta,
+            partial_rotary_factor: rope_dim as f32 / head_dim as f32,
+            rms_norm_eps: self.rms_norm_eps,
+            original_max_position_embeddings: self.original_context_length,
+            rope_scaling: self.rope_scaling.clone(),
+            ..crate::architectures::phi::PhiConfig::phi3_mini()
         }
     }
 
@@ -579,7 +705,37 @@ impl GgufModelConfig {
             max_position_embeddings: self.max_position_embeddings,
             rms_norm_eps: self.rms_norm_eps,
             rope_theta: self.rope_theta,
+            rope_scaling: self.rope_scaling.clone(),
             ..Default::default()
+        }
+    }
+}
+
+/// Name a Phi-3 GGUF's fused tensors as the model holds them.
+///
+/// Phi-3 keeps the attention projections in one `attn_qkv` (rows q, k, v) and
+/// the SwiGLU gate and up projections in one `ffn_up` (rows gate, up), where
+/// the generic name map treats `ffn_up` as the up projection alone. They become
+/// `self_attn.qkv_proj` (split into three by
+/// [`split_phi_fused_qkv`](crate::loader::split_phi_fused_qkv)) and
+/// `mlp.gate_up_proj`, the names of the Hugging Face checkpoint.
+pub fn name_phi3_fused_tensors(weights: &mut HashMap<String, Array>) {
+    let renames: Vec<(String, String)> = weights
+        .keys()
+        .filter_map(|key| {
+            if let Some(layer) = key.strip_suffix(".attn_qkv.weight") {
+                return Some((key.clone(), format!("{layer}.self_attn.qkv_proj.weight")));
+            }
+            let layer = key.strip_suffix(".mlp.up_proj.weight")?;
+            // Only a layer with no gate of its own fuses it into the up
+            // projection.
+            (!weights.contains_key(&format!("{layer}.mlp.gate_proj.weight")))
+                .then(|| (key.clone(), format!("{layer}.mlp.gate_up_proj.weight")))
+        })
+        .collect();
+    for (from, to) in renames {
+        if let Some(tensor) = weights.remove(&from) {
+            weights.insert(to, tensor);
         }
     }
 }

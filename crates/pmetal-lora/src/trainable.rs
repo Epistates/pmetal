@@ -150,6 +150,22 @@ pub trait TrainableModel: ModuleParameters {
         self.forward(input_ids, mask)
     }
 
+    /// [`forward_with_cache`](Self::forward_with_cache) returning only the last
+    /// position's logits, `[batch, 1, vocab_size]`, for a caller that samples
+    /// from them alone (a prefill, a decode step).
+    ///
+    /// A model that can run its head on one position overrides this; the
+    /// default computes every position's logits and slices.
+    fn forward_with_cache_last(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, LoraError> {
+        let logits = self.forward_with_cache(input_ids, mask, cache)?;
+        Ok(pmetal_runtime::decode::last_token_hidden(&logits))
+    }
+
     /// Create a KV cache for this model.
     ///
     /// Creates an appropriately sized cache based on the model's configuration.

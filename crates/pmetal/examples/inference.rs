@@ -74,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = std::time::Instant::now();
     let output = generate_cached_async(
         |input, cache| {
-            model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
+            model.forward_with_hybrid_cache_last(input, None, Some(cache), mamba_cache.as_mut())
         },
         &input_ids,
         gen_config,

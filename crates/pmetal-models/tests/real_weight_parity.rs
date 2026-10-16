@@ -577,12 +577,15 @@ fn unclaimed_is_expected(key: &str) -> bool {
 ///
 /// Multimodal wrappers nest the text stack under `model.language_model.` and
 /// the dispatcher strips the infix back to `model.` before assignment.
-/// DeepSeek's loader stacks each layer's expert-per-key tensors into
+/// The loader of DeepSeek and Qwen3-MoE stacks each layer's expert-per-key tensors into
 /// `mlp.switch_mlp.*`, which this applies to the names as
-/// `deepseek::stack_experts` does to the tensors.
+/// `loader::experts::stack_experts` does to the tensors.
 fn loader_normalized(arch: ModelArchitecture, key: &str) -> String {
     let collapsed = collapse_indices(&key.replace("model.language_model.", "model."));
-    if arch == ModelArchitecture::DeepSeek {
+    if matches!(
+        arch,
+        ModelArchitecture::DeepSeek | ModelArchitecture::Qwen3MoE
+    ) {
         collapsed.replace(".mlp.experts.N.", ".mlp.switch_mlp.")
     } else {
         collapsed

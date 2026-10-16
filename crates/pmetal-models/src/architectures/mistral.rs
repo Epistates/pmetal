@@ -6,9 +6,8 @@
 //! - Sliding Window Attention (SWA) for efficient long-context handling
 //! - Different default configurations
 use pmetal_runtime::compat::{Array, Exception, Module, nn};
+use pmetal_runtime::decode::last_token_hidden;
 use pmetal_runtime::impl_module_params;
-
-use std::collections::HashMap;
 
 use pmetal_cache::kv_cache::KVCache;
 use pmetal_runtime::nn::{
@@ -19,6 +18,7 @@ use pmetal_runtime::rope::{RopeConfig, RotaryEmbedding};
 use serde::{Deserialize, Serialize};
 
 use crate::checkpointing::checkpointed_layer;
+use crate::common::windowed_mask;
 use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
 
 use crate::traits::{CausalLMModel, ModelConfig};
@@ -310,6 +310,11 @@ impl MistralAttention {
         } else {
             (keys, values)
         };
+
+        // A caller's mask (packed sequences' block-diagonal one) says which
+        // sequence a token belongs to, not how far back this layer reaches.
+        let windowed = windowed_mask(mask, self.sliding_window, seq_len, keys.dim(2))?;
+        let mask = windowed.as_ref().or(mask);
 
         // Fused SDPA
         let output = fused_sdpa(&queries, &keys, &values, &attn_config, mask)?;
@@ -633,6 +638,20 @@ impl MistralForCausalLM {
         self.lm_head_forward(&hidden_states)
     }
 
+    /// [`forward_with_cache`](Self::forward_with_cache) returning the last
+    /// position's logits, `[B, 1, vocab]`: the LM head runs on one hidden state
+    /// per sequence instead of every prompt token's, for a caller that samples
+    /// from the last position alone (a prefill, a decode step).
+    pub fn forward_with_cache_last(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, Exception> {
+        let hidden_states = self.model.forward_with_cache(input_ids, mask, cache)?;
+        self.lm_head_forward(&last_token_hidden(&hidden_states))
+    }
+
     /// Forward pass with one rotary position per token; see
     /// [`MistralModel::forward_with_positions`].
     pub fn forward_with_positions(
@@ -803,11 +822,6 @@ impl CausalLMModel for MistralForCausalLM {
 
     fn config(&self) -> &Self::Config {
         Self::config(self)
-    }
-
-    fn load_weights(&mut self, weights: &HashMap<String, Array>) -> Result<(), Exception> {
-        crate::loader::load_mistral_weights(self, weights)
-            .map_err(|e: crate::loader::LoadError| Exception::custom(e.to_string()))
     }
 
     fn eval(&self) -> Result<(), Exception> {

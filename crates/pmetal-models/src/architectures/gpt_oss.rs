@@ -26,6 +26,7 @@ use pmetal_runtime::compat::{Array, Exception, ModuleParametersExt, Param, nn, o
 use pmetal_runtime::impl_module_params;
 
 use crate::checkpointing::checkpointed_layer;
+use crate::common::windowed_mask;
 use crate::fp8_utils::dequantize_fp8_weight_for_compute;
 use pmetal_runtime::gpt_oss_native::{GptOssExperts, glu, route_logits};
 use pmetal_runtime::native_weight::LayerWeight;
@@ -490,6 +491,13 @@ impl GptOssAttention {
         } else {
             (k, v)
         };
+
+        // A caller's mask (packed sequences' block-diagonal one) says which
+        // sequence a token belongs to, not how far back a sliding layer reaches.
+        let window = matches!(self.attention_type, AttentionType::SlidingAttention)
+            .then_some(self.sliding_window);
+        let windowed = windowed_mask(mask, window, seq_len, k.dim(2))?;
+        let mask = windowed.as_ref().or(mask);
 
         // GPT-OSS attention has learned per-head sinks, which the fused/
         // TurboQuant SDPA kernels can't express — always take the sink-aware

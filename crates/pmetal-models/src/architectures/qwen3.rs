@@ -9,12 +9,13 @@
 //! - Per-layer sliding window configuration via `layer_types`
 
 use pmetal_runtime::compat::{Array, Exception, Module, ModuleParametersExt, Param, nn};
+use pmetal_runtime::decode::last_token_hidden;
 use pmetal_runtime::impl_module_params;
-use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
 use crate::checkpointing::checkpointed_layer;
+use crate::common::windowed_mask;
 use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
 use crate::traits::ModelConfig;
 use pmetal_cache::kv_cache::KVCache;
@@ -204,19 +205,18 @@ impl Qwen3Config {
         self.num_attention_heads / self.num_kv_heads()
     }
 
-    /// Check if layer at index should use sliding window.
+    /// Whether layer `layer_idx` attends within the sliding window, as
+    /// `transformers` decides it: only with `use_sliding_window`, by
+    /// `layer_types` (`"sliding_attention"`) or, without it, for the layers
+    /// from `max_window_layers` (28 by default) up.
     pub fn use_sliding_window_at(&self, layer_idx: usize) -> bool {
-        if let Some(ref layer_types) = self.layer_types {
-            if let Some(layer_type) = layer_types.get(layer_idx) {
-                return layer_type == "sliding_window";
-            }
-        }
-
-        // Default: layers at or above max_window_layers use sliding window (matches HF transformers)
-        if let Some(max_layers) = self.max_window_layers {
-            return self.use_sliding_window && (layer_idx as i32) >= max_layers;
-        }
-        false
+        crate::common::layer_is_sliding(
+            self.use_sliding_window,
+            self.sliding_window,
+            self.max_window_layers,
+            self.layer_types.as_deref(),
+            layer_idx,
+        )
     }
 }
 
@@ -524,6 +524,12 @@ impl Qwen3Attention {
         } else {
             (k, v)
         };
+
+        // A caller's mask (packed sequences' block-diagonal one) says which
+        // sequence a token belongs to, not how far back this layer reaches.
+        let window = self.sliding_window.filter(|_| self.use_sliding_window);
+        let windowed = windowed_mask(mask, window, l, k.dim(2))?;
+        let mask = windowed.as_ref().or(mask);
 
         let out = fused_sdpa(&q, &k, &v, &attn_config, mask)?;
         let out = out
@@ -906,6 +912,20 @@ impl Qwen3ForCausalLM {
         self.lm_head_forward(&h)
     }
 
+    /// [`forward_with_cache`](Self::forward_with_cache) returning the last
+    /// position's logits, `[B, 1, vocab]`: the LM head runs on one hidden state
+    /// per sequence instead of every prompt token's, for a caller that samples
+    /// from the last position alone (a prefill, a decode step).
+    pub fn forward_with_cache_last(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, Exception> {
+        let h = self.model.forward(input_ids, mask, cache)?;
+        self.lm_head_forward(&last_token_hidden(&h))
+    }
+
     /// Forward pass with one rotary position per token; see
     /// [`Qwen3Model::forward_with_positions`].
     pub fn forward_with_positions(
@@ -1008,79 +1028,6 @@ impl crate::traits::CausalLMModel for Qwen3ForCausalLM {
         &self.config
     }
 
-    fn load_weights(&mut self, weights: &HashMap<String, Array>) -> Result<(), Exception> {
-        for (name, weight) in weights {
-            if name == "model.embed_tokens.weight" {
-                self.model.embed_tokens.weight =
-                    pmetal_runtime::compat::module::Param::new(weight.clone());
-            } else if name == "lm_head.weight" {
-                if let Some(ref mut lm_head) = self.lm_head {
-                    lm_head.weight = pmetal_runtime::compat::module::Param::new(weight.clone());
-                }
-            } else if name == "model.norm.weight" {
-                self.model.norm.weight = pmetal_runtime::compat::module::Param::new(weight.clone());
-            } else if name.starts_with("model.layers.") {
-                let parts: Vec<&str> = name.split('.').collect();
-                let i: usize = parts[2].parse().map_err(|_| {
-                    Exception::custom(format!("Invalid layer index in weight key: {}", name))
-                })?;
-                if i >= self.model.layers.len() {
-                    continue;
-                }
-                let suffix = parts[3..].join(".");
-                let layer = &mut self.model.layers[i];
-                match suffix.as_str() {
-                    "input_layernorm.weight" => {
-                        layer.input_layernorm.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "post_attention_layernorm.weight" => {
-                        layer.post_attention_layernorm.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "self_attn.q_proj.weight" => {
-                        layer.self_attn.q_proj.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "self_attn.k_proj.weight" => {
-                        layer.self_attn.k_proj.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "self_attn.v_proj.weight" => {
-                        layer.self_attn.v_proj.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "self_attn.o_proj.weight" => {
-                        layer.self_attn.o_proj.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "self_attn.q_norm.weight" => {
-                        layer.self_attn.q_norm.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "self_attn.k_norm.weight" => {
-                        layer.self_attn.k_norm.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "mlp.gate_proj.weight" => {
-                        layer.mlp.gate_proj.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "mlp.up_proj.weight" => {
-                        layer.mlp.up_proj.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "mlp.down_proj.weight" => {
-                        layer.mlp.down_proj.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    _ => {}
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn eval(&self) -> Result<(), Exception> {
         ModuleParametersExt::eval(self)
     }
@@ -1109,29 +1056,31 @@ mod tests {
     #[test]
     fn test_sliding_window_layer_types() {
         let mut config = tiny_config();
+        config.use_sliding_window = true;
+        config.sliding_window = Some(8);
         config.layer_types = Some(vec![
-            "dense".to_string(),
-            "sliding_window".to_string(),
-            "dense".to_string(),
-            "sliding_window".to_string(),
+            "full_attention".to_string(),
+            "sliding_attention".to_string(),
+            "full_attention".to_string(),
+            "sliding_attention".to_string(),
         ]);
 
         assert!(!config.use_sliding_window_at(0), "layer 0 should be dense");
-        assert!(
-            config.use_sliding_window_at(1),
-            "layer 1 should be sliding_window"
-        );
+        assert!(config.use_sliding_window_at(1), "layer 1 should be sliding");
         assert!(!config.use_sliding_window_at(2), "layer 2 should be dense");
-        assert!(
-            config.use_sliding_window_at(3),
-            "layer 3 should be sliding_window"
-        );
+        assert!(config.use_sliding_window_at(3), "layer 3 should be sliding");
+
+        // The reference drops the window unless `use_sliding_window` is set,
+        // whatever the layer types say.
+        config.use_sliding_window = false;
+        assert!(!config.use_sliding_window_at(1));
     }
 
     #[test]
     fn test_sliding_window_max_layers() {
         let mut config = tiny_config();
         config.use_sliding_window = true;
+        config.sliding_window = Some(8);
         config.max_window_layers = Some(2);
 
         // Layers below max_window_layers should NOT use sliding window
@@ -1152,6 +1101,11 @@ mod tests {
             config.use_sliding_window_at(3),
             "layer 3 >= max_window_layers, should be sliding"
         );
+
+        // With no `max_window_layers` the reference's default of 28 applies.
+        config.max_window_layers = None;
+        assert!(!config.use_sliding_window_at(3));
+        assert!(config.use_sliding_window_at(28));
     }
 
     #[test]

@@ -125,8 +125,12 @@ impl PyModel {
 
         let output = pmetal_models::generate_cached_async(
             |input, cache| {
-                self.inner
-                    .forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
+                self.inner.forward_with_hybrid_cache_last(
+                    input,
+                    None,
+                    Some(cache),
+                    mamba_cache.as_mut(),
+                )
             },
             &input_ids,
             gen_config,

@@ -12,12 +12,10 @@ use super::{
 };
 use crate::architectures::bert::BertForEmbedding;
 use crate::architectures::gemma::GemmaForCausalLM;
-use crate::architectures::llama::LlamaForCausalLM;
-use crate::architectures::mistral::MistralForCausalLM;
 use crate::architectures::nemotron_h::{
     NemotronHForCausalLM, load_nemotron_weights as load_nemotron,
 };
-use crate::architectures::phi::{PhiConfig, PhiForCausalLM};
+use crate::architectures::phi::PhiConfig;
 use crate::architectures::qwen3_next::{
     Qwen3NextConfig, Qwen3NextFeedForward, Qwen3NextForCausalLM, Qwen3NextSanitizeOptions,
     sanitize_weights, take_packed_experts,
@@ -169,138 +167,6 @@ pub fn load_qwen3_next_weights_with_options(
     }
 
     tracing::info!("Qwen3Next weight loading: all {matched} weights matched successfully");
-    Ok(())
-}
-
-pub fn load_llama_weights(
-    model: &mut LlamaForCausalLM,
-    weights: &HashMap<String, Array>,
-) -> Result<(), LoadError> {
-    if let Some(w) = weights.get("model.embed_tokens.weight") {
-        model.model.embed_tokens.weight = pmetal_runtime::compat::module::Param::new(w.clone());
-    } else {
-        return Err(LoadError::MissingWeight("model.embed_tokens.weight".into()));
-    }
-    for (i, layer) in model.model.layers.iter_mut().enumerate() {
-        let prefix = format!("model.layers.{i}");
-        load_linear_weight(
-            &mut layer.self_attn.q_proj,
-            weights,
-            &format!("{prefix}.self_attn.q_proj"),
-        )?;
-        load_linear_weight(
-            &mut layer.self_attn.k_proj,
-            weights,
-            &format!("{prefix}.self_attn.k_proj"),
-        )?;
-        load_linear_weight(
-            &mut layer.self_attn.v_proj,
-            weights,
-            &format!("{prefix}.self_attn.v_proj"),
-        )?;
-        load_linear_weight(
-            &mut layer.self_attn.o_proj,
-            weights,
-            &format!("{prefix}.self_attn.o_proj"),
-        )?;
-        load_linear_weight(
-            &mut layer.mlp.gate_proj,
-            weights,
-            &format!("{prefix}.mlp.gate_proj"),
-        )?;
-        load_linear_weight(
-            &mut layer.mlp.up_proj,
-            weights,
-            &format!("{prefix}.mlp.up_proj"),
-        )?;
-        load_linear_weight(
-            &mut layer.mlp.down_proj,
-            weights,
-            &format!("{prefix}.mlp.down_proj"),
-        )?;
-        load_rms_norm_weight(
-            &mut layer.input_layernorm,
-            weights,
-            &format!("{prefix}.input_layernorm"),
-        )?;
-        load_rms_norm_weight(
-            &mut layer.post_attention_layernorm,
-            weights,
-            &format!("{prefix}.post_attention_layernorm"),
-        )?;
-    }
-    load_rms_norm_weight(&mut model.model.norm, weights, "model.norm")?;
-    if let Some(ref mut lm_head) = model.lm_head {
-        if let Some(w) = weights.get("lm_head.weight") {
-            lm_head.weight = pmetal_runtime::compat::module::Param::new(w.clone());
-        }
-    }
-    Ok(())
-}
-
-pub fn load_mistral_weights(
-    model: &mut MistralForCausalLM,
-    weights: &HashMap<String, Array>,
-) -> Result<(), LoadError> {
-    if let Some(w) = weights.get("model.embed_tokens.weight") {
-        model.model.embed_tokens.weight = pmetal_runtime::compat::module::Param::new(w.clone());
-    } else {
-        return Err(LoadError::MissingWeight("model.embed_tokens.weight".into()));
-    }
-    for (i, layer) in model.model.layers.iter_mut().enumerate() {
-        let prefix = format!("model.layers.{i}");
-        load_linear_weight(
-            &mut layer.self_attn.q_proj,
-            weights,
-            &format!("{prefix}.self_attn.q_proj"),
-        )?;
-        load_linear_weight(
-            &mut layer.self_attn.k_proj,
-            weights,
-            &format!("{prefix}.self_attn.k_proj"),
-        )?;
-        load_linear_weight(
-            &mut layer.self_attn.v_proj,
-            weights,
-            &format!("{prefix}.self_attn.v_proj"),
-        )?;
-        load_linear_weight(
-            &mut layer.self_attn.o_proj,
-            weights,
-            &format!("{prefix}.self_attn.o_proj"),
-        )?;
-        load_linear_weight(
-            &mut layer.mlp.gate_proj,
-            weights,
-            &format!("{prefix}.mlp.gate_proj"),
-        )?;
-        load_linear_weight(
-            &mut layer.mlp.up_proj,
-            weights,
-            &format!("{prefix}.mlp.up_proj"),
-        )?;
-        load_linear_weight(
-            &mut layer.mlp.down_proj,
-            weights,
-            &format!("{prefix}.mlp.down_proj"),
-        )?;
-        load_rms_norm_weight(
-            &mut layer.input_layernorm,
-            weights,
-            &format!("{prefix}.input_layernorm"),
-        )?;
-        load_rms_norm_weight(
-            &mut layer.post_attention_layernorm,
-            weights,
-            &format!("{prefix}.post_attention_layernorm"),
-        )?;
-    }
-    load_rms_norm_weight(&mut model.model.norm, weights, "model.norm")?;
-    if let Some(ref mut lm_head) = model.lm_head {
-        if let Some(w) = weights.get("lm_head.weight") {
-            lm_head.weight = pmetal_runtime::compat::module::Param::new(w.clone());
-        }
-    }
     Ok(())
 }
 
@@ -487,67 +353,6 @@ pub fn split_phi_fused_qkv(weights: &mut HashMap<String, Array>, config: &PhiCon
     }
 }
 
-pub fn load_phi_weights(
-    model: &mut PhiForCausalLM,
-    weights: &HashMap<String, Array>,
-) -> Result<(), LoadError> {
-    if let Some(w) = weights.get("model.embed_tokens.weight") {
-        model.model.embed_tokens.weight = pmetal_runtime::compat::module::Param::new(w.clone());
-    } else {
-        return Err(LoadError::MissingWeight("model.embed_tokens.weight".into()));
-    }
-    for (i, layer) in model.model.layers.iter_mut().enumerate() {
-        let prefix = format!("model.layers.{i}");
-        load_linear_weight(
-            &mut layer.self_attn.q_proj,
-            weights,
-            &format!("{prefix}.self_attn.q_proj"),
-        )?;
-        load_linear_weight(
-            &mut layer.self_attn.k_proj,
-            weights,
-            &format!("{prefix}.self_attn.k_proj"),
-        )?;
-        load_linear_weight(
-            &mut layer.self_attn.v_proj,
-            weights,
-            &format!("{prefix}.self_attn.v_proj"),
-        )?;
-        load_linear_weight(
-            &mut layer.self_attn.o_proj,
-            weights,
-            &format!("{prefix}.self_attn.o_proj"),
-        )?;
-        load_linear_weight(
-            &mut layer.mlp.gate_up_proj,
-            weights,
-            &format!("{prefix}.mlp.gate_up_proj"),
-        )?;
-        load_linear_weight(
-            &mut layer.mlp.down_proj,
-            weights,
-            &format!("{prefix}.mlp.down_proj"),
-        )?;
-        load_phi_rms_norm_weight(
-            &mut layer.input_layernorm,
-            weights,
-            &format!("{prefix}.input_layernorm"),
-        )?;
-        load_phi_rms_norm_weight(
-            &mut layer.post_attention_layernorm,
-            weights,
-            &format!("{prefix}.post_attention_layernorm"),
-        )?;
-    }
-    load_phi_rms_norm_weight(&mut model.model.norm, weights, "model.norm")?;
-    // Absent on a tied checkpoint, where `lm_head` is `None` and the embedding
-    // is reused instead.
-    if let Some(lm_head) = model.lm_head.as_mut() {
-        load_linear_weight(lm_head, weights, "lm_head")?;
-    }
-    Ok(())
-}
-
 fn load_linear_weight(
     linear: &mut pmetal_runtime::compat::nn::Linear,
     weights: &HashMap<String, Array>,
@@ -566,36 +371,8 @@ fn load_linear_weight(
     Ok(())
 }
 
-fn load_rms_norm_weight(
-    norm: &mut pmetal_runtime::compat::nn::RmsNorm,
-    weights: &HashMap<String, Array>,
-    prefix: &str,
-) -> Result<(), LoadError> {
-    let weight_key = format!("{prefix}.weight");
-    if let Some(w) = weights.get(&weight_key) {
-        norm.weight = pmetal_runtime::compat::module::Param::new(w.clone());
-    } else {
-        return Err(LoadError::MissingWeight(weight_key));
-    }
-    Ok(())
-}
-
 fn load_gemma_rms_norm_weight(
     norm: &mut crate::architectures::gemma::GemmaRmsNorm,
-    weights: &HashMap<String, Array>,
-    prefix: &str,
-) -> Result<(), LoadError> {
-    let weight_key = format!("{prefix}.weight");
-    if let Some(w) = weights.get(&weight_key) {
-        norm.weight = pmetal_runtime::compat::module::Param::new(w.clone());
-    } else {
-        return Err(LoadError::MissingWeight(weight_key));
-    }
-    Ok(())
-}
-
-fn load_phi_rms_norm_weight(
-    norm: &mut crate::architectures::phi::PhiRMSNorm,
     weights: &HashMap<String, Array>,
     prefix: &str,
 ) -> Result<(), LoadError> {

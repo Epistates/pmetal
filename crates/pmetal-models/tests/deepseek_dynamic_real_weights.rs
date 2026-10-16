@@ -24,7 +24,8 @@
 use std::path::PathBuf;
 
 use pmetal_cache::test_utils::{load_shard, ref_tensor};
-use pmetal_models::architectures::deepseek::{DeepSeek, DeepSeekConfig, stack_experts};
+use pmetal_models::architectures::deepseek::{DeepSeek, DeepSeekConfig};
+use pmetal_models::loader::experts::stack_experts;
 use pmetal_models::loader::load_weights;
 use pmetal_runtime::compat::{Array, Dtype, ModuleParametersExt};
 use pmetal_runtime::deepseek_native::{NativeCache, forward_step, load_config, load_model};
@@ -96,7 +97,8 @@ fn dynamic_deepseek_v2_lite_tracks_the_native_engine_by_depth() {
         let mut config: DeepSeekConfig = json5::from_str(&config_text).expect("config parses");
         config.num_hidden_layers = n;
         let mut model = DeepSeek::new(config).expect("model builds");
-        let weights = stack_experts(load_weights(&dir).expect("tensors open")).expect("stack");
+        let weights =
+            stack_experts("deepseek", load_weights(&dir).expect("tensors open")).expect("stack");
         let mut params = model.flatten_params_mut();
         for (key, value) in weights {
             if let Some(param) = params.get_mut(key.as_str()) {
