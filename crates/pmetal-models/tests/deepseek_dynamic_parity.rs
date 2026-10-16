@@ -144,9 +144,10 @@ fn dynamic_deepseek_parameters_are_the_checkpoints_tensors() {
     use pmetal_runtime::compat::ModuleParametersExt;
 
     let fx = checkpoint("v3", "deepseek_native_v3_weights.safetensors");
-    let shard = pmetal_models::architectures::deepseek::stack_experts(load_shard(&fixture_path(
-        "deepseek_native_v3_weights.safetensors",
-    )))
+    let shard = pmetal_models::loader::experts::stack_experts(
+        "deepseek",
+        load_shard(&fixture_path("deepseek_native_v3_weights.safetensors")),
+    )
     .expect("the experts stack");
     let params = fx.model.flatten_params();
     let trainable = fx.model.flatten_trainable_params();
@@ -179,9 +180,10 @@ fn dynamic_deepseek_parameters_are_the_checkpoints_tensors() {
 #[test]
 #[serial]
 fn dynamic_deepseek_loads_an_mlx_stacked_checkpoint() {
-    let stacked = pmetal_models::architectures::deepseek::stack_experts(load_shard(&fixture_path(
-        "deepseek_native_v3_weights.safetensors",
-    )))
+    let stacked = pmetal_models::loader::experts::stack_experts(
+        "deepseek",
+        load_shard(&fixture_path("deepseek_native_v3_weights.safetensors")),
+    )
     .expect("the experts stack");
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::copy(

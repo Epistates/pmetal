@@ -22,6 +22,7 @@ mod assign;
 mod audit;
 mod checkpoint;
 mod diffusion;
+pub mod experts;
 mod families;
 mod quant;
 

@@ -20,8 +20,8 @@ use pmetal_runtime::rope::{RopeConfig, RotaryEmbedding};
 use serde::{Deserialize, Serialize};
 
 use crate::checkpointing::checkpointed_layer;
+use crate::common::switch_mlp::SwitchMlp;
 use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
-use crate::fp8_utils::dequantize_fp8_weight_for_compute;
 
 /// Qwen3-MoE model configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -383,277 +383,127 @@ impl Qwen3MoEDenseMLP {
     }
 }
 
-/// MoE block with softmax routing for Qwen3-MoE.
+/// Qwen3-MoE's router: the gate matrix, `[num_experts, hidden]`.
 ///
-/// Uses cached stacked expert weights plus GPU batched gathers/matmuls for the main inference path.
-/// The cache is rebuilt automatically when the underlying expert weight handles change.
+/// A bare matrix and not a `Linear`, so its parameter path is the checkpoint's
+/// (`mlp.gate.weight`) and no adapter can attach to it: a router's argmax picks
+/// which computation runs.
+#[derive(Debug)]
+pub struct Qwen3MoERouter {
+    /// `[num_experts, hidden]`.
+    pub weight: Array,
+}
+impl_module_params!(Qwen3MoERouter; weight);
+
+impl Qwen3MoERouter {
+    fn new(hidden_size: i32, num_experts: i32) -> Self {
+        let bound = (hidden_size as f32).sqrt().recip();
+        Self {
+            weight: pmetal_runtime::compat::random::uniform_range(
+                -bound,
+                bound,
+                &[num_experts, hidden_size],
+                pmetal_runtime::compat::Dtype::Float32,
+            ),
+        }
+    }
+
+    /// `[tokens, hidden]` to each token's experts and their weights, both
+    /// `[tokens, top_k]`, the weights in the dtype of `x`.
+    ///
+    /// The logits are computed in the model's dtype and the softmax in `f32`,
+    /// as transformers' `Qwen3MoeTopKRouter` does; the weights are
+    /// renormalized over the chosen experts when `norm_topk_prob` asks, and
+    /// cast to the activation dtype last
+    /// ([`native_moe::route_top_k`](pmetal_runtime::native_moe::route_top_k), the
+    /// router the native engine runs too).
+    fn route(&self, x: &Array, top_k: i32, norm_topk_prob: bool) -> (Array, Array) {
+        let logits = x.matmul(&self.weight.as_dtype(x.dtype().as_i32()).t());
+        pmetal_runtime::native_moe::route_top_k(&logits, top_k, norm_topk_prob, x.dtype().as_i32())
+    }
+}
+
+/// MoE block of Qwen3-MoE: a softmax top-k router over stacked SwiGLU experts.
+///
+/// The experts are the three `switch_mlp` weights an MLX conversion stores
+/// (`[experts, out, in]`); a released checkpoint's expert-per-key layout and
+/// transformers' fused `gate_up_proj` are stacked at load
+/// ([`crate::loader::experts::stack_experts`]). Nothing is derived from them:
+/// the next forward runs the weights the block holds.
 #[derive(Debug)]
 pub struct Qwen3MoEBlock {
-    /// Number of experts.
-    pub num_experts: usize,
     /// Top-k experts per token.
     pub top_k: usize,
     /// Whether to normalize top-k probabilities.
     pub norm_topk_prob: bool,
-    /// Gate projection (routes to experts).
-    pub gate: nn::Linear,
-    /// Expert MLPs.
-    pub experts: Vec<pmetal_runtime::nn::Expert>,
-    /// Stacked gate projection weights `[num_experts, hidden, intermediate]`.
-    pub stacked_gate_proj: Option<Array>,
-    /// Stacked up projection weights `[num_experts, hidden, intermediate]`.
-    pub stacked_up_proj: Option<Array>,
-    /// Stacked down projection weights `[num_experts, intermediate, hidden]`.
-    pub stacked_down_proj: Option<Array>,
-    /// Signature of the currently stacked expert weight handles.
-    pub stacked_weight_signature: Option<Vec<usize>>,
+    /// The router.
+    pub gate: Qwen3MoERouter,
+    /// The routed experts.
+    pub switch_mlp: SwitchMlp,
 }
-impl_module_params!(Qwen3MoEBlock; gate, experts);
+impl_module_params!(Qwen3MoEBlock; gate, switch_mlp);
 
 impl Qwen3MoEBlock {
     /// Create a new MoE block.
     pub fn new(config: &Qwen3MoEConfig) -> Result<Self, Exception> {
-        let num_experts = config.num_experts as usize;
-        let moe_intermediate = config.get_moe_intermediate_size();
-
-        let gate = nn::LinearBuilder::new(config.hidden_size, config.num_experts)
-            .bias(false)
-            .build()?;
-
-        let experts = (0..num_experts)
-            .map(|_| pmetal_runtime::nn::Expert::new(config.hidden_size, moe_intermediate))
-            .collect();
-
+        let num_experts = config.num_experts;
+        if config.num_experts_per_tok < 1 || config.num_experts_per_tok > num_experts {
+            return Err(Exception::custom(format!(
+                "qwen3_moe config: num_experts_per_tok {} is not within the {num_experts} experts",
+                config.num_experts_per_tok
+            )));
+        }
         Ok(Self {
-            num_experts,
             top_k: config.num_experts_per_tok as usize,
             norm_topk_prob: config.norm_topk_prob,
-            gate,
-            experts,
-            stacked_gate_proj: None,
-            stacked_up_proj: None,
-            stacked_down_proj: None,
-            stacked_weight_signature: None,
+            gate: Qwen3MoERouter::new(config.hidden_size, num_experts),
+            switch_mlp: SwitchMlp::new(
+                num_experts,
+                config.hidden_size,
+                config.get_moe_intermediate_size(),
+            ),
         })
     }
 
-    fn current_stacked_weight_signature(&self) -> Vec<usize> {
-        // Use `Array::id()` — stable on lazy arrays. `data_ptr()` would
-        // segfault on unevaluated expert weights (null data buffer).
-        let mut signature = Vec::with_capacity(self.experts.len() * 3);
-        for expert in &self.experts {
-            signature.push(expert.w1.weight.as_ref().id());
-            signature.push(expert.w3.weight.as_ref().id());
-            signature.push(expert.w2.weight.as_ref().id());
-        }
-        signature
-    }
-
-    fn stack_expert_weights(&self) -> Result<(Array, Array, Array), Exception> {
-        let gate_weights: Vec<Array> = self
-            .experts
-            .iter()
-            .map(|expert| {
-                dequantize_fp8_weight_for_compute(expert.w1.weight.as_ref()).map(|w| w.t())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let up_weights: Vec<Array> = self
-            .experts
-            .iter()
-            .map(|expert| {
-                dequantize_fp8_weight_for_compute(expert.w3.weight.as_ref()).map(|w| w.t())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let down_weights: Vec<Array> = self
-            .experts
-            .iter()
-            .map(|expert| {
-                dequantize_fp8_weight_for_compute(expert.w2.weight.as_ref()).map(|w| w.t())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok((
-            pmetal_runtime::compat::ops::stack_axis(&gate_weights, 0),
-            pmetal_runtime::compat::ops::stack_axis(&up_weights, 0),
-            pmetal_runtime::compat::ops::stack_axis(&down_weights, 0),
-        ))
-    }
-
-    fn ensure_stacked_moe(&mut self) -> Result<(), Exception> {
-        let signature = self.current_stacked_weight_signature();
-        let needs_refresh = self.stacked_gate_proj.is_none()
-            || self.stacked_up_proj.is_none()
-            || self.stacked_down_proj.is_none()
-            || self.stacked_weight_signature.as_ref() != Some(&signature);
-
-        if needs_refresh {
-            let (stacked_gate_proj, stacked_up_proj, stacked_down_proj) =
-                self.stack_expert_weights()?;
-            stacked_gate_proj.eval();
-            stacked_up_proj.eval();
-            stacked_down_proj.eval();
-            self.stacked_gate_proj = Some(stacked_gate_proj);
-            self.stacked_up_proj = Some(stacked_up_proj);
-            self.stacked_down_proj = Some(stacked_down_proj);
-            self.stacked_weight_signature = Some(signature);
-        }
-
-        Ok(())
-    }
-
-    /// Eagerly build or refresh the stacked expert-weight cache.
-    pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
-        self.ensure_stacked_moe()
-    }
-
-    /// Whether the stacked expert-weight cache is currently populated.
-    pub fn has_stacked_moe(&self) -> bool {
-        self.stacked_gate_proj.is_some()
-            && self.stacked_up_proj.is_some()
-            && self.stacked_down_proj.is_some()
-    }
-
-    fn route_topk(&mut self, hidden_flat: &Array) -> Result<(i32, i32, Array, Array), Exception> {
-        let batch_seq = hidden_flat.dim(0);
-        let hidden_size = hidden_flat.dim(1);
-
-        // Softmax over expert logits, with an f32 cast for numerical stability.
-        let gate_logits = self.gate.forward(hidden_flat);
-        let gate_logits_f32 = if gate_logits.dtype() != pmetal_runtime::compat::Dtype::Float32 {
-            gate_logits.as_type::<f32>()
-        } else {
-            gate_logits
-        };
-        let routing_probs = pmetal_runtime::compat::ops::softmax_axis(&gate_logits_f32, -1);
-
-        // Shared top-k selection + optional renormalisation — see
-        // `crate::moe_routing::topk_normalize`.
-        let (top_indices, normalized_weights) = crate::moe_routing::topk_normalize(
-            &routing_probs,
-            self.top_k as i32,
-            self.norm_topk_prob,
-        )?;
-
-        Ok((batch_seq, hidden_size, top_indices, normalized_weights))
-    }
-
+    /// Every expert over every token, each weighted by the router's weight for
+    /// it where the router picked it and zero elsewhere: the routed sum written
+    /// out densely, from primitives.
     #[cfg(test)]
-    fn forward_per_expert(&mut self, x: &Array) -> Result<Array, Exception> {
-        let shape = x.shape();
-        let batch_seq: i32 = shape[..shape.len() - 1].iter().product();
-        let hidden_size = shape[shape.len() - 1];
-        let hidden_flat = x.reshape(&[batch_seq, hidden_size]);
-        let (_batch_seq, _hidden_size, top_indices, normalized_weights) =
-            self.route_topk(&hidden_flat)?;
-
-        top_indices.eval();
-        normalized_weights.eval();
-
-        let n_tokens = batch_seq as usize;
-        let expert_indices: Vec<i32> = top_indices.as_slice().to_vec();
-        let expert_weights: Vec<f32> = normalized_weights.as_slice().to_vec();
-
-        let mut expert_assignments: Vec<Vec<(usize, f32)>> = vec![Vec::new(); self.num_experts];
-        for token_idx in 0..n_tokens {
-            for slot in 0..self.top_k {
-                let flat_idx = token_idx * self.top_k + slot;
-                let expert_id = expert_indices[flat_idx] as usize;
-                let weight = expert_weights[flat_idx];
-                if expert_id < self.num_experts {
-                    expert_assignments[expert_id].push((token_idx, weight));
-                }
-            }
+    fn forward_reference(&self, x: &Array) -> Result<Array, Exception> {
+        let shape = x.shape().to_vec();
+        let hidden = shape[shape.len() - 1];
+        let flat = x.reshape(&[-1, hidden]);
+        let (indices, weights) = self
+            .gate
+            .route(&flat, self.top_k as i32, self.norm_topk_prob);
+        let mut routed =
+            pmetal_runtime::compat::ops::zeros_dtype(&[flat.dim(0), hidden], flat.dtype());
+        let expert = |linear: &pmetal_runtime::nn::moe::Linear, e: i32| {
+            pmetal_runtime::compat::ops::slice_axis(&linear.weight, 0, e, e + 1).squeeze(0)
+        };
+        for e in 0..self.switch_mlp.num_experts() {
+            let picked = indices
+                .equal(&Array::from_int(e))
+                .as_dtype(weights.dtype().as_i32());
+            let weight = picked.multiply(&weights).sum_axis(-1, true);
+            let activated = nn::silu(&flat.matmul(&expert(&self.switch_mlp.gate_proj, e).t()))
+                .multiply(&flat.matmul(&expert(&self.switch_mlp.up_proj, e).t()));
+            let out = activated.matmul(&expert(&self.switch_mlp.down_proj, e).t());
+            routed = routed.add(&out.multiply(&weight));
         }
-
-        let mut final_output = pmetal_runtime::compat::ops::zeros_dtype(
-            &[batch_seq, hidden_size],
-            hidden_flat.dtype(),
-        );
-        for (expert_idx, assignments) in expert_assignments.iter().enumerate() {
-            if assignments.is_empty() {
-                continue;
-            }
-
-            let token_indices: Vec<i32> = assignments.iter().map(|&(idx, _)| idx as i32).collect();
-            let weights: Vec<f32> = assignments.iter().map(|&(_, w)| w).collect();
-
-            let idx_array = Array::from_slice(&token_indices, &[token_indices.len() as i32]);
-            let weight_array = Array::from_slice(&weights, &[weights.len() as i32, 1]);
-            let expert_input = hidden_flat.take_axis(&idx_array, 0);
-            let expert_out = self.experts[expert_idx].forward(&expert_input);
-            let weighted_out = expert_out.multiply(&weight_array);
-            let updates_3d = weighted_out.reshape(&[token_indices.len() as i32, 1, hidden_size]);
-            final_output = pmetal_runtime::compat::indexing::scatter_add_single(
-                &final_output,
-                &idx_array,
-                &updates_3d,
-                0,
-            );
-        }
-
-        let mut output_shape = shape.to_vec();
-        output_shape[shape.len() - 1] = hidden_size;
-        Ok(final_output.reshape(&output_shape))
+        Ok(routed.reshape(&shape))
     }
 
-    fn batched_matmul(&self, x: &Array, w: &Array) -> Result<Array, Exception> {
-        let x_expanded = x.reshape(&[x.dim(0), 1, x.dim(1)]);
-        let result = pmetal_runtime::compat::ops::matmul(&x_expanded, w);
-        Ok(result.squeeze_axes(&[1]))
-    }
-
-    fn forward_stacked(&mut self, x: &Array) -> Result<Array, Exception> {
-        self.ensure_stacked_moe()?;
-
-        let shape = x.shape();
-        let hidden_flat = x.reshape(&[
-            shape[..shape.len() - 1].iter().product(),
-            shape[shape.len() - 1],
-        ]);
-        let (batch_seq, hidden_size, top_indices, normalized_weights) =
-            self.route_topk(&hidden_flat)?;
-        let top_k = self.top_k as i32;
-        let mut output = pmetal_runtime::compat::ops::zeros_dtype(
-            &[batch_seq, hidden_size],
-            hidden_flat.dtype(),
-        );
-        for slot in 0..top_k {
-            let slot_experts =
-                pmetal_runtime::compat::ops::slice_axis(&top_indices, -1, slot, slot + 1)
-                    .reshape(&[top_indices.dim(0)]);
-            let slot_weights =
-                pmetal_runtime::compat::ops::slice_axis(&normalized_weights, -1, slot, slot + 1);
-
-            let gate_weights = self
-                .stacked_gate_proj
-                .as_ref()
-                .unwrap()
-                .take_axis(&slot_experts, 0);
-            let up_weights = self
-                .stacked_up_proj
-                .as_ref()
-                .unwrap()
-                .take_axis(&slot_experts, 0);
-            let down_weights = self
-                .stacked_down_proj
-                .as_ref()
-                .unwrap()
-                .take_axis(&slot_experts, 0);
-
-            let gate_out = self.batched_matmul(&hidden_flat, &gate_weights)?;
-            let up_out = self.batched_matmul(&hidden_flat, &up_weights)?;
-            let activated = nn::silu(&gate_out).multiply(&up_out);
-            let slot_out = self.batched_matmul(&activated, &down_weights)?;
-            output = output.add(&slot_out.multiply(&slot_weights));
-        }
-
-        let mut output_shape = shape.to_vec();
-        output_shape[shape.len() - 1] = hidden_size;
-        Ok(output.reshape(&output_shape))
-    }
-
-    /// Forward pass using the stacked batched-gather path.
+    /// Forward pass: `[.., hidden]` in, the same shape out.
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        self.forward_stacked(x)
+        let shape = x.shape().to_vec();
+        let hidden = shape[shape.len() - 1];
+        let flat = x.reshape(&[-1, hidden]);
+        let (indices, weights) = self
+            .gate
+            .route(&flat, self.top_k as i32, self.norm_topk_prob);
+        let routed = self.switch_mlp.forward(&flat, &indices, &weights)?;
+        Ok(routed.reshape(&shape))
     }
 }
 
@@ -749,14 +599,6 @@ impl Qwen3MoEFeedForward {
             Self::MoE(moe) => moe.forward(x),
         }
     }
-
-    /// Eagerly build stacked expert caches for MoE variants.
-    pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
-        match self {
-            Self::Dense(_) => Ok(()),
-            Self::MoE(moe) => moe.init_stacked_moe(),
-        }
-    }
 }
 
 /// Qwen3-MoE decoder layer.
@@ -771,9 +613,9 @@ pub struct Qwen3MoEDecoderLayer {
     /// Post-attention layer norm.
     pub post_attention_layernorm: nn::RmsNorm,
     /// Feed-forward (MLP or MoE).
-    pub ffn: Qwen3MoEFeedForward,
+    pub mlp: Qwen3MoEFeedForward,
 }
-impl_module_params!(Qwen3MoEDecoderLayer; self_attn, input_layernorm, post_attention_layernorm, ffn);
+impl_module_params!(Qwen3MoEDecoderLayer; self_attn, input_layernorm, post_attention_layernorm, mlp);
 
 impl Qwen3MoEDecoderLayer {
     /// Create a new decoder layer.
@@ -788,7 +630,7 @@ impl Qwen3MoEDecoderLayer {
             .build()?;
 
         // Determine if this layer uses MoE
-        let ffn = if config.use_moe_at(layer_idx) {
+        let mlp = if config.use_moe_at(layer_idx) {
             Qwen3MoEFeedForward::MoE(Qwen3MoEBlock::new(&config)?)
         } else {
             Qwen3MoEFeedForward::Dense(Qwen3MoEDenseMLP::new(
@@ -802,7 +644,7 @@ impl Qwen3MoEDecoderLayer {
             self_attn,
             input_layernorm,
             post_attention_layernorm,
-            ffn,
+            mlp,
         })
     }
 
@@ -810,7 +652,7 @@ impl Qwen3MoEDecoderLayer {
     ///
     /// Delegates to `crate::decoder_layer::std_pre_norm_forward` — the
     /// standard pre-norm skeleton, with `self_attn: Qwen3MoEAttention` and
-    /// `ffn: Qwen3MoEFeedForward` plugging into the `AttentionModule` /
+    /// `mlp: Qwen3MoEFeedForward` plugging into the `AttentionModule` /
     /// `MlpModule` traits.
     pub fn forward(
         &mut self,
@@ -823,17 +665,12 @@ impl Qwen3MoEDecoderLayer {
             &mut self.input_layernorm,
             &mut self.self_attn,
             &mut self.post_attention_layernorm,
-            &mut self.ffn,
+            &mut self.mlp,
             x,
             mask,
             cache,
             positions,
         )
-    }
-
-    /// Eagerly build stacked expert caches for this layer's MoE path.
-    pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
-        self.ffn.init_stacked_moe()
     }
 }
 
@@ -981,14 +818,6 @@ impl Qwen3MoEModel {
 
         Ok(self.norm.forward(&h))
     }
-
-    /// Eagerly build stacked expert caches for all MoE layers.
-    pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
-        for layer in &mut self.layers {
-            layer.init_stacked_moe()?;
-        }
-        Ok(())
-    }
 }
 
 /// Full Qwen3-MoE model with LM head.
@@ -1094,11 +923,6 @@ impl Qwen3MoE {
         }
     }
 
-    /// Eagerly build stacked expert caches for all Qwen3-MoE layers.
-    pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
-        self.model.init_stacked_moe()
-    }
-
     /// Fused batched decode forward.
     ///
     /// Mirrors [`crate::architectures::llama::LlamaForCausalLM::forward_batched_impl`]
@@ -1135,7 +959,7 @@ impl Qwen3MoE {
                 Some(&mut layer.self_attn.q_norm),
                 Some(&mut layer.self_attn.k_norm),
                 &mut layer.post_attention_layernorm,
-                &mut layer.ffn,
+                &mut layer.mlp,
                 &attn_cfg,
                 cache,
                 active_indices,
@@ -1219,7 +1043,7 @@ mod tests {
     #[serial]
     fn test_feed_forward_dense_dispatch() {
         let config = tiny_moe_config();
-        let mut ffn = Qwen3MoEFeedForward::Dense(
+        let mut mlp = Qwen3MoEFeedForward::Dense(
             Qwen3MoEDenseMLP::new(config.hidden_size, config.intermediate_size).unwrap(),
         );
         let x = pmetal_runtime::compat::random::uniform_range(
@@ -1228,7 +1052,7 @@ mod tests {
             &[1, 4, config.hidden_size],
             pmetal_runtime::compat::Dtype::Float32,
         );
-        let out = ffn.forward(&x).unwrap();
+        let out = mlp.forward(&x).unwrap();
         assert_eq!(out.shape(), &[1, 4, config.hidden_size]);
     }
 
@@ -1236,14 +1060,14 @@ mod tests {
     #[serial]
     fn test_feed_forward_moe_dispatch() {
         let config = tiny_moe_config();
-        let mut ffn = Qwen3MoEFeedForward::MoE(Qwen3MoEBlock::new(&config).unwrap());
+        let mut mlp = Qwen3MoEFeedForward::MoE(Qwen3MoEBlock::new(&config).unwrap());
         let x = pmetal_runtime::compat::random::uniform_range(
             -1.0,
             1.0,
             &[1, 4, config.hidden_size],
             pmetal_runtime::compat::Dtype::Float32,
         );
-        let out = ffn.forward(&x).unwrap();
+        let out = mlp.forward(&x).unwrap();
         assert_eq!(out.shape(), &[1, 4, config.hidden_size]);
     }
 
@@ -1324,42 +1148,45 @@ mod tests {
         assert_eq!(out.shape(), &[2, 5, config.hidden_size]);
     }
 
-    #[test]
-    #[serial]
-    fn test_moe_block_stacked_matches_per_expert_path() {
-        let config = tiny_moe_config();
-        let mut block = Qwen3MoEBlock::new(&config).unwrap();
-        let x = pmetal_runtime::compat::random::uniform_range(
-            -1.0,
-            1.0,
-            &[2, 5, config.hidden_size],
-            pmetal_runtime::compat::Dtype::Float32,
-        );
-
-        let reference = block.forward_per_expert(&x).unwrap();
-        let fast = block.forward(&x).unwrap();
-        reference.eval().unwrap();
-        fast.eval().unwrap();
-
-        assert!(block.has_stacked_moe());
-
-        let max_diff = fast
-            .subtract(&reference)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .max(None)
-            .unwrap();
-        max_diff.eval().unwrap();
-        assert!(
-            max_diff.item::<f32>() < 1e-4,
-            "stacked qwen3-moe path drifted from per-expert reference"
-        );
+    fn max_diff(a: &Array, b: &Array) -> f32 {
+        let diff = a.subtract(b).abs().max(None);
+        diff.eval();
+        diff.item::<f32>()
     }
 
+    /// The routed sum through the grouped gather matmuls against every expert
+    /// over every token written out densely. 80 tokens x 2 experts is past the
+    /// point where the dispatch groups the (token, expert) pairs by expert; 5
+    /// tokens run the router-order path.
     #[test]
     #[serial]
-    fn test_moe_block_stacked_cache_refreshes_after_weight_change() {
+    fn test_moe_block_matches_dense_reference() {
+        pmetal_runtime::compat::random::seed(11);
+        let config = tiny_moe_config();
+        let mut block = Qwen3MoEBlock::new(&config).unwrap();
+        for tokens in [5, 80] {
+            let x = pmetal_runtime::compat::random::uniform_range(
+                -1.0,
+                1.0,
+                &[2, tokens, config.hidden_size],
+                pmetal_runtime::compat::Dtype::Float32,
+            );
+            let reference = block.forward_reference(&x).unwrap();
+            let fast = block.forward(&x).unwrap();
+            pmetal_runtime::check_unobserved_error().expect("runtime error");
+            assert!(
+                max_diff(&fast, &reference) < 1e-4,
+                "qwen3-moe block drifted from the dense reference at {tokens} tokens"
+            );
+        }
+    }
+
+    /// The experts are the parameters, with nothing derived from them: a
+    /// replaced weight is what the next forward runs.
+    #[test]
+    #[serial]
+    fn test_moe_block_runs_the_weights_it_holds() {
+        pmetal_runtime::compat::random::seed(12);
         let config = tiny_moe_config();
         let mut block = Qwen3MoEBlock::new(&config).unwrap();
         let x = pmetal_runtime::compat::random::uniform_range(
@@ -1369,29 +1196,133 @@ mod tests {
             pmetal_runtime::compat::Dtype::Float32,
         );
 
-        let _ = block.forward(&x).unwrap();
-        assert!(block.has_stacked_moe());
-
-        block.experts[0].w1.weight =
-            Array::zeros_f32(&[config.get_moe_intermediate_size(), config.hidden_size]);
-
-        let reference = block.forward_per_expert(&x).unwrap();
-        let fast = block.forward(&x).unwrap();
-        reference.eval().unwrap();
-        fast.eval().unwrap();
-
-        let max_diff = fast
-            .subtract(&reference)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .max(None)
-            .unwrap();
-        max_diff.eval().unwrap();
+        let before = block.forward(&x).unwrap();
+        block.switch_mlp.gate_proj.weight = Array::zeros_f32(&[
+            config.num_experts,
+            config.get_moe_intermediate_size(),
+            config.hidden_size,
+        ]);
+        let reference = block.forward_reference(&x).unwrap();
+        let after = block.forward(&x).unwrap();
+        assert!(max_diff(&after, &reference) < 1e-4);
         assert!(
-            max_diff.item::<f32>() < 1e-4,
-            "stacked cache failed to refresh after expert weight change"
+            max_diff(&after, &before) > 1e-3,
+            "zeroing every gate projection changed nothing"
         );
+    }
+
+    /// The routing weights are in the activation dtype, as the experts'
+    /// outputs they scale are, so a bf16 model's MoE output stays bf16 and
+    /// agrees with the f32 run to bf16 resolution.
+    #[test]
+    #[serial]
+    fn test_moe_block_keeps_the_activation_dtype() {
+        pmetal_runtime::compat::random::seed(13);
+        let config = tiny_moe_config();
+        let mut block = Qwen3MoEBlock::new(&config).unwrap();
+        let x = pmetal_runtime::compat::random::uniform_range(
+            -1.0,
+            1.0,
+            &[1, 6, config.hidden_size],
+            pmetal_runtime::compat::Dtype::Float32,
+        );
+        let bf16 = pmetal_runtime::compat::Dtype::Bfloat16.as_i32();
+        for proj in [
+            &mut block.switch_mlp.gate_proj,
+            &mut block.switch_mlp.up_proj,
+            &mut block.switch_mlp.down_proj,
+        ] {
+            proj.weight = proj.weight.as_dtype(bf16);
+        }
+        block.gate.weight = block.gate.weight.as_dtype(bf16);
+        let out = block.forward(&x.as_dtype(bf16)).unwrap();
+        pmetal_runtime::check_unobserved_error().expect("runtime error");
+        assert_eq!(out.dtype().as_i32(), bf16);
+    }
+
+    /// Training reaches the router and every expert projection, with the
+    /// gradients of the dense reference. A gather that dropped the experts'
+    /// gradient would train a model whose routed layers never moved.
+    #[test]
+    #[serial]
+    fn test_moe_block_gradients_match_the_dense_reference() {
+        pmetal_runtime::compat::random::seed(14);
+        let config = tiny_moe_config();
+        let mut block = Qwen3MoEBlock::new(&config).unwrap();
+        // 40 tokens x 2 experts = 80 pairs: the grouped dispatch.
+        let x = pmetal_runtime::compat::random::normal(
+            &[1, 40, config.hidden_size],
+            pmetal_runtime::compat::Dtype::Float32,
+        );
+        let inputs = [
+            x,
+            block.gate.weight.clone(),
+            block.switch_mlp.gate_proj.weight.clone(),
+            block.switch_mlp.up_proj.weight.clone(),
+            block.switch_mlp.down_proj.weight.clone(),
+        ];
+        let loss = |block: &mut Qwen3MoEBlock, arrays: &[Array], dense: bool| {
+            block.gate.weight = arrays[1].clone();
+            block.switch_mlp.gate_proj.weight = arrays[2].clone();
+            block.switch_mlp.up_proj.weight = arrays[3].clone();
+            block.switch_mlp.down_proj.weight = arrays[4].clone();
+            let out = if dense {
+                block.forward_reference(&arrays[0]).unwrap()
+            } else {
+                block.forward(&arrays[0]).unwrap()
+            };
+            out.square().sum(None)
+        };
+        let (fast_loss, fast) = pmetal_runtime::compat::nn::value_and_grad_explicit(
+            |arrays: &[Array]| loss(&mut block, arrays, false),
+            &inputs,
+            &[],
+        )
+        .unwrap();
+        let mut reference_block = Qwen3MoEBlock::new(&config).unwrap();
+        let (ref_loss, reference) = pmetal_runtime::compat::nn::value_and_grad_explicit(
+            |arrays: &[Array]| loss(&mut reference_block, arrays, true),
+            &inputs,
+            &[],
+        )
+        .unwrap();
+        pmetal_runtime::check_unobserved_error().expect("runtime error");
+
+        let host = |a: &Array| -> Vec<f32> {
+            let a = a.as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32());
+            a.eval();
+            a.as_slice::<f32>().to_vec()
+        };
+        let loss_diff = (fast_loss.item::<f32>() - ref_loss.item::<f32>()).abs()
+            / ref_loss.item::<f32>().abs().max(1.0);
+        assert!(loss_diff < 1e-4, "loss differs by {loss_diff:e}");
+        for (name, (g, r)) in ["input", "router", "gate_proj", "up_proj", "down_proj"]
+            .iter()
+            .zip(fast.iter().zip(&reference))
+        {
+            let (g, r) = (host(g), host(r));
+            assert!(
+                g.iter().all(|v| v.is_finite()),
+                "the {name} gradient is not finite"
+            );
+            assert!(g.iter().any(|v| *v != 0.0), "the {name} gradient is zero");
+            let scale = r.iter().fold(1e-6f32, |m, v| m.max(v.abs()));
+            let diff = g
+                .iter()
+                .zip(&r)
+                .fold(0.0f32, |m, (p, q)| m.max((p - q).abs()))
+                / scale;
+            assert!(diff < 1e-3, "the {name} gradient differs by {diff:e}");
+        }
+    }
+
+    #[test]
+    fn test_moe_block_rejects_an_impossible_top_k() {
+        let mut config = tiny_moe_config();
+        config.num_experts_per_tok = config.num_experts + 1;
+        assert!(Qwen3MoEBlock::new(&config).is_err());
+        config.num_experts_per_tok = 0;
+        assert!(Qwen3MoEBlock::new(&config).is_err());
     }
 
     #[test]
@@ -1406,40 +1337,13 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_full_model_init_stacked_moe_preserves_forward() {
-        let config = tiny_moe_config();
-        let mut model = Qwen3MoE::new(config.clone()).unwrap();
-        let input_ids = Array::from_slice(&[1i32, 2, 3, 4], &[1, 4]);
-
-        let reference = model.forward(&input_ids, None, None).unwrap();
-        model.init_stacked_moe().unwrap();
-        let fast = model.forward(&input_ids, None, None).unwrap();
-        reference.eval().unwrap();
-        fast.eval().unwrap();
-
-        let max_diff = fast
-            .subtract(&reference)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .max(None)
-            .unwrap();
-        max_diff.eval().unwrap();
-        assert!(
-            max_diff.item::<f32>() < 1e-4,
-            "qwen3-moe full model drifted after stacked init"
-        );
-    }
-
-    #[test]
-    #[serial]
     fn test_decoder_layer_moe_vs_dense() {
         let config = tiny_moe_config();
 
         // Layer 0 with sparse_step=1 should be MoE
         let layer_moe = Qwen3MoEDecoderLayer::new(config.clone(), 0).unwrap();
         assert!(
-            matches!(layer_moe.ffn, Qwen3MoEFeedForward::MoE(_)),
+            matches!(layer_moe.mlp, Qwen3MoEFeedForward::MoE(_)),
             "Layer 0 should be MoE with sparse_step=1"
         );
 
@@ -1448,7 +1352,7 @@ mod tests {
         config_dense.mlp_only_layers = vec![0];
         let layer_dense = Qwen3MoEDecoderLayer::new(config_dense, 0).unwrap();
         assert!(
-            matches!(layer_dense.ffn, Qwen3MoEFeedForward::Dense(_)),
+            matches!(layer_dense.mlp, Qwen3MoEFeedForward::Dense(_)),
             "Layer 0 should be Dense when in mlp_only_layers"
         );
     }
@@ -1458,14 +1362,14 @@ mod tests {
     #[ignore = "bridge ModuleParameters default freeze/unfreeze are no-ops — impl_module_params! does not generate them"]
     fn test_freeze_unfreeze_delegation() {
         let config = tiny_moe_config();
-        let mut ffn = Qwen3MoEFeedForward::MoE(Qwen3MoEBlock::new(&config).unwrap());
+        let mut mlp = Qwen3MoEFeedForward::MoE(Qwen3MoEBlock::new(&config).unwrap());
 
         // Freeze all parameters
-        ffn.freeze_parameters(true);
-        assert_eq!(ffn.all_frozen(), Some(true));
+        mlp.freeze_parameters(true);
+        assert_eq!(mlp.all_frozen(), Some(true));
 
         // Unfreeze all parameters
-        ffn.unfreeze_parameters(true);
-        assert_eq!(ffn.all_frozen(), Some(false));
+        mlp.unfreeze_parameters(true);
+        assert_eq!(mlp.all_frozen(), Some(false));
     }
 }

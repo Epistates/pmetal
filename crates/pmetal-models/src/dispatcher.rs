@@ -57,6 +57,23 @@ fn load_checked<M: ModuleParametersExt, T>(
     Ok(out)
 }
 
+/// Load a checkpoint into a routed-expert model: its experts stacked into the
+/// `mlp.switch_mlp` layout the model holds
+/// ([`stack_experts`](crate::loader::experts::stack_experts)), then assigned
+/// under `policy`, which fails unless checkpoint and model account for each
+/// other.
+fn load_with_stacked_experts<M: ModuleParametersExt>(
+    family: &str,
+    model: &mut M,
+    model_dir: &Path,
+    policy: &LoadPolicy,
+) -> Result<(), Exception> {
+    let weights = load_weights(model_dir).map_err(|e| Exception::custom(e.to_string()))?;
+    let weights = crate::loader::experts::stack_experts(family, weights)?;
+    assign_weights(model, weights, policy)
+        .map_err(|e| Exception::custom(e.with_quantization_hint(model_dir).to_string()))
+}
+
 /// Rewrite the bare `Infinity` / `NaN` literals some released configs contain
 /// into `null`.
 ///
@@ -721,28 +738,6 @@ macro_rules! simple_load {
     }};
 }
 
-/// Same as `simple_load!` but additionally calls `init_post_load_fast_paths()`
-/// on the wrapped `DynamicModel` before returning — required for MoE
-/// architectures (Qwen3MoE, DeepSeek, NemotronH, GptOss) that materialise
-/// stacked expert weights after the base load.
-macro_rules! simple_load_moe {
-    ($config_ty:ty, $new:expr, $content:expr, $model_dir:expr, $variant:ident) => {{
-        let config: $config_ty =
-            json5::from_str($content).map_err(|e| Exception::custom(e.to_string()))?;
-        let mut model = ($new)(config)?;
-        load_generic_weights_with(
-            &mut model,
-            $model_dir,
-            &ModelArchitecture::$variant.load_policy(),
-        )
-        .map_err(|e| Exception::custom(e.to_string()))?;
-        eval_module_parameters_batched(&model)?;
-        let mut model = Self::$variant(model);
-        model.init_post_load_fast_paths()?;
-        Ok(model)
-    }};
-}
-
 /// An LM head in the form cut cross-entropy computes a loss from: the logits
 /// of hidden states `h` are `softcap(logit_scale · (h·Wᵀ + b))`, never
 /// materialised. See [`DynamicModel::lm_head`].
@@ -905,7 +900,6 @@ impl std::fmt::Debug for DynamicModel {
 impl DynamicModel {
     fn init_post_load_fast_paths(&mut self) -> Result<(), Exception> {
         match self {
-            Self::Qwen3MoE(model) => model.init_stacked_moe(),
             Self::NemotronH(model) => model.init_stacked_moe(),
             Self::GptOss(model) => model.init_stacked_moe(),
             _ => Ok(()),
@@ -1098,13 +1092,23 @@ impl DynamicModel {
                 model_dir,
                 Qwen3
             ),
-            ModelArchitecture::Qwen3MoE => simple_load_moe!(
-                Qwen3MoEConfig,
-                Qwen3MoE::new,
-                &config_content,
-                model_dir,
-                Qwen3MoE
-            ),
+            // The parameter tree is the checkpoint's layout with each layer's
+            // experts stacked: a released checkpoint's expert-per-key tensors
+            // and transformers 5's fused `gate_up_proj` are stacked at load,
+            // an MLX conversion's `mlp.switch_mlp` is held as it is.
+            ModelArchitecture::Qwen3MoE => {
+                let config: Qwen3MoEConfig = json5::from_str(&config_content)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                let mut model = Qwen3MoE::new(config)?;
+                load_with_stacked_experts(
+                    "qwen3_moe",
+                    &mut model,
+                    model_dir,
+                    &ModelArchitecture::Qwen3MoE.load_policy(),
+                )?;
+                eval_module_parameters_batched(&model)?;
+                Ok(Self::Qwen3MoE(model))
+            }
             ModelArchitecture::Gemma => {
                 let config = parse_gemma_config(&config_content)?;
                 let mut model = GemmaForCausalLM::new(config)?;
@@ -1192,12 +1196,7 @@ impl DynamicModel {
                     ));
                 }
                 let mut model = DeepSeek::new(config)?;
-                let weights = crate::loader::load_weights(model_dir)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let weights = crate::architectures::deepseek::stack_experts(weights)?;
-                assign_weights(&mut model, weights, &policy).map_err(|e| {
-                    Exception::custom(e.with_quantization_hint(model_dir).to_string())
-                })?;
+                load_with_stacked_experts("deepseek", &mut model, model_dir, &policy)?;
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::DeepSeek(model))
             }
@@ -1223,9 +1222,9 @@ impl DynamicModel {
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::Granite(model))
             }
-            // NemotronH uses a bespoke weight loader (load_nemotron_weights) so we
-            // can't route through simple_load_moe!, but the init_post_load_fast_paths
-            // step still applies after weights are materialised.
+            // NemotronH uses a bespoke weight loader (`load_nemotron_weights`);
+            // `init_post_load_fast_paths` still applies once the weights are
+            // materialised.
             ModelArchitecture::NemotronH => {
                 let config: NemotronHConfig = json5::from_str(&config_content)
                     .map_err(|e| Exception::custom(e.to_string()))?;
@@ -2801,24 +2800,6 @@ mod tests {
         );
     }
 
-    fn tiny_qwen3_moe_config() -> Qwen3MoEConfig {
-        Qwen3MoEConfig {
-            hidden_size: 32,
-            intermediate_size: 64,
-            moe_intermediate_size: Some(32),
-            num_hidden_layers: 2,
-            num_attention_heads: 2,
-            num_key_value_heads: Some(1),
-            head_dim: 16,
-            vocab_size: 100,
-            num_experts: 4,
-            num_experts_per_tok: 2,
-            decoder_sparse_step: 1,
-            tie_word_embeddings: true,
-            ..Default::default()
-        }
-    }
-
     fn tiny_nemotron_h_config() -> NemotronHConfig {
         NemotronHConfig {
             model_type: "nemotron_h".to_string(),
@@ -3011,21 +2992,6 @@ mod tests {
             .unwrap(),
         );
         assert!(model.requires_expert_offloading());
-    }
-
-    #[test]
-    #[serial]
-    fn qwen3_moe_post_load_fast_paths_initialize_stacked_experts() {
-        let mut model = DynamicModel::Qwen3MoE(Qwen3MoE::new(tiny_qwen3_moe_config()).unwrap());
-        model.init_post_load_fast_paths().unwrap();
-
-        let DynamicModel::Qwen3MoE(model) = &model else {
-            panic!("expected qwen3-moe model");
-        };
-        let Qwen3MoEFeedForward::MoE(moe) = &model.model.layers[0].ffn else {
-            panic!("expected moe layer");
-        };
-        assert!(moe.has_stacked_moe());
     }
 
     #[test]

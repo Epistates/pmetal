@@ -1,6 +1,6 @@
 //! Shared routing helpers for Mixture-of-Experts architectures.
 //!
-//! Most pmetal MoE blocks (Qwen3-MoE, GptOss, …) compute expert weights the
+//! Most pmetal MoE blocks (Qwen3-Next, Gemma 4, Granite, …) compute expert weights the
 //! same way after the activation step:
 //!
 //! ```text
@@ -16,7 +16,7 @@
 //! scores so each architecture keeps its activation choice local while
 //! sharing the selection + normalisation path.
 //!
-//! Note: Qwen3-Next, Qwen3-MoE, Gemma 4 and Granite route through this
+//! Note: Qwen3-Next, Gemma 4 and Granite route through this
 //! helper. The earlier sign-flipped `argpartition(-scores, -k)[..., -k:]`
 //! variant was anti-top-k (selects the k *smallest*) and has been removed —
 //! see the `sign_flipped_argpartition_is_anti_topk` test below. DeepSeek's

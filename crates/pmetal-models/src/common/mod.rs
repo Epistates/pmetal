@@ -9,6 +9,7 @@
 
 pub mod batched_attention;
 pub mod rotary;
+pub mod switch_mlp;
 
 pub use batched_attention::{
     BatchedGqaAttnCfg, batched_gqa_attn, batched_parallel_block, batched_perinorm_layer,
