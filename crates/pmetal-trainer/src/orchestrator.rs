@@ -1077,7 +1077,7 @@ fn run_lora_path(
         if config.dispatch.no_adaptive_lr {
             adaptive_config.enabled = false;
         }
-        let control_file = PathBuf::from(output_dir).join(".lr_control.json");
+        let control_file = pmetal_core::lr_control_path(std::path::Path::new(output_dir));
         training_loop.enable_adaptive_lr_with_control(adaptive_config, control_file);
         training_loop.set_snapshot_persist_dir(checkpoint_manager.checkpoint_dir().to_path_buf());
     }

@@ -23,6 +23,7 @@ extern crate self as pmetal_core;
 mod config;
 mod config_file;
 pub mod constants;
+pub mod control;
 mod error;
 pub mod events;
 pub mod fields;
@@ -35,6 +36,7 @@ mod validation;
 
 pub use config::*;
 pub use config_file::{FullTrainingConfig, LoadedConfig};
+pub use control::{LR_CONTROL_FILE, LrControlCommand, lr_control_path, write_lr_control};
 pub use error::*;
 pub use events::{
     BenchTrialMetrics, BroadcastSink, CompletionSummary, JobEvent, JobEventSink, JobKind,

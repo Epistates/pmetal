@@ -12,7 +12,7 @@
 //! and adaptive logic can only reduce from there (never increase beyond schedule).
 
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// An LR adjustment event emitted by the controller.
 #[derive(Debug, Clone)]
@@ -272,21 +272,9 @@ impl AdaptiveLrConfig {
     }
 }
 
-/// Control command from TUI/MCP → training subprocess.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
-pub enum LrControlCommand {
-    /// Set LR to an absolute value.
-    SetLr { value: f64 },
-    /// Reduce LR by a factor.
-    ReduceLr { factor: f64 },
-    /// Reset to the scheduled LR (clear all adaptive adjustments).
-    ResetLr,
-    /// Trigger an immediate checkpoint save (training continues).
-    SaveCheckpoint,
-    /// Gracefully stop: restore best weights, save checkpoint, then exit.
-    GracefulStop,
-}
+// The command a surface sends to a running job, and how it is written, live in
+// `pmetal-core` so the TUI, the GUI and the MCP server share one definition.
+pub use pmetal_core::LrControlCommand;
 
 /// The adaptive LR controller.
 ///
@@ -1053,16 +1041,6 @@ impl AdaptiveLrController {
             }
         }
     }
-}
-
-/// Write an LR control command to the control file.
-///
-/// Called by the TUI to send LR adjustments to a running training job.
-pub fn write_lr_control(output_dir: &Path, command: &LrControlCommand) -> std::io::Result<()> {
-    let control_path = output_dir.join(".lr_control.json");
-    let json = serde_json::to_string(command)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&control_path, json)
 }
 
 #[cfg(test)]
