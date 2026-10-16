@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use crate::architectures::clip::{CLIPConfig, CLIPTextModel};
 use crate::architectures::flux::{FluxConfig, FluxDiT};
 use crate::architectures::t5::{T5Config, T5EncoderModel};
-use crate::architectures::vae::{FluxVAE, VAEConfig};
+use crate::architectures::vae::{AutoencoderKL, VAEConfig};
 use crate::loader::{
     load_clip_weights, load_flux_weights, load_t5_weights, load_vae_weights, load_weights,
 };
@@ -22,7 +22,7 @@ pub struct FluxPipeline {
     pub clip: CLIPTextModel,
     pub t5: T5EncoderModel,
     pub dit: FluxDiT,
-    pub vae: FluxVAE,
+    pub vae: AutoencoderKL,
     pub scheduler: FlowMatchScheduler,
 }
 
@@ -39,7 +39,8 @@ impl FluxPipeline {
         let t5 = T5EncoderModel::new(t5_config)
             .map_err(|e| pmetal_core::PMetalError::ModelLoad(e.to_string()))?;
         let dit = FluxDiT::new(flux_config);
-        let vae = FluxVAE::new(vae_config);
+        let vae = AutoencoderKL::new(vae_config)
+            .map_err(|e| pmetal_core::PMetalError::ModelLoad(e.to_string()))?;
         let scheduler = FlowMatchScheduler::new_flux(20, 1.0, Some(3.0)).unwrap();
 
         Ok(Self {
@@ -80,7 +81,7 @@ impl FluxPipeline {
 
         let vae_weights = load_weights(&component_paths.vae)
             .map_err(|e| pmetal_core::PMetalError::ModelLoad(e.to_string()))?;
-        load_vae_weights(&mut pipeline.vae, &vae_weights)
+        load_vae_weights(&mut pipeline.vae, vae_weights)
             .map_err(|e| pmetal_core::PMetalError::ModelLoad(e.to_string()))?;
 
         ModuleParametersExt::eval(&pipeline.clip)
@@ -307,19 +308,7 @@ fn load_t5_config(component_dir: &Path) -> Result<T5Config> {
 
 fn load_vae_config(component_dir: &Path) -> Result<VAEConfig> {
     let raw = read_json(&component_dir.join("config.json"))?;
-    let mut config = VAEConfig::default();
-
-    config.in_channels = value_usize(&raw, &["in_channels"]).unwrap_or(config.in_channels);
-    config.out_channels = value_usize(&raw, &["out_channels"]).unwrap_or(config.out_channels);
-    config.latent_channels =
-        value_usize(&raw, &["latent_channels"]).unwrap_or(config.latent_channels);
-    config.layers_per_block =
-        value_usize(&raw, &["layers_per_block"]).unwrap_or(config.layers_per_block);
-    if let Some(block_out_channels) = value_usize_array(&raw, &["block_out_channels"]) {
-        config.block_out_channels = block_out_channels;
-    }
-
-    Ok(config)
+    serde_json::from_value(raw).map_err(|e| pmetal_core::PMetalError::Config(e.to_string()))
 }
 
 fn load_flux_config(component_dir: &Path) -> Result<FluxConfig> {
@@ -416,7 +405,7 @@ mod tests {
             num_single_blocks: 1,
             ..Default::default()
         };
-        let vae_config = VAEConfig::default();
+        let vae_config = VAEConfig::flux();
 
         let mut pipeline = FluxPipeline::new(clip_config, t5_config, flux_config, vae_config).unwrap();
 

@@ -1,0 +1,36 @@
+{
+  "config": {
+    "act_fn": "silu",
+    "block_out_channels": [
+      16,
+      32,
+      32
+    ],
+    "down_block_types": [
+      "DownEncoderBlock2D",
+      "DownEncoderBlock2D",
+      "DownEncoderBlock2D"
+    ],
+    "force_upcast": true,
+    "in_channels": 3,
+    "latent_channels": 4,
+    "layers_per_block": 2,
+    "norm_num_groups": 8,
+    "out_channels": 3,
+    "sample_size": 32,
+    "scaling_factor": 0.18215,
+    "shift_factor": null,
+    "up_block_types": [
+      "UpDecoderBlock2D",
+      "UpDecoderBlock2D",
+      "UpDecoderBlock2D"
+    ],
+    "use_post_quant_conv": true,
+    "use_quant_conv": true
+  },
+  "model_id": "synthetic",
+  "oracle": "transformers",
+  "rng_seed": 9,
+  "torch_version": "2.11.0",
+  "transformers_version": "5.6.1"
+}
