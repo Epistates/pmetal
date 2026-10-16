@@ -76,6 +76,8 @@ tower-http = "0.7"
 
 # MCP server (pmetal-mcp)
 turbomcp = "3.6.0"
+turbomcp-types = "3.6.0"
+schemars = { version = "1.2", features = ["derive"] }
 
 # Peer discovery and networking (pmetal-distributed)
 libp2p = "0.57"

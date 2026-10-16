@@ -1,37 +1,56 @@
 # pmetal-mcp — implementation notes
 
-The MCP server exposes 53 tools (`#[tool]` methods in `lib.rs`; the user-facing
-list is in `docs/cli/mcp.md`). Every tool that starts a `pmetal` subcommand
-builds that subcommand's `pmetal_core::jobs::*Spec`, runs `normalize()` for
-validation, and spawns `spec.to_argv()`, so a tool's parameters, defaults and
-checks are the CLI's. The parity gaps an April 2026 audit recorded here (the
-`generate` tool's missing inference flags and the missing `tokenize`, `memory`
-and `dflash` tools) are closed.
+The user-facing tool list, limits and environment variables are in
+`docs/cli/mcp.md`. This file is about how the server is put together.
 
-## Architecture notes
+## Where a tool comes from
 
-### JobEvent JSONL consumer (landed)
+There is one definition of each tool, and it is the one nearest the thing it
+runs:
 
-`jobs.rs` now tries `pmetal_core::events::parse_event` on each stdout line before
-falling back to the legacy `{"step":N,"loss":F}` flat-JSON parser. This means
-MCP works with both old subprocesses (flat metrics JSON) and new ones that emit
-`JobEvent` JSONL via `--log-events /dev/stdout`.
+| Source | Module | Tools |
+|--------|--------|-------|
+| A job spec in `pmetal-core` | `spec_tools` | training, inference, quantize, merge, serve, ... |
+| A table row for a CLI command with no spec | `cli_tools` | `dataset_*`, `ollama_*`, `bench_gen`, `bench_corpus` |
+| Code in this crate | `native` | the Hub, the cache, jobs, `chat`, `decide` |
 
-The structured path populates `JobMetrics` from `MetricPayload::Step` and
-`MetricPayload::Eval`; the legacy path remains for backward compatibility until
-all subcommands have been ported to emit `JobEvent` JSONL.
+`spec_tools` builds a tool's input schema from the spec's `FieldDescriptor`s and
+its defaults from `Spec::default()`, deserializes the call into the spec, runs
+the spec's `normalize` and runs `to_argv()`. Nothing about a spec is repeated
+here, apart from the list of specs, so a field added to or removed from a spec
+appears in or leaves the tool. `native` tools declare their arguments as a
+struct that is both the schema (`schemars`) and the parse (`serde`, unknown
+fields refused).
 
-### Ring-buffer cap
+`schema_check` holds every call to the schema the tool advertised, whichever of
+the three it came from.
 
-`MAX_BUFFER_LINES = 10_000`. When full, the oldest **10%** (1000 lines) are
-dropped atomically before inserting the new line. This bounds steady-state memory
-at ~10 000 lines per stream regardless of job duration.
+## Paths and references
 
-### Wire-format stability
+`policy::PathPolicy` is the only place a path is judged. A spec field is a path
+if its descriptor says so (`Path`, `ModelPicker`, `DatasetPicker`) or the tool
+lists it in `extra_path_fields`; a `cli_tools` parameter says so in its type.
+Defaults are checked as well as what the caller gave, so `./output` cannot
+escape the roots either.
 
-`JobStatus` in `jobs.rs` retains `#[serde(tag = "state", rename_all = "snake_case")]`
-and its current variant names (`Running`, `Stopping`, `Completed { exit_code }`,
-`Failed { exit_code, error }`, `Stopped`). This is intentionally NOT migrated to
-`pmetal_core::JobStatus<R>` yet because the wire format differs (core uses
-`Running { progress, last_metric }` vs MCP's thin `Running`). A follow-up PR
-will migrate after agreeing on the wire contract with existing MCP clients.
+## Jobs
+
+`jobs::JobManager` starts a `pmetal` subcommand in its own process group and
+owns it until it ends. Output is one ordered sequence, bounded by lines, bytes
+and line length, with tokens redacted. Metrics come from the `--log-metrics`
+file the server asks the command to write (the TUI reads the same file) and from
+`JobEvent` lines on standard output. The manager caps running jobs and kept
+finished jobs, and `shutdown` stops what is left; `run_stdio` calls it however
+the server ends.
+
+Commands that run to completion go through `native::Core::run` (a semaphore, so
+a few at a time) and `util::run_command` (time limit, bounded output,
+cancellation, progress heartbeat).
+
+## Tests
+
+`tests/` drives the server through `McpHandlerExt::handle_request`, the same
+JSON-RPC entry point a transport uses, against a shell script standing in for
+`pmetal`. The flags the `cli_tools` rows spell, and the argv the spec tools
+build, are checked against the CLI's real parser by the `mcp_tools_parse` tests
+in the `pmetal` crate (`cargo test -p pmetal --features mcp mcp_tools_parse`).

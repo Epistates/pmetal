@@ -5360,12 +5360,15 @@ dependencies = [
  "pmetal-hub",
  "pmetal-metal",
  "reqwest",
+ "schemars",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "turbomcp",
+ "turbomcp-types",
  "uuid",
 ]
 

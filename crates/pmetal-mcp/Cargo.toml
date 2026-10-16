@@ -21,6 +21,10 @@ pmetal-hub = { workspace = true }
 
 # MCP server framework
 turbomcp = { workspace = true, features = ["stdio"] }
+turbomcp-types = { workspace = true }
+
+# Input and output schemas, generated from the types the tools use
+schemars = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
@@ -39,6 +43,10 @@ reqwest = { workspace = true }
 # Job management
 chrono = { workspace = true, features = ["serde"] }
 uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+# The cancellation token a transport hands a request, to cancel one in a test
+tokio-util = { workspace = true }
 
 [lints]
 workspace = true

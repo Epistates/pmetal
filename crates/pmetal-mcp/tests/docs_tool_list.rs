@@ -1,35 +1,21 @@
 //! The MCP docs list exactly the tools the server defines.
 
+mod common;
+
 use std::collections::BTreeSet;
 
-/// Names of the `#[tool]` methods in the server source.
-fn defined_tools() -> BTreeSet<String> {
-    let src = include_str!("../src/lib.rs");
-    let mut tools = BTreeSet::new();
-    let mut after_attr = false;
-    for line in src.lines() {
-        let line = line.trim();
-        if line.starts_with("#[tool") {
-            after_attr = true;
-            continue;
-        }
-        if after_attr {
-            if let Some(rest) = line
-                .strip_prefix("pub async fn ")
-                .or_else(|| line.strip_prefix("async fn "))
-            {
-                let name: String = rest
-                    .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                    .collect();
-                tools.insert(name);
-                after_attr = false;
-            } else if !line.starts_with("#[") && !line.starts_with("///") {
-                after_attr = false;
-            }
-        }
-    }
-    tools
+use common::Harness;
+use serde_json::json;
+
+/// Names of the tools the server lists.
+async fn defined_tools() -> BTreeSet<String> {
+    let list = Harness::new("exit 0").result("tools/list", json!({})).await;
+    list["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect()
 }
 
 /// The tool names in the docs' tool table, and the count its intro states.
@@ -51,11 +37,11 @@ fn documented_tools() -> (BTreeSet<String>, usize) {
     (tools, count)
 }
 
-#[test]
-fn the_docs_list_every_tool_and_nothing_else() {
-    let defined = defined_tools();
+#[tokio::test]
+async fn the_docs_list_every_tool_and_nothing_else() {
+    let defined = defined_tools().await;
     let (documented, stated) = documented_tools();
-    assert!(defined.len() > 40, "parsed only {} tools", defined.len());
+    assert!(defined.len() > 40, "found only {} tools", defined.len());
     let undocumented: Vec<_> = defined.difference(&documented).collect();
     let phantom: Vec<_> = documented.difference(&defined).collect();
     assert!(
