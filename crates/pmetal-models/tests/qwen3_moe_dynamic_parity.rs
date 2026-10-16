@@ -227,7 +227,7 @@ fn qwen3_moe_fixture_is_sensitive_to_its_experts() {
     let mut weights = load_shard(&fixture_path("qwen3_moe_weights.safetensors"));
     for (key, value) in weights.iter_mut() {
         if key.ends_with(".mlp.experts.down_proj") {
-            *value = Array::zeros_f32(&value.shape().to_vec());
+            *value = Array::zeros_f32(value.shape());
         }
     }
     let entries: Vec<(&str, &Array)> = weights.iter().map(|(k, v)| (k.as_str(), v)).collect();

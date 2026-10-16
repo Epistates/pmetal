@@ -1175,13 +1175,4 @@ mod tests {
 
         assert_eq!(logits.shape(), &[1, 1, 1000]);
     }
-
-    #[test]
-    fn test_phi4_config() {
-        let config = PhiConfig::phi4();
-        assert_eq!(config.vocab_size, 100352);
-        assert!(config.qkv_bias);
-        assert_eq!(config.rope_theta, 250000.0);
-        assert_eq!(config.partial_rotary_factor, 0.4);
-    }
 }

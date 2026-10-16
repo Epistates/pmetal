@@ -386,7 +386,7 @@ fn gguf_rope_scaling_metadata_is_read_and_unknown_types_are_refused() {
         ),
     )
     .unwrap();
-    let err = DynamicModel::load(&path).err().expect("refused");
+    let err = DynamicModel::load(&path).expect_err("refused");
     assert!(err.to_string().contains("longrope"), "{err}");
 
     std::fs::write(
@@ -402,7 +402,7 @@ fn gguf_rope_scaling_metadata_is_read_and_unknown_types_are_refused() {
         ),
     )
     .unwrap();
-    let err = DynamicModel::load(&path).err().expect("refused");
+    let err = DynamicModel::load(&path).expect_err("refused");
     assert!(err.to_string().contains("rope_freqs"), "{err}");
 }
 

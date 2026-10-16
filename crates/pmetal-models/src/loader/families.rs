@@ -371,20 +371,6 @@ fn load_linear_weight(
     Ok(())
 }
 
-fn load_rms_norm_weight(
-    norm: &mut pmetal_runtime::compat::nn::RmsNorm,
-    weights: &HashMap<String, Array>,
-    prefix: &str,
-) -> Result<(), LoadError> {
-    let weight_key = format!("{prefix}.weight");
-    if let Some(w) = weights.get(&weight_key) {
-        norm.weight = pmetal_runtime::compat::module::Param::new(w.clone());
-    } else {
-        return Err(LoadError::MissingWeight(weight_key));
-    }
-    Ok(())
-}
-
 fn load_gemma_rms_norm_weight(
     norm: &mut crate::architectures::gemma::GemmaRmsNorm,
     weights: &HashMap<String, Array>,

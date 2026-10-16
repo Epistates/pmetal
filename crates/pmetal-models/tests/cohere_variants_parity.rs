@@ -155,8 +155,6 @@ fn a_model_without_query_key_norm_refuses_its_tensors() {
         dir.path().join("model.safetensors"),
     )
     .unwrap();
-    let err = DynamicModel::load(dir.path())
-        .err()
-        .expect("the load is refused");
+    let err = DynamicModel::load(dir.path()).expect_err("the load is refused");
     assert!(err.to_string().contains("q_norm"), "{err}");
 }

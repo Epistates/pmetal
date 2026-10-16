@@ -30,7 +30,7 @@ use crate::traits::ModelConfig;
 /// Cohere model configuration: Command R / R+ (`model_type = "cohere"`) and
 /// Command R7B / Command A (`"cohere2"`).
 ///
-/// Read from a `config.json` through [`CohereConfigFile`], which fills what a
+/// Read from a `config.json` through a file struct that fills what a
 /// released config leaves out the way `transformers` does: `head_dim` is
 /// `hidden_size / num_attention_heads`, `num_key_value_heads` defaults to the
 /// attention heads, `rope_theta` comes from `rope_parameters` when that is how
