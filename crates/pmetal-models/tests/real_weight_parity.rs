@@ -66,7 +66,8 @@
 //!   `floor_pos_cos_long`, when those were run;
 //! * `_manifest.json`: slug to [`RefMeta`], where `model_dir` is the local
 //!   checkpoint snapshot and `noise_floor` the same model rerun in fp32 against
-//!   its bf16 taps.
+//!   its bf16 taps. `input_id_offset` (default 0) shifts the arithmetic token
+//!   ids for a model whose vocabulary has untrained rows where they land.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -172,6 +173,10 @@ struct RefMeta {
     sliding_window: Option<usize>,
     vocab_size: i32,
     hidden_size: i32,
+    /// Added to the arithmetic token ids, for a model whose vocabulary has
+    /// untrained rows where the arithmetic sequence lands (see [`input_ids`]).
+    #[serde(default)]
+    input_id_offset: i32,
     /// The oracle's argmax token at each position.
     top1: Vec<i32>,
     /// Per-tap bf16-vs-fp32 divergence, keyed `trunk` / `trunk_long` / `logits`.
@@ -208,6 +213,31 @@ impl RefMeta {
     }
 }
 
+/// The embedding rows the ids select, when any of them is all but zero.
+///
+/// A checkpoint's vocabulary can hold rows nothing trained: Nemotron-H's ids
+/// 20 to 125 are about 1e-37. Fed those, the residual stream starts at the
+/// edge of float32's range and the model computes from its biases, so two
+/// correct implementations disagree wildly; the sweep once recorded that as a
+/// 6x excess over the noise floor and a defect to chase.
+fn untrained_input(model: &mut DynamicModel, meta: &RefMeta) -> Option<String> {
+    let longest = meta.long_seq_len.unwrap_or(meta.seq_len).max(meta.seq_len);
+    let ids = input_ids(longest, meta.vocab_size, meta.input_id_offset);
+    let embedding = model.token_embedding_mut()?;
+    let table = embedding.weight.as_ref();
+    let rows = table.take_axis(&Array::from_slice(&ids, &[ids.len() as i32]), 0);
+    let strongest = rows.abs().max_axis(-1, false);
+    let weakest = to_f32_vec_eval(&strongest)
+        .into_iter()
+        .fold(f32::INFINITY, f32::min);
+    (weakest < 1e-6).then(|| {
+        format!(
+            "the input ids select an embedding row of at most {weakest:e}: untrained rows, so \
+             the comparison measures rounding. Set input_id_offset in the reference."
+        )
+    })
+}
+
 struct Finding {
     slug: String,
     detail: String,
@@ -215,9 +245,16 @@ struct Finding {
 
 /// The reference's token ids, recomputed rather than read, so a mismatch between
 /// the two sides is itself a failure the fixture cannot paper over.
-fn input_ids(seq_len: usize, vocab_size: i32) -> Vec<i32> {
+///
+/// `offset` moves the sequence for a model whose embedding table has untrained
+/// rows where the unshifted one lands. Nemotron-H's ids 20 to 125 are rows of
+/// about 1e-37: the whole residual stream starts at the edge of float32's
+/// range, every layer's output is dominated by biases and the answer is a
+/// chaotic function of rounding, which measured nothing about the port. See
+/// [`RefMeta::untrained_input`].
+fn input_ids(seq_len: usize, vocab_size: i32, offset: i32) -> Vec<i32> {
     (0..seq_len)
-        .map(|i| ((i as i32 + 1) * 7 + 13) % vocab_size)
+        .map(|i| (((i as i32 + 1) * 7 + 13 + offset) % vocab_size + vocab_size) % vocab_size)
         .collect()
 }
 
@@ -365,7 +402,7 @@ fn check_one_inner(slug: &str, meta: &RefMeta, refs_root: &Path) -> Outcome {
         .chain(meta.long_seq_len.map(|len| ("input_ids_long", len)))
         .collect();
     for (key, len) in id_checks {
-        let ids = input_ids(len, meta.vocab_size);
+        let ids = input_ids(len, meta.vocab_size, meta.input_id_offset);
         let from_fixture: Vec<i32> = to_f32_vec_eval(ref_tensor(&shard, key))
             .into_iter()
             .map(|v| v as i32)
@@ -380,10 +417,17 @@ fn check_one_inner(slug: &str, meta: &RefMeta, refs_root: &Path) -> Outcome {
         }
     }
 
-    let short = input_ids(meta.seq_len, meta.vocab_size);
+    // Ids that land on untrained embedding rows make every layer's output a
+    // function of rounding, and the comparison below meaningless.
+    if let Some(detail) = untrained_input(&mut model, meta) {
+        out.details.push(detail);
+        return out;
+    }
+
+    let short = input_ids(meta.seq_len, meta.vocab_size, meta.input_id_offset);
     let short_array = Array::from_slice(&short, &[1, meta.seq_len as i32]);
     let long_array = meta.long_seq_len.map(|len| {
-        let long = input_ids(len, meta.vocab_size);
+        let long = input_ids(len, meta.vocab_size, meta.input_id_offset);
         Array::from_slice(&long, &[1, len as i32])
     });
 
@@ -681,7 +725,7 @@ fn released_checkpoints_leave_no_parameter_at_random_init() {
     let mut findings = Vec::new();
 
     for (slug, meta) in &manifest {
-        let ids = input_ids(meta.seq_len, meta.vocab_size);
+        let ids = input_ids(meta.seq_len, meta.vocab_size, meta.input_id_offset);
         let ids_array = Array::from_slice(&ids, &[1, meta.seq_len as i32]);
 
         // Both taps, because *which* one moves says where the hole is: a trunk
