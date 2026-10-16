@@ -186,6 +186,50 @@ fn qwen4_exp_matches_transformers_full_and_cached() {
     assert_argmax(&cached, ref_tensor(&reference, "argmax_tokens"));
 }
 
+/// A prefill that samples from the last position runs the final mix and the
+/// LM head on that position alone: its row is the full forward's last row, and
+/// the caches it leaves decode the next token as the full forward's do.
+#[test]
+#[serial]
+fn qwen4_exp_last_position_is_the_full_forwards_last_row() {
+    let reference = load_shard(&fixture_path("qwen4_exp_synth_reference.safetensors"));
+    let input_ids = ref_tensor(&reference, "input_ids").clone();
+    let dir = checkpoint_dir();
+    let mut model = DynamicModel::load(dir.path()).expect("production load");
+    let (batch, seq) = (input_ids.dim(0), input_ids.dim(1));
+    let want = ref_tensor(&reference, "logits");
+    let want_last = want.slice(&[0, seq - 1, 0], &[batch, seq, want.dim(2)]);
+
+    let prompt = input_ids.slice(&[0, 0], &[batch, seq - 1]);
+    let next = input_ids.slice(&[0, seq - 1], &[batch, seq]);
+    let mut kv = model.create_cache(64);
+    let mut mamba = model.create_mamba_cache();
+    let prefill = model
+        .forward_with_hybrid_cache_last(&prompt, None, Some(&mut kv), mamba.as_mut())
+        .expect("last-position prefill");
+    assert_eq!(prefill.shape(), &[batch, 1, want.dim(2)]);
+    let step = model
+        .forward_with_hybrid_cache_last(&next, None, Some(&mut kv), mamba.as_mut())
+        .expect("decode after a last-position prefill");
+    pmetal_runtime::check_unobserved_error().expect("no bridge error");
+
+    let tolerance = tolerances()
+        .into_iter()
+        .find(|(name, _)| *name == "logits")
+        .expect("a logits tolerance")
+        .1;
+    let reports = vec![
+        ParityReport::compute(
+            "prefill_last_row",
+            &prefill,
+            &want.slice(&[0, seq - 2, 0], &[batch, seq - 1, want.dim(2)]),
+            tolerance,
+        ),
+        ParityReport::compute("decode_after_last", &step, &want_last, tolerance),
+    ];
+    assert_all_pass("last position", &reports);
+}
+
 /// Serving the n-gram rows from the checkpoint file must give exactly what the
 /// resident table gives: the same bytes, looked up by the same row ids.
 #[test]

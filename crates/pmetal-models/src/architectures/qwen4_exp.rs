@@ -1610,6 +1610,35 @@ impl Qwen4ExpModel {
         &mut self,
         input_ids: &Array,
         mask: Option<&Array>,
+        kv_cache: Option<&mut KVCache>,
+        mamba_cache: Option<&mut MambaCache>,
+        capture: Option<&mut SpecCapture>,
+    ) -> Result<Array, Exception> {
+        let streams = self.forward_streams(input_ids, mask, kv_cache, mamba_cache, capture)?;
+        Ok(self.hyper_connection_mixer.mix(&streams).0)
+    }
+
+    /// [`forward_with_cache`](Self::forward_with_cache) for the last position
+    /// alone, `[B, 1, H]`: every layer runs over the whole input (the caches
+    /// fill as they would) and the final mix runs on one position's streams.
+    pub fn forward_with_cache_last(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        kv_cache: Option<&mut KVCache>,
+        mamba_cache: Option<&mut MambaCache>,
+    ) -> Result<Array, Exception> {
+        let streams = self.forward_streams(input_ids, mask, kv_cache, mamba_cache, None)?;
+        let last = pmetal_runtime::decode::last_token_hidden(&streams);
+        Ok(self.hyper_connection_mixer.mix(&last).0)
+    }
+
+    /// The streams `[B, L, hc·H]` after the last decoder layer, before the
+    /// final mix.
+    fn forward_streams(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
         mut kv_cache: Option<&mut KVCache>,
         mut mamba_cache: Option<&mut MambaCache>,
         mut capture: Option<&mut SpecCapture>,
@@ -1665,8 +1694,7 @@ impl Qwen4ExpModel {
                 buf.record_hidden(layer_idx, h.clone());
             }
         }
-        let (mixed, _) = self.hyper_connection_mixer.mix(&h);
-        Ok(mixed)
+        Ok(h)
     }
 
     pub fn forward(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Array, Exception> {
@@ -1778,6 +1806,22 @@ impl Qwen4ExpForCausalLM {
         let h = self
             .model
             .forward_with_cache(input_ids, mask, kv_cache, mamba_cache)?;
+        Ok(self.lm_head_forward(&h))
+    }
+
+    /// [`forward_with_cache`](Self::forward_with_cache) returning the last
+    /// position's logits, `[B, 1, vocab]`: the final mix and the LM head run
+    /// on one position per sequence instead of every prompt token's.
+    pub fn forward_with_cache_last(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        kv_cache: Option<&mut KVCache>,
+        mamba_cache: Option<&mut MambaCache>,
+    ) -> Result<Array, Exception> {
+        let h = self
+            .model
+            .forward_with_cache_last(input_ids, mask, kv_cache, mamba_cache)?;
         Ok(self.lm_head_forward(&h))
     }
 

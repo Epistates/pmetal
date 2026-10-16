@@ -2427,12 +2427,7 @@ impl DynamicModel {
                 m.forward_with_hybrid_cache_last(input_ids, mask, kv_cache, mamba_cache)
             }
             Self::NemotronH(m) => m.forward_with_cache_last(input_ids, mask, kv_cache, mamba_cache),
-            Self::Qwen4Exp(_) => Ok(last_token_hidden(&self.forward_with_hybrid_cache(
-                input_ids,
-                mask,
-                kv_cache,
-                mamba_cache,
-            )?)),
+            Self::Qwen4Exp(m) => m.forward_with_cache_last(input_ids, mask, kv_cache, mamba_cache),
             _ => self.forward_with_cache_last(input_ids, mask, kv_cache),
         }
     }
