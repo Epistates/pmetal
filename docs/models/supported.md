@@ -54,7 +54,7 @@ to export DFlash draft checkpoints for the dedicated `pmetal dflash` runtime.
 
 | Family | Architecture | Variants | `model_type` values |
 |--------|-------------|----------|-------------------|
-| BERT | `Bert` | BERT, RoBERTa, DistilBERT, XLM-RoBERTa | `bert`, `roberta`, `distilbert`, `xlm-roberta`, `xlm_roberta` |
+| BERT | `Bert` | BERT, RoBERTa, XLM-RoBERTa, CamemBERT, DistilBERT | `bert`, `roberta`, `xlm-roberta`, `xlm_roberta`, `camembert`, `distilbert` |
 
 ## LoRA / QLoRA Training Support
 
@@ -81,9 +81,9 @@ to export DFlash draft checkpoints for the dedicated `pmetal dflash` runtime.
 
 | Family | Variants | Status |
 |--------|----------|--------|
-| Flux | 1-dev, 1-schnell | Dispatcher + pipeline implemented |
+| Flux | 1-dev, 1-schnell | Pipeline over tokenized prompts (checked against `diffusers`); no tokenizer or CLI command yet |
 
-The Flux pipeline loads its CLIP and T5 text encoders and its VAE from `pmetal-models`.
+`pipelines::FluxPipeline` loads a `diffusers`-layout FLUX.1 directory (transformer, CLIP-L and T5-XXL text encoders, VAE, scheduler) from `pmetal-models`, strictly.
 
 ## See Also
 
