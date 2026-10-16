@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::checkpointing::checkpointed_layer;
+use crate::common::windowed_mask;
 use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
 use crate::traits::ModelConfig;
 use pmetal_cache::kv_cache::KVCache;
@@ -524,6 +525,12 @@ impl Qwen3Attention {
         } else {
             (k, v)
         };
+
+        // A caller's mask (packed sequences' block-diagonal one) says which
+        // sequence a token belongs to, not how far back this layer reaches.
+        let window = self.sliding_window.filter(|_| self.use_sliding_window);
+        let windowed = windowed_mask(mask, window, l, k.dim(2))?;
+        let mask = windowed.as_ref().or(mask);
 
         let out = fused_sdpa(&q, &k, &v, &attn_config, mask)?;
         let out = out

@@ -19,6 +19,7 @@ use pmetal_runtime::rope::{RopeConfig, RotaryEmbedding};
 use serde::{Deserialize, Serialize};
 
 use crate::checkpointing::checkpointed_layer;
+use crate::common::windowed_mask;
 use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
 
 use crate::traits::{CausalLMModel, ModelConfig};
@@ -310,6 +311,11 @@ impl MistralAttention {
         } else {
             (keys, values)
         };
+
+        // A caller's mask (packed sequences' block-diagonal one) says which
+        // sequence a token belongs to, not how far back this layer reaches.
+        let windowed = windowed_mask(mask, self.sliding_window, seq_len, keys.dim(2))?;
+        let mask = windowed.as_ref().or(mask);
 
         // Fused SDPA
         let output = fused_sdpa(&queries, &keys, &values, &attn_config, mask)?;

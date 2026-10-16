@@ -11,13 +11,14 @@ use pmetal_runtime::impl_module_params;
 
 use pmetal_cache::kv_cache::KVCache;
 use pmetal_runtime::nn::{
-    AttentionMaskType, FusedAttentionConfig, fused_sdpa, restrict_to_sliding_window,
+    AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     rope::{RopePositions, rope_embedding},
 };
 use pmetal_runtime::rope::{RopeConfig, RotaryEmbedding};
 use serde::{Deserialize, Serialize};
 
 use crate::checkpointing::checkpointed_layer;
+use crate::common::windowed_mask;
 use crate::decoder_layer::{
     AttentionModule, DecoderLayer, MlpModule, NormModule, std_pre_norm_forward,
 };
@@ -605,14 +606,9 @@ impl GemmaAttention {
 
         // A caller's mask (packed sequences' block-diagonal one) says which
         // sequence a token belongs to, not how far back a local layer reaches.
-        let windowed;
-        let mask = match (mask, self.sliding_window, self.is_local_attention) {
-            (Some(mask), Some(window), true) => {
-                windowed = restrict_to_sliding_window(mask, seq_len, keys.dim(2), window)?;
-                Some(&windowed)
-            }
-            (mask, _, _) => mask,
-        };
+        let window = self.sliding_window.filter(|_| self.is_local_attention);
+        let windowed = windowed_mask(mask, window, seq_len, keys.dim(2))?;
+        let mask = windowed.as_ref().or(mask);
 
         // Fused SDPA with optional softcapping
         let output = fused_sdpa(&queries, &keys, &values, &attn_config, mask)?;
