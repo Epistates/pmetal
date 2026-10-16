@@ -899,9 +899,10 @@ fn tiny_cohere_config() -> CohereConfig {
         layer_norm_eps: 1e-5,
         logit_scale: 0.0625,
         tie_word_embeddings: false,
-        use_sliding_window: false,
-        sliding_window: 4096,
-        global_attention_layers: None,
+        model_type: "cohere".to_string(),
+        use_qk_norm: false,
+        sliding_window: None,
+        layer_types: Vec::new(),
         rope_scaling: None,
         rope_parameters: None,
     }

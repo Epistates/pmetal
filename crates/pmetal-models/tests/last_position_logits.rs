@@ -288,7 +288,6 @@ fn cohere() {
         num_attention_heads: 4,
         num_key_value_heads: 2,
         head_dim: 8,
-        use_sliding_window: false,
         ..Default::default()
     })
     .unwrap();

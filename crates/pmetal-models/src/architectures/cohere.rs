@@ -23,12 +23,23 @@ use pmetal_runtime::rope::{RopeConfig, RotaryEmbedding};
 use serde::{Deserialize, Serialize};
 
 use crate::checkpointing::checkpointed_layer;
+use crate::common::windowed_mask;
 use crate::decoder_layer::{AttentionModule, MlpModule};
 use crate::traits::ModelConfig;
 
-/// Cohere model configuration.
+/// Cohere model configuration: Command R / R+ (`model_type = "cohere"`) and
+/// Command R7B / Command A (`"cohere2"`).
+///
+/// Read from a `config.json` through [`CohereConfigFile`], which fills what a
+/// released config leaves out the way `transformers` does: `head_dim` is
+/// `hidden_size / num_attention_heads`, `num_key_value_heads` defaults to the
+/// attention heads, `rope_theta` comes from `rope_parameters` when that is how
+/// the config spells it, and `tie_word_embeddings` is true.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "CohereConfigFile")]
 pub struct CohereConfig {
+    /// `"cohere"` or `"cohere2"`.
+    pub model_type: String,
     pub vocab_size: i32,
     pub hidden_size: i32,
     pub intermediate_size: i32,
@@ -42,20 +53,17 @@ pub struct CohereConfig {
     /// Output logit scaling factor. Cohere multiplies the LM-head logits by
     /// this (HF `CohereForCausalLM`:
     /// `out = out * logit_scale`). Command-R family ships `0.0625`.
-    #[serde(default = "default_logit_scale")]
     pub logit_scale: f32,
-    #[serde(default)]
     pub tie_word_embeddings: bool,
-    /// Use sliding window attention for certain layers.
-    #[serde(default)]
-    pub use_sliding_window: bool,
-    /// Sliding window size.
-    #[serde(default = "default_sliding_window")]
-    pub sliding_window: i32,
-    /// Layers that use global attention (no sliding window).
-    /// Pattern: every 4th layer uses global attention.
-    #[serde(default)]
-    pub global_attention_layers: Option<Vec<i32>>,
+    /// Command R+'s per-head LayerNorm on the queries and keys, after the
+    /// projections and before RoPE (`use_qk_norm`).
+    pub use_qk_norm: bool,
+    /// Window of the sliding-attention layers of a Cohere2 model; `None` for
+    /// Cohere, which attends globally everywhere.
+    pub sliding_window: Option<i32>,
+    /// Cohere2's attention type per layer, `"sliding_attention"` or
+    /// `"full_attention"`; empty for Cohere.
+    pub layer_types: Vec<String>,
     /// RoPE scaling, read by [`pmetal_runtime::rope`]; the Command-R
     /// releases ship none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -63,6 +71,149 @@ pub struct CohereConfig {
     /// transformers v5's spelling of the same, with `rope_theta` inside.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rope_parameters: Option<serde_json::Value>,
+}
+
+/// A Cohere `config.json` as released, before the defaults `transformers`
+/// applies are resolved into a [`CohereConfig`].
+#[derive(Debug, Deserialize)]
+struct CohereConfigFile {
+    #[serde(default = "default_model_type")]
+    model_type: String,
+    #[serde(default = "default_vocab_size")]
+    vocab_size: i32,
+    #[serde(default = "default_hidden_size")]
+    hidden_size: i32,
+    #[serde(default = "default_intermediate_size")]
+    intermediate_size: i32,
+    #[serde(default = "default_num_hidden_layers")]
+    num_hidden_layers: i32,
+    #[serde(default = "default_num_attention_heads")]
+    num_attention_heads: i32,
+    #[serde(default)]
+    num_key_value_heads: Option<i32>,
+    #[serde(default)]
+    head_dim: Option<i32>,
+    #[serde(default = "default_max_position_embeddings")]
+    max_position_embeddings: i32,
+    #[serde(default)]
+    rope_theta: Option<f32>,
+    #[serde(default = "default_layer_norm_eps")]
+    layer_norm_eps: f32,
+    #[serde(default = "default_logit_scale")]
+    logit_scale: f32,
+    #[serde(default = "default_true")]
+    tie_word_embeddings: bool,
+    #[serde(default)]
+    use_qk_norm: bool,
+    #[serde(default)]
+    sliding_window: Option<i32>,
+    #[serde(default)]
+    layer_types: Option<Vec<String>>,
+    /// Cohere2's older spelling of `layer_types`: every `n`-th layer attends
+    /// globally.
+    #[serde(default)]
+    sliding_window_pattern: Option<i32>,
+    #[serde(default)]
+    rope_scaling: Option<serde_json::Value>,
+    #[serde(default)]
+    rope_parameters: Option<serde_json::Value>,
+}
+
+fn default_model_type() -> String {
+    "cohere".to_string()
+}
+fn default_vocab_size() -> i32 {
+    256_000
+}
+fn default_hidden_size() -> i32 {
+    8192
+}
+fn default_intermediate_size() -> i32 {
+    22_528
+}
+fn default_num_hidden_layers() -> i32 {
+    40
+}
+fn default_num_attention_heads() -> i32 {
+    64
+}
+fn default_max_position_embeddings() -> i32 {
+    8192
+}
+fn default_layer_norm_eps() -> f32 {
+    1e-5
+}
+fn default_logit_scale() -> f32 {
+    0.0625
+}
+fn default_true() -> bool {
+    true
+}
+
+/// `transformers`' `Cohere2Config` default window.
+const COHERE2_SLIDING_WINDOW: i32 = 4096;
+/// `transformers`' default of every how many Cohere2 layers attend globally.
+const COHERE2_SLIDING_WINDOW_PATTERN: i32 = 4;
+
+impl From<CohereConfigFile> for CohereConfig {
+    fn from(file: CohereConfigFile) -> Self {
+        let cohere2 = file.model_type == "cohere2";
+        let rope_theta = file
+            .rope_theta
+            .or_else(|| {
+                file.rope_parameters
+                    .as_ref()
+                    .and_then(|p| p.get("rope_theta"))
+                    .and_then(serde_json::Value::as_f64)
+                    .map(|t| t as f32)
+            })
+            .unwrap_or(10_000.0);
+        let (sliding_window, layer_types) = if cohere2 {
+            let pattern = file
+                .sliding_window_pattern
+                .unwrap_or(COHERE2_SLIDING_WINDOW_PATTERN);
+            let layer_types = file.layer_types.unwrap_or_else(|| {
+                (1..=file.num_hidden_layers)
+                    .map(|i| {
+                        if pattern > 0 && i % pattern == 0 {
+                            "full_attention"
+                        } else {
+                            "sliding_attention"
+                        }
+                        .to_string()
+                    })
+                    .collect()
+            });
+            (
+                Some(file.sliding_window.unwrap_or(COHERE2_SLIDING_WINDOW)),
+                layer_types,
+            )
+        } else {
+            (None, Vec::new())
+        };
+        Self {
+            model_type: file.model_type,
+            vocab_size: file.vocab_size,
+            hidden_size: file.hidden_size,
+            intermediate_size: file.intermediate_size,
+            num_hidden_layers: file.num_hidden_layers,
+            num_attention_heads: file.num_attention_heads,
+            num_key_value_heads: file.num_key_value_heads.unwrap_or(file.num_attention_heads),
+            head_dim: file
+                .head_dim
+                .unwrap_or(file.hidden_size / file.num_attention_heads.max(1)),
+            max_position_embeddings: file.max_position_embeddings,
+            rope_theta,
+            layer_norm_eps: file.layer_norm_eps,
+            logit_scale: file.logit_scale,
+            tie_word_embeddings: file.tie_word_embeddings,
+            use_qk_norm: file.use_qk_norm,
+            sliding_window,
+            layer_types,
+            rope_scaling: file.rope_scaling,
+            rope_parameters: file.rope_parameters,
+        }
+    }
 }
 
 impl CohereConfig {
@@ -83,20 +234,34 @@ impl CohereConfig {
             true,
         )
     }
-}
 
-fn default_sliding_window() -> i32 {
-    4096
-}
+    /// Whether layer `layer_idx` attends within a sliding window (and rotates
+    /// its queries and keys): Cohere2's `"sliding_attention"` layers. Its
+    /// `"full_attention"` layers attend globally with no positional rotation
+    /// at all; every layer of a Cohere model attends globally and rotates.
+    pub fn is_local_layer(&self, layer_idx: usize) -> bool {
+        self.layer_types
+            .get(layer_idx)
+            .is_some_and(|t| t == "sliding_attention")
+    }
 
-fn default_logit_scale() -> f32 {
-    0.0625
+    /// Whether layer `layer_idx` applies RoPE.
+    pub fn uses_rope(&self, layer_idx: usize) -> bool {
+        self.layer_types.is_empty() || self.is_local_layer(layer_idx)
+    }
+
+    /// Whether any layer attends within a window or skips RoPE, which the
+    /// fused batched decode (one global-attention block shape) does not carry.
+    pub fn has_cohere2_layers(&self) -> bool {
+        !self.layer_types.is_empty()
+    }
 }
 
 impl Default for CohereConfig {
     fn default() -> Self {
         // Default for Command R 35B
         Self {
+            model_type: "cohere".to_string(),
             vocab_size: 256000,
             hidden_size: 8192,
             intermediate_size: 22528,
@@ -109,60 +274,18 @@ impl Default for CohereConfig {
             layer_norm_eps: 1e-5,
             logit_scale: 0.0625,
             tie_word_embeddings: true,
-            use_sliding_window: true,
-            sliding_window: 4096,
-            global_attention_layers: None,
+            use_qk_norm: false,
+            sliding_window: None,
+            layer_types: Vec::new(),
             rope_scaling: None,
             rope_parameters: None,
         }
     }
 }
 
-impl CohereConfig {
-    /// Check if a layer uses global attention.
-    pub fn uses_global_attention(&self, layer_idx: i32) -> bool {
-        if let Some(ref layers) = self.global_attention_layers {
-            layers.contains(&layer_idx)
-        } else {
-            // Default: every 4th layer uses global attention
-            (layer_idx + 1) % 4 == 0
-        }
-    }
-
-    /// Create config for Command R 35B.
-    pub fn command_r() -> Self {
-        Self::default()
-    }
-
-    /// Create config for Command R+ 104B.
-    pub fn command_r_plus() -> Self {
-        Self {
-            hidden_size: 12288,
-            intermediate_size: 33792,
-            num_hidden_layers: 64,
-            num_attention_heads: 96,
-            num_key_value_heads: 12,
-            ..Default::default()
-        }
-    }
-
-    /// Create config for Command A 111B (2025).
-    pub fn command_a() -> Self {
-        Self {
-            hidden_size: 12288,
-            intermediate_size: 33792,
-            num_hidden_layers: 64,
-            num_attention_heads: 96,
-            num_key_value_heads: 12,
-            max_position_embeddings: 262144, // 256K context
-            ..Default::default()
-        }
-    }
-}
-
 impl ModelConfig for CohereConfig {
     fn model_type(&self) -> &str {
-        "cohere"
+        &self.model_type
     }
     fn vocab_size(&self) -> i32 {
         self.vocab_size
@@ -239,7 +362,44 @@ impl CohereMLP {
     }
 }
 
-/// Cohere attention with optional sliding window.
+/// Command R+'s query/key normalization: a LayerNorm over each head's
+/// `head_dim` (mean subtracted, no bias) whose weight is per head,
+/// `[heads, head_dim]`, as `transformers`' `CohereLayerNorm` with
+/// `hidden_size = (heads, head_dim)` holds it.
+#[derive(Debug)]
+pub struct HeadLayerNorm {
+    /// `[heads, head_dim]`.
+    pub weight: Array,
+    eps: f32,
+}
+impl_module_params!(HeadLayerNorm; weight);
+
+impl HeadLayerNorm {
+    fn new(heads: i32, head_dim: i32, eps: f32) -> Self {
+        Self {
+            weight: pmetal_runtime::compat::ops::ones(
+                &[heads, head_dim],
+                pmetal_runtime::compat::Dtype::Float32,
+            ),
+            eps,
+        }
+    }
+
+    /// `[B, L, heads, head_dim]` normalized over the last axis, scaled by the
+    /// head's weight, in the input's dtype. The scale is applied in `f32`
+    /// before the cast back, as the reference does.
+    fn forward(&self, x: &Array) -> Array {
+        let f32 = pmetal_runtime::compat::Dtype::Float32.as_i32();
+        let normed = x.layer_norm(None, None, self.eps).as_dtype(f32);
+        normed
+            .multiply(&self.weight.as_dtype(f32))
+            .as_dtype(x.dtype().as_i32())
+    }
+}
+
+/// Cohere attention: grouped-query, interleaved RoPE, optional per-head
+/// query/key LayerNorm (Command R+), and for Cohere2 either a sliding window
+/// with RoPE or global attention with none.
 #[derive(Debug)]
 pub struct CohereAttention {
     pub layer_idx: usize,
@@ -249,15 +409,20 @@ pub struct CohereAttention {
     pub scale: f32,
     /// Interleaved RoPE, scaling included.
     pub rotary: RotaryEmbedding,
-    pub use_sliding_window: bool,
-    pub sliding_window: i32,
+    /// Whether queries and keys are rotated: every layer of a Cohere model,
+    /// and the sliding layers of a Cohere2 one.
+    pub use_rope: bool,
+    /// The window of a sliding-attention layer; `None` attends globally.
+    pub sliding_window: Option<i32>,
 
     pub q_proj: nn::Linear,
     pub k_proj: nn::Linear,
     pub v_proj: nn::Linear,
     pub o_proj: nn::Linear,
+    pub q_norm: Option<HeadLayerNorm>,
+    pub k_norm: Option<HeadLayerNorm>,
 }
-impl_module_params!(CohereAttention; q_proj, k_proj, v_proj, o_proj);
+impl_module_params!(CohereAttention; q_proj, k_proj, v_proj, o_proj, q_norm, k_norm);
 
 impl CohereAttention {
     pub fn new(config: &CohereConfig, layer_idx: usize) -> Result<Self, Exception> {
@@ -278,10 +443,18 @@ impl CohereAttention {
         let o_proj = nn::LinearBuilder::new(n_heads * head_dim, hidden_size)
             .bias(false)
             .build()?;
-
-        // Check if this layer uses global attention
-        let use_sliding_window =
-            config.use_sliding_window && !config.uses_global_attention(layer_idx as i32);
+        let (q_norm, k_norm) = if config.use_qk_norm {
+            (
+                Some(HeadLayerNorm::new(n_heads, head_dim, config.layer_norm_eps)),
+                Some(HeadLayerNorm::new(
+                    n_kv_heads,
+                    head_dim,
+                    config.layer_norm_eps,
+                )),
+            )
+        } else {
+            (None, None)
+        };
 
         Ok(Self {
             layer_idx,
@@ -290,12 +463,17 @@ impl CohereAttention {
             head_dim,
             scale: (head_dim as f32).sqrt().recip(),
             rotary: config.rotary()?,
-            use_sliding_window,
-            sliding_window: config.sliding_window,
+            use_rope: config.uses_rope(layer_idx),
+            sliding_window: config
+                .is_local_layer(layer_idx)
+                .then_some(config.sliding_window)
+                .flatten(),
             q_proj,
             k_proj,
             v_proj,
             o_proj,
+            q_norm,
+            k_norm,
         })
     }
 
@@ -310,14 +488,10 @@ impl CohereAttention {
 
     /// Forward pass with optional KV cache.
     ///
-    /// Mirrors the Llama-style serial cached path: project → reshape →
-    /// **transpose first** → `apply_rope` with axis -2 = seq → cache write
-    /// → fused SDPA. The previous implementation applied RoPE before the
-    /// transpose on `[B, S, H, D]`, which silently misrotated heads as
-    /// positions for `offset > 0` (same axis bug fixed in Phi). Sliding
-    /// window per-layer masking is not yet plumbed; configs with
-    /// `use_sliding_window = true` AND non-global layers must build a
-    /// custom mask externally and pass it via `mask`.
+    /// Mirrors the Llama-style serial cached path: project → reshape (→
+    /// per-head norm) → **transpose** → `apply_rope` with axis -2 = seq →
+    /// cache write → fused SDPA. A sliding layer restricts a caller's mask to
+    /// its window.
     pub fn forward_with_cache(
         &mut self,
         x: &Array,
@@ -332,30 +506,38 @@ impl CohereAttention {
         let k = Module::forward(&mut self.k_proj, x)?;
         let v = Module::forward(&mut self.v_proj, x)?;
 
-        // Reshape + transpose to [B, heads, seq, head_dim] BEFORE RoPE so
-        // axis -2 is correctly the seq axis.
-        let q = q
-            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
-            .transpose_axes(&[0, 2, 1, 3]);
-        let k = k
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
-            .transpose_axes(&[0, 2, 1, 3]);
-        let v = v
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
-            .transpose_axes(&[0, 2, 1, 3]);
+        let mut q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim]);
+        let mut k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
+        let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
+        if let (Some(q_norm), Some(k_norm)) = (&self.q_norm, &self.k_norm) {
+            q = q_norm.forward(&q);
+            k = k_norm.forward(&k);
+        }
+
+        // Transpose to [B, heads, seq, head_dim] BEFORE RoPE so axis -2 is
+        // correctly the seq axis.
+        let q = q.transpose_axes(&[0, 2, 1, 3]);
+        let k = k.transpose_axes(&[0, 2, 1, 3]);
+        let v = v.transpose_axes(&[0, 2, 1, 3]);
 
         // Cohere uses *traditional* (interleaved) RoPE — HF `CohereRotaryEmbedding`
         // rotates adjacent pairs, i.e. `nn.RoPE(..., traditional=True)`.
         // The split-half (`traditional=false`) form rotates the wrong element
         // pairs and silently corrupts every attention score.
-        let rope_positions = RopePositions::resolve(
-            positions,
-            cache
-                .as_ref()
-                .map_or(0, |(c, layer)| c.rope_offset_for(*layer)),
-        );
-        let q = rope_embedding(&q, rope_positions, &self.rotary);
-        let k = rope_embedding(&k, rope_positions, &self.rotary);
+        let (q, k) = if self.use_rope {
+            let rope_positions = RopePositions::resolve(
+                positions,
+                cache
+                    .as_ref()
+                    .map_or(0, |(c, layer)| c.rope_offset_for(*layer)),
+            );
+            (
+                rope_embedding(&q, rope_positions, &self.rotary),
+                rope_embedding(&k, rope_positions, &self.rotary),
+            )
+        } else {
+            (q, k)
+        };
 
         let (k, v) = if let Some((cache, layer_idx)) = cache {
             cache.update_and_fetch(layer_idx, &k, &v)?
@@ -363,13 +545,19 @@ impl CohereAttention {
             (k, v)
         };
 
+        // A caller's mask (packed sequences' block-diagonal one) says which
+        // sequence a token belongs to, not how far back a sliding layer reaches.
+        let windowed = windowed_mask(mask, self.sliding_window, seq_len, k.dim(2))?;
+        let mask = windowed.as_ref().or(mask);
+
+        let mask_type = match (mask.is_some(), self.sliding_window) {
+            (true, _) => AttentionMaskType::None,
+            (false, Some(window)) => AttentionMaskType::SlidingWindow(window),
+            (false, None) => AttentionMaskType::Causal,
+        };
         let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
             .with_scale(self.scale)
-            .with_mask_type(if mask.is_some() {
-                AttentionMaskType::None
-            } else {
-                AttentionMaskType::Causal
-            });
+            .with_mask_type(mask_type);
         let output = fused_sdpa(&q, &k, &v, &attn_config, mask)?;
 
         let output = output
@@ -612,7 +800,7 @@ impl CohereForCausalLM {
         } else {
             self.model.embed_tokens.as_linear(h)
         };
-        Ok(logits.multiply(&Array::from_f32(self.config.logit_scale)))
+        Ok(logits.mul_scalar(self.config.logit_scale))
     }
 
     pub fn forward(
@@ -730,19 +918,64 @@ mod tests {
     use pmetal_runtime::compat::ModuleParametersExt;
     use serial_test::serial;
 
+    /// A released Command-R config states no `head_dim` and, in transformers 5's
+    /// spelling, no top-level `rope_theta`: the reference derives and defaults.
     #[test]
-    fn test_cohere_config() {
-        let config = CohereConfig::default();
+    fn a_released_command_r_config_parses_with_the_references_defaults() {
+        let config: CohereConfig = json5::from_str(
+            r#"{
+                "model_type": "cohere",
+                "vocab_size": 256000, "hidden_size": 8192, "intermediate_size": 22528,
+                "num_hidden_layers": 40, "num_attention_heads": 64,
+                "num_key_value_heads": 64, "max_position_embeddings": 8192,
+                "rope_theta": 8000000.0, "layer_norm_eps": 1e-05, "logit_scale": 0.0625,
+                "use_qk_norm": false, "tie_word_embeddings": true
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.head_dim, 128);
+        assert_eq!(config.rope_theta, 8_000_000.0);
+        assert!(config.layer_types.is_empty() && config.sliding_window.is_none());
+        assert!(config.uses_rope(7) && !config.is_local_layer(7));
 
-        // Every 4th layer uses global attention
-        assert!(!config.uses_global_attention(0));
-        assert!(!config.uses_global_attention(1));
-        assert!(!config.uses_global_attention(2));
-        assert!(config.uses_global_attention(3)); // 4th layer
-        assert!(!config.uses_global_attention(4));
-        assert!(!config.uses_global_attention(5));
-        assert!(!config.uses_global_attention(6));
-        assert!(config.uses_global_attention(7)); // 8th layer
+        let v5: CohereConfig = json5::from_str(
+            r#"{"model_type": "cohere", "hidden_size": 64, "num_attention_heads": 4,
+                "use_qk_norm": true,
+                "rope_parameters": {"rope_type": "default", "rope_theta": 75000000.0}}"#,
+        )
+        .unwrap();
+        assert_eq!((v5.head_dim, v5.num_key_value_heads), (16, 4));
+        assert_eq!(v5.rope_theta, 75_000_000.0);
+        assert!(v5.use_qk_norm && v5.tie_word_embeddings);
+    }
+
+    /// Cohere2 sliding-attention layers rotate and attend in a window; every
+    /// fourth layer by default (or as `layer_types` says) attends globally
+    /// with no RoPE.
+    #[test]
+    fn cohere2_layer_types_come_from_the_config_or_the_pattern() {
+        let config: CohereConfig = json5::from_str(
+            r#"{"model_type": "cohere2", "num_hidden_layers": 8, "hidden_size": 64,
+                "num_attention_heads": 4}"#,
+        )
+        .unwrap();
+        assert_eq!(config.sliding_window, Some(4096));
+        let local: Vec<bool> = (0..8).map(|i| config.is_local_layer(i)).collect();
+        assert_eq!(
+            local,
+            [true, true, true, false, true, true, true, false],
+            "every 4th layer is global"
+        );
+        assert!(config.uses_rope(0) && !config.uses_rope(3));
+
+        let listed: CohereConfig = json5::from_str(
+            r#"{"model_type": "cohere2", "num_hidden_layers": 3, "hidden_size": 64,
+                "num_attention_heads": 4, "sliding_window": 128,
+                "layer_types": ["full_attention", "sliding_attention", "sliding_attention"]}"#,
+        )
+        .unwrap();
+        assert_eq!(listed.sliding_window, Some(128));
+        assert!(!listed.is_local_layer(0) && listed.is_local_layer(1));
     }
 
     #[test]
