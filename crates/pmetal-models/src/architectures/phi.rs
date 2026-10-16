@@ -20,6 +20,7 @@ use crate::decoder_layer::{
 };
 use pmetal_runtime::compat::nn::{Embedding, Linear};
 use pmetal_runtime::compat::{Array, Exception, Module, Param, nn};
+use pmetal_runtime::decode::last_token_hidden;
 use pmetal_runtime::impl_module_params;
 
 use pmetal_cache::kv_cache::KVCache;
@@ -791,6 +792,20 @@ impl PhiForCausalLM {
     ) -> Result<Array, Exception> {
         let hidden = self.model.forward_with_cache(input_ids, mask, cache)?;
         self.project_logits(&hidden)
+    }
+
+    /// [`forward_with_cache`](Self::forward_with_cache) returning the last
+    /// position's logits, `[B, 1, vocab]`: the LM head runs on one hidden state
+    /// per sequence instead of every prompt token's, for a caller that samples
+    /// from the last position alone (a prefill, a decode step).
+    pub fn forward_with_cache_last(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, Exception> {
+        let hidden = self.model.forward_with_cache(input_ids, mask, cache)?;
+        self.project_logits(&last_token_hidden(&hidden))
     }
 
     /// Forward pass with one rotary position per token; see

@@ -42,7 +42,9 @@ pub trait SlotForward {
     /// Forward `tokens` (shape `[1, tokens.len()]`) through the model,
     /// extending `cache` with the produced K/V pairs and, for a hybrid
     /// model, advancing the slot's `recurrent` (Mamba / gated-delta-net)
-    /// state. Returns the *lazy* logits tensor — the driver batches
+    /// state. Returns the *lazy* logits tensor, whose last position is the one
+    /// sampled from (`[1, 1, vocab]` from `forward_with_hybrid_cache_last`, so
+    /// the head runs on that position alone) — the driver batches
     /// `async_eval` across all slots so the caller doesn't pay a host sync
     /// per slot.
     fn forward(

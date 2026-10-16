@@ -17,6 +17,7 @@ use pmetal_cache::kv_cache::{
 use pmetal_runtime::compat::{
     Array, Dtype, Exception, Module, ModuleParameters, ModuleParametersExt, nn, ops,
 };
+use pmetal_runtime::decode::last_token_hidden;
 use std::path::Path;
 
 const PARAM_EVAL_BATCH_SIZE: usize = 128;
@@ -1864,6 +1865,36 @@ impl DynamicModel {
         }
     }
 
+    /// [`forward_with_cache`](Self::forward_with_cache) returning the last
+    /// position's logits, `[B, 1, vocab]`, for a caller that samples from them
+    /// alone: a prefill, or a decode step.
+    ///
+    /// The LM head runs on that one position where the architecture has this
+    /// path (Llama, Qwen 2/3, Qwen3-MoE, Mistral, Phi, Cohere, Granite); the
+    /// others compute every position's logits and slice, which is the same
+    /// numbers at the cost of the `[B, T, vocab]` allocation. The cache is
+    /// filled as the full forward fills it.
+    pub fn forward_with_cache_last(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, Exception> {
+        match self {
+            Self::Llama(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::Qwen2(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::Qwen3(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::Qwen3MoE(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::Cohere(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::Granite(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::Mistral(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::Phi(m) | Self::Phi4(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            _ => Ok(last_token_hidden(
+                &self.forward_with_cache(input_ids, mask, cache)?,
+            )),
+        }
+    }
+
     pub fn forward_with_cache(
         &mut self,
         input_ids: &Array,
@@ -2350,9 +2381,10 @@ impl DynamicModel {
 
     /// [`forward_with_hybrid_cache`](Self::forward_with_hybrid_cache) returning
     /// the last position's logits, `[B, 1, vocab]`, for a caller that samples
-    /// from them alone: a prefill, or a decode step. Qwen 3.5 runs its head on
-    /// that one position; the other architectures compute every position's and
-    /// slice.
+    /// from them alone: a prefill, or a decode step. Qwen 3.5, Granite and the
+    /// architectures of [`forward_with_cache_last`](Self::forward_with_cache_last)
+    /// run their head on that one position; the others compute every position's
+    /// and slice.
     pub fn forward_with_hybrid_cache_last(
         &mut self,
         input_ids: &Array,
@@ -2360,12 +2392,16 @@ impl DynamicModel {
         kv_cache: Option<&mut KVCache>,
         mamba_cache: Option<&mut MambaCache>,
     ) -> Result<Array, Exception> {
-        if let Self::Qwen3Next(m) = self {
-            return m.forward_with_cache_last(input_ids, mask, kv_cache, mamba_cache);
+        match self {
+            Self::Qwen3Next(m) => m.forward_with_cache_last(input_ids, mask, kv_cache, mamba_cache),
+            Self::Granite(m) => {
+                m.forward_with_hybrid_cache_last(input_ids, mask, kv_cache, mamba_cache)
+            }
+            Self::NemotronH(_) | Self::Qwen4Exp(_) => Ok(last_token_hidden(
+                &self.forward_with_hybrid_cache(input_ids, mask, kv_cache, mamba_cache)?,
+            )),
+            _ => self.forward_with_cache_last(input_ids, mask, kv_cache),
         }
-        let logits = self.forward_with_hybrid_cache(input_ids, mask, kv_cache, mamba_cache)?;
-        let (b, t, v) = (logits.dim(0), logits.dim(1), logits.dim(2));
-        Ok(logits.slice(&[0, t - 1, 0], &[b, t, v]))
     }
 
     /// Whether this architecture has a fused `[N, 1]` batched-decode

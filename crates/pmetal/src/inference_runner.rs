@@ -1067,7 +1067,12 @@ impl InferenceGenState {
                 generate_cached_async_streaming(
                     |input, cache| {
                         model
-                            .forward_with_hybrid_cache(input, None, Some(cache), mamba.as_mut())
+                            .forward_with_hybrid_cache_last(
+                                input,
+                                None,
+                                Some(cache),
+                                mamba.as_mut(),
+                            )
                             .map_err(|e| Exception::custom(e.to_string()))
                     },
                     &self.input_ids,

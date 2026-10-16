@@ -383,6 +383,17 @@ impl crate::TrainableModel for AdaptedModel {
             .map_err(LoraError::Mlx)
     }
 
+    fn forward_with_cache_last(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut pmetal_cache::kv_cache::KVCache>,
+    ) -> Result<Array, LoraError> {
+        self.model
+            .forward_with_cache_last(input_ids, mask, cache)
+            .map_err(LoraError::Mlx)
+    }
+
     fn forward_with_positions(
         &mut self,
         input_ids: &Array,

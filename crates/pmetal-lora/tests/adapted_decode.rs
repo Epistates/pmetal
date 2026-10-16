@@ -48,17 +48,10 @@ fn argmax(row: &[f32]) -> usize {
         .unwrap()
 }
 
-/// How far the cached decode of `config_json`, adapted, strays from the
-/// uncached forward, relative to the logits' scale; `Err` names the first
-/// step where they pick different tokens. `scale_b` multiplies the adapters'
-/// random `B`: 1 adapts the model, 0 leaves it computing the base model.
-/// `packed` packs the base for QLoRA first.
-fn worst_disagreement(
-    name: &str,
-    config_json: &str,
-    scale_b: f32,
-    packed: bool,
-) -> Result<f32, String> {
+/// `config_json` built, adapted on every projection and given random adapter
+/// weights. `scale_b` multiplies the random `B`: 1 adapts the model, 0 leaves
+/// it computing the base model. `packed` packs the base for QLoRA first.
+fn nudged_model(config_json: &str, scale_b: f32, packed: bool) -> AdaptedModel {
     random::seed(3);
     let mut base = DynamicModel::from_config(config_json).expect("build");
     if packed {
@@ -81,6 +74,21 @@ fn worst_disagreement(
         })
         .collect();
     model.set_lora_parameters(&nudged);
+    model
+}
+
+/// How far the cached decode of `config_json`, adapted, strays from the
+/// uncached forward, relative to the logits' scale; `Err` names the first
+/// step where they pick different tokens. `scale_b` multiplies the adapters'
+/// random `B`: 1 adapts the model, 0 leaves it computing the base model.
+/// `packed` packs the base for QLoRA first.
+fn worst_disagreement(
+    name: &str,
+    config_json: &str,
+    scale_b: f32,
+    packed: bool,
+) -> Result<f32, String> {
+    let mut model = nudged_model(config_json, scale_b, packed);
 
     let capacity = PROMPT.len() + STEPS + 1;
     let mut cache = model.create_cache(capacity);
@@ -162,4 +170,81 @@ fn an_adapted_model_decodes_what_its_forward_computes() {
         "adapted models whose decode ignores their adapters:\n  {}",
         problems.join("\n  ")
     );
+}
+
+/// A prefill or a decode step that wants the last position's logits gets them
+/// from `forward_with_hybrid_cache_last` with the adapters applied: the same
+/// row the full forward ends in, and a cache that decodes on as the full
+/// forward's does.
+#[test]
+fn the_last_position_logits_of_an_adapted_model_are_the_full_forwards() {
+    let mut problems = Vec::new();
+    for case in cases() {
+        if BASE_DECODE_DEFECTS.contains(&case.name) {
+            continue;
+        }
+        let mut model = nudged_model(case.config_json, 1.0, false);
+        let capacity = PROMPT.len() + 2;
+        let mut full_cache = model.create_cache(capacity);
+        let mut full_mamba = model.model().create_mamba_cache();
+        let mut last_cache = model.create_cache(capacity);
+        let mut last_mamba = model.model().create_mamba_cache();
+        let dynamic = model.model_mut();
+
+        let full = dynamic
+            .forward_with_hybrid_cache(
+                &ids(&PROMPT),
+                None,
+                Some(&mut full_cache),
+                full_mamba.as_mut(),
+            )
+            .expect("full prefill");
+        let last = dynamic
+            .forward_with_hybrid_cache_last(
+                &ids(&PROMPT),
+                None,
+                Some(&mut last_cache),
+                last_mamba.as_mut(),
+            )
+            .expect("last prefill");
+        if last.shape() != [1, 1, full.dim(2)] {
+            problems.push(format!("{}: shape {:?}", case.name, last.shape()));
+            continue;
+        }
+        let (want, got) = (last_row(&full), last_row(&last));
+        let next = argmax(&want) as i32;
+        let want_next = last_row(
+            &dynamic
+                .forward_with_hybrid_cache(
+                    &ids(&[next]),
+                    None,
+                    Some(&mut full_cache),
+                    full_mamba.as_mut(),
+                )
+                .expect("full decode"),
+        );
+        let got_next = last_row(
+            &dynamic
+                .forward_with_hybrid_cache_last(
+                    &ids(&[next]),
+                    None,
+                    Some(&mut last_cache),
+                    last_mamba.as_mut(),
+                )
+                .expect("last decode"),
+        );
+        pmetal_runtime::check_unobserved_error().expect("a runtime op threw");
+        for (what, want, got) in [("prefill", &want, &got), ("decode", &want_next, &got_next)] {
+            let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
+            let diff = want
+                .iter()
+                .zip(got)
+                .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()))
+                / scale;
+            if diff.is_nan() || diff > 1e-4 {
+                problems.push(format!("{}: {what} differs by {diff:e}", case.name));
+            }
+        }
+    }
+    assert!(problems.is_empty(), "\n  {}", problems.join("\n  "));
 }
