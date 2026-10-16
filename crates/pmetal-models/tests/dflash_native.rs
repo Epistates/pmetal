@@ -41,8 +41,10 @@ fn checkpoint(prefix: &str) -> tempfile::TempDir {
 }
 
 /// A random draft for a target `hidden` wide with `vocab` tokens, tapping
-/// layers 0 and 1, drafting blocks of `block_size`.
+/// layers 0 and 1, drafting blocks of `block_size`. Seeded: the tests also
+/// require that some guesses are kept, which an unlucky draw can miss.
 fn random_draft(hidden: i32, vocab: i32, block_size: i32) -> DFlashDraftModel {
+    pmetal_runtime::compat::random::seed(17 + block_size as u64);
     let config = DFlashDraftConfig {
         model_type: "dflash_qwen3".to_string(),
         hidden_size: hidden,
