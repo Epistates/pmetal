@@ -1,3 +1,40 @@
+/// One text as the encoder was trained to read it: the tokenizer's own
+/// special tokens around it (`[CLS] ... [SEP]`, `<s> ... </s>`), cut to
+/// `max_len` tokens *inside* them, so a long text keeps its closing token.
+///
+/// A tokenizer failure is an error, not an empty row.
+fn encode_row(
+    tokenizer: &pmetal_data::Tokenizer,
+    text: &str,
+    max_len: usize,
+) -> anyhow::Result<Vec<i32>> {
+    let plain = tokenizer
+        .encode(text)
+        .map_err(|e| anyhow::anyhow!("Failed to tokenize {text:?}: {e}"))?;
+    let framed = tokenizer
+        .encode_with_special_tokens(text)
+        .map_err(|e| anyhow::anyhow!("Failed to tokenize {text:?}: {e}"))?;
+    // The post-processor adds a fixed prefix and suffix around the text's own
+    // tokens; find where those sit.
+    let start = if plain.is_empty() {
+        0
+    } else {
+        framed
+            .windows(plain.len())
+            .position(|window| window == plain.as_slice())
+            .unwrap_or(0)
+    };
+    let end = (start + plain.len()).min(framed.len());
+    let (prefix, suffix) = (&framed[..start], &framed[end..]);
+    let room = max_len.saturating_sub(prefix.len() + suffix.len());
+    Ok(prefix
+        .iter()
+        .chain(plain.iter().take(room))
+        .chain(suffix)
+        .map(|&id| id as i32)
+        .collect())
+}
+
 /// Run embedding / sentence-transformer training.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_embed_train(
@@ -182,20 +219,8 @@ pub(crate) async fn run_embed_train(
                     let mut actual_max_a = 0usize;
                     let mut actual_max_b = 0usize;
                     for p in &batch {
-                        let a: Vec<i32> = tokenizer
-                            .encode(&p.text_a)
-                            .unwrap_or_default()
-                            .iter()
-                            .take(max_len)
-                            .map(|&x| x as i32)
-                            .collect();
-                        let b: Vec<i32> = tokenizer
-                            .encode(&p.text_b)
-                            .unwrap_or_default()
-                            .iter()
-                            .take(max_len)
-                            .map(|&x| x as i32)
-                            .collect();
+                        let a = encode_row(&tokenizer, &p.text_a, max_len)?;
+                        let b = encode_row(&tokenizer, &p.text_b, max_len)?;
                         actual_max_a = actual_max_a.max(a.len());
                         actual_max_b = actual_max_b.max(b.len());
                         ids_a_raw.push(a);
@@ -324,13 +349,7 @@ pub(crate) async fn run_embed_train(
                             let mut raw: Vec<Vec<i32>> = Vec::new();
                             let mut mlen = 0usize;
                             for t in $texts.iter() {
-                                let ids: Vec<i32> = tokenizer
-                                    .encode(t)
-                                    .unwrap_or_default()
-                                    .iter()
-                                    .take(max_len)
-                                    .map(|&x| x as i32)
-                                    .collect();
+                                let ids = encode_row(&tokenizer, t, max_len)?;
                                 mlen = mlen.max(ids.len());
                                 raw.push(ids);
                             }
@@ -460,4 +479,72 @@ pub(crate) async fn run_embed_train(
         output_dir
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_row;
+
+    /// A WordPiece tokenizer whose post-processor frames text as
+    /// `[CLS] text [SEP]`, as a BERT encoder's does.
+    fn bert_tokenizer() -> pmetal_data::Tokenizer {
+        let json = r###"{
+            "version": "1.0",
+            "added_tokens": [
+                {"id": 0, "content": "[PAD]", "special": true, "single_word": false,
+                 "lstrip": false, "rstrip": false, "normalized": false},
+                {"id": 1, "content": "[UNK]", "special": true, "single_word": false,
+                 "lstrip": false, "rstrip": false, "normalized": false},
+                {"id": 2, "content": "[CLS]", "special": true, "single_word": false,
+                 "lstrip": false, "rstrip": false, "normalized": false},
+                {"id": 3, "content": "[SEP]", "special": true, "single_word": false,
+                 "lstrip": false, "rstrip": false, "normalized": false}
+            ],
+            "normalizer": {"type": "Lowercase"},
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": {
+                "type": "TemplateProcessing",
+                "single": [
+                    {"SpecialToken": {"id": "[CLS]", "type_id": 0}},
+                    {"Sequence": {"id": "A", "type_id": 0}},
+                    {"SpecialToken": {"id": "[SEP]", "type_id": 0}}
+                ],
+                "pair": [
+                    {"SpecialToken": {"id": "[CLS]", "type_id": 0}},
+                    {"Sequence": {"id": "A", "type_id": 0}},
+                    {"SpecialToken": {"id": "[SEP]", "type_id": 0}},
+                    {"Sequence": {"id": "B", "type_id": 1}},
+                    {"SpecialToken": {"id": "[SEP]", "type_id": 1}}
+                ],
+                "special_tokens": {
+                    "[CLS]": {"id": "[CLS]", "ids": [2], "tokens": ["[CLS]"]},
+                    "[SEP]": {"id": "[SEP]", "ids": [3], "tokens": ["[SEP]"]}
+                }
+            },
+            "model": {
+                "type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##",
+                "max_input_chars_per_word": 100,
+                "vocab": {"[PAD]": 0, "[UNK]": 1, "[CLS]": 2, "[SEP]": 3,
+                          "one": 4, "two": 5, "three": 6, "four": 7}
+            }
+        }"###;
+        pmetal_data::Tokenizer::from_bytes(json.as_bytes()).expect("tokenizer parses")
+    }
+
+    /// An encoder reads `[CLS] ... [SEP]`; the rows `embed-train` builds used to
+    /// leave both out, so a model was trained on text it is never shown at
+    /// inference. A long text is cut inside the frame and keeps its `[SEP]`.
+    #[test]
+    fn rows_are_framed_by_the_special_tokens_and_cut_inside_them() {
+        let tokenizer = bert_tokenizer();
+        assert_eq!(
+            encode_row(&tokenizer, "one two", 16).unwrap(),
+            vec![2, 4, 5, 3]
+        );
+        assert_eq!(
+            encode_row(&tokenizer, "one two three four", 5).unwrap(),
+            vec![2, 4, 5, 6, 3]
+        );
+        assert_eq!(encode_row(&tokenizer, "", 8).unwrap(), vec![2, 3]);
+    }
 }

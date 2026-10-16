@@ -2289,36 +2289,47 @@ impl InferenceEngine {
             return Ok(Vec::new());
         }
 
-        // Tokenise every input on the async side (pure CPU, no MLX state).
-        let tokenized: Vec<Vec<u32>> = inputs
+        // Tokenise every input on the async side (pure CPU, no MLX state),
+        // both ways: an encoder was trained on `[CLS] ... [SEP]` (the
+        // tokenizer's own special tokens), which a causal model's embedding
+        // does not take. Which one the model wants is known on its thread.
+        let plain: Vec<Vec<u32>> = inputs
             .iter()
             .map(|s| self.tokenize(s))
             .collect::<ServeResult<_>>()?;
-        let batch = tokenized.len();
-        let seq_max = tokenized.iter().map(Vec::len).max().unwrap_or(0).max(1);
-
-        // Padded [batch, seq_max] token ids and mask, built here as plain
-        // vectors; the arrays are made on the model thread.
-        let mut ids_flat: Vec<i32> = vec![0; batch * seq_max];
-        let mut mask_flat: Vec<f32> = vec![0.0; batch * seq_max];
-        for (b, row) in tokenized.iter().enumerate() {
-            for (j, &tok) in row.iter().enumerate() {
-                ids_flat[b * seq_max + j] = tok as i32;
-                mask_flat[b * seq_max + j] = 1.0;
-            }
-        }
+        let with_special: Vec<Vec<u32>> = inputs
+            .iter()
+            .map(|s| {
+                self.tokenizer
+                    .encode_with_special_tokens(s)
+                    .map_err(|e| ServeError::Tokenizer(e.to_string()))
+            })
+            .collect::<ServeResult<_>>()?;
+        let batch = inputs.len();
 
         let (reply, answer) = tokio::sync::oneshot::channel();
         self.model
             .submit(move |state| {
                 let mut embed = || -> ServeResult<Vec<Vec<f32>>> {
+                    let encoder = state.model.takes_padding_mask();
+                    let tokenized = if encoder { &with_special } else { &plain };
+                    let seq_max = tokenized.iter().map(Vec::len).max().unwrap_or(0).max(1);
+                    // Padded [batch, seq_max] token ids and mask.
+                    let mut ids_flat: Vec<i32> = vec![0; batch * seq_max];
+                    let mut mask_flat: Vec<f32> = vec![0.0; batch * seq_max];
+                    for (b, row) in tokenized.iter().enumerate() {
+                        for (j, &tok) in row.iter().enumerate() {
+                            ids_flat[b * seq_max + j] = tok as i32;
+                            mask_flat[b * seq_max + j] = 1.0;
+                        }
+                    }
                     let ids = Array::from_slice(&ids_flat, &[batch as i32, seq_max as i32]);
                     let mask = Array::from_slice(&mask_flat, &[batch as i32, seq_max as i32]);
                     // An encoder attends both ways, so the padding must be
                     // hidden or every row's embedding depends on which other
                     // rows share its batch; a causal model's right-padding is
                     // out of its real tokens' reach.
-                    let padding_mask = state.model.takes_padding_mask().then_some(&mask);
+                    let padding_mask = encoder.then_some(&mask);
                     let hidden = state
                         .model
                         .forward_hidden(&ids, padding_mask)
