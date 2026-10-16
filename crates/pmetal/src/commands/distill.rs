@@ -391,7 +391,7 @@ pub(crate) async fn run_distillation_cli(
 
     {
         let adaptive_config = pmetal_trainer::AdaptiveLrConfig::for_distillation();
-        let control_file = validated_distill_output.join(".lr_control.json");
+        let control_file = pmetal_core::lr_control_path(&validated_distill_output);
         trainer.enable_adaptive_lr_with_control(adaptive_config, control_file);
         tracing::info!("Adaptive LR enabled (spike/plateau/divergence detection)");
     }

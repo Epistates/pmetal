@@ -2909,19 +2909,16 @@ impl App {
     /// Write an LR control command to the active job's control file.
     fn write_lr_control(&mut self, lr: f64) {
         if let Some(ref dir) = self.active_training_output_dir {
-            let control_file = dir.join(".lr_control.json");
-            let cmd = serde_json::json!({
-                "action": "set_lr",
-                "value": lr,
-            });
-            match std::fs::write(&control_file, cmd.to_string()) {
-                Ok(()) => {}
-                Err(e) => {
-                    self.modal_stack.push(Modal::error(
-                        "LR Override Failed",
-                        format!("Could not write control file: {e}"),
-                    ));
-                }
+            let cmd = pmetal_core::LrControlCommand::SetLr { value: lr };
+            if let Err(e) = pmetal_core::write_lr_control(dir, &cmd) {
+                let message = if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    "The job has not read the previous command yet; try again in a moment."
+                        .to_string()
+                } else {
+                    format!("Could not write control file: {e}")
+                };
+                self.modal_stack
+                    .push(Modal::error("LR Override Failed", message));
             }
         }
     }

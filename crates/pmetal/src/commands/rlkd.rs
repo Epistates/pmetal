@@ -248,7 +248,7 @@ pub(crate) async fn run_rlkd_cli(
 
     {
         let adaptive_config = pmetal_trainer::AdaptiveLrConfig::default();
-        let control_file = PathBuf::from(output_dir).join(".lr_control.json");
+        let control_file = pmetal_core::lr_control_path(std::path::Path::new(output_dir));
         trainer.enable_adaptive_lr_with_control(adaptive_config, control_file);
     }
 
