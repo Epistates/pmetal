@@ -195,7 +195,8 @@ fn rows(a: &Array, start: i32, end: i32) -> Array {
 }
 
 /// Rewrite an original-layout (Black Forest Labs, as in the single-file
-/// `flux1-*.safetensors` releases and ComfyUI) FLUX transformer checkpoint as
+/// `flux1-*.safetensors` releases and the fine-tunes cut from them) FLUX
+/// transformer checkpoint as
 /// `diffusers`' tensors, the way `diffusers`' `convert_flux_to_diffusers.py`
 /// does: fused `qkv` and `linear1` projections split into their parts, the
 /// final layer's scale and shift (stored shift first) swapped, and the names
