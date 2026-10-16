@@ -18,8 +18,11 @@ use std::path::Path;
 
 use pmetal_runtime::compat::{Array, Exception, Module, ModuleParametersExt, Param, nn, ops};
 use pmetal_runtime::impl_module_params;
+use pmetal_runtime::native_moe;
+use pmetal_runtime::native_weight::LayerWeight;
 
 use super::granite::GraniteForCausalLM;
+use crate::fp8_utils::dequantize_fp8_weight_for_compute;
 
 // =============================================================================
 // Shared MLP
@@ -131,34 +134,23 @@ impl GraniteMoe {
         let (indices, top_logits) = crate::moe_routing::topk_normalize(&logits, self.top_k, false)?;
         let weights = ops::softmax_axis(&top_logits, -1).as_dtype(x.dtype().as_i32());
 
-        // [N, 1, 1, H] against [E, H, 2I] gathered per row -> [N, k, 1, 2I].
-        let rows = flat.expand_dims(1).expand_dims(2);
-        let gate_up = rows.gather_mm(
-            &self.input_linear.weight.as_ref().transpose_axes(&[0, 2, 1]),
-            None,
-            Some(&indices),
-            false,
+        // The experts through the grouped gather matmuls every routed layer
+        // runs (`native_moe::switch_glu_fused`): `input_linear` is `[E, 2I, H]`,
+        // gate then up on the output axis, and the gather reads the transposed
+        // view `[E, H, 2I]` without a copy.
+        let expert_weight = |bank: &GraniteExpertBank| -> Result<LayerWeight, Exception> {
+            Ok(LayerWeight::Dense(
+                dequantize_fp8_weight_for_compute(bank.weight.as_ref())?.swap_axes(-1, -2),
+            ))
+        };
+        let mixed = native_moe::switch_glu_fused(
+            &flat,
+            &expert_weight(&self.input_linear)?,
+            &expert_weight(&self.output_linear)?,
+            &indices,
+            &weights,
+            |gate, up| nn::silu(gate).multiply(up),
         );
-        let i = self.intermediate;
-        let gate = ops::slice_axis(&gate_up, -1, 0, i);
-        let up = ops::slice_axis(&gate_up, -1, i, 2 * i);
-        let activated = nn::silu(&gate).multiply(&up);
-        // [N, k, 1, I] against [E, I, H] -> [N, k, H].
-        let down = activated
-            .gather_mm(
-                &self
-                    .output_linear
-                    .weight
-                    .as_ref()
-                    .transpose_axes(&[0, 2, 1]),
-                None,
-                Some(&indices),
-                false,
-            )
-            .squeeze_axes(&[2]);
-        let mixed = down
-            .multiply(&weights.reshape(&[tokens, self.top_k, 1]))
-            .sum_axis(1, false);
         Ok(mixed.reshape(&shape))
     }
 }
