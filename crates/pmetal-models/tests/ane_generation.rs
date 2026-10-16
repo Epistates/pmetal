@@ -13,8 +13,7 @@ use pmetal_models::{GenerationConfig, generate_cached_ane_streaming};
 /// "The capital of France is"
 const PROMPT: [u32; 5] = [785, 6722, 315, 9625, 374];
 
-/// Greedy: `do_sample` off. (`temperature: 0.0` alone does not ask for it:
-/// with `do_sample` on, a temperature at or below zero is taken as 1.)
+/// Greedy.
 fn generate(model: &Path) -> Vec<u32> {
     generate_with(model, GenerationConfig::greedy(8))
 }

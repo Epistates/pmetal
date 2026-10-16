@@ -427,14 +427,14 @@ impl GenerationConfig {
     }
 
     /// This config's sampling as the runtime's [`SamplingParams`], which
-    /// [`DecodeSampler`] and the native engines read: greedy
-    /// (temperature 0) without `do_sample`, and a sampling temperature at
-    /// or below 0 taken as 1.
+    /// [`DecodeSampler`] and the native engines read: greedy (temperature 0)
+    /// without `do_sample` or at a temperature at or below 0, as an
+    /// OpenAI-style request's `temperature: 0` means.
     pub fn sampling_params(&self) -> SamplingParams {
-        let temperature = match (self.do_sample, self.temperature) {
-            (false, _) => 0.0,
-            (true, t) if t > 0.0 => t,
-            (true, _) => 1.0,
+        let temperature = if self.do_sample && self.temperature > 0.0 {
+            self.temperature
+        } else {
+            0.0
         };
         SamplingParams {
             temperature,
@@ -1476,6 +1476,27 @@ mod tests {
         let config = GenerationConfig::greedy(100);
         assert_eq!(config.max_new_tokens, 100);
         assert!(!config.do_sample);
+    }
+
+    #[test]
+    fn a_temperature_of_zero_decodes_greedily_whatever_do_sample_says() {
+        for temperature in [0.0, -0.5] {
+            let config = GenerationConfig {
+                temperature,
+                ..GenerationConfig::default()
+            };
+            assert!(config.do_sample);
+            assert_eq!(config.sampling_params().temperature, 0.0, "{temperature}");
+            let config = GenerationConfig::default().with_temperature(temperature);
+            assert_eq!(config.sampling_params().temperature, 0.0, "{temperature}");
+        }
+        let sampled = GenerationConfig::default().with_temperature(0.8);
+        assert_eq!(sampled.sampling_params().temperature, 0.8);
+        let greedy = GenerationConfig {
+            do_sample: false,
+            ..GenerationConfig::default().with_temperature(0.8)
+        };
+        assert_eq!(greedy.sampling_params().temperature, 0.0);
     }
 
     #[test]
