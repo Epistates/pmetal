@@ -411,9 +411,10 @@ impl crate::TrainableModel for AdaptedModel {
 
     /// An architecture with recurrent layers is one whose decoding needs a
     /// recurrent cache beside the KV cache, which is what the dispatcher's
-    /// `create_mamba_cache` answers for every such model.
+    /// `create_mamba_cache` answers for every such model; the ones whose
+    /// layers reset at a packed boundary on their own are not counted.
     fn has_recurrent_layers(&self) -> bool {
-        self.model.create_mamba_cache().is_some()
+        self.model.has_unresettable_recurrent_layers()
     }
 
     fn output_projection_path(&mut self) -> Option<String> {

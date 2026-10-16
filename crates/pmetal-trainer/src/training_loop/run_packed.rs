@@ -19,15 +19,17 @@ impl TrainingLoop {
     where
         M: TrainableModel + ModuleParameters + 'static,
     {
-        // A recurrent layer (Mamba, gated delta net) carries its state from one
-        // packed sequence into the next: the block-diagonal mask only reaches
-        // attention, so the second sequence in a row would train on the first
-        // one's state. Train such models on unpacked batches instead.
+        // A gated delta net carries its state from one packed sequence into
+        // the next: the block-diagonal mask only reaches attention, so the
+        // second sequence in a row would train on the first one's state.
+        // (A Mamba-2 layer resets at the position ids' restarts and does not
+        // count: `has_recurrent_layers` says false for it.) Train such models
+        // on unpacked batches instead.
         if model.has_recurrent_layers() {
             tracing::info!(
                 "Sequence packing is off for this model: its recurrent layers would carry \
                  state across packed sequence boundaries, which the attention mask cannot \
-                 stop. Training on unpacked batches."
+                 stop and they cannot reset. Training on unpacked batches."
             );
             return self.run_standard_owned(model, train_dataset, eval_dataset, checkpoint_manager);
         }
