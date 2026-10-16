@@ -26,7 +26,7 @@ use pmetal_runtime::impl_module_params;
 use pmetal_runtime::nn::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 use serde::{Deserialize, Serialize};
 
-use crate::common::mamba2::{Mamba2Config, Mamba2Mixer};
+use crate::common::mamba2::{Mamba2Config, Mamba2Mixer, segments_from_positions};
 use crate::common::switch_mlp::PlainSwitchMlp;
 
 // ============================================================================
@@ -742,8 +742,27 @@ impl NemotronHMixer {
         kv_cache: Option<(&mut KVCache, usize)>,
         mamba_cache: Option<&mut MambaCacheEntry>,
     ) -> Result<Array, Exception> {
+        self.forward_segmented(x, mask, kv_cache, mamba_cache, None)
+    }
+
+    /// [`forward`](Self::forward) over a row that packs several sequences:
+    /// `segments` (`[B, L]`, see [`segments_from_positions`]) is what keeps a
+    /// Mamba layer from carrying one sequence into the next. Attention is
+    /// kept apart by `mask`; the other layers act on each token alone. Only
+    /// meaningful without caches.
+    pub fn forward_segmented(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        kv_cache: Option<(&mut KVCache, usize)>,
+        mamba_cache: Option<&mut MambaCacheEntry>,
+        segments: Option<&Array>,
+    ) -> Result<Array, Exception> {
         match self {
-            Self::Mamba(m) => m.forward(x, mamba_cache),
+            Self::Mamba(m) => match (segments, mamba_cache) {
+                (Some(segments), None) => m.forward_packed(x, segments),
+                (_, cache) => m.forward(x, cache),
+            },
             Self::Attention(m) => m.forward(x, mask, kv_cache),
             Self::Mlp(m) => m.forward(x),
             Self::Moe(m) => m.forward(x),
@@ -776,8 +795,23 @@ impl NemotronHBlock {
         kv_cache: Option<(&mut KVCache, usize)>,
         mamba_cache: Option<&mut MambaCacheEntry>,
     ) -> Result<Array, Exception> {
+        self.forward_segmented(x, mask, kv_cache, mamba_cache, None)
+    }
+
+    /// [`forward_with_cache`](Self::forward_with_cache) over a packed row; see
+    /// [`NemotronHMixer::forward_segmented`].
+    pub fn forward_segmented(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        kv_cache: Option<(&mut KVCache, usize)>,
+        mamba_cache: Option<&mut MambaCacheEntry>,
+        segments: Option<&Array>,
+    ) -> Result<Array, Exception> {
         let hidden = Module::forward(&mut self.norm, x)?;
-        let output = self.mixer.forward(&hidden, mask, kv_cache, mamba_cache)?;
+        let output =
+            self.mixer
+                .forward_segmented(&hidden, mask, kv_cache, mamba_cache, segments)?;
         Ok(x.add(&output))
     }
 
@@ -827,7 +861,13 @@ impl NemotronHModel {
         mask: Option<&Array>,
         mut kv_cache: Option<&mut KVCache>,
         mut mamba_cache: Option<&mut MambaCache>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
+        // A packed row restarts its position ids at every sequence; the Mamba
+        // layers, which no attention mask reaches, reset there too.
+        let segments = positions
+            .filter(|_| kv_cache.is_none() && mamba_cache.is_none())
+            .map(|p| segments_from_positions(p, input_ids.dim(0)));
         let mut hidden = Module::forward(&mut self.embeddings, input_ids)?;
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             let attends = layer.block_type() == '*';
@@ -843,7 +883,13 @@ impl NemotronHModel {
             } else {
                 None
             };
-            hidden = layer.forward_with_cache(&hidden, mask.filter(|_| attends), kv, mamba)?;
+            hidden = layer.forward_segmented(
+                &hidden,
+                mask.filter(|_| attends),
+                kv,
+                mamba,
+                segments.as_ref(),
+            )?;
         }
         Ok(hidden)
     }
@@ -855,7 +901,7 @@ impl NemotronHModel {
         kv_cache: Option<&mut KVCache>,
         mamba_cache: Option<&mut MambaCache>,
     ) -> Result<Array, Exception> {
-        let hidden = self.forward_layers(input_ids, mask, kv_cache, mamba_cache)?;
+        let hidden = self.forward_layers(input_ids, mask, kv_cache, mamba_cache, None)?;
         Module::forward(&mut self.norm_f, &hidden)
     }
 
@@ -869,7 +915,7 @@ impl NemotronHModel {
         kv_cache: Option<&mut KVCache>,
         mamba_cache: Option<&mut MambaCache>,
     ) -> Result<Array, Exception> {
-        let hidden = self.forward_layers(input_ids, mask, kv_cache, mamba_cache)?;
+        let hidden = self.forward_layers(input_ids, mask, kv_cache, mamba_cache, None)?;
         Module::forward(
             &mut self.norm_f,
             &pmetal_runtime::decode::last_token_hidden(&hidden),
@@ -878,6 +924,21 @@ impl NemotronHModel {
 
     pub fn forward(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Array, Exception> {
         self.forward_with_cache(input_ids, mask, None, None)
+    }
+
+    /// Forward over a row that packs several sequences, with one position id
+    /// per token `[L]` (or `[B, L]`) restarting at 0 for each. Attention is
+    /// kept within a sequence by `mask`; the Mamba layers reset their state
+    /// and their convolution's history at each restart. Nothing else reads
+    /// the positions: Nemotron-H's attention is unrotated.
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        let hidden = self.forward_layers(input_ids, mask, None, None, positions)?;
+        Module::forward(&mut self.norm_f, &hidden)
     }
 }
 
@@ -936,6 +997,20 @@ impl NemotronHForCausalLM {
         let hidden = self
             .backbone
             .forward_with_cache(input_ids, mask, kv_cache, mamba_cache)?;
+        self.lm_head_forward(&hidden)
+    }
+
+    /// Logits for a row that packs several sequences; see
+    /// [`NemotronHModel::forward_with_positions`].
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        let hidden = self
+            .backbone
+            .forward_with_positions(input_ids, mask, positions)?;
         self.lm_head_forward(&hidden)
     }
 

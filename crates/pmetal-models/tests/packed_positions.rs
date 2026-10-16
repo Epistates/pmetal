@@ -419,3 +419,115 @@ fn positions_restart_at_each_record() {
         vec![0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 3.0]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Hybrids. A Mamba-2 layer is a recurrence the block-diagonal mask cannot
+// reach: it resets where the positions restart, or the second record would
+// start from the first one's state.
+// ---------------------------------------------------------------------------
+
+/// The same two runs as [`assert_packing_is_transparent`], with the one
+/// assertion that makes sense for a model whose positions only mark where a
+/// record starts: *without* the positions, the second record is mixed from
+/// the first one's state and comes out different, so the equality above is
+/// the reset's doing.
+fn assert_recurrent_packing_is_transparent(model: &mut pmetal_models::DynamicModel) {
+    assert!(
+        model.supports_packed_positions(),
+        "the model says it ignores positions"
+    );
+    let lengths = [FIRST.len() as i32, SECOND.len() as i32];
+    let separate: Vec<Vec<f32>> = [&FIRST[..], &SECOND[..]]
+        .iter()
+        .map(|tokens| {
+            let length = tokens.len() as i32;
+            let output = model
+                .forward_with_positions(&ids(tokens), Some(&causal_mask(length)), None)
+                .expect("separate forward");
+            rows(&output, 0, length)
+        })
+        .collect();
+
+    let packed: Vec<i32> = FIRST.iter().chain(SECOND.iter()).copied().collect();
+    let packed_ids = ids(&packed);
+    let mask = block_diagonal_causal_mask(&lengths);
+    let together = model
+        .forward_with_positions(&packed_ids, Some(&mask), Some(&packed_positions(&lengths)))
+        .expect("packed forward");
+    let without = model
+        .forward_with_positions(&packed_ids, Some(&mask), None)
+        .expect("packed forward without positions");
+    pmetal_runtime::check_unobserved_error().expect("a runtime op threw");
+
+    let scale = separate
+        .iter()
+        .flatten()
+        .fold(0.0f32, |worst, v| worst.max(v.abs()));
+    assert!(scale > 1e-6, "the output is all but zero ({scale:e})");
+    for (index, (start, end)) in [(0, lengths[0]), (lengths[0], lengths[0] + lengths[1])]
+        .into_iter()
+        .enumerate()
+    {
+        let diff = max_abs_diff(&separate[index], &rows(&together, start, end));
+        assert!(
+            diff / scale < 1e-4,
+            "record {index}: packed output differs from the separate run by {diff:e} \
+             (relative {:e})",
+            diff / scale
+        );
+    }
+    let carried = max_abs_diff(
+        &rows(&together, lengths[0], lengths[0] + lengths[1]),
+        &rows(&without, lengths[0], lengths[0] + lengths[1]),
+    );
+    assert!(
+        carried / scale > 1e-3,
+        "without positions the second record is unchanged (relative {:e}): the Mamba layers \
+         carry nothing across the boundary here, so the equality above proves nothing",
+        carried / scale
+    );
+}
+
+fn hybrid_from_fixture(
+    name: &str,
+    patch: impl FnOnce(&mut serde_json::Value),
+) -> pmetal_models::DynamicModel {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    let mut config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    patch(&mut config);
+    pmetal_runtime::compat::random::seed(21);
+    pmetal_models::DynamicModel::from_config(&config.to_string()).expect("the config builds")
+}
+
+#[test]
+fn nemotron_h_packs_transparently() {
+    // Chunks of two tokens: the records' boundary falls inside a chunk, and
+    // each record crosses chunk edges of its own.
+    let mut model = hybrid_from_fixture("nemotron_h_hybrid_moe_config.json", |c| {
+        c["chunk_size"] = serde_json::json!(2);
+    });
+    assert_recurrent_packing_is_transparent(&mut model);
+}
+
+#[test]
+fn granite_hybrid_packs_transparently() {
+    let mut model = hybrid_from_fixture("granite_hybrid_dense_config.json", |c| {
+        c["mamba_chunk_size"] = serde_json::json!(2);
+    });
+    assert_recurrent_packing_is_transparent(&mut model);
+}
+
+#[test]
+fn only_a_recurrence_that_cannot_reset_blocks_packing() {
+    for name in [
+        "nemotron_h_hybrid_moe_config.json",
+        "granite_hybrid_dense_config.json",
+        "granite_dense_rope_config.json",
+    ] {
+        let model = hybrid_from_fixture(name, |_| {});
+        assert!(!model.has_unresettable_recurrent_layers(), "{name}");
+    }
+}

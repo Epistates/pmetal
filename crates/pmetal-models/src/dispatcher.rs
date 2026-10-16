@@ -1690,12 +1690,14 @@ impl DynamicModel {
             Self::DeepSeek(m) => m.forward_with_positions(input_ids, mask, positions),
             Self::Cohere(m) => m.forward_with_positions(input_ids, mask, positions),
             Self::Granite(m) => m.forward_with_positions(input_ids, mask, positions),
+            // Its attention carries no positional encoding; the positions tell
+            // the Mamba layers where one packed sequence ends and the next
+            // begins.
+            Self::NemotronH(m) => m.forward_with_positions(input_ids, mask, positions),
             Self::GptOss(m) => m.forward_with_positions(input_ids, mask, positions),
             // Text-only, as for `forward`.
             Self::Mllama(m) => m.forward_with_positions(input_ids, mask, positions),
-            // NemotronH's attention blocks carry no positional encoding, and a
-            // packed row breaks the Mamba recurrence in a way positions cannot
-            // repair. Flux / BERT / DiffusionGemma are not causal LMs.
+            // Flux / BERT / DiffusionGemma are not causal LMs.
             other => Err(Exception::custom(format!(
                 "forward_with_positions is not implemented for {other:?}; \
                  check supports_packed_positions() before calling"
@@ -1761,11 +1763,10 @@ impl DynamicModel {
     ///
     /// [`forward_with_positions`]: Self::forward_with_positions
     pub fn supports_packed_positions(&self) -> bool {
-        // A Granite hybrid's attention layers carry no positions (NoPE), and
-        // its Mamba layers take their order from the recurrence, which no
-        // position can restart.
+        // A Granite hybrid's attention layers carry no positions (NoPE); its
+        // Mamba layers read them to reset where a packed sequence restarts.
         if let Self::Granite(m) = self {
-            return m.config.uses_rope() && !m.config.has_mamba_layers();
+            return m.config.uses_rope() || m.config.has_mamba_layers();
         }
         matches!(
             self,
@@ -1784,7 +1785,23 @@ impl DynamicModel {
                 | Self::Cohere(_)
                 | Self::GptOss(_)
                 | Self::Mllama(_)
+                // Its Mamba layers reset where the positions restart.
+                | Self::NemotronH(_)
         )
+    }
+
+    /// Whether some layer carries recurrent state that two sequences packed
+    /// into one row would share. The block-diagonal mask of a packed batch
+    /// only reaches attention; a recurrent layer has to reset at the
+    /// boundary itself. The Mamba-2 layers of Nemotron-H and Granite do (they
+    /// read the position ids, see [`forward_with_positions`]); the gated delta
+    /// net of Qwen 3.5 and Qwen4-Exp does not, and those models are trained on
+    /// unpacked batches.
+    ///
+    /// [`forward_with_positions`]: Self::forward_with_positions
+    pub fn has_unresettable_recurrent_layers(&self) -> bool {
+        self.create_mamba_cache().is_some()
+            && !matches!(self, Self::NemotronH(_) | Self::Granite(_))
     }
 
     /// Forward pass returning last-layer hidden states `[batch, seq, hidden]`
@@ -1886,6 +1903,7 @@ impl DynamicModel {
             Self::DeepSeek(m) => m.model.forward_with_positions(input_ids, mask, p),
             Self::Cohere(m) => m.model.forward_with_positions(input_ids, mask, p),
             Self::Granite(m) => m.model.forward_with_positions(input_ids, mask, p),
+            Self::NemotronH(m) => m.backbone.forward_with_positions(input_ids, mask, p),
             Self::GptOss(m) => m.model.forward_with_positions(input_ids, mask, p),
             Self::Mllama(m) => m
                 .language_model

@@ -970,7 +970,16 @@ impl GraniteDecoderLayer {
         let normed = Module::forward(&mut self.input_layernorm, x)?;
         let mixed = match (self.self_attn.as_mut(), self.mamba.as_mut()) {
             (Some(attn), _) => attn.forward_with_cache(&normed, mask, cache, positions)?,
-            (None, Some(mixer)) => mixer.forward(&normed, mamba)?,
+            // Uncached with explicit positions is a packed row: the Mamba
+            // layer resets where the positions restart, as attention is kept
+            // apart by the mask.
+            (None, Some(mixer)) => match (positions, mamba) {
+                (Some(positions), None) => mixer.forward_packed(
+                    &normed,
+                    &crate::common::mamba2::segments_from_positions(positions, x.dim(0)),
+                )?,
+                (_, mamba) => mixer.forward(&normed, mamba)?,
+            },
             (None, None) => unreachable!("a Granite layer always has a mixer"),
         };
         let h = x.add(&scale(mixed));

@@ -19,9 +19,11 @@
 use std::collections::HashMap;
 
 use pmetal_cache::kv_cache::MambaCacheEntry;
-use pmetal_runtime::compat::{Array, Exception, Module, Param, nn, ops};
+use pmetal_runtime::compat::{Array, Dtype, Exception, Module, Param, nn, ops};
 use pmetal_runtime::impl_module_params;
-use pmetal_runtime::nn::ssd::{SsdParams, gated_group_rms_norm, ssd_scan, ssd_step};
+use pmetal_runtime::nn::ssd::{
+    SsdParams, gated_group_rms_norm, ssd_scan, ssd_scan_segmented, ssd_step,
+};
 
 /// Everything that shapes one Mamba-2 mixer.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -151,7 +153,26 @@ impl Mamba2Mixer {
     pub fn forward(
         &mut self,
         x: &Array,
+        cache: Option<&mut MambaCacheEntry>,
+    ) -> Result<Array, Exception> {
+        self.mix(x, cache, None)
+    }
+
+    /// [`forward`](Self::forward) over a row that packs several sequences:
+    /// `segments` `[B, L]` numbers the sequence of each token
+    /// ([`segments_from_positions`]). Neither the convolution nor the scan
+    /// reads across a boundary, so each sequence is mixed as if it were alone;
+    /// the attention mask of a packed batch cannot reach this layer. There is
+    /// no cache: a packed row is a training input.
+    pub fn forward_packed(&mut self, x: &Array, segments: &Array) -> Result<Array, Exception> {
+        self.mix(x, None, Some(segments))
+    }
+
+    fn mix(
+        &mut self,
+        x: &Array,
         mut cache: Option<&mut MambaCacheEntry>,
+        segments: Option<&Array>,
     ) -> Result<Array, Exception> {
         let cfg = self.config;
         let (batch, seq_len) = (x.dim(0), x.dim(1));
@@ -168,22 +189,23 @@ impl Mamba2Mixer {
 
         // Causal depthwise conv: zero history for a fresh sequence, the
         // cached history otherwise.
-        let padded = match cache.as_deref_mut() {
-            Some(entry) => entry.update_conv_state(xbc, cfg.conv_kernel)?,
-            None => ops::pad(
-                xbc,
-                &[(0, 0), (cfg.conv_kernel - 1, 0), (0, 0)],
-                None,
-                Some(0.0),
-            ),
+        let conv = match segments {
+            Some(segments) => self.packed_conv(xbc, segments),
+            None => {
+                let padded = match cache.as_deref_mut() {
+                    Some(entry) => entry.update_conv_state(xbc, cfg.conv_kernel)?,
+                    None => ops::pad(
+                        xbc,
+                        &[(0, 0), (cfg.conv_kernel - 1, 0), (0, 0)],
+                        None,
+                        Some(0.0),
+                    ),
+                };
+                let conv = Module::forward(&mut self.conv1d, &padded)?;
+                ops::slice_axis(&conv, 1, conv.dim(1) - seq_len, conv.dim(1))
+            }
         };
-        let conv = Module::forward(&mut self.conv1d, &padded)?;
-        let conv = nn::silu(&ops::slice_axis(
-            &conv,
-            1,
-            conv.dim(1) - seq_len,
-            conv.dim(1),
-        ));
+        let conv = nn::silu(&conv);
 
         let bc = cfg.n_groups * cfg.state_size;
         let conv_parts = ops::split_sections(&conv, &[intermediate, intermediate + bc], -1);
@@ -201,9 +223,12 @@ impl Mamba2Mixer {
         let previous = cache
             .as_ref()
             .and_then(|entry| entry.get_ssm_state().cloned());
-        let (y, state) = match (seq_len, previous.as_ref()) {
-            (1, Some(state)) => ssd_step(&xs, dt, &b, &c, params, state)?,
-            (_, state) => ssd_scan(&xs, dt, &b, &c, params, state, cfg.chunk_size)?,
+        let (y, state) = match (segments, seq_len, previous.as_ref()) {
+            (Some(segments), _, state) => {
+                ssd_scan_segmented(&xs, dt, &b, &c, params, state, cfg.chunk_size, segments)?
+            }
+            (None, 1, Some(state)) => ssd_step(&xs, dt, &b, &c, params, state)?,
+            (None, _, state) => ssd_scan(&xs, dt, &b, &c, params, state, cfg.chunk_size)?,
         };
         if let Some(entry) = cache {
             entry.set_ssm_state(state);
@@ -218,6 +243,74 @@ impl Mamba2Mixer {
             cfg.norm_group_size,
         )?;
         Module::forward(&mut self.out_proj, &normed.as_dtype(input_dtype.as_i32()))
+    }
+
+    /// The causal depthwise convolution of a packed row, `[B, L, C]` to the
+    /// same: tap `k` of an output reads the input `kernel - 1 - k` tokens
+    /// back only when that token is in the same sequence, so no sequence sees
+    /// the inputs of the one before it (the zeros before the row stand in for
+    /// the inputs that are not there). Accumulated in float32.
+    fn packed_conv(&self, xbc: &Array, segments: &Array) -> Array {
+        let cfg = self.config;
+        let (batch, seq_len, channels) = (xbc.dim(0), xbc.dim(1), xbc.dim(2));
+        let taps = cfg.conv_kernel;
+        let history = taps - 1;
+        let f32 = Dtype::Float32;
+
+        let padded = ops::pad(
+            &xbc.as_dtype(f32.as_i32()),
+            &[(0, 0), (history, 0), (0, 0)],
+            None,
+            Some(0.0),
+        );
+        // No sequence has a negative number, so the padding matches nothing.
+        let before = ops::full(&[batch, history], -1.0, Dtype::Int32);
+        let numbered = ops::concatenate_axis(&[&before, segments], 1);
+        // [C, K, 1] -> [K, C]
+        let weights = self
+            .conv1d
+            .weight
+            .as_ref()
+            .as_dtype(f32.as_i32())
+            .reshape(&[channels, taps])
+            .transpose_axes(&[1, 0]);
+
+        let mut out: Option<Array> = None;
+        for tap in 0..taps {
+            let inputs = ops::slice_axis(&padded, 1, tap, tap + seq_len);
+            let same = segments
+                .equal(&ops::slice_axis(&numbered, 1, tap, tap + seq_len))
+                .as_dtype(f32.as_i32())
+                .reshape(&[batch, seq_len, 1]);
+            let weight = ops::slice_axis(&weights, 0, tap, tap + 1); // [1, C]
+            let term = inputs.multiply(&same).multiply(&weight);
+            out = Some(match out {
+                Some(sum) => sum.add(&term),
+                None => term,
+            });
+        }
+        let mut out = out.expect("a convolution has at least one tap");
+        if let Some(bias) = self.conv1d.bias.as_ref() {
+            out = out.add(&bias.as_dtype(f32.as_i32()));
+        }
+        out.as_dtype(xbc.dtype().as_i32())
+    }
+}
+
+/// The sequence number of every token of a packed row, from its position ids:
+/// the numbers count the tokens at position 0, each of which starts a
+/// sequence. `positions` is `[L]` (shared by every row) or `[B, L]`; the
+/// result is `[B, L]`, `int32`.
+pub fn segments_from_positions(positions: &Array, batch: i32) -> Array {
+    let starts = positions
+        .equal(&Array::from_i32(0))
+        .as_dtype(Dtype::Int32.as_i32());
+    let numbers = starts.cumsum(-1);
+    if numbers.ndim() == 1 {
+        let len = numbers.dim(0);
+        numbers.reshape(&[1, len]).broadcast_to(&[batch, len])
+    } else {
+        numbers
     }
 }
 
