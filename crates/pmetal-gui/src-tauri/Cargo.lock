@@ -6358,6 +6358,7 @@ dependencies = [
  "pmetal-core",
  "pmetal-data",
  "pmetal-gguf",
+ "pmetal-hub",
  "pmetal-metal",
  "pmetal-runtime",
  "safetensors",

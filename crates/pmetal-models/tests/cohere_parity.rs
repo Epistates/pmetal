@@ -24,8 +24,9 @@ use pmetal_cache::test_utils::{
 };
 use pmetal_runtime::compat::{Array, Module};
 
+use pmetal_models::ModelArchitecture;
 use pmetal_models::architectures::cohere::{CohereConfig, CohereForCausalLM};
-use pmetal_models::loader::load_generic_weights;
+use pmetal_models::loader::load_generic_weights_with;
 
 /// Synthetic config — the one the fixture was generated with.
 /// `use_sliding_window` is omitted (defaults false) so the synthetic run is a
@@ -61,7 +62,8 @@ fn build_model_via_production_loader() -> CohereForCausalLM {
     std::fs::create_dir_all(&tmp).expect("temp dir");
     let dst = tmp.join("model.safetensors");
     std::fs::copy(fixture_path("cohere_synth_weights.safetensors"), &dst).expect("copy weights");
-    load_generic_weights(&mut model, &tmp).expect("production loader runs");
+    load_generic_weights_with(&mut model, &tmp, &ModelArchitecture::Cohere.load_policy())
+        .expect("production loader runs");
     let _ = std::fs::remove_dir_all(&tmp);
     model
 }

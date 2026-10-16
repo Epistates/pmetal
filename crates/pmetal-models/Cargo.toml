@@ -14,6 +14,7 @@ pmetal-runtime = { workspace = true }
 pmetal-core = { workspace = true }
 pmetal-data = { workspace = true }
 pmetal-gguf = { workspace = true }
+pmetal-hub = { workspace = true }
 pmetal-metal = { workspace = true }
 pmetal-cache = { workspace = true }
 serde = { workspace = true }
@@ -33,6 +34,8 @@ objc2 = { workspace = true }
 objc2-metal = { workspace = true }
 
 [dev-dependencies]
+# PyTorch checkpoint builders for the loader's tests.
+pmetal-hub = { workspace = true, features = ["testing"] }
 # Fail every test at the bridge op that throws (pmetal-runtime `strict-errors`).
 pmetal-runtime = { workspace = true, features = ["strict-errors"] }
 serial_test = { workspace = true }

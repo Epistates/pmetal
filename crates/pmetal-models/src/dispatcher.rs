@@ -5,8 +5,8 @@
 
 use crate::architectures::*;
 use crate::loader::{
-    Qwen3NextLoadOptions, assign_weights, load_bert_weights, load_generic_weights,
-    load_qwen3_next_weights_with_options, load_weights,
+    Exemption, LoadPolicy, ParamSnapshot, Qwen3NextLoadOptions, assign_weights, load_bert_weights,
+    load_generic_weights_with, load_qwen3_next_weights_with_options, load_weights,
 };
 use crate::traits::{CausalLMModel, ModelConfig};
 use crate::weight_format::{GgufModelConfig, WeightFormat, WeightLoader};
@@ -35,6 +35,26 @@ fn eval_module_parameters_batched(module: &impl ModuleParametersExt) -> Result<(
     }
 
     Ok(())
+}
+
+/// Run an architecture's own weight loader on `model`, then fail unless every
+/// parameter was assigned (bar what `policy` exempts).
+///
+/// The generic loader audits itself; this is for the architectures that fill
+/// their parameters by hand. A parameter such a loader forgets keeps the value
+/// it was constructed with, which looks like a model and computes noise.
+fn load_checked<M: ModuleParametersExt, T>(
+    model: &mut M,
+    model_dir: &Path,
+    policy: &LoadPolicy,
+    load: impl FnOnce(&mut M) -> Result<T, Exception>,
+) -> Result<T, Exception> {
+    let snapshot = ParamSnapshot::of(model);
+    let out = load(model)?;
+    snapshot
+        .require_complete(model, policy, Vec::new())
+        .map_err(|e| Exception::custom(e.with_quantization_hint(model_dir).to_string()))?;
+    Ok(out)
 }
 
 /// Rewrite the bare `Infinity` / `NaN` literals some released configs contain
@@ -196,6 +216,42 @@ impl std::fmt::Display for ModelArchitecture {
 }
 
 impl ModelArchitecture {
+    /// What a load of this architecture may leave unmatched, beyond the buffers
+    /// no architecture takes from a checkpoint.
+    ///
+    /// Every exemption is a claim that the model is right without the tensor
+    /// or parameter, so each says why. The default is nothing: a checkpoint
+    /// that does not fit the model it names is an error, not a model with a
+    /// few random weights.
+    pub fn load_policy(self) -> LoadPolicy {
+        let policy = LoadPolicy::strict();
+        match self {
+            Self::Cohere => policy.allowing_unloaded_params(&[
+                Exemption::new(
+                    "*layernorm.bias",
+                    "Cohere's LayerNorm has no bias in any release; the parameter stays at its zero init",
+                ),
+                Exemption::new(
+                    "model.norm.bias",
+                    "Cohere's LayerNorm has no bias in any release; the parameter stays at its zero init",
+                ),
+            ]),
+            Self::Llama4 => policy.allowing_unloaded_params(&[
+                Exemption::new(
+                    "*self_attn.q_norm.weight",
+                    "Llama 4's QK norm is a parameter-free L2 norm; the model holds it as an \
+                     RMSNorm whose weight stays at its identity init of ones",
+                ),
+                Exemption::new(
+                    "*self_attn.k_norm.weight",
+                    "Llama 4's QK norm is a parameter-free L2 norm; the model holds it as an \
+                     RMSNorm whose weight stays at its identity init of ones",
+                ),
+            ]),
+            _ => policy,
+        }
+    }
+
     /// The variant's name as a bare identifier, with no spacing or branding.
     ///
     /// Distinct from `Display`, which is prose for a human ("Qwen 3.5 / 3.6").
@@ -654,8 +710,12 @@ macro_rules! simple_load {
         let config: $config_ty =
             json5::from_str($content).map_err(|e| Exception::custom(e.to_string()))?;
         let mut model = ($new)(config)?;
-        load_generic_weights(&mut model, $model_dir)
-            .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+        load_generic_weights_with(
+            &mut model,
+            $model_dir,
+            &ModelArchitecture::$variant.load_policy(),
+        )
+        .map_err(|e| Exception::custom(e.to_string()))?;
         eval_module_parameters_batched(&model)?;
         Ok(Self::$variant(model))
     }};
@@ -670,8 +730,12 @@ macro_rules! simple_load_moe {
         let config: $config_ty =
             json5::from_str($content).map_err(|e| Exception::custom(e.to_string()))?;
         let mut model = ($new)(config)?;
-        load_generic_weights(&mut model, $model_dir)
-            .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+        load_generic_weights_with(
+            &mut model,
+            $model_dir,
+            &ModelArchitecture::$variant.load_policy(),
+        )
+        .map_err(|e| Exception::custom(e.to_string()))?;
         eval_module_parameters_batched(&model)?;
         let mut model = Self::$variant(model);
         model.init_post_load_fast_paths()?;
@@ -695,23 +759,85 @@ pub struct LmHead {
     pub softcap: Option<f32>,
 }
 
+/// What a cut cross-entropy loss computes besides the plain mean negative
+/// log-likelihood.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CceLoss {
+    /// Targets equal to this are not scored.
+    pub ignore_index: i32,
+    /// Smooth the target distribution toward uniform by this share, in
+    /// `[0, 1)`: `(1 - eps)(lse - z_y) + eps(lse - mean z)`, as PyTorch's
+    /// `label_smoothing` defines it.
+    pub label_smoothing: f32,
+    /// Add `weight * lse^2` to each token's loss (the z-loss that keeps the
+    /// softmax normaliser near 1), finite and non-negative.
+    pub z_loss: f32,
+}
+
+impl CceLoss {
+    /// The plain loss, skipping `ignore_index`.
+    pub const fn new(ignore_index: i32) -> Self {
+        Self {
+            ignore_index,
+            label_smoothing: 0.0,
+            z_loss: 0.0,
+        }
+    }
+
+    /// With label smoothing `epsilon`.
+    #[must_use]
+    pub const fn with_label_smoothing(mut self, epsilon: f32) -> Self {
+        self.label_smoothing = epsilon;
+        self
+    }
+
+    /// With z-loss `weight`.
+    #[must_use]
+    pub const fn with_z_loss(mut self, weight: f32) -> Self {
+        self.z_loss = weight;
+        self
+    }
+}
+
 impl LmHead {
-    /// Mean cross-entropy of `targets` (`[n]`, `ignore_index` skipped) under
-    /// the logits of `hidden` (`[n, hidden]`, or any leading shape that
-    /// flattens to it), computed a vocabulary chunk at a time.
+    /// Mean cross-entropy of `targets` (`[n]`, `loss.ignore_index` skipped)
+    /// under the logits of `hidden` (`[n, hidden]`, or any leading shape that
+    /// flattens to it), computed a vocabulary chunk at a time, with label
+    /// smoothing and z-loss as `loss` asks.
+    ///
+    /// # Errors
+    /// A label smoothing outside `[0, 1)` or a z-loss weight that is negative
+    /// or not finite, or the loss kernel failing.
     pub fn cut_cross_entropy(
         &self,
         hidden: &Array,
         targets: &Array,
-        ignore_index: i32,
+        loss: CceLoss,
     ) -> Result<Array, Exception> {
         use pmetal_runtime::nn::loss::{CutCrossEntropy, CutCrossEntropyConfig};
+
+        // The runtime's builders assert; a bad value from a config file is an
+        // error to report, not a panic.
+        if !(0.0..1.0).contains(&loss.label_smoothing) {
+            return Err(Exception::custom(format!(
+                "label smoothing must be in [0, 1), got {}",
+                loss.label_smoothing
+            )));
+        }
+        if !loss.z_loss.is_finite() || loss.z_loss < 0.0 {
+            return Err(Exception::custom(format!(
+                "z-loss weight must be finite and non-negative, got {}",
+                loss.z_loss
+            )));
+        }
 
         let width = hidden.dim(-1);
         let flat = hidden.reshape(&[-1, width]);
         let mut config = CutCrossEntropyConfig::new()
-            .with_ignore_index(ignore_index)
-            .with_logit_scale(self.logit_scale);
+            .with_ignore_index(loss.ignore_index)
+            .with_logit_scale(self.logit_scale)
+            .with_label_smoothing(loss.label_smoothing)
+            .with_z_loss(loss.z_loss);
         if let Some(cap) = self.softcap {
             config = config.with_softcap(cap);
         }
@@ -947,22 +1073,14 @@ impl DynamicModel {
                     json5::from_str(&effective).map_err(|e| Exception::custom(e.to_string()))?;
                 let mut model = Llama4ForCausalLM::new(config)?;
                 let weights = crate::loader::load_weights(model_dir)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                    .map_err(|e| Exception::custom(e.to_string()))?;
                 let weights = crate::architectures::llama4::sanitize_checkpoint(weights);
-                let mut params = model.flatten_params_mut();
-                let mut unread = Vec::new();
-                for (key, value) in weights {
-                    match params.get_mut(key.as_str()) {
-                        Some(param) => **param = value,
-                        None => unread.push(key),
-                    }
-                }
-                if !unread.is_empty() {
-                    unread.sort();
-                    return Err(Exception::custom(format!(
-                        "llama4: checkpoint tensors nothing reads: {unread:?}"
-                    )));
-                }
+                assign_weights(
+                    &mut model,
+                    weights,
+                    &ModelArchitecture::Llama4.load_policy(),
+                )
+                .map_err(|e| Exception::custom(e.with_quantization_hint(model_dir).to_string()))?;
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::Llama4(model))
             }
@@ -991,7 +1109,7 @@ impl DynamicModel {
                 let config = parse_gemma_config(&config_content)?;
                 let mut model = GemmaForCausalLM::new(config)?;
                 let weights = crate::loader::load_weights(model_dir)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                    .map_err(|e| Exception::custom(e.to_string()))?;
                 // Gemma 4 stores the language-tower weights under
                 // `model.language_model.…` (multimodal wrapper). Strip the
                 // infix so the existing loader's `model.…` keys match.
@@ -1026,8 +1144,10 @@ impl DynamicModel {
                 } else {
                     weights
                 };
-                crate::loader::load_gemma_weights(&mut model, &weights_effective)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                load_checked(&mut model, model_dir, &LoadPolicy::strict(), |model| {
+                    crate::loader::load_gemma_weights(model, &weights_effective)
+                        .map_err(|e| Exception::custom(e.to_string()))
+                })?;
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::Gemma(model))
             }
@@ -1053,16 +1173,31 @@ impl DynamicModel {
             ModelArchitecture::DeepSeek => {
                 let config: DeepSeekConfig = json5::from_str(&config_content)
                     .map_err(|e| Exception::custom(e.to_string()))?;
+                let mut policy = LoadPolicy::strict();
+                // V3 ships its multi-token-prediction layers after the trunk, as
+                // `model.layers.{num_hidden_layers + i}.*`. They are a separate
+                // draft head, not part of the model that decodes.
+                for i in 0..config.num_nextn_predict_layers.max(0) {
+                    policy.unused_tensors.push(Exemption::owned(
+                        format!("model.layers.{}.*", config.num_hidden_layers + i),
+                        "a multi-token-prediction layer: a draft head, not part of the trunk",
+                    ));
+                }
+                // Only V3's bias-corrected routing selects on the bias; V2
+                // checkpoints do not carry one and the router never reads it.
+                if config.routing().method != pmetal_runtime::deepseek_native::TopkMethod::NoauxTc {
+                    policy.unloaded_params.push(Exemption::new(
+                        "*.mlp.gate.e_score_correction_bias",
+                        "this routing method selects experts on the scores alone, with no bias",
+                    ));
+                }
                 let mut model = DeepSeek::new(config)?;
                 let weights = crate::loader::load_weights(model_dir)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                    .map_err(|e| Exception::custom(e.to_string()))?;
                 let weights = crate::architectures::deepseek::stack_experts(weights)?;
-                let mut params = model.flatten_params_mut();
-                for (key, value) in weights {
-                    if let Some(param) = params.get_mut(key.as_str()) {
-                        **param = value;
-                    }
-                }
+                assign_weights(&mut model, weights, &policy).map_err(|e| {
+                    Exception::custom(e.with_quantization_hint(model_dir).to_string())
+                })?;
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::DeepSeek(model))
             }
@@ -1095,8 +1230,15 @@ impl DynamicModel {
                 let config: NemotronHConfig = json5::from_str(&config_content)
                     .map_err(|e| Exception::custom(e.to_string()))?;
                 let mut model = NemotronHForCausalLM::new(config)?;
-                crate::loader::load_nemotron_weights(&mut model, model_dir)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                load_checked(
+                    &mut model,
+                    model_dir,
+                    &ModelArchitecture::NemotronH.load_policy(),
+                    |model| {
+                        crate::loader::load_nemotron_weights(model, model_dir)
+                            .map_err(|e| Exception::custom(e.to_string()))
+                    },
+                )?;
                 eval_module_parameters_batched(&model)?;
                 let mut model = Self::NemotronH(model);
                 model.init_post_load_fast_paths()?;
@@ -1123,7 +1265,7 @@ impl DynamicModel {
                     Qwen3NextLoadOptions::default()
                 };
                 load_qwen3_next_weights_with_options(&mut model, model_dir, &config, load_options)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                    .map_err(|e| Exception::custom(e.to_string()))?;
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::Qwen3Next(model))
             }
@@ -1166,9 +1308,17 @@ impl DynamicModel {
                 // The release (MXFP4) and transformers' own layout ship the
                 // experts fused; a per-expert `Linear` checkpoint takes the
                 // generic loader.
-                if !model.load_fused_checkpoint(model_dir)? {
-                    load_generic_weights(&mut model, model_dir)
-                        .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                let policy = ModelArchitecture::GptOss.load_policy();
+                let snapshot = ParamSnapshot::of(&model);
+                if model.load_fused_checkpoint(model_dir)? {
+                    snapshot
+                        .require_complete(&model, &policy, Vec::new())
+                        .map_err(|e| {
+                            Exception::custom(e.with_quantization_hint(model_dir).to_string())
+                        })?;
+                } else {
+                    load_generic_weights_with(&mut model, model_dir, &policy)
+                        .map_err(|e| Exception::custom(e.to_string()))?;
                 }
                 eval_module_parameters_batched(&model)?;
                 let mut model = Self::GptOss(model);
@@ -1179,12 +1329,25 @@ impl DynamicModel {
                 let effective = unwrap_text_config(&config_content)?;
                 let config: crate::architectures::gemma4::Gemma4Config =
                     json5::from_str(&effective).map_err(|e| Exception::custom(e.to_string()))?;
+                // A layer that shares another's keys and values reads them from
+                // its source and has no K/V projections of its own; checkpoints
+                // omit them, and the layer never reads them.
+                let mut policy = ModelArchitecture::Gemma4.load_policy();
+                for layer in config.first_kv_shared_layer_idx()..config.num_hidden_layers as usize {
+                    for tensor in ["k_proj.weight", "v_proj.weight", "k_norm.weight"] {
+                        policy.unloaded_params.push(Exemption::owned(
+                            format!("model.layers.{layer}.self_attn.{tensor}"),
+                            "a KV-shared layer reads its source layer's keys and values",
+                        ));
+                    }
+                }
                 let mut model = crate::architectures::gemma4::Gemma4ForCausalLM::new(config)?;
                 let weights = crate::loader::load_weights(model_dir)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                let report =
-                    crate::architectures::gemma4::load_gemma4_weights(&mut model, &weights)
-                        .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                let report = load_checked(&mut model, model_dir, &policy, |model| {
+                    crate::architectures::gemma4::load_gemma4_weights(model, &weights)
+                        .map_err(|e| Exception::custom(e.to_string()))
+                })?;
                 if !report.skipped.is_empty() {
                     tracing::info!(
                         "Gemma 4 weight load: {} loaded, {} skipped (first: {:?})",
@@ -1204,9 +1367,16 @@ impl DynamicModel {
                 // checkpoints use paths like `bert.encoder.layer.0.attention.self.query.*`
                 // which differ from PMetal's `model.layers.0.attention.query.*`.
                 let weights =
-                    load_weights(model_dir).map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                load_bert_weights(&mut model, &weights)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                    load_weights(model_dir).map_err(|e| Exception::custom(e.to_string()))?;
+                load_checked(
+                    &mut model,
+                    model_dir,
+                    &ModelArchitecture::Bert.load_policy(),
+                    |model| {
+                        load_bert_weights(model, &weights)
+                            .map_err(|e| Exception::custom(e.to_string()))
+                    },
+                )?;
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::Bert(model))
             }
@@ -1233,9 +1403,16 @@ impl DynamicModel {
                     model.attach_vision(&vision_config, image_token_id)?;
                 }
                 let weights = crate::loader::load_weights(model_dir)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                let report = crate::architectures::diffusion_gemma::load_diffusion_gemma_weights(
-                    &mut model, &weights,
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                let report = load_checked(
+                    &mut model,
+                    model_dir,
+                    &ModelArchitecture::DiffusionGemma.load_policy(),
+                    |model| {
+                        crate::architectures::diffusion_gemma::load_diffusion_gemma_weights(
+                            model, &weights,
+                        )
+                    },
                 )?;
                 if !report.skipped.is_empty() {
                     tracing::info!(
@@ -1259,9 +1436,13 @@ impl DynamicModel {
                     .map_err(|e| Exception::custom(e.to_string()))?;
                 let mut model = MllamaForConditionalGeneration::new(config)?;
                 let weights = crate::loader::load_weights(model_dir)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                let report =
-                    crate::architectures::mllama::load_mllama_weights(&mut model, &weights)?;
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                let report = load_checked(
+                    &mut model,
+                    model_dir,
+                    &ModelArchitecture::Mllama.load_policy(),
+                    |model| crate::architectures::mllama::load_mllama_weights(model, &weights),
+                )?;
                 if !report.skipped.is_empty() {
                     tracing::info!(
                         "Mllama weight load: {} loaded, {} skipped (first: {:?})",
@@ -1290,11 +1471,11 @@ impl DynamicModel {
         let config: PhiConfig =
             json5::from_str(config_content).map_err(|e| Exception::custom(e.to_string()))?;
         let mut model = PhiForCausalLM::new(config.clone())?;
-        let mut weights = crate::loader::load_weights(model_dir)
-            .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+        let mut weights =
+            crate::loader::load_weights(model_dir).map_err(|e| Exception::custom(e.to_string()))?;
         crate::loader::split_phi_fused_qkv(&mut weights, &config);
-        crate::loader::assign_weights(&mut model, weights)
-            .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+        crate::loader::assign_weights(&mut model, weights, &LoadPolicy::strict())
+            .map_err(|e| Exception::custom(e.with_quantization_hint(model_dir).to_string()))?;
         eval_module_parameters_batched(&model)?;
         Ok(if is_phi4 {
             Self::Phi4(model)
@@ -1330,43 +1511,70 @@ impl DynamicModel {
                 ))
             })?;
 
-        let weights =
+        let mut weights =
             WeightLoader::load_gguf(path).map_err(|e| Exception::custom(format!("GGUF: {e}")))?;
+
+        // A GGUF with no `output.weight` ties its head to the embedding; one
+        // with it has an untied head, which the model has to hold. The configs
+        // default to tied, so left alone every untied head was dropped and the
+        // embedding matrix was used in its place.
+        let tied = !weights.contains_key("lm_head.weight");
+        let policy = LoadPolicy::strict().allowing_unused_tensors(&[Exemption::new(
+            "rope_freqs.weight",
+            "the GGUF converter's precomputed RoPE frequency factors (Llama 3.x scaling); \
+             the config's own rope settings are used instead, see the warning below",
+        )]);
+        if weights.contains_key("rope_freqs.weight") {
+            tracing::warn!(
+                "this GGUF carries precomputed RoPE frequency factors, which pmetal does not apply; \
+                 positions beyond the original context window will not match the reference"
+            );
+        }
 
         match arch {
             ModelArchitecture::Llama => {
-                let mut model = LlamaForCausalLM::new(gguf_config.to_llama_config())?;
-                assign_weights(&mut model, weights)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                let mut config = gguf_config.to_llama_config();
+                config.tie_word_embeddings = tied;
+                let num_heads = config.num_attention_heads;
+                let num_kv_heads = config.num_key_value_heads.unwrap_or(num_heads);
+                // `llama` GGUFs store q/k rows permuted for the GGUF converter's
+                // interleaved RoPE; the other families are stored as published.
+                crate::weight_format::unpermute_llama_qk(&mut weights, num_heads, num_kv_heads)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                let mut model = LlamaForCausalLM::new(config)?;
+                assign_weights(&mut model, weights, &policy)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
                 Ok(Self::Llama(model))
             }
             ModelArchitecture::Qwen2 => {
-                let mut model = Qwen2ForCausalLM::new(gguf_config.to_qwen2_config())?;
-                assign_weights(&mut model, weights)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                let mut config = gguf_config.to_qwen2_config();
+                config.tie_word_embeddings = tied;
+                let mut model = Qwen2ForCausalLM::new(config)?;
+                assign_weights(&mut model, weights, &policy)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
                 Ok(Self::Qwen2(model))
             }
             ModelArchitecture::Qwen3 => {
-                let mut model = Qwen3ForCausalLM::new_for_loading(gguf_config.to_qwen3_config())?;
-                assign_weights(&mut model, weights)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                let mut config = gguf_config.to_qwen3_config();
+                config.tie_word_embeddings = tied;
+                let mut model = Qwen3ForCausalLM::new_for_loading(config)?;
+                assign_weights(&mut model, weights, &policy)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
                 Ok(Self::Qwen3(model))
             }
             ModelArchitecture::Mistral => {
-                let mut model = MistralForCausalLM::new(gguf_config.to_mistral_config())?;
-                assign_weights(&mut model, weights)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                let mut config = gguf_config.to_mistral_config();
+                config.tie_word_embeddings = tied;
+                let mut model = MistralForCausalLM::new(config)?;
+                assign_weights(&mut model, weights, &policy)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
                 Ok(Self::Mistral(model))
-            }
-            ModelArchitecture::Phi => {
-                let mut model = PhiForCausalLM::new(gguf_config.to_phi_config())?;
-                assign_weights(&mut model, weights)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                Ok(Self::Phi(model))
             }
             other => Err(Exception::custom(format!(
                 "GGUF inference loading is not yet implemented for {other} \
-                 (Phase B supports dense Llama, Qwen2, Qwen3, Mistral, Phi)"
+                 (supported: dense Llama, Qwen2, Qwen3, Mistral). Phi-3 GGUFs fuse the \
+                 attention and MLP projections and carry LongRoPE factors, none of which \
+                 the loader reads yet."
             ))),
         }
     }
@@ -1971,7 +2179,40 @@ impl DynamicModel {
         }
     }
 
+    /// The dtype the model computes in: that of its floating-point parameters.
+    ///
+    /// Read from a one-dimensional parameter (a norm weight, which no quantizer
+    /// touches), falling back to any floating-point one, never from a packed
+    /// weight: a `uint32` payload read as the model dtype is silent noise.
+    /// `Float32` for a model with no floating-point parameter at all.
+    pub fn compute_dtype(&self) -> Dtype {
+        let params = self.flatten_params();
+        params
+            .iter()
+            .filter(|(_, array)| {
+                matches!(
+                    array.dtype(),
+                    Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32
+                )
+            })
+            .min_by_key(|(name, array)| (array.ndim() != 1, name.to_string()))
+            .map_or(Dtype::Float32, |(_, array)| array.dtype())
+    }
+
+    /// A KV cache for `max_seq_len` tokens, holding keys and values in the
+    /// model's [`compute_dtype`](Self::compute_dtype).
+    ///
+    /// The layout (layers, heads, head size) is the architecture's own. The
+    /// dtype used to be `KVCacheConfig`'s default of f32 whatever the model ran
+    /// in, which doubled every memory estimate made from the cache's config and
+    /// allocated a fused batch cache twice the size of the one the model fills.
     pub fn create_cache(&self, max_seq_len: usize) -> KVCache {
+        let layout = self.create_cache_layout(max_seq_len);
+        let config = layout.config().clone().with_dtype(self.compute_dtype());
+        KVCache::new(config)
+    }
+
+    fn create_cache_layout(&self, max_seq_len: usize) -> KVCache {
         match self {
             Self::Llama(m) => m.create_cache(max_seq_len),
             Self::Llama4(m) => KVCache::new(KVCacheConfig::new(

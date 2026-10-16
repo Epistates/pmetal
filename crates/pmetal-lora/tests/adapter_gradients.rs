@@ -432,7 +432,12 @@ fn cce_against_logits(
         let seq = hidden.dim(1);
         let hidden = hidden.slice(&[0, 0, 0], &[1, seq - 1, hidden.dim(2)]);
         let targets = ids.slice(&[0, 1], &[1, seq]).reshape(&[-1]);
-        head.cut_cross_entropy(&hidden, &targets, -100).unwrap()
+        head.cut_cross_entropy(
+            &hidden,
+            &targets,
+            pmetal_models::dispatcher::CceLoss::new(-100),
+        )
+        .unwrap()
     });
     drain(name);
 

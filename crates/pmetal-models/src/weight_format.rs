@@ -1,22 +1,10 @@
-//! Unified weight loading for multiple formats.
+//! GGUF weight loading and the format detection that routes to it.
 //!
-//! This module provides format-agnostic weight loading, supporting:
-//! - **Safetensors** (HuggingFace format) with automatic BF16→F32 conversion
-//! - **GGUF** (llama.cpp format) with dequantization and tensor name mapping
-//!
-//! # Usage
-//!
-//! ```ignore
-//! use pmetal_models::weight_format::{WeightLoader, WeightFormat};
-//!
-//! // Auto-detect format and load
-//! let weights = WeightLoader::load("./model");
-//!
-//! // Or load specific format
-//! let weights = WeightLoader::load_gguf("./model.gguf");
-//! ```
+//! Safetensors checkpoints are read by [`crate::loader`]; this module owns the
+//! GGUF side: tensor-name mapping, dequantization and the model config GGUF
+//! carries in its metadata.
 
-use pmetal_runtime::compat::{Array, Dtype};
+use pmetal_runtime::compat::Array;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -170,103 +158,6 @@ fn gguf_shape_to_i32(dimensions: &[u64], tensor_name: &str) -> Result<Vec<i32>, 
 pub struct WeightLoader;
 
 impl WeightLoader {
-    /// Load weights from a path, auto-detecting the format.
-    ///
-    /// For directories, looks for safetensors or GGUF files.
-    /// For files, uses the file extension to determine format.
-    ///
-    /// # Arguments
-    /// * `path` - Path to model directory or weight file
-    ///
-    /// # Returns
-    /// HashMap of weight name (in HuggingFace format) to Array
-    pub fn load(path: impl AsRef<Path>) -> Result<HashMap<String, Array>, WeightFormatError> {
-        let path = path.as_ref();
-
-        match WeightFormat::detect(path) {
-            Some(WeightFormat::Safetensors) => Self::load_safetensors(path),
-            Some(WeightFormat::Gguf) => Self::load_gguf(path),
-            None => Err(WeightFormatError::UnsupportedFormat(format!(
-                "Could not detect weight format for: {}",
-                path.display()
-            ))),
-        }
-    }
-
-    /// Load weights from safetensors format.
-    ///
-    /// Handles both single-file and sharded models.
-    /// Automatically converts BF16 weights to F32 for training compatibility.
-    pub fn load_safetensors(
-        path: impl AsRef<Path>,
-    ) -> Result<HashMap<String, Array>, WeightFormatError> {
-        let path = path.as_ref();
-        let mut weights = HashMap::new();
-
-        if path.is_file() {
-            // Single file
-            let path_str = path.to_str().unwrap_or_default();
-            if let Some(pairs) = pmetal_runtime::inline_array::load_safetensors_shard(path_str) {
-                for (name, array) in pairs {
-                    weights.insert(name, Self::convert_dtype_for_training(array)?);
-                }
-            }
-        } else if path.is_dir() {
-            // Directory - check for single file or sharded
-            let single_file = path.join("model.safetensors");
-            if single_file.exists() {
-                let path_str = single_file.to_str().unwrap_or_default();
-                if let Some(pairs) = pmetal_runtime::inline_array::load_safetensors_shard(path_str)
-                {
-                    for (name, array) in pairs {
-                        weights.insert(name, Self::convert_dtype_for_training(array)?);
-                    }
-                }
-            } else {
-                // Load sharded model
-                let index_path = path.join("model.safetensors.index.json");
-                if !index_path.exists() {
-                    return Err(WeightFormatError::Io(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "No model.safetensors or model.safetensors.index.json found",
-                    )));
-                }
-
-                #[derive(serde::Deserialize)]
-                struct WeightIndex {
-                    weight_map: HashMap<String, String>,
-                }
-
-                let index_content = std::fs::read_to_string(&index_path)?;
-                let index: WeightIndex = serde_json::from_str(&index_content)?;
-
-                // Get unique shard files
-                let shard_files: std::collections::HashSet<&String> =
-                    index.weight_map.values().collect();
-
-                // Load each shard
-                for shard_file in shard_files {
-                    let shard_path = path.join(shard_file);
-                    let path_str = shard_path.to_str().unwrap_or_default();
-                    if let Some(pairs) =
-                        pmetal_runtime::inline_array::load_safetensors_shard(path_str)
-                    {
-                        for (name, array) in pairs {
-                            weights.insert(name, Self::convert_dtype_for_training(array)?);
-                        }
-                    }
-                }
-            }
-        } else {
-            return Err(WeightFormatError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Path not found: {}", path.display()),
-            )));
-        }
-
-        Ok(weights)
-    }
-
     /// Load weights from GGUF format.
     ///
     /// Dequantizes all tensors to F32 and maps tensor names to HuggingFace format.
@@ -324,21 +215,6 @@ impl WeightLoader {
         }
 
         Ok(weights)
-    }
-
-    /// Convert array dtype for training compatibility.
-    ///
-    /// BF16 is converted to F32 since MLX training works better with F32.
-    /// F16 is kept as-is (MLX handles F16 well).
-    fn convert_dtype_for_training(array: Array) -> Result<Array, WeightFormatError> {
-        match array.dtype() {
-            Dtype::Bfloat16 => {
-                // Convert BF16 to F32 for training compatibility
-                Ok(array.as_dtype(Dtype::Float32.as_i32()))
-            }
-            // Keep other dtypes as-is
-            _ => Ok(array),
-        }
     }
 
     /// Map GGUF tensor name to HuggingFace format.
@@ -706,49 +582,60 @@ impl GgufModelConfig {
             ..Default::default()
         }
     }
+}
 
-    /// Convert to Gemma config.
-    pub fn to_gemma_config(&self) -> crate::architectures::gemma::GemmaConfig {
-        crate::architectures::gemma::GemmaConfig {
-            vocab_size: self.vocab_size,
-            hidden_size: self.hidden_size,
-            intermediate_size: self.intermediate_size,
-            num_hidden_layers: self.num_hidden_layers,
-            num_attention_heads: self.num_attention_heads,
-            num_key_value_heads: self.num_kv_heads,
-            head_dim: self.head_dim,
-            max_position_embeddings: self.max_position_embeddings,
-            rms_norm_eps: self.rms_norm_eps,
-            rope_theta: self.rope_theta,
-            ..Default::default()
+/// Undo the GGUF converter's row permutation of a Llama-architecture
+/// checkpoint's query and key projections, in place.
+///
+/// GGUF runtimes rotate the `llama` architecture's heads in *interleaved* pairs
+/// `(2i, 2i+1)`, where Hugging Face rotates `(i, i + head_dim/2)`. The
+/// converter reorders every head's rows so the two conventions
+/// agree: `reshape(n_head, 2, head_dim/2, ..).swapaxes(1, 2)`, which sends row
+/// `a·head_dim/2 + b` of a head to row `2b + a`. The permutation touches
+/// `q_proj` and `k_proj`, weights and biases, and nothing else, and it is only
+/// done for the `llama` architecture: the Qwen and Phi families rotate in the
+/// Hugging Face convention already.
+///
+/// Loading such a file without undoing it feeds the HF-convention rotation rows
+/// in the wrong order: finite, plausibly shaped logits from attention that
+/// attends to the wrong positions.
+///
+/// `num_heads` is the query head count and `num_kv_heads` the key head count
+/// (the same for MHA).
+pub fn unpermute_llama_qk(
+    weights: &mut HashMap<String, Array>,
+    num_heads: i32,
+    num_kv_heads: i32,
+) -> Result<(), WeightFormatError> {
+    let heads_of = |name: &str| -> Option<i32> {
+        if name.ends_with(".self_attn.q_proj.weight") || name.ends_with(".self_attn.q_proj.bias") {
+            Some(num_heads)
+        } else if name.ends_with(".self_attn.k_proj.weight")
+            || name.ends_with(".self_attn.k_proj.bias")
+        {
+            Some(num_kv_heads)
+        } else {
+            None
         }
-    }
-
-    /// Convert to Phi config.
-    pub fn to_phi_config(&self) -> crate::architectures::phi::PhiConfig {
-        use crate::architectures::phi::{LayerNormType, PhiActivation, PhiConfig};
-
-        PhiConfig {
-            model_type: "phi3".to_string(),
-            vocab_size: self.vocab_size,
-            hidden_size: self.hidden_size,
-            intermediate_size: self.intermediate_size,
-            num_hidden_layers: self.num_hidden_layers,
-            num_attention_heads: self.num_attention_heads,
-            num_key_value_heads: self.num_kv_heads.unwrap_or(self.num_attention_heads),
-            max_position_embeddings: self.max_position_embeddings,
-            rope_theta: self.rope_theta,
-            partial_rotary_factor: 0.5, // Default for Phi-3
-            rms_norm_eps: self.rms_norm_eps,
-            qkv_bias: false, // Default, Phi-4 uses true
-            hidden_act: PhiActivation::SwiGLU,
-            sliding_window: None,
-            layer_norm_type: LayerNormType::RmsNorm,
-            original_max_position_embeddings: None,
-            rope_scaling: None,
-            tie_word_embeddings: false,
+    };
+    for (name, tensor) in weights.iter_mut() {
+        let Some(heads) = heads_of(name) else {
+            continue;
+        };
+        let shape = tensor.shape().to_vec();
+        let rows = shape[0];
+        if heads <= 0 || rows % (2 * heads) != 0 {
+            return Err(WeightFormatError::Gguf(format!(
+                "{name} has {rows} rows, which {heads} heads cannot split into rotary pairs"
+            )));
         }
+        let rest: Vec<i32> = shape[1..].to_vec();
+        let mut grouped = vec![heads, rows / heads / 2, 2];
+        grouped.extend(&rest);
+        // The inverse of `[heads, 2, d/2] -> [heads, d/2, 2]`.
+        *tensor = tensor.reshape(&grouped).swap_axes(1, 2).reshape(&shape);
     }
+    Ok(())
 }
 
 /// Get the detected model architecture from a GGUF file.
@@ -1007,5 +894,110 @@ mod tests {
         // Two different models are still ambiguous.
         std::fs::write(dir.path().join("Other-Q8_0.gguf"), b"x").unwrap();
         assert!(find_gguf_file_in_dir(dir.path()).is_err());
+    }
+
+    /// the GGUF converter's `LlamaModel.permute`, written out row by row rather than as
+    /// the reshape it is in the converter, so the loader cannot agree with it by
+    /// construction: head row `a·d/2 + b` goes to row `2b + a`.
+    fn gguf_permute(rows: &[Vec<f32>], heads: usize) -> Vec<Vec<f32>> {
+        let d = rows.len() / heads;
+        let mut out = vec![Vec::new(); rows.len()];
+        for h in 0..heads {
+            for a in 0..2 {
+                for b in 0..d / 2 {
+                    out[h * d + 2 * b + a] = rows[h * d + a * (d / 2) + b].clone();
+                }
+            }
+        }
+        out
+    }
+
+    fn matrix(rows: &[Vec<f32>]) -> Array {
+        let flat: Vec<f32> = rows.iter().flatten().copied().collect();
+        Array::from_f32_slice(&flat, &[rows.len() as i32, rows[0].len() as i32])
+    }
+
+    fn rows_of(array: &Array) -> Vec<Vec<f32>> {
+        let (rows, cols) = (array.shape()[0] as usize, array.shape()[1] as usize);
+        let mut array = array.clone();
+        let flat = array.to_f32_vec(rows * cols).unwrap();
+        flat.chunks(cols).map(<[f32]>::to_vec).collect()
+    }
+
+    /// ⚠️ Every `llama`-architecture GGUF stores its q and k rows permuted, and
+    /// the loader assigned them as they were.
+    #[test]
+    fn gguf_row_permutation_is_undone_for_q_and_k_but_not_v() {
+        let (heads, kv_heads, head_dim, hidden) = (4usize, 2usize, 8usize, 3usize);
+        let rows = |n: usize, seed: f32| -> Vec<Vec<f32>> {
+            (0..n)
+                .map(|r| {
+                    (0..hidden)
+                        .map(|c| seed + (r * hidden + c) as f32)
+                        .collect()
+                })
+                .collect()
+        };
+        let q = rows(heads * head_dim, 0.0);
+        let k = rows(kv_heads * head_dim, 1000.0);
+        let v = rows(kv_heads * head_dim, 2000.0);
+
+        let mut weights = HashMap::new();
+        weights.insert(
+            "model.layers.0.self_attn.q_proj.weight".to_string(),
+            matrix(&gguf_permute(&q, heads)),
+        );
+        weights.insert(
+            "model.layers.0.self_attn.k_proj.weight".to_string(),
+            matrix(&gguf_permute(&k, kv_heads)),
+        );
+        weights.insert(
+            "model.layers.0.self_attn.v_proj.weight".to_string(),
+            matrix(&v),
+        );
+
+        unpermute_llama_qk(&mut weights, heads as i32, kv_heads as i32).unwrap();
+
+        assert_eq!(
+            rows_of(&weights["model.layers.0.self_attn.q_proj.weight"]),
+            q
+        );
+        assert_eq!(
+            rows_of(&weights["model.layers.0.self_attn.k_proj.weight"]),
+            k
+        );
+        assert_eq!(
+            rows_of(&weights["model.layers.0.self_attn.v_proj.weight"]),
+            v
+        );
+        pmetal_runtime::check_unobserved_error().unwrap();
+    }
+
+    /// A query bias is permuted the same way as the rows it belongs to.
+    #[test]
+    fn a_permuted_bias_is_unpermuted_too() {
+        let (heads, head_dim) = (2usize, 4usize);
+        let rows: Vec<Vec<f32>> = (0..heads * head_dim).map(|r| vec![r as f32]).collect();
+        let permuted = gguf_permute(&rows, heads);
+        let flat: Vec<f32> = permuted.iter().flatten().copied().collect();
+        let mut weights = HashMap::new();
+        weights.insert(
+            "model.layers.0.self_attn.q_proj.bias".to_string(),
+            Array::from_f32_slice(&flat, &[(heads * head_dim) as i32]),
+        );
+        unpermute_llama_qk(&mut weights, heads as i32, heads as i32).unwrap();
+        let mut bias = weights["model.layers.0.self_attn.q_proj.bias"].clone();
+        let want: Vec<f32> = rows.iter().flatten().copied().collect();
+        assert_eq!(bias.to_f32_vec(want.len()).unwrap(), want);
+    }
+
+    #[test]
+    fn rows_that_cannot_be_rotary_pairs_are_refused() {
+        let mut weights = HashMap::new();
+        weights.insert(
+            "model.layers.0.self_attn.q_proj.weight".to_string(),
+            Array::from_f32_slice(&[0.0; 9], &[3, 3]),
+        );
+        assert!(unpermute_llama_qk(&mut weights, 1, 1).is_err());
     }
 }
