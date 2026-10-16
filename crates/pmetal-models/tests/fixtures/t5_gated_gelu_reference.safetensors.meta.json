@@ -1,0 +1,22 @@
+{
+  "config": {
+    "d_ff": 128,
+    "d_kv": 16,
+    "d_model": 64,
+    "dropout_rate": 0.0,
+    "feed_forward_proj": "gated-gelu",
+    "layer_norm_epsilon": 1e-06,
+    "num_heads": 4,
+    "num_layers": 3,
+    "relative_attention_max_distance": 128,
+    "relative_attention_num_buckets": 32,
+    "tie_word_embeddings": false,
+    "vocab_size": 200
+  },
+  "model_id": "synthetic",
+  "oracle": "transformers",
+  "rng_seed": 7,
+  "seq_len": 40,
+  "torch_version": "2.11.0",
+  "transformers_version": "5.6.1"
+}

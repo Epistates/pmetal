@@ -16,7 +16,7 @@
 use pmetal_models::architectures::bert::{BertConfig, BertIntermediate};
 use pmetal_models::architectures::clip::{CLIPConfig, CLIPMLP};
 use pmetal_models::architectures::phi::{PhiActivation, PhiConfig, PhiMLP};
-use pmetal_models::architectures::t5::{T5Config, T5DenseGatedActDense};
+use pmetal_models::architectures::t5::{T5Config, T5FeedForward};
 use pmetal_models::architectures::utils::Activation;
 use pmetal_runtime::compat::{Array, Dtype, Param, nn, ops};
 
@@ -128,13 +128,14 @@ fn t5_gated_dense_uses_the_tanh_gelu() {
     let config = T5Config {
         d_model: N,
         d_ff: N,
+        feed_forward_proj: "gated-gelu".to_string(),
         ..Default::default()
     };
     assert_eq!(config.dense_act_fn(), "gelu_new");
 
-    let mut dense = T5DenseGatedActDense::new(&config);
-    make_identity(&mut dense.wi_0);
-    make_identity(&mut dense.wi_1);
+    let mut dense = T5FeedForward::new(&config).expect("T5FeedForward::new");
+    make_identity(dense.wi_0.as_mut().expect("gated"));
+    make_identity(dense.wi_1.as_mut().expect("gated"));
     make_identity(&mut dense.wo);
 
     // With identity projections the block reduces to `act(x) * x`.

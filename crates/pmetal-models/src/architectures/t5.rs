@@ -1,29 +1,89 @@
-//! T5 Encoder architecture.
+//! T5 encoder.
 //!
-//! Implementation of T5 (Text-to-Text Transfer Transformer) encoder.
-//! Based on the architecture from Google and used in Flux.1 (T5-XXL).
+//! The encoder half of T5 (Raffel et al., 2020; v1.1 and Flan follow Shazeer,
+//! 2020 for the gated feed-forward), as `T5EncoderModel` in `transformers`: the
+//! text encoder FLUX conditions on and the backbone of sentence-T5 style
+//! embedders.
+//!
+//! What sets it apart from a BERT-style encoder:
+//!
+//! - **No score scaling.** `softmax(Q·Kᵀ + bias)`; the `1/√d` is folded into
+//!   the weights at initialisation. Scaling here as well shrinks every
+//!   attention logit by `√d_kv` and flattens the attention.
+//! - **Relative position bias.** Only the first block owns the bucket
+//!   embedding; its `[heads, query, key]` bias (plus the padding mask) is
+//!   shared by every block.
+//! - **A bias-free RMS norm** (`T5LayerNorm`) and bias-free projections.
+//! - A **gated** (`gated-gelu`, `gated-silu`) or plain (`relu`) feed-forward.
 
-use pmetal_runtime::compat::{Array, Dtype, Exception, nn};
+use pmetal_runtime::compat::{Array, Exception, nn};
 use pmetal_runtime::impl_module_params;
+use pmetal_runtime::nn::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 use serde::{Deserialize, Serialize};
 
-use crate::architectures::utils::{Activation, resolve_activation};
+use crate::architectures::utils::{
+    Activation, activate, additive_padding_mask, resolve_activation,
+};
 
-/// T5 encoder configuration.
+/// T5 encoder configuration, with the defaults of `transformers`' `T5Config`
+/// for the fields a `config.json` may leave out.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct T5Config {
+    #[serde(default = "default_vocab_size")]
     pub vocab_size: usize,
+    #[serde(default = "default_d_model")]
     pub d_model: usize,
+    #[serde(default = "default_d_ff")]
     pub d_ff: usize,
+    /// Width of one attention head. Not `d_model / num_heads`: T5 sizes the
+    /// attention's inner dimension independently of the model width.
+    #[serde(default = "default_d_kv")]
     pub d_kv: usize,
+    #[serde(default = "default_num_layers", alias = "num_hidden_layers")]
     pub num_layers: usize,
+    #[serde(default = "default_num_heads", alias = "num_attention_heads")]
     pub num_heads: usize,
+    #[serde(default = "default_buckets")]
     pub relative_attention_num_buckets: usize,
+    #[serde(default = "default_max_distance")]
     pub relative_attention_max_distance: usize,
-    pub dropout_rate: f32,
+    #[serde(default = "default_epsilon")]
     pub layer_norm_epsilon: f32,
+    /// `"relu"` (the original T5), or `"gated-gelu"` / `"gated-silu"` (v1.1,
+    /// Flan).
+    #[serde(default = "default_feed_forward_proj")]
     pub feed_forward_proj: String,
-    pub is_gated_act: bool,
+}
+
+fn default_vocab_size() -> usize {
+    32128
+}
+fn default_d_model() -> usize {
+    512
+}
+fn default_d_ff() -> usize {
+    2048
+}
+fn default_d_kv() -> usize {
+    64
+}
+fn default_num_layers() -> usize {
+    6
+}
+fn default_num_heads() -> usize {
+    8
+}
+fn default_buckets() -> usize {
+    32
+}
+fn default_max_distance() -> usize {
+    128
+}
+fn default_epsilon() -> f32 {
+    1e-6
+}
+fn default_feed_forward_proj() -> String {
+    "relu".to_string()
 }
 
 impl T5Config {
@@ -44,29 +104,61 @@ impl T5Config {
                 .unwrap_or(&self.feed_forward_proj)
         }
     }
+
+    /// Whether the feed-forward is gated (`wi_0 · wi_1`), as against a single
+    /// `wi`.
+    pub fn is_gated_act(&self) -> bool {
+        self.feed_forward_proj.starts_with("gated-")
+    }
+
+    /// The width of the attention's query, key and value projections.
+    pub fn inner_dim(&self) -> usize {
+        self.num_heads * self.d_kv
+    }
 }
 
 impl Default for T5Config {
+    /// `transformers`' `T5Config()`: the t5-small shape with a ReLU
+    /// feed-forward.
     fn default() -> Self {
-        // Defaults for T5-XXL used in Flux.1
         Self {
-            vocab_size: 32128,
-            d_model: 4096,
-            d_ff: 10240,
-            d_kv: 64,
-            num_layers: 24,
-            num_heads: 64,
-            relative_attention_num_buckets: 32,
-            relative_attention_max_distance: 128,
-            dropout_rate: 0.1,
-            layer_norm_epsilon: 1e-6,
-            feed_forward_proj: "gated-gelu".to_string(),
-            is_gated_act: true,
+            vocab_size: default_vocab_size(),
+            d_model: default_d_model(),
+            d_ff: default_d_ff(),
+            d_kv: default_d_kv(),
+            num_layers: default_num_layers(),
+            num_heads: default_num_heads(),
+            relative_attention_num_buckets: default_buckets(),
+            relative_attention_max_distance: default_max_distance(),
+            layer_norm_epsilon: default_epsilon(),
+            feed_forward_proj: default_feed_forward_proj(),
         }
     }
 }
 
-/// T5 Relative Position Bias.
+/// The bucket of a signed relative position (`key - query`) in a bidirectional
+/// encoder, as `T5Attention._relative_position_bucket`.
+///
+/// Half the buckets are for keys after the query. Within a direction, the
+/// nearest `num_buckets / 4` offsets get one bucket each and the rest share
+/// logarithmically spaced buckets up to `max_distance`, beyond which they
+/// share the last. The logarithm runs in f32 and truncates toward zero, as the
+/// reference's `.to(torch.long)` does, so bucket boundaries land on the same
+/// offsets.
+fn relative_position_bucket(relative_position: i64, num_buckets: usize, max_distance: usize) -> i32 {
+    let half = (num_buckets / 2) as i64;
+    let offset = if relative_position > 0 { half } else { 0 };
+    let distance = relative_position.abs();
+    let max_exact = half / 2;
+    if distance < max_exact {
+        return (offset + distance) as i32;
+    }
+    let log_range = ((max_distance as f64) / (max_exact as f64)).ln() as f32;
+    let scaled = (distance as f32 / max_exact as f32).ln() / log_range * (half - max_exact) as f32;
+    (offset + (max_exact + scaled as i64).min(half - 1)) as i32
+}
+
+/// T5's learned relative position bias.
 #[derive(Debug)]
 pub struct T5RelativePositionBias {
     pub embedding: nn::Embedding,
@@ -77,166 +169,106 @@ pub struct T5RelativePositionBias {
 impl_module_params!(T5RelativePositionBias; embedding);
 
 impl T5RelativePositionBias {
-    pub fn new(config: &T5Config) -> Self {
-        let embedding = nn::Embedding::new(
-            config.relative_attention_num_buckets as i32,
-            config.num_heads as i32,
-        )
-        .unwrap();
-        Self {
-            embedding,
+    pub fn new(config: &T5Config) -> Result<Self, Exception> {
+        Ok(Self {
+            embedding: nn::Embedding::new(
+                config.relative_attention_num_buckets as i32,
+                config.num_heads as i32,
+            )?,
             num_buckets: config.relative_attention_num_buckets,
             max_distance: config.relative_attention_max_distance,
             num_heads: config.num_heads,
-        }
+        })
     }
 
-    fn relative_position_bucket(
-        relative_position: &Array,
-        bidirectional: bool,
-        num_buckets: i32,
-        max_distance: i32,
-    ) -> Result<Array, Exception> {
-        let mut ret = pmetal_runtime::compat::ops::zeros_like(relative_position);
-        let mut num_buckets = num_buckets;
-        let rel_pos_f = relative_position.as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32());
+    /// The bias for a `length x length` self-attention: `[1, heads, length,
+    /// length]`, in the embedding's dtype.
+    pub fn forward(&mut self, length: usize) -> Result<Array, Exception> {
+        // The bucket depends only on `key - query`, so look each of the
+        // `2·length - 1` offsets up once and gather the matrix from them.
+        let offsets: Vec<i32> = (0..2 * length as i64 - 1)
+            .map(|i| {
+                relative_position_bucket(
+                    i - (length as i64 - 1),
+                    self.num_buckets,
+                    self.max_distance,
+                )
+            })
+            .collect();
+        let buckets: Vec<i32> = (0..length)
+            .flat_map(|query| {
+                let offsets = &offsets;
+                (0..length).map(move |key| offsets[key + length - 1 - query])
+            })
+            .collect();
+        let buckets = Array::from_slice(&buckets, &[length as i32, length as i32]);
 
-        let n = if bidirectional {
-            num_buckets /= 2;
-            // Offset positive relative positions by num_buckets
-            let is_positive = relative_position
-                .gt(&Array::from_int(0))
-                .as_dtype(pmetal_runtime::compat::Dtype::Int32.as_i32());
-            ret = is_positive.multiply(&Array::from_int(num_buckets));
-            rel_pos_f.abs()
-        } else {
-            // Clamp to non-positive, then negate
-            pmetal_runtime::compat::ops::maximum(&rel_pos_f.negative(), &Array::from_f32(0.0))
-        };
-
-        // Half buckets for exact (linear) positions, half for log-spaced
-        let max_exact = num_buckets / 2;
-        let is_small = n.lt(&Array::from_f32(max_exact as f32));
-
-        // Log-linear bucketing for large positions
-        let log_ratio =
-            n.divide(&Array::from_f32(max_exact as f32))
-                .log()
-                .divide(&Array::from_f32(
-                    (max_distance as f32 / max_exact as f32).ln(),
-                ));
-        let large_val = log_ratio
-            .multiply(&Array::from_f32((num_buckets - max_exact) as f32))
-            .add(&Array::from_f32(max_exact as f32));
-        let large_val = pmetal_runtime::compat::ops::minimum(
-            &large_val,
-            &Array::from_f32((num_buckets - 1) as f32),
-        );
-
-        let buckets = pmetal_runtime::compat::ops::where_fn(&is_small, &n, &large_val);
-        let buckets = ret.add(&buckets.as_dtype(pmetal_runtime::compat::Dtype::Int32.as_i32()));
-        Ok(buckets)
-    }
-
-    pub fn forward(&mut self, query_length: usize, key_length: usize) -> Result<Array, Exception> {
-        let context_position =
-            pmetal_runtime::compat::ops::arange(query_length as i32, Dtype::Int32);
-        let memory_position = pmetal_runtime::compat::ops::arange(key_length as i32, Dtype::Int32);
-
-        let relative_position = memory_position
-            .expand_dims_axes(&[0])
-            .subtract(&context_position.expand_dims_axes(&[1]));
-
-        let buckets = Self::relative_position_bucket(
-            &relative_position,
-            true,
-            self.num_buckets as i32,
-            self.max_distance as i32,
-        )?;
-
-        let values = self.embedding.forward(&buckets); // [Q, K, Heads]
-        Ok(values.transpose_axes(&[2, 0, 1])) // [Heads, Q, K]
+        let values = self.embedding.forward(&buckets); // [query, key, heads]
+        Ok(values.transpose_axes(&[2, 0, 1]).expand_dims_axes(&[0]))
     }
 }
 
-/// T5 Layer Norm (RMSNorm style, but often called T5LayerNorm).
+/// T5's feed-forward: `wo(act(wi_0 x) · wi_1 x)` for a gated variant, `wo(act(wi
+/// x))` for the original.
 #[derive(Debug)]
-pub struct T5LayerNorm {
-    pub weight: pmetal_runtime::compat::module::Param<Array>,
-    pub variance_epsilon: f32,
-}
-impl_module_params!(T5LayerNorm; weight);
-
-impl T5LayerNorm {
-    pub fn new(dim: usize, eps: f32) -> Self {
-        let weight = pmetal_runtime::compat::module::Param::new(pmetal_runtime::compat::ops::ones(
-            &[dim as i32],
-            Dtype::Float32,
-        ));
-        Self {
-            weight,
-            variance_epsilon: eps,
-        }
-    }
-
-    pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let variance = x.power(&Array::from_f32(2.0)).mean_axes(&[-1], true);
-        let x = x.multiply(&pmetal_runtime::compat::ops::rsqrt(
-            &variance.add(&Array::from_f32(self.variance_epsilon)),
-        ));
-        Ok(x.multiply(&self.weight))
-    }
-}
-
-/// T5 Dense Gated Activation (for T5-v1.1 and later).
-#[derive(Debug)]
-pub struct T5DenseGatedActDense {
-    pub wi_0: nn::Linear,
-    pub wi_1: nn::Linear,
+pub struct T5FeedForward {
+    /// The single input projection of the original, ungated T5.
+    pub wi: Option<nn::Linear>,
+    /// The activated half of a gated feed-forward.
+    pub wi_0: Option<nn::Linear>,
+    /// The linear half of a gated feed-forward.
+    pub wi_1: Option<nn::Linear>,
     pub wo: nn::Linear,
     /// `ACT2FN[config.dense_act_fn]`, resolved once — see
     /// [`T5Config::dense_act_fn`].
     pub act: Activation,
 }
-impl_module_params!(T5DenseGatedActDense; wi_0, wi_1, wo);
+impl_module_params!(T5FeedForward; wi, wi_0, wi_1, wo);
 
-impl T5DenseGatedActDense {
-    pub fn new(config: &T5Config) -> Self {
-        let wi_0 = nn::LinearBuilder::new(config.d_model as i32, config.d_ff as i32)
-            .bias(false)
-            .build()
-            .unwrap();
-        let wi_1 = nn::LinearBuilder::new(config.d_model as i32, config.d_ff as i32)
-            .bias(false)
-            .build()
-            .unwrap();
-        let wo = nn::LinearBuilder::new(config.d_ff as i32, config.d_model as i32)
-            .bias(false)
-            .build()
-            .unwrap();
-        let act = resolve_activation(config.dense_act_fn()).unwrap_or_else(|| {
-            panic!(
+impl T5FeedForward {
+    pub fn new(config: &T5Config) -> Result<Self, Exception> {
+        let linear = |inputs: usize, outputs: usize| {
+            nn::LinearBuilder::new(inputs as i32, outputs as i32)
+                .bias(false)
+                .build()
+        };
+        let act = resolve_activation(config.dense_act_fn()).ok_or_else(|| {
+            Exception::custom(format!(
                 "t5: unsupported feed_forward_proj {:?}",
                 config.feed_forward_proj
+            ))
+        })?;
+        let (wi, wi_0, wi_1) = if config.is_gated_act() {
+            (
+                None,
+                Some(linear(config.d_model, config.d_ff)?),
+                Some(linear(config.d_model, config.d_ff)?),
             )
-        });
-        Self {
+        } else {
+            (Some(linear(config.d_model, config.d_ff)?), None, None)
+        };
+        Ok(Self {
+            wi,
             wi_0,
             wi_1,
-            wo,
+            wo: linear(config.d_ff, config.d_model)?,
             act,
-        }
+        })
     }
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let hidden_act = (self.act)(&self.wi_0.forward(x));
-        let hidden_linear = self.wi_1.forward(x);
-        let x = hidden_act.multiply(&hidden_linear);
-        Ok(self.wo.forward(&x))
+        let hidden = match (&mut self.wi, &mut self.wi_0, &mut self.wi_1) {
+            (_, Some(wi_0), Some(wi_1)) => {
+                activate(self.act, &wi_0.forward(x)).multiply(&wi_1.forward(x))
+            }
+            (Some(wi), _, _) => activate(self.act, &wi.forward(x)),
+            _ => return Err(Exception::custom("t5: feed-forward has no input projection")),
+        };
+        Ok(self.wo.forward(&hidden))
     }
 }
 
-/// T5 Attention layer.
+/// T5 self-attention.
 #[derive(Debug)]
 pub struct T5Attention {
     pub q: nn::Linear,
@@ -245,198 +277,193 @@ pub struct T5Attention {
     pub o: nn::Linear,
     pub num_heads: usize,
     pub head_dim: usize,
-    pub scale: f32,
+    /// Present on the first block only.
     pub relative_attention_bias: Option<T5RelativePositionBias>,
 }
 impl_module_params!(T5Attention; q, k, v, o, relative_attention_bias);
 
 impl T5Attention {
-    pub fn new(config: &T5Config, has_relative_attention_bias: bool) -> Self {
-        let dim = config.d_model as i32;
-        let inner_dim = (config.num_heads * config.d_kv) as i32;
-
-        let q = nn::LinearBuilder::new(dim, inner_dim)
-            .bias(false)
-            .build()
-            .unwrap();
-        let k = nn::LinearBuilder::new(dim, inner_dim)
-            .bias(false)
-            .build()
-            .unwrap();
-        let v = nn::LinearBuilder::new(dim, inner_dim)
-            .bias(false)
-            .build()
-            .unwrap();
-        let o = nn::LinearBuilder::new(inner_dim, dim)
-            .bias(false)
-            .build()
-            .unwrap();
-
-        let relative_attention_bias = if has_relative_attention_bias {
-            Some(T5RelativePositionBias::new(config))
-        } else {
-            None
+    pub fn new(config: &T5Config, has_relative_attention_bias: bool) -> Result<Self, Exception> {
+        let linear = |inputs: usize, outputs: usize| {
+            nn::LinearBuilder::new(inputs as i32, outputs as i32)
+                .bias(false)
+                .build()
         };
-
-        Self {
-            q,
-            k,
-            v,
-            o,
+        let inner = config.inner_dim();
+        Ok(Self {
+            q: linear(config.d_model, inner)?,
+            k: linear(config.d_model, inner)?,
+            v: linear(config.d_model, inner)?,
+            o: linear(inner, config.d_model)?,
             num_heads: config.num_heads,
             head_dim: config.d_kv,
-            scale: (config.d_kv as f32).sqrt().recip(),
-            relative_attention_bias,
-        }
+            relative_attention_bias: has_relative_attention_bias
+                .then(|| T5RelativePositionBias::new(config))
+                .transpose()?,
+        })
     }
 
-    pub fn forward(
-        &mut self,
-        x: &Array,
-        mask: Option<&Array>,
-        position_bias: Option<&Array>,
-    ) -> Result<(Array, Array), Exception> {
-        let b = x.dim(0);
-        let l = x.dim(1);
+    /// Attend over `x` with `bias`, the `[batch | 1, heads, query, key]`
+    /// relative position bias plus padding mask, added to the *unscaled*
+    /// scores.
+    pub fn forward(&mut self, x: &Array, bias: &Array) -> Result<Array, Exception> {
+        let (b, l) = (x.dim(0), x.dim(1));
+        let split = |t: Array| {
+            t.reshape(&[b, l, self.num_heads as i32, self.head_dim as i32])
+                .transpose_axes(&[0, 2, 1, 3])
+        };
+        let q = split(self.q.forward(x));
+        let k = split(self.k.forward(x));
+        let v = split(self.v.forward(x));
 
-        let q = self.q.forward(x);
-        let k = self.k.forward(x);
-        let v = self.v.forward(x);
-
-        let q = q
-            .reshape(&[b, l, self.num_heads as i32, self.head_dim as i32])
-            .transpose_axes(&[0, 2, 1, 3]);
-        let k = k
-            .reshape(&[b, l, self.num_heads as i32, self.head_dim as i32])
-            .transpose_axes(&[0, 2, 1, 3]);
-        let v = v
-            .reshape(&[b, l, self.num_heads as i32, self.head_dim as i32])
-            .transpose_axes(&[0, 2, 1, 3]);
-
-        let mut bias = position_bias.cloned();
-        if bias.is_none() {
-            if let Some(ref mut rel_bias) = self.relative_attention_bias {
-                bias = Some(rel_bias.forward(l as usize, l as usize)?);
-            }
-        }
-
-        // Add mask and bias to attention scores
-        // Note: simplified SDPA might not support external bias easily if it's not a mask.
-        // We'll use manual attention if bias is present or combine it into mask.
-
-        let mut attn_mask = mask.cloned();
-        if let Some(ref b) = bias {
-            // Combine mask and bias
-            // mask is usually additive (0 or -inf)
-            // bias is additive scores
-            if let Some(ref m) = attn_mask {
-                attn_mask = Some(m.add(b));
-            } else {
-                attn_mask = Some(b.clone());
-            }
-        }
-
-        let out = pmetal_runtime::compat::fast::scaled_dot_product_attention_masked(
-            &q,
-            &k,
-            &v,
-            self.scale,
-            attn_mask.as_ref(),
-        );
+        let config = FusedAttentionConfig::new(
+            self.num_heads as i32,
+            self.num_heads as i32,
+            self.head_dim as i32,
+        )
+        .with_scale(1.0)
+        .with_mask_type(AttentionMaskType::None);
+        let out = fused_sdpa(&q, &k, &v, &config, Some(bias))?;
         let out = out.transpose_axes(&[0, 2, 1, 3]).reshape(&[b, l, -1]);
-        let out = self.o.forward(&out);
-
-        Ok((
-            out,
-            bias.unwrap_or_else(|| {
-                pmetal_runtime::compat::ops::zeros(
-                    &[1, 1, 1],
-                    pmetal_runtime::compat::Dtype::Float32,
-                )
-            }),
-        )) // Return bias for next layers
+        Ok(self.o.forward(&out))
     }
 }
 
-/// T5 Block.
+/// One encoder block: pre-norm self-attention, then a pre-norm feed-forward,
+/// each added to the residual stream.
+///
+/// The fields keep the order of `T5Block.layer`, which holds the attention
+/// layer at index 0 and the feed-forward at index 1.
 #[derive(Debug)]
 pub struct T5Block {
-    pub layer_0_norm: T5LayerNorm,
+    pub layer_0_norm: nn::RmsNorm,
     pub layer_0_attn: T5Attention,
-    pub layer_1_norm: T5LayerNorm,
-    pub layer_1_mlp: T5DenseGatedActDense,
+    pub layer_1_norm: nn::RmsNorm,
+    pub layer_1_mlp: T5FeedForward,
 }
 impl_module_params!(T5Block; layer_0_norm, layer_0_attn, layer_1_norm, layer_1_mlp);
 
 impl T5Block {
-    pub fn new(config: &T5Config, has_relative_attention_bias: bool) -> Self {
-        let layer_0_norm = T5LayerNorm::new(config.d_model, config.layer_norm_epsilon);
-        let layer_0_attn = T5Attention::new(config, has_relative_attention_bias);
-        let layer_1_norm = T5LayerNorm::new(config.d_model, config.layer_norm_epsilon);
-        let layer_1_mlp = T5DenseGatedActDense::new(config);
-
-        Self {
-            layer_0_norm,
-            layer_0_attn,
-            layer_1_norm,
-            layer_1_mlp,
-        }
+    pub fn new(config: &T5Config, has_relative_attention_bias: bool) -> Result<Self, Exception> {
+        let norm = || {
+            nn::RmsNormBuilder::new(config.d_model as i32)
+                .eps(config.layer_norm_epsilon)
+                .build()
+        };
+        Ok(Self {
+            layer_0_norm: norm()?,
+            layer_0_attn: T5Attention::new(config, has_relative_attention_bias)?,
+            layer_1_norm: norm()?,
+            layer_1_mlp: T5FeedForward::new(config)?,
+        })
     }
 
-    pub fn forward(
-        &mut self,
-        x: &Array,
-        mask: Option<&Array>,
-        position_bias: Option<&Array>,
-    ) -> Result<(Array, Array), Exception> {
-        let residual = x;
-        let x_norm = self.layer_0_norm.forward(x)?;
-        let (attn_out, bias) = self.layer_0_attn.forward(&x_norm, mask, position_bias)?;
-        let x = residual.add(&attn_out);
-
-        let residual = &x;
-        let x_norm = self.layer_1_norm.forward(&x)?;
-        let mlp_out = self.layer_1_mlp.forward(&x_norm)?;
-        let x = residual.add(&mlp_out);
-
-        Ok((x, bias))
+    pub fn forward(&mut self, x: &Array, bias: &Array) -> Result<Array, Exception> {
+        let attn = self
+            .layer_0_attn
+            .forward(&self.layer_0_norm.forward(x), bias)?;
+        let x = x.add(&attn);
+        let mlp = self.layer_1_mlp.forward(&self.layer_1_norm.forward(&x))?;
+        Ok(x.add(&mlp))
     }
 }
 
-/// T5 Encoder Model.
+/// The T5 encoder: token embedding, blocks, final norm.
 #[derive(Debug)]
 pub struct T5EncoderModel {
     pub shared: nn::Embedding,
     pub blocks: Vec<T5Block>,
-    pub final_layer_norm: T5LayerNorm,
+    pub final_layer_norm: nn::RmsNorm,
+    /// Model configuration (not a parameter).
+    pub config: T5Config,
 }
 impl_module_params!(T5EncoderModel; shared, blocks, final_layer_norm);
 
 impl T5EncoderModel {
-    pub fn new(config: T5Config) -> Self {
-        let shared = nn::Embedding::new(config.vocab_size as i32, config.d_model as i32).unwrap();
+    pub fn new(config: T5Config) -> Result<Self, Exception> {
         let blocks = (0..config.num_layers)
             .map(|i| T5Block::new(&config, i == 0))
-            .collect();
-        let final_layer_norm = T5LayerNorm::new(config.d_model, config.layer_norm_epsilon);
-
-        Self {
-            shared,
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            shared: nn::Embedding::new(config.vocab_size as i32, config.d_model as i32)?,
             blocks,
-            final_layer_norm,
+            final_layer_norm: nn::RmsNormBuilder::new(config.d_model as i32)
+                .eps(config.layer_norm_epsilon)
+                .build()?,
+            config,
+        })
+    }
+
+    pub fn config(&self) -> &T5Config {
+        &self.config
+    }
+
+    /// Encode `input_ids` (`[batch, length]`).
+    ///
+    /// `attention_mask` is `[batch, length]`, non-zero for real tokens; padded
+    /// keys are hidden from every query. Without one every token attends to
+    /// every other, which is what FLUX's pipeline does with its padded prompt.
+    ///
+    /// Returns `[batch, length, d_model]` in the dtype of the weights.
+    pub fn forward(
+        &mut self,
+        input_ids: &Array,
+        attention_mask: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        let mut x = self.shared.forward(input_ids);
+        let Some(first) = self.blocks.first_mut() else {
+            return Ok(self.final_layer_norm.forward(&x));
+        };
+        let relative = first
+            .layer_0_attn
+            .relative_attention_bias
+            .as_mut()
+            .ok_or_else(|| Exception::custom("t5: the first block has no relative bias"))?;
+        let mut bias = relative.forward(input_ids.dim(1) as usize)?;
+        if let Some(mask) = attention_mask {
+            bias = bias.add(&additive_padding_mask(mask, bias.dtype()));
+        }
+        for block in &mut self.blocks {
+            x = block.forward(&x, &bias)?;
+        }
+        Ok(self.final_layer_norm.forward(&x))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every bucket of a 32-bucket, 128-distance bidirectional encoder for
+    /// offsets -599 to 599, against `T5Attention._relative_position_bucket`
+    /// run in torch. The logarithmic range truncates, so a one-ulp difference
+    /// in the logarithm would move a boundary offset to its neighbour's bucket;
+    /// only the whole table pins that down.
+    #[test]
+    fn buckets_match_the_reference_for_every_offset() {
+        let want: Vec<i32> =
+            serde_json::from_str(include_str!("../../tests/fixtures/t5_buckets_600.json"))
+                .expect("fixture parses");
+        assert_eq!(want.len(), 1199);
+        for (i, &want) in want.iter().enumerate() {
+            let relative = i as i64 - 599;
+            assert_eq!(
+                relative_position_bucket(relative, 32, 128),
+                want,
+                "relative position {relative}"
+            );
         }
     }
 
-    pub fn forward(&mut self, input_ids: &Array) -> Result<Array, Exception> {
-        let mut x = self.shared.forward(input_ids);
-
-        let mut position_bias = None;
-        for block in &mut self.blocks {
-            let (out, bias) = block.forward(&x, None, position_bias.as_ref())?;
-            x = out;
-            position_bias = Some(bias);
-        }
-
-        self.final_layer_norm.forward(&x)
+    /// The first of each bucket's offsets, spot-checked by value so the
+    /// fixture comparison above cannot pass on two tables that are both wrong
+    /// the same way: exact buckets below 8, logarithmic ones above, mirrored.
+    #[test]
+    fn buckets_split_exact_and_logarithmic_ranges() {
+        let bucket = |rp| relative_position_bucket(rp, 32, 128);
+        assert_eq!([bucket(0), bucket(-1), bucket(-7), bucket(-8)], [0, 1, 7, 8]);
+        assert_eq!([bucket(1), bucket(7), bucket(8)], [17, 23, 24]);
+        assert_eq!([bucket(-40), bucket(-90), bucket(-127)], [12, 14, 15]);
+        assert_eq!([bucket(500), bucket(-500)], [31, 15]);
     }
 }

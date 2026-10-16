@@ -1,10 +1,10 @@
 //! Loaders for the text-to-image pipeline's components: the CLIP and T5 text
 //! encoders, the VAE and the Flux transformer.
 
-use pmetal_runtime::compat::{Array, nn};
+use pmetal_runtime::compat::{Array, ModuleParameters, ModuleParametersExt, nn};
 use std::collections::HashMap;
 
-use super::LoadError;
+use super::{Exemption, LoadError, LoadPolicy, assign_weights};
 use crate::architectures::clip::CLIPTextModel;
 use crate::architectures::flux::FluxDiT;
 use crate::architectures::t5::T5EncoderModel;
@@ -121,80 +121,101 @@ pub fn load_clip_weights(
     Ok(())
 }
 
-pub fn load_t5_weights(
-    model: &mut T5EncoderModel,
-    weights: &HashMap<String, Array>,
+/// Rename a checkpoint's tensors to the model's parameter paths, check each
+/// shape against the parameter it lands on, and assign them under `policy`,
+/// which fails unless checkpoint and model account for each other.
+///
+/// A key `rename` leaves alone keeps its checkpoint name, so it reaches no
+/// parameter and is reported as unconsumed unless `policy` exempts it. Two
+/// tensors renamed onto one parameter are an error rather than a race.
+fn assign_renamed<M: ModuleParameters + ModuleParametersExt>(
+    model: &mut M,
+    weights: HashMap<String, Array>,
+    rename: impl Fn(&str) -> String,
+    policy: &LoadPolicy,
 ) -> Result<(), LoadError> {
-    for (name, weight) in weights {
-        match name.as_str() {
-            "shared.weight" => {
-                model.shared.weight = pmetal_runtime::compat::module::Param::new(weight.clone())
-            }
-            "encoder.final_layer_norm.weight" => {
-                model.final_layer_norm.weight =
-                    pmetal_runtime::compat::module::Param::new(weight.clone())
-            }
-            _ if name.starts_with("encoder.block.") => {
-                let parts: Vec<&str> = name.split('.').collect();
-                let idx = parts[2].parse::<usize>().map_err(|_| {
-                    LoadError::SafeTensors(format!("Invalid layer index in key: {}", name))
-                })?;
-                if idx >= model.blocks.len() {
-                    continue;
-                }
-                let sub_path = parts[3..].join(".");
-                match sub_path.as_str() {
-                    "layer.0.SelfAttention.q.weight" => {
-                        model.blocks[idx].layer_0_attn.q.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "layer.0.SelfAttention.k.weight" => {
-                        model.blocks[idx].layer_0_attn.k.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "layer.0.SelfAttention.v.weight" => {
-                        model.blocks[idx].layer_0_attn.v.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "layer.0.SelfAttention.o.weight" => {
-                        model.blocks[idx].layer_0_attn.o.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "layer.0.SelfAttention.relative_attention_bias.weight" => {
-                        if let Some(ref mut rel_bias) =
-                            model.blocks[idx].layer_0_attn.relative_attention_bias
-                        {
-                            rel_bias.embedding.weight =
-                                pmetal_runtime::compat::module::Param::new(weight.clone());
-                        }
-                    }
-                    "layer.0.layer_norm.weight" => {
-                        model.blocks[idx].layer_0_norm.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "layer.1.DenseReluDense.wi_0.weight" => {
-                        model.blocks[idx].layer_1_mlp.wi_0.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "layer.1.DenseReluDense.wi_1.weight" => {
-                        model.blocks[idx].layer_1_mlp.wi_1.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "layer.1.DenseReluDense.wo.weight" => {
-                        model.blocks[idx].layer_1_mlp.wo.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "layer.1.layer_norm.weight" => {
-                        model.blocks[idx].layer_1_norm.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
+    let mut renamed: HashMap<String, Array> = HashMap::with_capacity(weights.len());
+    for (key, value) in weights {
+        let target = rename(&key);
+        if renamed.insert(target.clone(), value).is_some() {
+            return Err(LoadError::SafeTensors(format!(
+                "two checkpoint tensors map onto the parameter `{target}` (one is `{key}`)"
+            )));
         }
     }
-    Ok(())
+    {
+        let params = model.flatten_params();
+        for (name, value) in &renamed {
+            if let Some(param) = params.get(name.as_str())
+                && param.shape() != value.shape()
+            {
+                return Err(LoadError::ShapeMismatch {
+                    key: name.clone(),
+                    expected: param.shape().to_vec(),
+                    actual: value.shape().to_vec(),
+                });
+            }
+        }
+    }
+    assign_weights(model, renamed, policy)
+}
+
+/// The model path of a T5 encoder checkpoint key, `transformers` layout.
+fn t5_param_name(key: &str) -> String {
+    if let Some(rest) = key.strip_prefix("encoder.final_layer_norm.") {
+        return format!("final_layer_norm.{rest}");
+    }
+    let Some(rest) = key.strip_prefix("encoder.block.") else {
+        return key.to_string();
+    };
+    let Some((index, rest)) = rest.split_once('.') else {
+        return key.to_string();
+    };
+    let mapped = if let Some(rest) = rest.strip_prefix("layer.0.SelfAttention.") {
+        match rest.strip_prefix("relative_attention_bias.") {
+            Some(rest) => format!("layer_0_attn.relative_attention_bias.embedding.{rest}"),
+            None => format!("layer_0_attn.{rest}"),
+        }
+    } else if let Some(rest) = rest.strip_prefix("layer.0.layer_norm.") {
+        format!("layer_0_norm.{rest}")
+    } else if let Some(rest) = rest.strip_prefix("layer.1.DenseReluDense.") {
+        format!("layer_1_mlp.{rest}")
+    } else if let Some(rest) = rest.strip_prefix("layer.1.layer_norm.") {
+        format!("layer_1_norm.{rest}")
+    } else {
+        return key.to_string();
+    };
+    format!("blocks.{index}.{mapped}")
+}
+
+/// Load a T5 encoder from a `transformers` checkpoint (`T5EncoderModel`, or
+/// the full `T5Model` / `T5ForConditionalGeneration`, whose decoder and head
+/// are not part of this model).
+///
+/// Fails, naming the difference, unless every tensor of the encoder is
+/// consumed and every parameter filled.
+pub fn load_t5_weights(
+    model: &mut T5EncoderModel,
+    mut weights: HashMap<String, Array>,
+) -> Result<(), LoadError> {
+    // `encoder.embed_tokens` is the same table as `shared`, which the
+    // reference ties; a checkpoint may carry either or both.
+    if weights.contains_key("shared.weight") {
+        weights.remove("encoder.embed_tokens.weight");
+    } else if let Some(table) = weights.remove("encoder.embed_tokens.weight") {
+        weights.insert("shared.weight".to_string(), table);
+    }
+    let policy = LoadPolicy::strict().allowing_unused_tensors(&[
+        Exemption::new(
+            "decoder.*",
+            "the decoder stack of a full T5 checkpoint; this model is the encoder",
+        ),
+        Exemption::new(
+            "lm_head.weight",
+            "the language-model head of a full T5 checkpoint; this model is the encoder",
+        ),
+    ]);
+    assign_renamed(model, weights, t5_param_name, &policy)
 }
 
 pub fn load_vae_weights(

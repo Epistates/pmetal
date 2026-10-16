@@ -166,6 +166,47 @@ pub fn resolve_activation(name: &str) -> Option<Activation> {
     })
 }
 
+/// Apply `act` to `x`, keeping `x`'s dtype.
+///
+/// The GELUs evaluate a half-precision input in f32 and return f32 (see
+/// `compat::nn::gelu`). An encoder that fed that result to its next projection
+/// would run the rest of the forward pass in f32 against bf16 weights: twice
+/// the memory traffic for a result the reference computes in bf16. This casts
+/// back, which is a no-op for an f32 model.
+pub fn activate(act: Activation, x: &Array) -> Array {
+    act(x).as_dtype(x.dtype().as_i32())
+}
+
+/// The most negative value `dtype` holds that a softmax can still subtract a
+/// row maximum from without overflowing to `-inf` (`finfo.min` in the
+/// reference). A row with no attendable key then stays finite instead of
+/// turning into NaN.
+fn lowest_finite(dtype: Dtype) -> f32 {
+    match dtype {
+        Dtype::Float16 => -65504.0,
+        // `f32::MIN` rounds up to `-inf` in bf16, whose own largest finite
+        // value is a few ulps lower.
+        Dtype::Bfloat16 => -3.389_531_4e38,
+        _ => f32::MIN,
+    }
+}
+
+/// An additive attention mask from a padding mask, for bidirectional encoders.
+///
+/// `attention_mask` is `[batch, keys]`, non-zero where a token is real. The
+/// result is `[batch, 1, 1, keys]` in `dtype`: `0` where a query may attend and
+/// the dtype's lowest finite value where it may not, ready to add to attention
+/// scores or hand to `fused_sdpa` as its mask.
+pub fn additive_padding_mask(attention_mask: &Array, dtype: Dtype) -> Array {
+    let (batch, keys) = (attention_mask.dim(0), attention_mask.dim(1));
+    let keep = attention_mask
+        .as_dtype(Dtype::Int32.as_i32())
+        .gt(&Array::from_int(0));
+    let zero = Array::from_f32(0.0).as_dtype(dtype.as_i32());
+    let lowest = Array::from_f32(lowest_finite(dtype)).as_dtype(dtype.as_i32());
+    ops::where_fn(&keep, &zero, &lowest).reshape(&[batch, 1, 1, keys])
+}
+
 /// Cast an additive attention mask to the query dtype, if it isn't already.
 ///
 /// MLX's scaled-dot-product attention requires the mask to promote to the

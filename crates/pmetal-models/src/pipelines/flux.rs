@@ -33,20 +33,21 @@ impl FluxPipeline {
         t5_config: T5Config,
         flux_config: FluxConfig,
         vae_config: VAEConfig,
-    ) -> Self {
+    ) -> Result<Self> {
         let clip = CLIPTextModel::new(clip_config);
-        let t5 = T5EncoderModel::new(t5_config);
+        let t5 = T5EncoderModel::new(t5_config)
+            .map_err(|e| pmetal_core::PMetalError::ModelLoad(e.to_string()))?;
         let dit = FluxDiT::new(flux_config);
         let vae = FluxVAE::new(vae_config);
         let scheduler = FlowMatchScheduler::new_flux(20, 1.0, Some(3.0)).unwrap();
 
-        Self {
+        Ok(Self {
             clip,
             t5,
             dit,
             vae,
             scheduler,
-        }
+        })
     }
 
     /// Load the pipeline from a model directory.
@@ -59,7 +60,7 @@ impl FluxPipeline {
         let flux_config = load_flux_config(&component_paths.transformer)?;
         let vae_config = load_vae_config(&component_paths.vae)?;
 
-        let mut pipeline = Self::new(clip_config, t5_config, flux_config, vae_config);
+        let mut pipeline = Self::new(clip_config, t5_config, flux_config, vae_config)?;
 
         let clip_weights = load_weights(&component_paths.text_encoder)
             .map_err(|e| pmetal_core::PMetalError::ModelLoad(e.to_string()))?;
@@ -68,7 +69,7 @@ impl FluxPipeline {
 
         let t5_weights = load_weights(&component_paths.text_encoder_2)
             .map_err(|e| pmetal_core::PMetalError::ModelLoad(e.to_string()))?;
-        load_t5_weights(&mut pipeline.t5, &t5_weights)
+        load_t5_weights(&mut pipeline.t5, t5_weights)
             .map_err(|e| pmetal_core::PMetalError::ModelLoad(e.to_string()))?;
 
         let flux_weights = load_weights(&component_paths.transformer)
@@ -128,7 +129,7 @@ impl FluxPipeline {
             .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?;
         let prompt_emb = self
             .t5
-            .forward(t5_input)
+            .forward(t5_input, None)
             .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?;
 
         // 2. Prepare latents (noise)
@@ -318,30 +319,7 @@ fn load_clip_config(component_dir: &Path) -> Result<CLIPConfig> {
 
 fn load_t5_config(component_dir: &Path) -> Result<T5Config> {
     let raw = read_json(&component_dir.join("config.json"))?;
-    let mut config = T5Config::default();
-
-    config.vocab_size = value_usize(&raw, &["vocab_size"]).unwrap_or(config.vocab_size);
-    config.d_model = value_usize(&raw, &["d_model"]).unwrap_or(config.d_model);
-    config.d_ff = value_usize(&raw, &["d_ff"]).unwrap_or(config.d_ff);
-    config.d_kv = value_usize(&raw, &["d_kv"]).unwrap_or(config.d_kv);
-    config.num_layers =
-        value_usize(&raw, &["num_layers", "num_hidden_layers"]).unwrap_or(config.num_layers);
-    config.num_heads =
-        value_usize(&raw, &["num_heads", "num_attention_heads"]).unwrap_or(config.num_heads);
-    config.relative_attention_num_buckets = value_usize(&raw, &["relative_attention_num_buckets"])
-        .unwrap_or(config.relative_attention_num_buckets);
-    config.relative_attention_max_distance =
-        value_usize(&raw, &["relative_attention_max_distance"])
-            .unwrap_or(config.relative_attention_max_distance);
-    config.dropout_rate = value_f32(&raw, &["dropout_rate"]).unwrap_or(config.dropout_rate);
-    config.layer_norm_epsilon =
-        value_f32(&raw, &["layer_norm_epsilon"]).unwrap_or(config.layer_norm_epsilon);
-    if let Some(feed_forward_proj) = value_str(&raw, &["feed_forward_proj"]) {
-        config.feed_forward_proj = feed_forward_proj.to_string();
-        config.is_gated_act = feed_forward_proj.contains("gated");
-    }
-
-    Ok(config)
+    serde_json::from_value(raw).map_err(|e| pmetal_core::PMetalError::Config(e.to_string()))
 }
 
 fn load_vae_config(component_dir: &Path) -> Result<VAEConfig> {
@@ -455,7 +433,7 @@ mod tests {
         };
         let vae_config = VAEConfig::default();
 
-        let mut pipeline = FluxPipeline::new(clip_config, t5_config, flux_config, vae_config);
+        let mut pipeline = FluxPipeline::new(clip_config, t5_config, flux_config, vae_config).unwrap();
 
         let batch = 1;
         let clip_input = zeros(&[batch, 77], pmetal_runtime::compat::Dtype::Int32);
