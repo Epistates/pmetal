@@ -8,8 +8,6 @@
 use pmetal_runtime::compat::{Array, Exception, Module, nn};
 use pmetal_runtime::impl_module_params;
 
-use std::collections::HashMap;
-
 use pmetal_cache::kv_cache::KVCache;
 use pmetal_runtime::nn::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
@@ -809,11 +807,6 @@ impl CausalLMModel for MistralForCausalLM {
 
     fn config(&self) -> &Self::Config {
         Self::config(self)
-    }
-
-    fn load_weights(&mut self, weights: &HashMap<String, Array>) -> Result<(), Exception> {
-        crate::loader::load_mistral_weights(self, weights)
-            .map_err(|e: crate::loader::LoadError| Exception::custom(e.to_string()))
     }
 
     fn eval(&self) -> Result<(), Exception> {

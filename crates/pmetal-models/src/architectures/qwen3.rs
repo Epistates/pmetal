@@ -10,7 +10,6 @@
 
 use pmetal_runtime::compat::{Array, Exception, Module, ModuleParametersExt, Param, nn};
 use pmetal_runtime::impl_module_params;
-use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -1013,79 +1012,6 @@ impl crate::traits::CausalLMModel for Qwen3ForCausalLM {
 
     fn config(&self) -> &Self::Config {
         &self.config
-    }
-
-    fn load_weights(&mut self, weights: &HashMap<String, Array>) -> Result<(), Exception> {
-        for (name, weight) in weights {
-            if name == "model.embed_tokens.weight" {
-                self.model.embed_tokens.weight =
-                    pmetal_runtime::compat::module::Param::new(weight.clone());
-            } else if name == "lm_head.weight" {
-                if let Some(ref mut lm_head) = self.lm_head {
-                    lm_head.weight = pmetal_runtime::compat::module::Param::new(weight.clone());
-                }
-            } else if name == "model.norm.weight" {
-                self.model.norm.weight = pmetal_runtime::compat::module::Param::new(weight.clone());
-            } else if name.starts_with("model.layers.") {
-                let parts: Vec<&str> = name.split('.').collect();
-                let i: usize = parts[2].parse().map_err(|_| {
-                    Exception::custom(format!("Invalid layer index in weight key: {}", name))
-                })?;
-                if i >= self.model.layers.len() {
-                    continue;
-                }
-                let suffix = parts[3..].join(".");
-                let layer = &mut self.model.layers[i];
-                match suffix.as_str() {
-                    "input_layernorm.weight" => {
-                        layer.input_layernorm.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "post_attention_layernorm.weight" => {
-                        layer.post_attention_layernorm.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "self_attn.q_proj.weight" => {
-                        layer.self_attn.q_proj.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "self_attn.k_proj.weight" => {
-                        layer.self_attn.k_proj.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "self_attn.v_proj.weight" => {
-                        layer.self_attn.v_proj.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "self_attn.o_proj.weight" => {
-                        layer.self_attn.o_proj.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "self_attn.q_norm.weight" => {
-                        layer.self_attn.q_norm.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "self_attn.k_norm.weight" => {
-                        layer.self_attn.k_norm.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "mlp.gate_proj.weight" => {
-                        layer.mlp.gate_proj.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "mlp.up_proj.weight" => {
-                        layer.mlp.up_proj.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "mlp.down_proj.weight" => {
-                        layer.mlp.down_proj.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    _ => {}
-                }
-            }
-        }
-        Ok(())
     }
 
     fn eval(&self) -> Result<(), Exception> {

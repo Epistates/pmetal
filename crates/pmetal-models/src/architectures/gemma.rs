@@ -23,7 +23,6 @@ use crate::decoder_layer::{
     AttentionModule, DecoderLayer, MlpModule, NormModule, std_pre_norm_forward,
 };
 use crate::traits::{CausalLMModel, ModelConfig};
-use std::collections::HashMap;
 
 /// Gemma model configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1316,11 +1315,6 @@ impl CausalLMModel for GemmaForCausalLM {
 
     fn config(&self) -> &Self::Config {
         Self::config(self)
-    }
-
-    fn load_weights(&mut self, weights: &HashMap<String, Array>) -> Result<(), Exception> {
-        crate::loader::load_gemma_weights(self, weights)
-            .map_err(|e: crate::loader::LoadError| Exception::custom(e.to_string()))
     }
 
     fn eval(&self) -> Result<(), Exception> {

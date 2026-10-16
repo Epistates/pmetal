@@ -32,7 +32,6 @@ use pmetal_runtime::rope::{RopeConfig, RotaryEmbedding};
 use crate::architectures::utils::{Activation, resolve_activation};
 use crate::checkpointing::checkpointed_layer;
 use crate::traits::{CausalLMModel, ModelConfig};
-use std::collections::HashMap;
 
 /// Phi model configuration.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -955,11 +954,6 @@ impl CausalLMModel for PhiForCausalLM {
         Self::config(self)
     }
 
-    fn load_weights(&mut self, weights: &HashMap<String, Array>) -> Result<(), Exception> {
-        crate::loader::load_phi_weights(self, weights)
-            .map_err(|e: crate::loader::LoadError| Exception::custom(e.to_string()))
-    }
-
     fn eval(&self) -> Result<(), Exception> {
         pmetal_runtime::compat::ModuleParametersExt::eval(self)
     }
@@ -1011,11 +1005,7 @@ mod tests {
     fn phi_longrope_matches_transformers_oracle() {
         let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.push("tests/fixtures/phi_surope_reference.safetensors");
-        let shard: std::collections::HashMap<String, Array> =
-            pmetal_runtime::inline_array::load_safetensors_shard(path.to_str().unwrap())
-                .expect("load surope fixture")
-                .into_iter()
-                .collect();
+        let shard = crate::loader::load_safetensors_file(&path).expect("load surope fixture");
         let x = shard.get("x").expect("x").clone();
         let y_ref = shard.get("y").expect("y").clone();
         let mut long_factor_arr = shard.get("long_factor").expect("long_factor").clone();
