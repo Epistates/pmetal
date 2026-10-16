@@ -61,10 +61,13 @@ pub struct NemotronHConfig {
     /// Attention bias.
     #[serde(default)]
     pub attention_bias: bool,
-    /// Head dimension for attention (`attention_head_dim` in the first
-    /// releases).
-    #[serde(default, alias = "attention_head_dim")]
+    /// Head dimension for attention.
+    #[serde(default)]
     pub head_dim: Option<i32>,
+    /// Head dimension for attention in the first releases, which state it
+    /// under this name.
+    #[serde(default, rename = "attention_head_dim")]
+    pub legacy_head_dim: Option<i32>,
 
     // Mamba config
     /// Number of Mamba heads.
@@ -109,9 +112,13 @@ pub struct NemotronHConfig {
     pub mlp_hidden_act: String,
 
     // General config
-    /// Epsilon of every norm (`norm_eps` in the Nemotron 3.5 releases).
-    #[serde(default = "default_layer_norm_epsilon", alias = "norm_eps")]
-    pub layer_norm_epsilon: f32,
+    /// Epsilon of every norm.
+    #[serde(default)]
+    pub layer_norm_epsilon: Option<f32>,
+    /// Epsilon of every norm in the Nemotron 3.5 releases, which state no
+    /// `layer_norm_epsilon`; the Nemotron 3 Nano releases state both, equal.
+    #[serde(default)]
+    pub norm_eps: Option<f32>,
     /// Bias in the Mamba input and output projections.
     #[serde(default)]
     pub use_bias: bool,
@@ -202,9 +209,6 @@ fn default_time_step_limit() -> (f32, f32) {
 fn default_mlp_hidden_act() -> String {
     "relu2".to_string()
 }
-fn default_layer_norm_epsilon() -> f32 {
-    1e-5
-}
 fn default_use_conv_bias() -> bool {
     true
 }
@@ -241,7 +245,7 @@ impl crate::traits::ModelConfig for NemotronHConfig {
         self.max_position_embeddings
     }
     fn norm_eps(&self) -> f32 {
-        self.layer_norm_epsilon
+        self.eps()
     }
     fn rope_theta(&self) -> f32 {
         self.rope_theta
@@ -277,9 +281,16 @@ impl NemotronHConfig {
             .unwrap_or_else(|| vec!['*'; self.num_hidden_layers.max(0) as usize])
     }
 
+    /// Epsilon of every norm: `layer_norm_epsilon`, else `norm_eps`, else the
+    /// reference's `1e-5`.
+    pub fn eps(&self) -> f32 {
+        self.layer_norm_epsilon.or(self.norm_eps).unwrap_or(1e-5)
+    }
+
     /// Get attention head dimension.
     pub fn attention_head_dim(&self) -> i32 {
         self.head_dim
+            .or(self.legacy_head_dim)
             .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 
@@ -314,7 +325,7 @@ impl NemotronHConfig {
             conv_kernel: self.conv_kernel,
             chunk_size: self.chunk_size,
             norm_group_size: self.mamba_intermediate_size() / self.n_groups.max(1),
-            norm_eps: self.layer_norm_epsilon,
+            norm_eps: self.eps(),
             dt_min: self.time_step_limit.0,
             dt_max: self.time_step_limit.1,
             proj_bias: self.use_bias,
@@ -752,7 +763,7 @@ impl NemotronHBlock {
     pub fn new(config: &NemotronHConfig, kind: char) -> Result<Self, Exception> {
         Ok(Self {
             norm: nn::RmsNormBuilder::new(config.hidden_size)
-                .eps(config.layer_norm_epsilon)
+                .eps(config.eps())
                 .build()?,
             mixer: NemotronHMixer::new(config, kind)?,
         })
@@ -799,7 +810,7 @@ impl NemotronHModel {
             .map(|kind| NemotronHBlock::new(&config, kind))
             .collect::<Result<Vec<_>, _>>()?;
         let norm_f = nn::RmsNormBuilder::new(config.hidden_size)
-            .eps(config.layer_norm_epsilon)
+            .eps(config.eps())
             .build()?;
         Ok(Self {
             embeddings,
@@ -962,10 +973,24 @@ pub fn sanitize_nemotron_h_checkpoint(
     Ok(weights)
 }
 
-/// Whether `key` is a tensor of the multi-token-prediction head some
-/// Nemotron 3 releases bundle (`mtp.*`), which the model does not run.
-pub fn is_mtp_tensor(key: &str) -> bool {
-    key.starts_with("mtp.")
+/// Assign a released Nemotron-H checkpoint's tensors (already unpacked to dense
+/// by the shared reader) to `model`, all of it or not at all: the experts are
+/// stacked and the convolutions reshaped
+/// ([`sanitize_nemotron_h_checkpoint`]), then every tensor must find a
+/// parameter and every parameter a tensor, bar what
+/// [`ModelArchitecture::load_policy`](crate::dispatcher::ModelArchitecture::load_policy)
+/// exempts (the bundled `mtp.*` head).
+pub fn assign_nemotron_h_weights(
+    model: &mut NemotronHForCausalLM,
+    weights: HashMap<String, Array>,
+) -> Result<(), crate::loader::LoadError> {
+    let weights = sanitize_nemotron_h_checkpoint(weights)
+        .map_err(|e| crate::loader::LoadError::SafeTensors(e.to_string()))?;
+    crate::loader::assign_weights(
+        model,
+        weights,
+        &crate::dispatcher::ModelArchitecture::NemotronH.load_policy(),
+    )
 }
 
 #[cfg(test)]
@@ -984,6 +1009,7 @@ pub(crate) mod tests {
             num_key_value_heads: 2,
             attention_bias: false,
             head_dim: Some(32),
+            legacy_head_dim: None,
             mamba_num_heads: 4,
             mamba_head_dim: 32,
             ssm_state_size: 16,
@@ -995,7 +1021,8 @@ pub(crate) mod tests {
             time_step_max: None,
             mlp_bias: false,
             mlp_hidden_act: "relu2".to_string(),
-            layer_norm_epsilon: 1e-5,
+            layer_norm_epsilon: Some(1e-5),
+            norm_eps: None,
             use_bias: false,
             use_conv_bias: true,
             tie_word_embeddings: true,
@@ -1068,7 +1095,19 @@ pub(crate) mod tests {
             }"#,
         )
         .unwrap();
-        assert_eq!(config.layer_norm_epsilon, 1e-6);
+        assert_eq!(config.eps(), 1e-6);
+
+        // Nemotron 3 Nano states both spellings of the epsilon.
+        let both: NemotronHConfig = json5::from_str(
+            r#"{
+                "vocab_size": 10, "hidden_size": 8, "intermediate_size": 16,
+                "num_attention_heads": 2, "num_key_value_heads": 1,
+                "norm_eps": 1e-5, "layer_norm_epsilon": 1e-5, "head_dim": 4,
+                "attention_head_dim": 4, "hybrid_override_pattern": "ME"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(both.eps(), 1e-5);
         assert_eq!(config.attention_head_dim(), 4);
         assert_eq!(config.layer_types(), vec!['M', 'E']);
         assert!(config.time_step_limit.1.is_infinite());

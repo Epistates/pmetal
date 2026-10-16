@@ -1229,21 +1229,17 @@ impl DynamicModel {
             }
             // The parameter tree is the checkpoint's layout with each MoE
             // layer's experts stacked and the convolutions in the runtime's
-            // layout; see `nemotron_h::sanitize_nemotron_h_checkpoint`.
+            // layout; see `nemotron_h::assign_nemotron_h_weights`.
             ModelArchitecture::NemotronH => {
                 let config: NemotronHConfig = json5::from_str(&config_content)
                     .map_err(|e| Exception::custom(e.to_string()))?;
                 let mut model = NemotronHForCausalLM::new(config)?;
                 let weights =
                     load_weights(model_dir).map_err(|e| Exception::custom(e.to_string()))?;
-                let weights =
-                    crate::architectures::nemotron_h::sanitize_nemotron_h_checkpoint(weights)?;
-                assign_weights(
-                    &mut model,
-                    weights,
-                    &ModelArchitecture::NemotronH.load_policy(),
-                )
-                .map_err(|e| Exception::custom(e.with_quantization_hint(model_dir).to_string()))?;
+                crate::architectures::nemotron_h::assign_nemotron_h_weights(&mut model, weights)
+                    .map_err(|e| {
+                        Exception::custom(e.with_quantization_hint(model_dir).to_string())
+                    })?;
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::NemotronH(model))
             }
