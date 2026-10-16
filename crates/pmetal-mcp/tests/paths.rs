@@ -33,7 +33,7 @@ async fn a_dataset_or_adapter_outside_the_roots_is_refused() {
     let message = h
         .call_err(
             "generate",
-            json!({"model": "Qwen/Qwen3-0.6B", "prompt": "hi", "lora": "/Users/someone/adapter"}),
+            json!({"model": "Qwen/Qwen3-0.6B", "prompt": "hi", "lora": "/srv/someone/adapter"}),
         )
         .await;
     assert!(

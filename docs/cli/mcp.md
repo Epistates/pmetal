@@ -107,7 +107,7 @@ lists no roots starts the server in `/`, set `PMETAL_MCP_ROOTS` in the server's 
     "pmetal": {
       "command": "pmetal",
       "args": ["mcp"],
-      "env": { "PMETAL_MCP_ROOTS": "/Users/me/projects:/Volumes/Models" }
+      "env": { "PMETAL_MCP_ROOTS": "/path/to/projects:/path/to/models" }
     }
   }
 }

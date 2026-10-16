@@ -320,7 +320,7 @@ mod tests {
         for good in [
             "Qwen/Qwen3-0.6B",
             "meta-llama/Llama-3.2-1B",
-            "unsloth/Qwen3-8B-GGUF:Q4_K_M",
+            "org/Model-GGUF:Q4_K_M",
         ] {
             assert_eq!(policy.check_reference("model", good).unwrap(), good);
         }
@@ -363,22 +363,22 @@ mod tests {
     #[test]
     fn a_roots_uri_names_a_local_directory() {
         assert_eq!(
-            root_uri_to_path("file:///Users/me/proj"),
-            Some(PathBuf::from("/Users/me/proj"))
+            root_uri_to_path("file:///srv/me/proj"),
+            Some(PathBuf::from("/srv/me/proj"))
         );
         assert_eq!(
             root_uri_to_path("file://localhost/tmp/a"),
             Some(PathBuf::from("/tmp/a"))
         );
         assert_eq!(
-            root_uri_to_path("file:///Users/me/My%20Models/q%C3%A9"),
-            Some(PathBuf::from("/Users/me/My Models/qé"))
+            root_uri_to_path("file:///srv/me/My%20Models/q%C3%A9"),
+            Some(PathBuf::from("/srv/me/My Models/qé"))
         );
         for bad in [
             "https://example.com/x",
             "file://otherhost/tmp",
             "file://relative/path",
-            "/Users/me",
+            "/srv/me",
             "file:///a%zz",
             "file:///a%00b",
             "file:///a%",
