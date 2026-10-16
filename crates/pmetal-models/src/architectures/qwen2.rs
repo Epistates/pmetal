@@ -73,6 +73,14 @@ pub struct Qwen2Config {
     /// Use sliding window attention.
     #[serde(default)]
     pub use_sliding_window: bool,
+    /// Layers below this index attend globally even with `use_sliding_window`
+    /// (`transformers`' default is 28).
+    #[serde(default)]
+    pub max_window_layers: Option<i32>,
+    /// Attention type per layer, `"sliding_attention"` or `"full_attention"`;
+    /// derived from `max_window_layers` when absent.
+    #[serde(default)]
+    pub layer_types: Option<Vec<String>>,
     /// Attention dropout (unused in inference).
     #[serde(default)]
     pub attention_dropout: f32,
@@ -196,6 +204,8 @@ impl Default for Qwen2Config {
             tie_word_embeddings: true,
             sliding_window: None,
             use_sliding_window: false,
+            max_window_layers: None,
+            layer_types: None,
             attention_dropout: 0.0,
             rope_scaling: None,
             rope_parameters: None,
@@ -205,6 +215,17 @@ impl Default for Qwen2Config {
 
 /// Qwen2 1.5B configuration.
 impl Qwen2Config {
+    /// Whether layer `layer_idx` attends within the sliding window.
+    pub fn use_sliding_window_at(&self, layer_idx: usize) -> bool {
+        crate::common::layer_is_sliding(
+            self.use_sliding_window,
+            self.sliding_window,
+            self.max_window_layers,
+            self.layer_types.as_deref(),
+            layer_idx,
+        )
+    }
+
     /// Create Qwen2-0.5B configuration.
     pub fn qwen2_0_5b() -> Self {
         Self {
@@ -291,7 +312,7 @@ impl_module_params!(Qwen2Attention; q_proj, k_proj, v_proj, o_proj);
 
 impl Qwen2Attention {
     /// Create a new attention layer.
-    pub fn new(config: &Qwen2Config) -> Result<Self, Exception> {
+    pub fn new(config: &Qwen2Config, layer_idx: usize) -> Result<Self, Exception> {
         let n_heads = config.num_attention_heads;
         let n_kv_heads = config.num_kv_heads();
         let head_dim = config.get_head_dim();
@@ -317,7 +338,7 @@ impl Qwen2Attention {
             head_dim,
             scale,
             rotary,
-            use_sliding_window: config.use_sliding_window,
+            use_sliding_window: config.use_sliding_window_at(layer_idx),
             sliding_window: config.sliding_window,
             q_proj,
             k_proj,
@@ -514,8 +535,8 @@ impl_module_params!(Qwen2DecoderLayer; self_attn, mlp, input_layernorm, post_att
 
 impl Qwen2DecoderLayer {
     /// Create a new decoder layer.
-    pub fn new(config: &Qwen2Config) -> Result<Self, Exception> {
-        let self_attn = Qwen2Attention::new(config)?;
+    pub fn new(config: &Qwen2Config, layer_idx: usize) -> Result<Self, Exception> {
+        let self_attn = Qwen2Attention::new(config, layer_idx)?;
 
         let mlp = Qwen2MLP::new(config)?;
 
@@ -610,7 +631,7 @@ impl Qwen2Model {
         let embed_tokens = nn::Embedding::new(config.vocab_size, config.hidden_size)?;
 
         let layers = (0..config.num_hidden_layers)
-            .map(|_| Qwen2DecoderLayer::new(&config))
+            .map(|i| Qwen2DecoderLayer::new(&config, i as usize))
             .collect::<Result<Vec<_>, _>>()?;
 
         let norm = nn::RmsNormBuilder::new(config.hidden_size)
@@ -677,21 +698,6 @@ impl Qwen2Model {
     ) -> Result<Array, Exception> {
         // Get embeddings
         let mut hidden_states = Module::forward(&mut self.embed_tokens, input_ids)?;
-
-        // Create causal mask if not provided and not using cache
-        let mask_owned;
-        let mask = if mask.is_none() && cache.is_none() {
-            let seq_len = input_ids.dim(1);
-            mask_owned = if self.config.use_sliding_window {
-                let window = self.config.sliding_window.unwrap_or(4096);
-                create_sliding_window_mask(seq_len, window)?
-            } else {
-                create_causal_mask(seq_len)?
-            };
-            Some(&mask_owned)
-        } else {
-            mask
-        };
 
         // Pass through transformer layers
         match cache {
@@ -910,40 +916,6 @@ impl Qwen2ForCausalLM {
     }
 }
 
-use super::utils::create_causal_mask;
-
-/// Create a sliding window causal attention mask.
-fn create_sliding_window_mask(seq_len: i32, window_size: i32) -> Result<Array, Exception> {
-    use pmetal_runtime::compat::Dtype;
-    // Create lower triangular mask
-    let causal_mask = pmetal_runtime::compat::ops::tri(seq_len, seq_len, 0, Dtype::Float32);
-
-    // Create window mask: positions within window_size distance
-    let indices =
-        pmetal_runtime::compat::ops::arange_from(0, seq_len).as_dtype(Dtype::Float32.as_i32());
-    let row_indices = indices.reshape(&[seq_len, 1]);
-    let col_indices = indices.reshape(&[1, seq_len]);
-    let distance = row_indices.subtract(&col_indices);
-
-    // Valid if distance >= 0 and distance < window_size
-    let window_size_arr = Array::from_f32(window_size as f32);
-    let zero = Array::from_f32(0.0);
-    let in_window = pmetal_runtime::compat::ops::logical_and(
-        &distance.greater_equal(&zero),
-        &distance.less(&window_size_arr),
-    );
-
-    // Combine with causal mask
-    let combined = causal_mask.multiply(&in_window.as_dtype(Dtype::Float32.as_i32()));
-
-    let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-    Ok(pmetal_runtime::compat::ops::where_fn(
-        &combined.equal(&zero),
-        &neg_inf,
-        &zero,
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1012,7 +984,7 @@ mod tests {
     #[serial]
     fn test_qwen2_attention() {
         let config = small_config();
-        let mut attn = Qwen2Attention::new(&config).unwrap();
+        let mut attn = Qwen2Attention::new(&config, 0).unwrap();
 
         let x = pmetal_runtime::compat::random::normal(
             &[1, 4, 128],
@@ -1042,7 +1014,7 @@ mod tests {
     #[serial]
     fn test_qwen2_decoder_layer() {
         let config = small_config();
-        let mut layer = Qwen2DecoderLayer::new(&config).unwrap();
+        let mut layer = Qwen2DecoderLayer::new(&config, 0).unwrap();
 
         let x = pmetal_runtime::compat::random::normal(
             &[1, 4, 128],
@@ -1075,14 +1047,6 @@ mod tests {
         let logits = model.forward(&input_ids, None).unwrap();
 
         assert_eq!(logits.shape(), &[1, 4, 1000]); // [batch, seq, vocab]
-    }
-
-    #[test]
-    #[serial]
-    fn test_sliding_window_mask() {
-        let mask = create_sliding_window_mask(8, 4).unwrap();
-        mask.eval().unwrap();
-        assert_eq!(mask.shape(), &[8, 8]);
     }
 
     #[test]

@@ -35,3 +35,26 @@ pub fn windowed_mask(
         _ => Ok(None),
     }
 }
+
+/// Whether layer `layer_idx` of a Qwen-style model attends within a sliding
+/// window, as `transformers` decides it.
+///
+/// The window exists only with `use_sliding_window` (the config drops
+/// `sliding_window` otherwise). Then a `layer_types` entry names the layer's
+/// type, `"sliding_attention"` or `"full_attention"`; without one the layers
+/// from `max_window_layers` (28 unless the config says) up are sliding.
+pub fn layer_is_sliding(
+    use_sliding_window: bool,
+    sliding_window: Option<i32>,
+    max_window_layers: Option<i32>,
+    layer_types: Option<&[String]>,
+    layer_idx: usize,
+) -> bool {
+    if !use_sliding_window || sliding_window.is_none() {
+        return false;
+    }
+    match layer_types.and_then(|types| types.get(layer_idx)) {
+        Some(layer_type) => layer_type == "sliding_attention",
+        None => layer_idx as i32 >= max_window_layers.unwrap_or(28),
+    }
+}

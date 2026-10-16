@@ -205,19 +205,18 @@ impl Qwen3Config {
         self.num_attention_heads / self.num_kv_heads()
     }
 
-    /// Check if layer at index should use sliding window.
+    /// Whether layer `layer_idx` attends within the sliding window, as
+    /// `transformers` decides it: only with `use_sliding_window`, by
+    /// `layer_types` (`"sliding_attention"`) or, without it, for the layers
+    /// from `max_window_layers` (28 by default) up.
     pub fn use_sliding_window_at(&self, layer_idx: usize) -> bool {
-        if let Some(ref layer_types) = self.layer_types {
-            if let Some(layer_type) = layer_types.get(layer_idx) {
-                return layer_type == "sliding_window";
-            }
-        }
-
-        // Default: layers at or above max_window_layers use sliding window (matches HF transformers)
-        if let Some(max_layers) = self.max_window_layers {
-            return self.use_sliding_window && (layer_idx as i32) >= max_layers;
-        }
-        false
+        crate::common::layer_is_sliding(
+            self.use_sliding_window,
+            self.sliding_window,
+            self.max_window_layers,
+            self.layer_types.as_deref(),
+            layer_idx,
+        )
     }
 }
 
@@ -1057,29 +1056,31 @@ mod tests {
     #[test]
     fn test_sliding_window_layer_types() {
         let mut config = tiny_config();
+        config.use_sliding_window = true;
+        config.sliding_window = Some(8);
         config.layer_types = Some(vec![
-            "dense".to_string(),
-            "sliding_window".to_string(),
-            "dense".to_string(),
-            "sliding_window".to_string(),
+            "full_attention".to_string(),
+            "sliding_attention".to_string(),
+            "full_attention".to_string(),
+            "sliding_attention".to_string(),
         ]);
 
         assert!(!config.use_sliding_window_at(0), "layer 0 should be dense");
-        assert!(
-            config.use_sliding_window_at(1),
-            "layer 1 should be sliding_window"
-        );
+        assert!(config.use_sliding_window_at(1), "layer 1 should be sliding");
         assert!(!config.use_sliding_window_at(2), "layer 2 should be dense");
-        assert!(
-            config.use_sliding_window_at(3),
-            "layer 3 should be sliding_window"
-        );
+        assert!(config.use_sliding_window_at(3), "layer 3 should be sliding");
+
+        // The reference drops the window unless `use_sliding_window` is set,
+        // whatever the layer types say.
+        config.use_sliding_window = false;
+        assert!(!config.use_sliding_window_at(1));
     }
 
     #[test]
     fn test_sliding_window_max_layers() {
         let mut config = tiny_config();
         config.use_sliding_window = true;
+        config.sliding_window = Some(8);
         config.max_window_layers = Some(2);
 
         // Layers below max_window_layers should NOT use sliding window
@@ -1100,6 +1101,11 @@ mod tests {
             config.use_sliding_window_at(3),
             "layer 3 >= max_window_layers, should be sliding"
         );
+
+        // With no `max_window_layers` the reference's default of 28 applies.
+        config.max_window_layers = None;
+        assert!(!config.use_sliding_window_at(3));
+        assert!(config.use_sliding_window_at(28));
     }
 
     #[test]

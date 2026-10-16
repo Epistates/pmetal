@@ -157,6 +157,7 @@ fn qwen2_packed_sequences_keep_their_sliding_window() {
         num_attention_heads: 4,
         num_key_value_heads: Some(2),
         use_sliding_window: true,
+        max_window_layers: Some(0),
         sliding_window: Some(window),
         ..Default::default()
     };

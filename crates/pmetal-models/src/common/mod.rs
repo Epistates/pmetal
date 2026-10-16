@@ -16,5 +16,5 @@ pub use batched_attention::{
     BatchedGqaAttnCfg, batched_gqa_attn, batched_parallel_block, batched_perinorm_layer,
     batched_prenorm_layer,
 };
-pub use local_attention::windowed_mask;
+pub use local_attention::{layer_is_sliding, windowed_mask};
 pub use rotary::rotary_embedding;
