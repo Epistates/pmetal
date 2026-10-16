@@ -2,10 +2,7 @@
 //!
 //! This module provides architecture-agnostic FP8 quantization by traversing
 //! a model's flattened parameter map and replacing every eligible linear
-//! weight tensor with its `to_fp8` equivalent.  It is intentionally separate
-//! from the NemotronH-specific implementation in `architectures/nemotron_h.rs`,
-//! which operates on concrete `nn::Linear` structs with custom FP8-aware
-//! forward passes.
+//! weight tensor with its `to_fp8` equivalent.
 //!
 //! # How it works
 //!
@@ -27,6 +24,13 @@ fn is_fp8_weight_candidate(key: &str, arr: &Array) -> bool {
         return false;
     }
     if arr.ndim() != 2 {
+        return false;
+    }
+
+    // A router is read as a float matrix by its own code, not through a
+    // `Linear` that would unpack it, and its argmax picks which computation
+    // runs.
+    if key.ends_with(".gate.weight") {
         return false;
     }
 

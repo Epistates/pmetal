@@ -266,6 +266,11 @@ impl ModelArchitecture {
                      RMSNorm whose weight stays at its identity init of ones",
                 ),
             ]),
+            Self::NemotronH => policy.allowing_unused_tensors(&[Exemption::new(
+                "mtp.*",
+                "the multi-token-prediction head some Nemotron 3 releases bundle; the model \
+                 does not run it",
+            )]),
             _ => policy,
         }
     }
@@ -901,7 +906,6 @@ impl std::fmt::Debug for DynamicModel {
 impl DynamicModel {
     fn init_post_load_fast_paths(&mut self) -> Result<(), Exception> {
         match self {
-            Self::NemotronH(model) => model.init_stacked_moe(),
             Self::GptOss(model) => model.init_stacked_moe(),
             _ => Ok(()),
         }
@@ -1223,26 +1227,25 @@ impl DynamicModel {
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::Granite(model))
             }
-            // NemotronH uses a bespoke weight loader (`load_nemotron_weights`);
-            // `init_post_load_fast_paths` still applies once the weights are
-            // materialised.
+            // The parameter tree is the checkpoint's layout with each MoE
+            // layer's experts stacked and the convolutions in the runtime's
+            // layout; see `nemotron_h::sanitize_nemotron_h_checkpoint`.
             ModelArchitecture::NemotronH => {
                 let config: NemotronHConfig = json5::from_str(&config_content)
                     .map_err(|e| Exception::custom(e.to_string()))?;
                 let mut model = NemotronHForCausalLM::new(config)?;
-                load_checked(
+                let weights =
+                    load_weights(model_dir).map_err(|e| Exception::custom(e.to_string()))?;
+                let weights =
+                    crate::architectures::nemotron_h::sanitize_nemotron_h_checkpoint(weights)?;
+                assign_weights(
                     &mut model,
-                    model_dir,
+                    weights,
                     &ModelArchitecture::NemotronH.load_policy(),
-                    |model| {
-                        crate::loader::load_nemotron_weights(model, model_dir)
-                            .map_err(|e| Exception::custom(e.to_string()))
-                    },
-                )?;
+                )
+                .map_err(|e| Exception::custom(e.with_quantization_hint(model_dir).to_string()))?;
                 eval_module_parameters_batched(&model)?;
-                let mut model = Self::NemotronH(model);
-                model.init_post_load_fast_paths()?;
-                Ok(model)
+                Ok(Self::NemotronH(model))
             }
             ModelArchitecture::Qwen3Next => {
                 let config = Qwen3NextConfig::from_config_json(&config_content)?;
@@ -1626,7 +1629,7 @@ impl DynamicModel {
             Self::DeepSeek(m) => m.forward(input_ids, mask, None),
             Self::Cohere(m) => m.forward(input_ids, mask, None),
             Self::Granite(m) => m.forward(input_ids, mask, None),
-            Self::NemotronH(m) => m.forward(input_ids, None),
+            Self::NemotronH(m) => m.forward(input_ids, mask),
             Self::Qwen3Next(m) => m.forward(input_ids, mask),
             Self::Qwen4Exp(m) => m.forward(input_ids, mask),
             Self::GptOss(m) => m.forward(input_ids, mask, None),
@@ -2201,10 +2204,6 @@ impl DynamicModel {
 
     pub fn quantize_fp8(&mut self) -> Result<(), Exception> {
         match self {
-            // NemotronH has a bespoke implementation that operates on concrete
-            // `nn::Linear` structs and handles Mamba/attention blocks explicitly.
-            Self::NemotronH(model) => model.quantize_fp8_weights(),
-
             // Flux is a diffusion model whose weight graph is not a flat set of
             // `nn::Linear` layers reachable through a single `ModuleParameters`
             // root.  Callers should use `FluxPipeline` and quantize each
@@ -2229,6 +2228,7 @@ impl DynamicModel {
             Self::DeepSeek(m) => crate::fp8_utils::quantize_model_linears(m),
             Self::Cohere(m) => crate::fp8_utils::quantize_model_linears(m),
             Self::Granite(m) => crate::fp8_utils::quantize_model_linears(m),
+            Self::NemotronH(m) => crate::fp8_utils::quantize_model_linears(m),
             Self::Qwen3Next(m) => crate::fp8_utils::quantize_model_linears(m),
             // The n-gram tables are embeddings, which the generic pass leaves alone.
             Self::Qwen4Exp(m) => crate::fp8_utils::quantize_model_linears(m),
@@ -2430,9 +2430,13 @@ impl DynamicModel {
             Self::Granite(m) => {
                 m.forward_with_hybrid_cache_last(input_ids, mask, kv_cache, mamba_cache)
             }
-            Self::NemotronH(_) | Self::Qwen4Exp(_) => Ok(last_token_hidden(
-                &self.forward_with_hybrid_cache(input_ids, mask, kv_cache, mamba_cache)?,
-            )),
+            Self::NemotronH(m) => m.forward_with_cache_last(input_ids, mask, kv_cache, mamba_cache),
+            Self::Qwen4Exp(_) => Ok(last_token_hidden(&self.forward_with_hybrid_cache(
+                input_ids,
+                mask,
+                kv_cache,
+                mamba_cache,
+            )?)),
             _ => self.forward_with_cache_last(input_ids, mask, kv_cache),
         }
     }
@@ -2874,47 +2878,6 @@ mod tests {
         );
     }
 
-    fn tiny_nemotron_h_config() -> NemotronHConfig {
-        NemotronHConfig {
-            model_type: "nemotron_h".to_string(),
-            vocab_size: 1000,
-            hidden_size: 128,
-            intermediate_size: 256,
-            num_hidden_layers: 4,
-            max_position_embeddings: 512,
-            num_attention_heads: 4,
-            num_key_value_heads: 2,
-            attention_bias: false,
-            head_dim: Some(32),
-            mamba_num_heads: 4,
-            mamba_head_dim: 32,
-            mamba_proj_bias: false,
-            ssm_state_size: 16,
-            conv_kernel: 4,
-            n_groups: 2,
-            time_step_limit: (0.0, f32::INFINITY),
-            time_step_min: None,
-            time_step_max: None,
-            mlp_bias: false,
-            mlp_hidden_act: "relu2".to_string(),
-            layer_norm_epsilon: 1e-5,
-            use_bias: false,
-            use_conv_bias: true,
-            tie_word_embeddings: true,
-            hybrid_override_pattern: Some("M*-E".to_string()),
-            moe_intermediate_size: Some(64),
-            moe_shared_expert_intermediate_size: None,
-            n_group: None,
-            n_routed_experts: Some(2),
-            n_shared_experts: None,
-            topk_group: None,
-            num_experts_per_tok: Some(1),
-            norm_topk_prob: None,
-            routed_scaling_factor: None,
-            rope_theta: 10000.0,
-        }
-    }
-
     fn tiny_qwen35_moe_text_config() -> Qwen3NextConfig {
         Qwen3NextConfig {
             model_type: "qwen3_5_moe_text".to_string(),
@@ -3066,20 +3029,5 @@ mod tests {
             .unwrap(),
         );
         assert!(model.requires_expert_offloading());
-    }
-
-    #[test]
-    #[serial]
-    fn nemotron_h_post_load_fast_paths_initialize_stacked_experts() {
-        let mut model =
-            DynamicModel::NemotronH(NemotronHForCausalLM::new(tiny_nemotron_h_config()).unwrap());
-        model.init_post_load_fast_paths().unwrap();
-
-        let DynamicModel::NemotronH(model) = &model else {
-            panic!("expected nemotron-h model");
-        };
-        let moe_layer = &model.backbone.layers[3].mixer;
-        assert!(moe_layer.stacked_moe_up.is_some());
-        assert!(moe_layer.stacked_moe_down.is_some());
     }
 }

@@ -9,6 +9,7 @@
 
 pub mod batched_attention;
 pub mod local_attention;
+pub mod mamba2;
 pub mod rotary;
 pub mod switch_mlp;
 

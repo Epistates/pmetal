@@ -1,242 +1,25 @@
-//! The pieces of the Granite family beyond plain Granite: the Mamba-2 mixer
-//! of Granite 4.0-H, the routed experts of `granitemoe` / `granitemoehybrid`,
-//! the shared MLP every `granitemoeshared` / `granitemoehybrid` layer runs, and
-//! the weight loader that maps a released checkpoint onto them.
+//! The pieces of the Granite family beyond plain Granite: the routed experts of
+//! `granitemoe` / `granitemoehybrid`, the shared MLP every `granitemoeshared` /
+//! `granitemoehybrid` layer runs, and the weight loader that maps a released
+//! checkpoint onto them (and onto Granite 4.0-H's Mamba-2 mixer).
 //!
 //! Reference: `transformers.models.granitemoehybrid.modeling_granitemoehybrid`
 //! (`GraniteMoeHybridMambaLayer`, `GraniteMoeHybridMoE`, `GraniteMoeHybridMLP`).
 //! `granitemoe` and `granitemoeshared` are the same layer with the Mamba and
 //! shared-MLP branches removed, so one implementation serves all three.
 //!
-//! The Mamba-2 scan itself is not reimplemented here: it is the SSD form in
-//! [`super::nemotron_h`] ([`ssm_attention`] for a sequence, [`ssm_update_single`]
-//! for one cached token), and the conv / SSM state lives in the shared
-//! [`MambaCache`](pmetal_cache::kv_cache::MambaCache). What differs from
-//! Nemotron-H is around the scan: Granite normalizes the gated output over the
-//! whole intermediate width (not per group), and runs the scan in float32 the
-//! way the reference's chunked path does.
+//! The Mamba-2 mixer itself is the shared [`Mamba2Mixer`](crate::common::mamba2::Mamba2Mixer)
+//! (`common::mamba2`); what differs from Nemotron-H is around the scan: Granite
+//! normalizes the gated output over the whole intermediate width, not per
+//! group.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use pmetal_cache::kv_cache::MambaCacheEntry;
 use pmetal_runtime::compat::{Array, Exception, Module, ModuleParametersExt, Param, nn, ops};
 use pmetal_runtime::impl_module_params;
 
-use super::granite::{GraniteConfig, GraniteForCausalLM};
-use super::nemotron_h::{ssm_attention, ssm_update_single};
-
-// =============================================================================
-// Mamba-2 mixer
-// =============================================================================
-
-/// Granite 4.0-H's Mamba-2 mixer (`GraniteMoeHybridMambaLayer`).
-///
-/// `in_proj` produces `[gate | x B C | dt]`; `x B C` goes through a causal
-/// depthwise conv and SiLU, the SSM scans it, and the output is normalized
-/// together with `silu(gate)` before `out_proj`. Field names are the
-/// checkpoint's, `A_log` and `D` included, so a loaded or saved state dict
-/// round-trips without a rename table.
-#[allow(non_snake_case)]
-#[derive(Debug)]
-pub struct GraniteMamba {
-    pub in_proj: nn::Linear,
-    /// Depthwise causal conv. MLX layout `[conv_dim, kernel, 1]`; the loader
-    /// reshapes a released `[conv_dim, 1, kernel]` weight into it.
-    pub conv1d: nn::Conv1d,
-    pub dt_bias: Param<Array>,
-    pub A_log: Param<Array>,
-    pub D: Param<Array>,
-    /// Gated RMSNorm over the full `intermediate` width.
-    pub norm: nn::RmsNorm,
-    pub out_proj: nn::Linear,
-
-    pub num_heads: i32,
-    pub head_dim: i32,
-    pub n_groups: i32,
-    pub state_size: i32,
-    pub intermediate: i32,
-    pub conv_dim: i32,
-    pub conv_kernel: i32,
-    pub chunk_size: i32,
-    pub norm_eps: f32,
-}
-impl_module_params!(GraniteMamba; in_proj, conv1d, dt_bias, A_log, D, norm, out_proj);
-
-impl GraniteMamba {
-    pub fn new(config: &GraniteConfig) -> Result<Self, Exception> {
-        let hidden = config.hidden_size;
-        let intermediate = config.mamba_intermediate_size();
-        let conv_dim = config.mamba_conv_dim();
-        let num_heads = config.mamba_n_heads;
-        let projection = intermediate + conv_dim + num_heads;
-
-        let in_proj = nn::LinearBuilder::new(hidden, projection)
-            .bias(config.mamba_proj_bias)
-            .build()?;
-        let conv1d = nn::Conv1dBuilder::new(conv_dim, conv_dim, config.mamba_d_conv)
-            .groups(conv_dim)
-            .bias(config.mamba_conv_bias)
-            .padding(0)
-            .build()?;
-        let out_proj = nn::LinearBuilder::new(intermediate, hidden)
-            .bias(config.mamba_proj_bias)
-            .build()?;
-        let norm = nn::RmsNormBuilder::new(intermediate)
-            .eps(config.rms_norm_eps)
-            .build()?;
-
-        // The reference's own initialisation: `A = arange(1, H + 1)`, unit
-        // `D` and `dt_bias`. Loaded checkpoints overwrite all three.
-        let a: Vec<f32> = (1..=num_heads).map(|h| (h as f32).ln()).collect();
-
-        Ok(Self {
-            in_proj,
-            conv1d,
-            dt_bias: Param::new(Array::ones_f32(&[num_heads])),
-            A_log: Param::new(Array::from_slice(&a, &[num_heads])),
-            D: Param::new(Array::ones_f32(&[num_heads])),
-            norm,
-            out_proj,
-            num_heads,
-            head_dim: config.mamba_head_dim(),
-            n_groups: config.mamba_n_groups,
-            state_size: config.mamba_d_state,
-            intermediate,
-            conv_dim,
-            conv_kernel: config.mamba_d_conv,
-            chunk_size: config.mamba_chunk_size.max(1),
-            norm_eps: config.rms_norm_eps,
-        })
-    }
-
-    /// Mix `x` `[B, L, hidden]`, advancing `cache` when one is given.
-    ///
-    /// With no cache the sequence starts from zero conv and SSM state. With
-    /// one, the conv reads the entry's last `kernel - 1` inputs and the scan
-    /// starts from its SSM state; both are written back. A single token
-    /// against existing state takes the recurrent step, anything else the
-    /// chunked scan, as the reference does.
-    pub fn forward(
-        &mut self,
-        x: &Array,
-        mut cache: Option<&mut MambaCacheEntry>,
-    ) -> Result<Array, Exception> {
-        let batch = x.dim(0);
-        let seq_len = x.dim(1);
-        let input_dtype = x.dtype();
-
-        let projected = Module::forward(&mut self.in_proj, x)?;
-        let parts = ops::split_sections(
-            &projected,
-            &[self.intermediate, self.intermediate + self.conv_dim],
-            -1,
-        );
-        let (gate, xbc, dt) = (&parts[0], &parts[1], &parts[2]);
-
-        // Causal depthwise conv: zero history for a fresh sequence, the
-        // cached history otherwise.
-        let padded = match cache.as_deref_mut() {
-            Some(entry) => entry.update_conv_state(xbc, self.conv_kernel)?,
-            None => ops::pad(
-                xbc,
-                &[(0, 0), (self.conv_kernel - 1, 0), (0, 0)],
-                None,
-                Some(0.0),
-            ),
-        };
-        let conv = Module::forward(&mut self.conv1d, &padded)?;
-        let conv = ops::slice_axis(&conv, 1, conv.dim(1) - seq_len, conv.dim(1));
-        let conv = nn::silu(&conv);
-
-        let bc = self.n_groups * self.state_size;
-        let conv_parts =
-            ops::split_sections(&conv, &[self.intermediate, self.intermediate + bc], -1);
-
-        // The reference's chunked scan runs in float32 whatever the model
-        // dtype; so does this one, on both paths.
-        let f32 = |a: &Array| a.as_type::<f32>();
-        let xs = f32(&conv_parts[0]).reshape(&[batch, seq_len, self.num_heads, self.head_dim]);
-        let b = f32(&conv_parts[1]).reshape(&[batch, seq_len, self.n_groups, self.state_size]);
-        let c = f32(&conv_parts[2]).reshape(&[batch, seq_len, self.n_groups, self.state_size]);
-        let dt = f32(dt);
-        let a_log = f32(self.A_log.as_ref());
-        let d = f32(self.D.as_ref());
-        let dt_bias = f32(self.dt_bias.as_ref());
-
-        let previous = cache
-            .as_ref()
-            .and_then(|entry| entry.get_ssm_state().cloned());
-        // `time_step_limit` is (0, inf) on every config this accepts (see
-        // `GraniteConfig::validate`), so the floor is 0 and softplus never
-        // reaches it.
-        let (y, state) = match (seq_len, previous) {
-            (1, Some(state)) => {
-                ssm_update_single(&xs, &a_log, &b, &c, &d, &dt, &dt_bias, &state, 0.0)?
-            }
-            (_, state) => self.chunked_scan(&xs, &a_log, &b, &c, &d, &dt, &dt_bias, state)?,
-        };
-        if let Some(entry) = cache {
-            entry.set_ssm_state(state);
-        }
-
-        let y = y.reshape(&[batch, seq_len, self.intermediate]);
-        // Gated RMSNorm with the gate applied first (`norm_before_gate=False`)
-        // and the statistics taken over the whole width, not per group.
-        let gated = y.multiply(&nn::silu(&f32(gate)));
-        let normed = gated.rms_norm(Some(&f32(self.norm.weight.as_ref())), self.norm_eps);
-        Module::forward(&mut self.out_proj, &normed.as_dtype(input_dtype.as_i32()))
-    }
-
-    /// The SSD scan in `chunk_size` pieces, carrying the state across.
-    ///
-    /// [`ssm_attention`] materialises an `[L, L]` decay matrix per head, so a
-    /// long prompt in one piece is quadratic in memory. Chunking is exactly the
-    /// reference's own decomposition (`mamba_chunk_size`): each piece starts
-    /// from the state the previous one ended in.
-    #[allow(clippy::too_many_arguments)]
-    fn chunked_scan(
-        &self,
-        xs: &Array,
-        a_log: &Array,
-        b: &Array,
-        c: &Array,
-        d: &Array,
-        dt: &Array,
-        dt_bias: &Array,
-        mut state: Option<Array>,
-    ) -> Result<(Array, Array), Exception> {
-        let seq_len = xs.dim(1);
-        let mut outputs = Vec::new();
-        let mut start = 0;
-        while start < seq_len {
-            let end = (start + self.chunk_size).min(seq_len);
-            let piece = |a: &Array| ops::slice_axis(a, 1, start, end);
-            let (y, next) = ssm_attention(
-                &piece(xs),
-                a_log,
-                &piece(b),
-                &piece(c),
-                d,
-                &piece(dt),
-                dt_bias,
-                state.as_ref(),
-                0.0,
-            )?;
-            outputs.push(y);
-            state = Some(next);
-            start = end;
-        }
-        let state = state.ok_or_else(|| Exception::custom("Granite Mamba: empty sequence"))?;
-        let y = if outputs.len() == 1 {
-            outputs.pop().expect("one chunk")
-        } else {
-            let refs: Vec<&Array> = outputs.iter().collect();
-            ops::concatenate_axis(&refs, 1)
-        };
-        Ok((y, state))
-    }
-}
+use super::granite::GraniteForCausalLM;
 
 // =============================================================================
 // Shared MLP
@@ -542,13 +325,6 @@ fn normalize_checkpoint_layout(
         }
     }
 
-    for (key, value) in weights.iter_mut() {
-        if key.ends_with(".conv1d.weight") && value.ndim() == 3 && value.dim(1) == 1 {
-            // [C, 1, K] -> [C, K, 1]: the middle axis is a singleton, so this
-            // is a reshape, not a transpose.
-            let (channels, kernel) = (value.dim(0), value.dim(2));
-            *value = value.reshape(&[channels, kernel, 1]);
-        }
-    }
+    crate::common::mamba2::conv_weights_to_runtime_layout(&mut weights);
     Ok(weights)
 }

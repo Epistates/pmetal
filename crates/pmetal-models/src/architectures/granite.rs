@@ -32,8 +32,9 @@ use pmetal_runtime::nn::{
 
 use serde::{Deserialize, Serialize};
 
-use super::granite_hybrid::{GraniteMamba, GraniteMoe, GraniteSharedMlp};
+use super::granite_hybrid::{GraniteMoe, GraniteSharedMlp};
 use crate::checkpointing::checkpointed_layer;
+use crate::common::mamba2::{Mamba2Config, Mamba2Mixer};
 use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule};
 use crate::traits::ModelConfig;
 
@@ -570,6 +571,30 @@ impl GraniteConfig {
     pub fn mamba_conv_dim(&self) -> i32 {
         self.mamba_intermediate_size() + 2 * self.mamba_n_groups * self.mamba_d_state
     }
+
+    /// The Mamba-2 mixer a `mamba` layer is.
+    ///
+    /// The gated norm normalizes the whole intermediate width as one group
+    /// whatever `mamba_n_groups` is (`n_groups` only splits `B` and `C`), and
+    /// the step size has no floor or ceiling (`validate` refuses a config that
+    /// sets `time_step_limit` otherwise).
+    pub fn mamba_config(&self) -> Mamba2Config {
+        Mamba2Config {
+            hidden_size: self.hidden_size,
+            num_heads: self.mamba_n_heads,
+            head_dim: self.mamba_head_dim(),
+            n_groups: self.mamba_n_groups,
+            state_size: self.mamba_d_state,
+            conv_kernel: self.mamba_d_conv,
+            chunk_size: self.mamba_chunk_size.max(1),
+            norm_group_size: self.mamba_intermediate_size(),
+            norm_eps: self.rms_norm_eps,
+            dt_min: 0.0,
+            dt_max: f32::INFINITY,
+            proj_bias: self.mamba_proj_bias,
+            conv_bias: self.mamba_conv_bias,
+        }
+    }
 }
 
 impl ModelConfig for GraniteConfig {
@@ -825,7 +850,7 @@ pub struct GraniteDecoderLayer {
     /// dropped silently, so the whole attention stack stayed at random init
     /// and Granite inference returned noise while parsing perfectly.
     pub self_attn: Option<GraniteAttention>,
-    pub mamba: Option<GraniteMamba>,
+    pub mamba: Option<Mamba2Mixer>,
     pub mlp: Option<GraniteMLP>,
     pub block_sparse_moe: Option<GraniteMoe>,
     pub shared_mlp: Option<GraniteSharedMlp>,
@@ -851,7 +876,7 @@ impl GraniteDecoderLayer {
 
         let (self_attn, mamba) = match layer_type {
             GraniteLayerType::Attention => (Some(GraniteAttention::new(config)?), None),
-            GraniteLayerType::Mamba2 => (None, Some(GraniteMamba::new(config)?)),
+            GraniteLayerType::Mamba2 => (None, Some(Mamba2Mixer::new(config.mamba_config())?)),
         };
 
         let mlp = if family == GraniteFamily::Dense {
