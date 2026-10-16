@@ -160,6 +160,35 @@ fn is_hub_id(raw: &str) -> bool {
     )
 }
 
+/// The directory a client's root names: a `file://` URI (as MCP roots are), on
+/// this machine, with its percent-escapes decoded. `None` for anything else.
+pub fn root_uri_to_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    // `file:///path` has an empty host; `file://localhost/path` names this one.
+    let path = match rest.strip_prefix("localhost") {
+        Some(path) => path,
+        None => rest,
+    };
+    if !path.starts_with('/') {
+        return None;
+    }
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = path.get(i + 1..i + 3)?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    let decoded = String::from_utf8(out).ok()?;
+    (!decoded.contains('\0')).then(|| PathBuf::from(decoded))
+}
+
 fn expand_home(raw: &str) -> Option<PathBuf> {
     let rest = raw.strip_prefix('~')?;
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
@@ -329,6 +358,33 @@ mod tests {
                 .check_reference("model", outside.to_str().unwrap())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_roots_uri_names_a_local_directory() {
+        assert_eq!(
+            root_uri_to_path("file:///Users/me/proj"),
+            Some(PathBuf::from("/Users/me/proj"))
+        );
+        assert_eq!(
+            root_uri_to_path("file://localhost/tmp/a"),
+            Some(PathBuf::from("/tmp/a"))
+        );
+        assert_eq!(
+            root_uri_to_path("file:///Users/me/My%20Models/q%C3%A9"),
+            Some(PathBuf::from("/Users/me/My Models/qé"))
+        );
+        for bad in [
+            "https://example.com/x",
+            "file://otherhost/tmp",
+            "file://relative/path",
+            "/Users/me",
+            "file:///a%zz",
+            "file:///a%00b",
+            "file:///a%",
+        ] {
+            assert_eq!(root_uri_to_path(bad), None, "{bad}");
+        }
     }
 
     #[test]

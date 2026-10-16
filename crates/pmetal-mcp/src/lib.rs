@@ -293,6 +293,23 @@ impl PmetalMcpServer {
         self.inner.core.jobs.shutdown().await;
     }
 
+    /// The policy for one request: the server's own, plus the directories the
+    /// client lists as its roots (MCP `roots/list`), when it has any. A client
+    /// that does not support roots, or does not answer in a couple of seconds,
+    /// adds none.
+    async fn policy_for(&self, ctx: &RequestContext) -> PathPolicy {
+        let base = &self.inner.core.policy;
+        let roots = tokio::time::timeout(std::time::Duration::from_secs(2), ctx.list_roots()).await;
+        match roots {
+            Ok(Ok(roots)) => base.with_extra_roots(
+                roots
+                    .iter()
+                    .filter_map(|root| policy::root_uri_to_path(&root.uri)),
+            ),
+            _ => base.clone(),
+        }
+    }
+
     async fn dispatch(
         &self,
         kind: Kind,
@@ -301,10 +318,19 @@ impl PmetalMcpServer {
         ctx: &RequestContext,
     ) -> McpResult<ToolResult> {
         let inner = &*self.inner;
+        let takes_paths = match kind {
+            Kind::Spec(_) | Kind::Cli(_) => true,
+            Kind::Native => native::takes_paths(name),
+        };
+        let policy = if takes_paths {
+            self.policy_for(ctx).await
+        } else {
+            inner.core.policy.clone()
+        };
         match kind {
             Kind::Spec(i) => {
                 let tool = &inner.spec_tools[i];
-                let prepared = tool.prepare(args, &inner.core.policy)?;
+                let prepared = tool.prepare(args, &policy)?;
                 match tool.mode() {
                     Mode::Job => {
                         let output = prepared.output.as_ref().map(|p| p.display().to_string());
@@ -329,7 +355,7 @@ impl PmetalMcpServer {
             }
             Kind::Cli(i) => {
                 let tool = &inner.cli_tools[i];
-                let argv = tool.argv(args, &inner.core.policy)?;
+                let argv = tool.argv(args, &policy)?;
                 inner.core.run(&argv, ctx).await.map(text)
             }
             Kind::Native => {
@@ -340,7 +366,7 @@ impl PmetalMcpServer {
                     schema_check::check_arguments(name, &schema, &args)
                         .map_err(McpError::invalid_params)?;
                 }
-                native::call(&inner.core, name, args, ctx)
+                native::call(&inner.core, &policy, name, args, ctx)
                     .await
                     .unwrap_or_else(|| Err(McpError::tool_not_found(name)))
             }

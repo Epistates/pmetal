@@ -110,6 +110,45 @@ async fn tools_that_start_jobs_declare_the_shape_of_what_they_return() {
 }
 
 #[tokio::test]
+async fn what_the_job_tools_return_conforms_to_the_schema_they_declare() {
+    use pmetal_mcp::schema_check::check_value;
+
+    let h = Harness::new("echo hi; echo oops >&2; exit 4");
+    let list = h.result("tools/list", json!({})).await;
+    let declared = |name: &str| -> Value {
+        tools(&list)
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name}"))["outputSchema"]
+            .clone()
+    };
+    let conforms = |name: &str, content: &Value| {
+        let schema = declared(name);
+        assert!(schema.is_object(), "{name} declares no output schema");
+        check_value(name, content, &schema).unwrap_or_else(|e| panic!("{name}: {e}\n{content}"));
+    };
+
+    let started = h.call_ok("train", train_args(&h)).await;
+    conforms("train", &started);
+    let id = started["job_id"].as_str().unwrap();
+    let failed = h
+        .wait_for_job(id, |s| s["status"]["state"] == "failed")
+        .await;
+    conforms("job_status", &failed);
+    conforms("list_jobs", &h.call_ok("list_jobs", json!({})).await);
+    conforms(
+        "job_logs",
+        &h.call_ok("job_logs", json!({"job_id": id})).await,
+    );
+
+    // The declaration says something: a result of the wrong shape does not conform.
+    assert!(check_value("job_status", &json!({"id": 5}), &declared("job_status")).is_err());
+    let mut wrong = failed.clone();
+    wrong["status"] = json!({"state": "exploded"});
+    assert!(check_value("job_status", &wrong, &declared("job_status")).is_err());
+}
+
+#[tokio::test]
 async fn an_unknown_tool_is_a_protocol_error() {
     let h = Harness::new("exit 0");
     let response = h

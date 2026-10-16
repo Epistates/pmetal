@@ -387,9 +387,8 @@ struct ModelArgs {
 
 /// The directory of a model that is on this machine: a local path, or a
 /// complete copy in the cache.
-fn local_model_dir(core: &Core, model: &str) -> McpResult<PathBuf> {
-    let reference = core
-        .policy
+fn local_model_dir(policy: &PathPolicy, model: &str) -> McpResult<PathBuf> {
+    let reference = policy
         .check_reference("model", model)
         .map_err(McpError::invalid_params)?;
     let path = Path::new(&reference);
@@ -403,9 +402,9 @@ fn local_model_dir(core: &Core, model: &str) -> McpResult<PathBuf> {
     })
 }
 
-async fn model_info(core: &Core, args: Value) -> McpResult<ToolResult> {
+async fn model_info(policy: &PathPolicy, args: Value) -> McpResult<ToolResult> {
     let args: ModelArgs = parse(args)?;
-    let dir = local_model_dir(core, &args.model)?;
+    let dir = local_model_dir(policy, &args.model)?;
     let config_path = dir.join("config.json");
     let bytes = tokio::fs::read(&config_path).await.map_err(|e| {
         McpError::invalid_params(format!("cannot read {}: {e}", config_path.display()))
@@ -436,9 +435,9 @@ async fn model_info(core: &Core, args: Value) -> McpResult<ToolResult> {
     }))
 }
 
-async fn verify_model(core: &Core, args: Value) -> McpResult<ToolResult> {
+async fn verify_model(policy: &PathPolicy, args: Value) -> McpResult<ToolResult> {
     let args: ModelArgs = parse(args)?;
-    let dir = local_model_dir(core, &args.model)?;
+    let dir = local_model_dir(policy, &args.model)?;
     let report = tokio::task::spawn_blocking({
         let dir = dir.clone();
         move || pmetal_hub::verify_model_dir(&dir)
@@ -465,11 +464,10 @@ struct EvictArgs {
     model_id: String,
 }
 
-async fn delete_local_model(core: &Core, args: Value) -> McpResult<ToolResult> {
+async fn delete_local_model(policy: &PathPolicy, args: Value) -> McpResult<ToolResult> {
     let args: EvictArgs = parse(args)?;
     // Only a Hub ID names something in the cache; a path is not a model to evict.
-    let id = core
-        .policy
+    let id = policy
         .check_reference("model_id", &args.model_id)
         .map_err(McpError::invalid_params)?;
     if Path::new(&id).is_absolute() || id.matches('/').count() != 1 || id.contains(':') {
@@ -495,13 +493,12 @@ struct FitArgs {
     quantization: Option<String>,
 }
 
-async fn model_fit(core: &Core, args: Value) -> McpResult<ToolResult> {
+async fn model_fit(policy: &PathPolicy, args: Value) -> McpResult<ToolResult> {
     let args: FitArgs = parse(args)?;
     let context = args
         .context_length
         .unwrap_or(pmetal_hub::fit::DEFAULT_FIT_CONTEXT);
-    let reference = core
-        .policy
+    let reference = policy
         .check_reference("model", &args.model)
         .map_err(McpError::invalid_params)?;
     let (mut spec, source) = match local_dir_of(&reference) {
@@ -572,10 +569,9 @@ struct InspectArgs {
     path: String,
 }
 
-async fn inspect_output(core: &Core, args: Value) -> McpResult<ToolResult> {
+async fn inspect_output(policy: &PathPolicy, args: Value) -> McpResult<ToolResult> {
     let args: InspectArgs = parse(args)?;
-    let root = core
-        .policy
+    let root = policy
         .check_path("path", &args.path)
         .map_err(McpError::invalid_params)?;
     let report = tokio::task::spawn_blocking(move || inspect_dir(&root))
@@ -884,7 +880,12 @@ struct DecideArgs {
     port: Option<u32>,
 }
 
-async fn decide(core: &Core, args: Value, ctx: &RequestContext) -> McpResult<ToolResult> {
+async fn decide(
+    core: &Core,
+    policy: &PathPolicy,
+    args: Value,
+    ctx: &RequestContext,
+) -> McpResult<ToolResult> {
     let args: DecideArgs = parse(args)?;
     let body = serde_json::from_str::<Value>(&args.request)
         .map_err(|e| McpError::invalid_params(format!("request is not JSON: {e}")))?;
@@ -905,8 +906,7 @@ async fn decide(core: &Core, args: Value, ctx: &RequestContext) -> McpResult<Too
             Ok(results::text(reply))
         }
         (Some(model), None) => {
-            let model = core
-                .policy
+            let model = policy
                 .check_reference("model", &model)
                 .map_err(McpError::invalid_params)?;
             let staged = crate::staging::stage_private_file("decide", args.request.as_bytes())
@@ -948,7 +948,7 @@ async fn decide(core: &Core, args: Value, ctx: &RequestContext) -> McpResult<Too
 
 /// Every native tool's definition.
 pub fn definitions() -> Vec<Tool> {
-    vec![
+    let mut tools = vec![
         tool_for::<NoArgs>(
             "device_info",
             "Get Apple Silicon device information: GPU architecture, ANE cores, memory bandwidth, NAX support and unified memory capacity.",
@@ -1049,12 +1049,38 @@ pub fn definitions() -> Vec<Tool> {
             "Answer typed questions about a state with a decision model (Clef, Clef-flash): takes a /v1/systemone request body and returns one probability per allowed option of every question. With model, loads the model for this call; with port, asks a decision-model server already running (start_serve), which answers many requests without reloading.",
             Hints::READ.open_world(),
         ),
-    ]
+    ];
+    // What the job tools return is declared, so a client can rely on its shape.
+    for tool in &mut tools {
+        let output = match tool.name.as_str() {
+            "job_status" => schema_of::<JobSummary>(),
+            "list_jobs" => schema_of::<JobList>(),
+            "job_logs" => schema_of::<Logs>(),
+            _ => continue,
+        };
+        tool.output_schema = Some(turbomcp::ToolOutputSchema::from_value(output));
+    }
+    tools
+}
+
+/// Whether the native tool `name` takes a path or a model reference, which the
+/// server checks against the roots the client lists as well as its own.
+pub fn takes_paths(name: &str) -> bool {
+    matches!(
+        name,
+        "model_info"
+            | "verify_model"
+            | "delete_local_model"
+            | "model_fit"
+            | "inspect_output"
+            | "decide"
+    )
 }
 
 /// Run the native tool `name`, or `None` if there is none.
 pub async fn call(
     core: &Core,
+    policy: &PathPolicy,
     name: &str,
     args: Value,
     ctx: &RequestContext,
@@ -1064,11 +1090,11 @@ pub async fn call(
         "search_models" => search_models(core, args).await,
         "download_model" => download_model(core, args, ctx).await,
         "list_local_models" => list_local_models(core, args).await,
-        "model_info" => model_info(core, args).await,
-        "verify_model" => verify_model(core, args).await,
-        "delete_local_model" => delete_local_model(core, args).await,
-        "model_fit" => model_fit(core, args).await,
-        "inspect_output" => inspect_output(core, args).await,
+        "model_info" => model_info(policy, args).await,
+        "verify_model" => verify_model(policy, args).await,
+        "delete_local_model" => delete_local_model(policy, args).await,
+        "model_fit" => model_fit(policy, args).await,
+        "inspect_output" => inspect_output(policy, args).await,
         "list_jobs" => list_jobs(core, args).await,
         "job_status" => job_status(core, args).await,
         "job_logs" => job_logs(core, args).await,
@@ -1079,7 +1105,7 @@ pub async fn call(
         "job_save_checkpoint" => job_save_checkpoint(core, args).await,
         "job_graceful_stop" => job_graceful_stop(core, args).await,
         "chat" => chat(core, args, ctx).await,
-        "decide" => decide(core, args, ctx).await,
+        "decide" => decide(core, policy, args, ctx).await,
         _ => return None,
     })
 }

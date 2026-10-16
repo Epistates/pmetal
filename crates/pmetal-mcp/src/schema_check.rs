@@ -140,6 +140,27 @@ pub fn check_value(name: &str, value: &Value, schema: &Value) -> Result<(), Stri
             }
         }
     }
+    if let (Some(object), Some(properties)) = (
+        value.as_object(),
+        schema.get("properties").and_then(Value::as_object),
+    ) {
+        for required in schema
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            if !object.contains_key(required) {
+                return Err(format!("`{name}` is missing `{required}`"));
+            }
+        }
+        for (key, member) in object {
+            if let Some(member_schema) = properties.get(key) {
+                check_value(&format!("{name}.{key}"), member, member_schema)?;
+            }
+        }
+    }
     if let Some(items) = value.as_array() {
         if let Some(min) = schema.get("minItems").and_then(Value::as_u64) {
             if (items.len() as u64) < min {

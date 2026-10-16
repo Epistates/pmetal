@@ -120,6 +120,115 @@ async fn pretraining_shard_globs_are_checked_entry_by_entry() {
     );
 }
 
+mod client_roots {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use turbomcp::__macro_support::turbomcp_core::{McpSession, SessionFuture};
+    use turbomcp::McpHandler as _;
+    use turbomcp::RequestContext;
+
+    use super::*;
+
+    /// A client that answers `roots/list` with `roots`, or never answers.
+    #[derive(Debug)]
+    struct Client(Option<Vec<String>>);
+
+    impl McpSession for Client {
+        fn call<'a>(
+            &'a self,
+            method: &'a str,
+            _params: serde_json::Value,
+        ) -> SessionFuture<'a, serde_json::Value> {
+            Box::pin(async move {
+                assert_eq!(method, "roots/list");
+                match &self.0 {
+                    Some(uris) => Ok(json!({
+                        "roots": uris.iter().map(|u| json!({"uri": u, "name": "root"})).collect::<Vec<_>>()
+                    })),
+                    None => std::future::pending().await,
+                }
+            })
+        }
+        fn notify<'a>(
+            &'a self,
+            _method: &'a str,
+            _params: serde_json::Value,
+        ) -> SessionFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn workspace() -> std::path::PathBuf {
+        let dir = common::scratch_dir("client-root");
+        std::fs::write(dir.join("adapter_config.json"), r#"{"r": 8}"#).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn directories_the_client_lists_as_roots_are_allowed_too() {
+        let h = Harness::new("exit 0");
+        let dir = workspace();
+        let args = json!({"path": dir.display().to_string()});
+
+        // Without the client's say-so the directory is outside the server's.
+        let refused = h.call_err("inspect_output", args.clone()).await;
+        assert!(refused.contains("outside the directories"), "{refused}");
+
+        let client = Client(Some(vec![
+            format!("file://{}", dir.display()),
+            "https://not-a-file".into(),
+        ]));
+        let ctx = RequestContext::stdio().with_session(Arc::new(client));
+        let result = h
+            .server
+            .call_tool("inspect_output", args.clone(), &ctx)
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        assert_eq!(
+            result.structured_content.unwrap()["has_adapter"],
+            json!(true)
+        );
+
+        // The roots widen what is allowed, and no more: a sibling is still out.
+        let sibling = common::scratch_dir("sibling");
+        let result = h
+            .server
+            .call_tool(
+                "inspect_output",
+                json!({"path": sibling.display().to_string()}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn a_client_that_never_answers_does_not_stall_the_call() {
+        let h = Harness::new("exit 0");
+        let dir = workspace();
+        let ctx = RequestContext::stdio().with_session(Arc::new(Client(None)));
+        let started = Instant::now();
+        let result = h
+            .server
+            .call_tool(
+                "inspect_output",
+                json!({"path": dir.display().to_string()}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+}
+
 #[tokio::test]
 async fn an_inference_server_binds_to_this_machine_unless_the_operator_allows_more() {
     let h = Harness::new("sleep 5");

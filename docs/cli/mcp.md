@@ -95,10 +95,11 @@ common workflows: `finetune`, `evaluate_adapter` and `export_for_ollama`.
 
 Paths a client gives (outputs, datasets, adapters, local models) are made absolute,
 checked for `..` and for symlinks that lead out, and must lie under the server's working
-directory, the temporary directory, the model cache, or a directory listed in
-`PMETAL_MCP_ROOTS` (a `:`-separated list). A model or dataset that is not a path must be
-a well-formed Hugging Face ID. When a launcher starts the server in `/`, set
-`PMETAL_MCP_ROOTS` in the server's `env`:
+directory, the temporary directory, the model cache, a directory listed in
+`PMETAL_MCP_ROOTS` (a `:`-separated list), or a root the client lists (MCP `roots`: a
+client that supports them lists its workspace). A model or dataset that is not a path
+must be `owner/name` (with `:QUANT` to pick one GGUF quantization). When a launcher that
+lists no roots starts the server in `/`, set `PMETAL_MCP_ROOTS` in the server's `env`:
 
 ```json
 {
