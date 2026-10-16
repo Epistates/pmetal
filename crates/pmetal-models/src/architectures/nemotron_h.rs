@@ -1112,4 +1112,40 @@ pub(crate) mod tests {
         assert_eq!(config.layer_types(), vec!['M', 'E']);
         assert!(config.time_step_limit.1.is_infinite());
     }
+
+    /// FP8 weight storage reaches every projection of every kind of layer
+    /// (the generic pass, which reads the weights back through `Linear`) and
+    /// leaves the router, which is read as a float matrix, alone.
+    #[test]
+    fn fp8_storage_covers_the_projections_and_spares_the_router() {
+        use pmetal_runtime::compat::ModuleParametersExt;
+
+        pmetal_runtime::compat::random::seed(3);
+        let mut model = NemotronHForCausalLM::new(small_config()).unwrap();
+        let ids = Array::from_slice(&[1i32, 5, 9, 2, 7, 3, 8, 4], &[1, 8]);
+        let dense = model.forward(&ids, None).unwrap();
+        crate::fp8_utils::quantize_model_linears(&mut model).unwrap();
+        let packed = model.forward(&ids, None).unwrap();
+        pmetal_runtime::check_unobserved_error().unwrap();
+
+        let params = model.flatten_params();
+        let dtype = |key: &str| params[key].dtype();
+        for packed_key in [
+            "backbone.layers.0.mixer.in_proj.weight",
+            "backbone.layers.0.mixer.out_proj.weight",
+            "backbone.layers.1.mixer.q_proj.weight",
+            "backbone.layers.2.mixer.up_proj.weight",
+            "backbone.layers.3.mixer.shared_experts.up_proj.weight",
+        ] {
+            assert_eq!(dtype(packed_key), Dtype::Uint8, "{packed_key}");
+        }
+        assert_eq!(
+            dtype("backbone.layers.3.mixer.gate.weight"),
+            Dtype::Float32,
+            "the router is not stored in FP8"
+        );
+        assert_eq!(packed.shape(), dense.shape());
+        let finite = packed.abs().max(None).item::<f32>();
+        assert!(finite.is_finite() && finite > 0.0, "{finite}");
+    }
 }
