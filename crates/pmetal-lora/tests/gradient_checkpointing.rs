@@ -118,6 +118,22 @@ const CASES: &[(&str, &str)] = &[
         }"#,
     ),
     (
+        // Mamba-2, attention, an MLP and routed experts, with the scan's
+        // chunks shorter than the sequence.
+        "nemotron_h",
+        r#"{
+            "model_type": "nemotron_h",
+            "vocab_size": 128, "hidden_size": 64, "intermediate_size": 96,
+            "hybrid_override_pattern": "M*-EM",
+            "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16,
+            "mamba_num_heads": 4, "mamba_head_dim": 16, "ssm_state_size": 16,
+            "n_groups": 2, "chunk_size": 8,
+            "moe_intermediate_size": 32, "moe_shared_expert_intermediate_size": 48,
+            "n_routed_experts": 4, "num_experts_per_tok": 2,
+            "max_position_embeddings": 256, "tie_word_embeddings": false
+        }"#,
+    ),
+    (
         "gemma",
         r#"{
             "model_type": "gemma",

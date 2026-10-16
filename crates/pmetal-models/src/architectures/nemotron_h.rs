@@ -26,6 +26,7 @@ use pmetal_runtime::impl_module_params;
 use pmetal_runtime::nn::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 use serde::{Deserialize, Serialize};
 
+use crate::checkpointing::checkpointed_layer;
 use crate::common::mamba2::{Mamba2Config, Mamba2Mixer, segments_from_positions};
 use crate::common::switch_mlp::PlainSwitchMlp;
 
@@ -831,6 +832,9 @@ pub struct NemotronHModel {
     pub layers: Vec<NemotronHBlock>,
     pub norm_f: nn::RmsNorm,
     pub config: NemotronHConfig,
+    /// Recompute each layer's activations during the backward pass instead of
+    /// holding them. Training only; see `crate::checkpointing`.
+    pub grad_checkpoint: bool,
 }
 impl_module_params!(NemotronHModel; embeddings, layers, norm_f);
 
@@ -851,6 +855,7 @@ impl NemotronHModel {
             layers,
             norm_f,
             config,
+            grad_checkpoint: false,
         })
     }
 
@@ -865,9 +870,9 @@ impl NemotronHModel {
     ) -> Result<Array, Exception> {
         // A packed row restarts its position ids at every sequence; the Mamba
         // layers, which no attention mask reaches, reset there too.
-        let segments = positions
-            .filter(|_| kv_cache.is_none() && mamba_cache.is_none())
-            .map(|p| segments_from_positions(p, input_ids.dim(0)));
+        let positions = positions.filter(|_| kv_cache.is_none() && mamba_cache.is_none());
+        let segments = positions.map(|p| segments_from_positions(p, input_ids.dim(0)));
+        let grad_checkpoint = self.grad_checkpoint;
         let mut hidden = Module::forward(&mut self.embeddings, input_ids)?;
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             let attends = layer.block_type() == '*';
@@ -883,13 +888,30 @@ impl NemotronHModel {
             } else {
                 None
             };
-            hidden = layer.forward_segmented(
-                &hidden,
-                mask.filter(|_| attends),
-                kv,
-                mamba,
-                segments.as_ref(),
-            )?;
+            hidden = if grad_checkpoint && kv.is_none() && mamba.is_none() {
+                // No cache means a pass that is differentiated, which has a
+                // backward for the recompute to pay for. The positions go in
+                // as an input and the segments are rebuilt from them inside,
+                // since the closure outlives this call.
+                checkpointed_layer(
+                    layer,
+                    &hidden,
+                    mask.filter(|_| attends),
+                    positions,
+                    |layer, h, mask, positions| {
+                        let segments = positions.map(|p| segments_from_positions(p, h.dim(0)));
+                        layer.forward_segmented(h, mask, None, None, segments.as_ref())
+                    },
+                )?
+            } else {
+                layer.forward_segmented(
+                    &hidden,
+                    mask.filter(|_| attends),
+                    kv,
+                    mamba,
+                    segments.as_ref(),
+                )?
+            };
         }
         Ok(hidden)
     }

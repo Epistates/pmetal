@@ -2045,11 +2045,12 @@ impl DynamicModel {
             Self::DeepSeek(m) => Some(&mut m.model.grad_checkpoint),
             Self::Cohere(m) => Some(&mut m.model.grad_checkpoint),
             Self::Granite(m) => Some(&mut m.model.grad_checkpoint),
+            Self::NemotronH(m) => Some(&mut m.backbone.grad_checkpoint),
             Self::GptOss(m) => Some(&mut m.model.grad_checkpoint),
-            // Gemma 4, Qwen3-Next, Nemotron-H and Mllama are left out on
+            // Gemma 4, Qwen3-Next and Mllama are left out on
             // purpose. Each has a trunk whose layers read or write state
-            // belonging to another layer (Gemma 4's shared KV, the hybrid
-            // models' recurrent caches, Mllama's cross-attention), and a
+            // belonging to another layer (Gemma 4's shared KV, Qwen 3.5's
+            // recurrent caches, Mllama's cross-attention), and a
             // recompute would replay those side effects a second time. They
             // need the state threading through `checkpoint` as an input, not
             // just an extra call site.
@@ -2070,6 +2071,7 @@ impl DynamicModel {
             Self::DeepSeek(m) => Some(m.model.grad_checkpoint),
             Self::Cohere(m) => Some(m.model.grad_checkpoint),
             Self::Granite(m) => Some(m.model.grad_checkpoint),
+            Self::NemotronH(m) => Some(m.backbone.grad_checkpoint),
             Self::GptOss(m) => Some(m.model.grad_checkpoint),
             _ => None,
         }
