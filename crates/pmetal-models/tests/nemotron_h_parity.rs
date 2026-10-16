@@ -274,6 +274,55 @@ fn cached_decode(profile: &str) {
     );
 }
 
+/// A compressed KV cache serves a hybrid whose first layer is not attention:
+/// the cache's length and token count cannot be read off layer 0.
+#[test]
+#[serial]
+fn a_quantized_kv_cache_decodes_a_hybrid() {
+    use pmetal_cache::kv_cache::CacheMode;
+
+    let (fx, mut model) = load("hybrid_moe");
+    let ids = fx.input_ids();
+    let t = ids.dim(1);
+    let want = fx.tensor("logits");
+    let mut kv = model.create_cache_with_mode(
+        t as usize + 1,
+        CacheMode::Quantized {
+            bits: 8,
+            group_size: 16,
+        },
+    );
+    let mut mamba = model.create_mamba_cache();
+    let first = model
+        .forward_with_hybrid_cache(&rows(&ids, 0, PREFILL), None, Some(&mut kv), mamba.as_mut())
+        .expect("quantized-cache prefill");
+    let mut got = vec![first];
+    for pos in PREFILL..t {
+        got.push(
+            model
+                .forward_with_hybrid_cache(
+                    &rows(&ids, pos, pos + 1),
+                    None,
+                    Some(&mut kv),
+                    mamba.as_mut(),
+                )
+                .expect("quantized-cache decode"),
+        );
+    }
+    drain_bridge("quantized cache");
+    let refs: Vec<&Array> = got.iter().collect();
+    let got = pmetal_runtime::compat::ops::concatenate_axis(&refs, 1);
+    // 8-bit keys and values: the logits move a little, the tokens not at all.
+    let report = ParityReport::compute("logits", &got, &want, Tolerance::new(5e-2, 0.0));
+    assert_all_pass("quantized KV cache", &[report]);
+    assert_eq!(
+        argmax_last_axis(&got),
+        argmax_last_axis(&want),
+        "greedy tokens differ from the reference"
+    );
+    assert!(kv.seq_len() > 0, "the cache reports no tokens");
+}
+
 /// A prompt cut into pieces of every awkward size (shorter than the conv
 /// kernel, shorter than a scan chunk, longer) carries the conv history and
 /// the SSM state across the cuts.
