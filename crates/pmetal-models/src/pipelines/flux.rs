@@ -34,7 +34,8 @@ impl FluxPipeline {
         flux_config: FluxConfig,
         vae_config: VAEConfig,
     ) -> Result<Self> {
-        let clip = CLIPTextModel::new(clip_config);
+        let clip = CLIPTextModel::new(clip_config)
+            .map_err(|e| pmetal_core::PMetalError::ModelLoad(e.to_string()))?;
         let t5 = T5EncoderModel::new(t5_config)
             .map_err(|e| pmetal_core::PMetalError::ModelLoad(e.to_string()))?;
         let dit = FluxDiT::new(flux_config);
@@ -64,7 +65,7 @@ impl FluxPipeline {
 
         let clip_weights = load_weights(&component_paths.text_encoder)
             .map_err(|e| pmetal_core::PMetalError::ModelLoad(e.to_string()))?;
-        load_clip_weights(&mut pipeline.clip, &clip_weights)
+        load_clip_weights(&mut pipeline.clip, clip_weights)
             .map_err(|e| pmetal_core::PMetalError::ModelLoad(e.to_string()))?;
 
         let t5_weights = load_weights(&component_paths.text_encoder_2)
@@ -123,10 +124,11 @@ impl FluxPipeline {
         let batch_size = clip_input.dim(0);
 
         // 1. Encode prompts
-        let (pooled_prompt_emb, _clip_hidden) = self
+        let pooled_prompt_emb = self
             .clip
             .forward(clip_input)
-            .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?;
+            .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?
+            .pooled_output;
         let prompt_emb = self
             .t5
             .forward(t5_input, None)
@@ -295,26 +297,7 @@ fn read_json(path: &Path) -> Result<Value> {
 
 fn load_clip_config(component_dir: &Path) -> Result<CLIPConfig> {
     let raw = read_json(&component_dir.join("config.json"))?;
-    let mut config = CLIPConfig::default();
-
-    config.vocab_size = value_usize(&raw, &["vocab_size"]).unwrap_or(config.vocab_size);
-    config.embed_dim = value_usize(&raw, &["embed_dim", "hidden_size"]).unwrap_or(config.embed_dim);
-    config.num_layers =
-        value_usize(&raw, &["num_layers", "num_hidden_layers"]).unwrap_or(config.num_layers);
-    config.num_heads =
-        value_usize(&raw, &["num_heads", "num_attention_heads"]).unwrap_or(config.num_heads);
-    config.intermediate_size =
-        value_usize(&raw, &["intermediate_size"]).unwrap_or(config.intermediate_size);
-    config.max_position_embeddings =
-        value_usize(&raw, &["max_position_embeddings"]).unwrap_or(config.max_position_embeddings);
-    config.layer_norm_eps = value_f32(&raw, &["layer_norm_eps"]).unwrap_or(config.layer_norm_eps);
-    // Taken verbatim — `CLIPMLP` resolves it through `ACT2FN`, so `"gelu"`
-    // (exact erf) and `"gelu_new"` (tanh) stay distinct.
-    if let Some(hidden_act) = value_str(&raw, &["hidden_act", "activation_function"]) {
-        config.hidden_act = hidden_act.to_string();
-    }
-
-    Ok(config)
+    serde_json::from_value(raw).map_err(|e| pmetal_core::PMetalError::Config(e.to_string()))
 }
 
 fn load_t5_config(component_dir: &Path) -> Result<T5Config> {
@@ -418,12 +401,14 @@ mod tests {
     fn test_flux_pipeline_structural() {
         let clip_config = CLIPConfig {
             num_layers: 1,
-            num_heads: 1,
-            ..Default::default()
+            ..CLIPConfig::clip_vit_l_14()
         };
         let t5_config = T5Config {
+            d_model: 4096,
+            d_ff: 10240,
             num_layers: 1,
-            num_heads: 1,
+            num_heads: 64,
+            feed_forward_proj: "gated-gelu".into(),
             ..Default::default()
         };
         let flux_config = FluxConfig {

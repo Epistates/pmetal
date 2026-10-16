@@ -10,117 +10,6 @@ use crate::architectures::flux::FluxDiT;
 use crate::architectures::t5::T5EncoderModel;
 use crate::architectures::vae::FluxVAE;
 
-pub fn load_clip_weights(
-    model: &mut CLIPTextModel,
-    weights: &HashMap<String, Array>,
-) -> Result<(), LoadError> {
-    for (name, weight) in weights {
-        let name = if let Some(stripped) = name.strip_prefix("text_model.") {
-            stripped
-        } else {
-            name
-        };
-
-        match name {
-            "embeddings.token_embedding.weight" => {
-                model.token_embedding.weight =
-                    pmetal_runtime::compat::module::Param::new(weight.clone())
-            }
-            "embeddings.position_embedding.weight" => {
-                model.position_embedding =
-                    pmetal_runtime::compat::module::Param::new(weight.clone())
-            }
-            "final_layer_norm.weight" => {
-                model.final_layer_norm.weight =
-                    pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-            }
-            "final_layer_norm.bias" => {
-                model.final_layer_norm.bias =
-                    pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-            }
-            _ if name.starts_with("encoder.layers.") => {
-                let parts: Vec<&str> = name.split('.').collect();
-                let idx = parts[2].parse::<usize>().map_err(|_| {
-                    LoadError::SafeTensors(format!("Invalid layer index in key: {}", name))
-                })?;
-                if idx >= model.layers.len() {
-                    continue;
-                }
-                let sub_path = parts[3..].join(".");
-                match sub_path.as_str() {
-                    "self_attn.q_proj.weight" => {
-                        model.layers[idx].attn.q_proj.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "self_attn.q_proj.bias" => {
-                        model.layers[idx].attn.q_proj.bias =
-                            pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                    }
-                    "self_attn.k_proj.weight" => {
-                        model.layers[idx].attn.k_proj.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "self_attn.k_proj.bias" => {
-                        model.layers[idx].attn.k_proj.bias =
-                            pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                    }
-                    "self_attn.v_proj.weight" => {
-                        model.layers[idx].attn.v_proj.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "self_attn.v_proj.bias" => {
-                        model.layers[idx].attn.v_proj.bias =
-                            pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                    }
-                    "self_attn.out_proj.weight" => {
-                        model.layers[idx].attn.out_proj.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "self_attn.out_proj.bias" => {
-                        model.layers[idx].attn.out_proj.bias =
-                            pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                    }
-                    "layer_norm1.weight" => {
-                        model.layers[idx].norm1.weight =
-                            pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                    }
-                    "layer_norm1.bias" => {
-                        model.layers[idx].norm1.bias =
-                            pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                    }
-                    "layer_norm2.weight" => {
-                        model.layers[idx].norm2.weight =
-                            pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                    }
-                    "layer_norm2.bias" => {
-                        model.layers[idx].norm2.bias =
-                            pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                    }
-                    "mlp.fc1.weight" => {
-                        model.layers[idx].mlp.fc1.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "mlp.fc1.bias" => {
-                        model.layers[idx].mlp.fc1.bias =
-                            pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                    }
-                    "mlp.fc2.weight" => {
-                        model.layers[idx].mlp.fc2.weight =
-                            pmetal_runtime::compat::module::Param::new(weight.clone())
-                    }
-                    "mlp.fc2.bias" => {
-                        model.layers[idx].mlp.fc2.bias =
-                            pmetal_runtime::compat::module::Param::new(Some(weight.clone()))
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
 /// Rename a checkpoint's tensors to the model's parameter paths, check each
 /// shape against the parameter it lands on, and assign them under `policy`,
 /// which fails unless checkpoint and model account for each other.
@@ -158,6 +47,69 @@ fn assign_renamed<M: ModuleParameters + ModuleParametersExt>(
         }
     }
     assign_weights(model, renamed, policy)
+}
+
+/// The model path of a CLIP text encoder checkpoint key, `transformers`
+/// layout, with or without the `text_model.` namespace a standalone text tower
+/// is saved under.
+fn clip_param_name(key: &str) -> String {
+    let key = key.strip_prefix("text_model.").unwrap_or(key);
+    if let Some(rest) = key.strip_prefix("embeddings.") {
+        return rest.to_string();
+    }
+    if key.starts_with("final_layer_norm.") || key.starts_with("text_projection.") {
+        return key.to_string();
+    }
+    let Some(rest) = key.strip_prefix("encoder.layers.") else {
+        return key.to_string();
+    };
+    let Some((index, rest)) = rest.split_once('.') else {
+        return key.to_string();
+    };
+    let mapped = if let Some(rest) = rest.strip_prefix("self_attn.") {
+        format!("attn.{rest}")
+    } else if let Some(rest) = rest.strip_prefix("layer_norm1.") {
+        format!("norm1.{rest}")
+    } else if let Some(rest) = rest.strip_prefix("layer_norm2.") {
+        format!("norm2.{rest}")
+    } else if rest.starts_with("mlp.") {
+        rest.to_string()
+    } else {
+        return key.to_string();
+    };
+    format!("layers.{index}.{mapped}")
+}
+
+/// Load a CLIP text encoder from a `transformers` checkpoint (`CLIPTextModel`,
+/// `CLIPTextModelWithProjection`, or the text half of a full `CLIPModel`).
+///
+/// Fails, naming the difference, unless every tensor of the text tower is
+/// consumed and every parameter filled and each shape matches.
+pub fn load_clip_weights(
+    model: &mut CLIPTextModel,
+    weights: HashMap<String, Array>,
+) -> Result<(), LoadError> {
+    let mut policy = LoadPolicy::strict().allowing_unused_tensors(&[
+        Exemption::new(
+            "vision_model.*",
+            "the image tower of a full CLIP checkpoint; this model is the text encoder",
+        ),
+        Exemption::new(
+            "visual_projection.weight",
+            "the image projection of a full CLIP checkpoint; this model is the text encoder",
+        ),
+        Exemption::new(
+            "logit_scale",
+            "the contrastive temperature of a full CLIP checkpoint; not used to encode text",
+        ),
+    ]);
+    if model.text_projection.is_none() {
+        policy = policy.allowing_unused_tensors(&[Exemption::new(
+            "*text_projection.weight",
+            "the projection of a full CLIP checkpoint; a CLIPTextModel pools without it",
+        )]);
+    }
+    assign_renamed(model, weights, clip_param_name, &policy)
 }
 
 /// The model path of a T5 encoder checkpoint key, `transformers` layout.
