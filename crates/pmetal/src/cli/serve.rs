@@ -17,6 +17,23 @@ pub struct ServeArgs {
     #[arg(long = "host", default_value = "127.0.0.1")]
     pub host: String,
 
+    /// API key clients must send (`Authorization: Bearer <key>` or
+    /// `x-api-key: <key>`); repeat for several. The PMETAL_API_KEY environment
+    /// variable (comma-separated) sets the same, without the key appearing in
+    /// the process list. With none, the server is open: bind it to loopback.
+    #[arg(long = "api-key")]
+    pub api_key: Vec<String>,
+
+    /// Browser origin whose pages may call the server (CORS), or `*` for
+    /// any; repeat for several. Without one, no CORS headers are sent.
+    #[arg(long = "cors-origin")]
+    pub cors_origin: Vec<String>,
+
+    /// Seconds one request may run before the server ends it (a 504, or an
+    /// error frame in a stream); 0 for no limit.
+    #[arg(long = "request-timeout", default_value = "1800")]
+    pub request_timeout: u64,
+
     /// Context length the server holds per sequence (prompt plus output).
     /// Default: the model's context window (max_position_embeddings, or the
     /// YaRN-stretched length), capped by what the device's memory holds for
@@ -52,7 +69,8 @@ pub struct ServeArgs {
     #[arg(long = "kv-turboquant-preset", value_parser = ["q2_5", "q3_5"])]
     pub kv_turboquant_preset: Option<String>,
 
-    /// Enable ANE (Apple Neural Engine) for serving (experimental).
+    /// Generate on the ANE (Apple Neural Engine) (experimental). A model the
+    /// ANE cannot run is an error, not a quiet GPU run.
     #[cfg(feature = "ane")]
     #[arg(long = "ane")]
     pub ane: bool,

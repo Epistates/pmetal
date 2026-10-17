@@ -422,6 +422,13 @@ pub struct DecodeSampler {
     penalties: Option<DecodePenalties>,
     processors: Vec<Box<dyn LogitsProcessor>>,
     draws: u64,
+    /// The newest token, drawn and recorded but not yet passed to the
+    /// processors that follow the generation. Reading it back when it is
+    /// recorded would stall the host until the GPU had finished the step that
+    /// drew it, with the next step's forward not yet queued behind it; it is
+    /// read when the next step needs it, after that forward has been queued
+    /// (see [`constrained_logits`](Self::constrained_logits)).
+    pending: Option<InlineArray>,
 }
 
 impl DecodeSampler {
@@ -442,6 +449,7 @@ impl DecodeSampler {
             penalties,
             processors,
             draws: 0,
+            pending: None,
         }
     }
 
@@ -466,6 +474,7 @@ impl DecodeSampler {
             penalties: self.penalties.clone(),
             processors: self.processors.iter().map(|p| p.fork()).collect(),
             draws: self.draws,
+            pending: self.pending.clone(),
         }
     }
 
@@ -487,6 +496,14 @@ impl DecodeSampler {
     /// greedy decoder takes the argmax of. Reads the history without
     /// recording a token.
     pub fn constrained_logits(&mut self, logits_2d: &InlineArray) -> InlineArray {
+        // The step that made these logits was queued behind the token the
+        // processors are waiting for. Start it on the GPU, then read that
+        // token (it is ready as soon as the GPU gets to it) and let the
+        // processors work out their constraint while the step runs.
+        if self.pending.is_some() {
+            logits_2d.async_eval_ref();
+            self.flush_pending();
+        }
         let mut logits = match self.penalties.as_mut() {
             Some(penalties) => penalties.apply(logits_2d),
             None => logits_2d.clone(),
@@ -605,6 +622,16 @@ impl DecodeSampler {
             penalties.record(token);
         }
         if self.needs_host_tokens() {
+            // The previous token goes first, whatever order the two were
+            // recorded in.
+            self.flush_pending();
+            self.pending = Some(token.clone());
+        }
+    }
+
+    /// Pass the token waiting to the processors that follow the generation.
+    fn flush_pending(&mut self) {
+        if let Some(token) = self.pending.take() {
             let id = token.item_u32();
             for processor in self.processors.iter_mut().filter(|p| p.needs_host_tokens()) {
                 processor.accept(id);
@@ -617,6 +644,7 @@ impl DecodeSampler {
         if let Some(penalties) = self.penalties.as_mut() {
             penalties.record_id(token);
         }
+        self.flush_pending();
         for processor in self.processors.iter_mut().filter(|p| p.needs_host_tokens()) {
             processor.accept(token);
         }
@@ -1934,6 +1962,68 @@ mod tests {
         };
         assert!(only(&odd_fork, last % 2), "{odd_fork:?}");
         assert!(only(&from_original, 1 - last % 2), "original untouched");
+    }
+
+    /// Records the order of the tokens it is told, and how many it has been
+    /// told, where the test can see.
+    struct Tally {
+        told: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+    }
+
+    impl LogitsProcessor for Tally {
+        fn process(&mut self, logits_2d: &InlineArray) -> InlineArray {
+            logits_2d.clone()
+        }
+
+        fn accept(&mut self, token: u32) {
+            self.told.lock().unwrap().push(token);
+        }
+
+        fn needs_host_tokens(&self) -> bool {
+            true
+        }
+
+        fn fork(&self) -> Box<dyn LogitsProcessor> {
+            Box::new(Tally {
+                told: std::sync::Arc::clone(&self.told),
+            })
+        }
+    }
+
+    /// A token is read back for the processors that follow the generation
+    /// when the next step needs them, not when it is recorded: reading it
+    /// then would stall the host until the GPU had finished the step that
+    /// drew it, before the next step's forward could be queued behind it.
+    /// What the processors see, and when they see it relative to the steps
+    /// that depend on it, does not change.
+    #[test]
+    fn processors_are_told_a_token_when_the_next_step_needs_it() {
+        let told = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut sampler =
+            DecodeSampler::new(SamplingParams::new(0.0), &[]).with_processor(Box::new(Tally {
+                told: std::sync::Arc::clone(&told),
+            }));
+        let logits = InlineArray::from_f32_slice(&[0.0, 0.0, 5.0, 1.0], &[1, 4]);
+        let first = sampler.sample(&logits);
+        assert!(
+            told.lock().unwrap().is_empty(),
+            "recording a token must not read it back"
+        );
+        let second = sampler.sample(&logits);
+        assert_eq!(*told.lock().unwrap(), vec![first.item_u32()]);
+        // A token the host holds goes after the one waiting.
+        sampler.record_id(3);
+        assert_eq!(
+            *told.lock().unwrap(),
+            vec![first.item_u32(), second.item_u32(), 3]
+        );
+        // A fork starts with the token its original had not yet passed on.
+        let third = sampler.sample(&logits);
+        let mut fork = sampler.fork();
+        fork.record_id(1);
+        let told = told.lock().unwrap();
+        assert_eq!(told[told.len() - 2..], [third.item_u32(), 1]);
+        crate::check_unobserved_error().expect("no bridge op failed");
     }
 
     /// Six positions' logits, one row each, spread enough that a draw at

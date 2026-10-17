@@ -3,16 +3,8 @@
 //! BPE tokenisers can split a multi-byte UTF-8 codepoint across two tokens
 //! — emitting each `Tokenizer::decode(&[token])` independently would send
 //! invalid `\xNN` byte sequences to the client, which most HTTP/SSE
-//! consumers reject. [`IncrementalDecoder`] buffers the full token
-//! sequence, decodes the growing buffer as a unit, and emits only the
-//! confirmed text prefix that has already shown up in a complete decode.
-//!
-//! All three streaming handlers (`chat_sse_stream`, `completion_sse_stream`,
-//! and Anthropic `messages` streaming) previously open-coded this pattern
-//! with `token_buffer: Vec<u32>` + `emitted_text_len: usize`. Factoring it
-//! here keeps the state machine in one place — the handlers only differ in
-//! how they wrap the decoded text into their endpoint-specific event
-//! frames.
+//! consumers reject. [`IncrementalDecoder`] decodes a window of the newest
+//! tokens as a unit and emits only the text confirmed complete.
 
 use std::sync::Arc;
 
@@ -29,9 +21,14 @@ use std::sync::Arc;
 /// // on TokenEvent::Done:
 /// let tail = dec.flush();
 /// if !tail.is_empty() { emit_content_delta(tail); }
-/// // For tool-call detection post-Done:
-/// let full = dec.decoded_text_with_special_tokens();
 /// ```
+///
+/// Each step decodes a window of the newest tokens, not the whole
+/// generation: the window starts at the tokens behind the last emission (the
+/// context that makes their text decode as it does in the full sequence) and
+/// ends at the newest token, so a step costs the same at the thirty-thousandth
+/// token as at the first. Text is held back while the window ends in a
+/// partial UTF-8 sequence (U+FFFD); [`flush`](Self::flush) releases it.
 ///
 /// Streaming logprobs use `push_with_aux` / `flush_aux` to keep an arbitrary
 /// per-token payload aligned with the text deltas: tokens that don't yet
@@ -40,8 +37,14 @@ use std::sync::Arc;
 /// returned alongside the new text.
 pub struct IncrementalDecoder<Aux = ()> {
     tokenizer: Arc<pmetal_data::Tokenizer>,
+    /// Keep special tokens in the text (tool-call protocols are written in
+    /// them) instead of skipping them.
+    keep_special: bool,
     buffer: Vec<u32>,
-    emitted: usize,
+    /// Where the decode window starts: the first token of the last emission.
+    prefix_offset: usize,
+    /// How many tokens' text has been emitted.
+    read_offset: usize,
     /// Per-token aux payloads waiting for their emission boundary.
     pending_aux: Vec<Aux>,
 }
@@ -51,10 +54,19 @@ impl<Aux> IncrementalDecoder<Aux> {
     pub fn new(tokenizer: Arc<pmetal_data::Tokenizer>) -> Self {
         Self {
             tokenizer,
+            keep_special: false,
             buffer: Vec::new(),
-            emitted: 0,
+            prefix_offset: 0,
+            read_offset: 0,
             pending_aux: Vec::new(),
         }
+    }
+
+    /// Decode special tokens into the text rather than dropping them.
+    #[must_use]
+    pub fn keeping_special_tokens(mut self, keep: bool) -> Self {
+        self.keep_special = keep;
+        self
     }
 
     /// Push a token and return the newly confirmed text prefix. Returns an
@@ -62,7 +74,7 @@ impl<Aux> IncrementalDecoder<Aux> {
     /// should skip emitting an SSE frame in that case.
     pub fn push(&mut self, token_id: u32) -> String {
         self.buffer.push(token_id);
-        self.consume_newly_decoded()
+        self.consume_newly_decoded(false)
     }
 
     /// Push a token with an associated aux payload. Returns the newly
@@ -73,7 +85,7 @@ impl<Aux> IncrementalDecoder<Aux> {
     pub fn push_with_aux(&mut self, token_id: u32, aux: Aux) -> (String, Vec<Aux>) {
         self.buffer.push(token_id);
         self.pending_aux.push(aux);
-        let text = self.consume_newly_decoded();
+        let text = self.consume_newly_decoded(false);
         if text.is_empty() {
             (text, Vec::new())
         } else {
@@ -84,40 +96,50 @@ impl<Aux> IncrementalDecoder<Aux> {
     /// Flush any remaining buffered tokens at end-of-stream. Returns an
     /// empty string when every decoded byte has already been emitted.
     pub fn flush(&mut self) -> String {
-        self.consume_newly_decoded()
+        self.consume_newly_decoded(true)
     }
 
-    /// Same as [`flush`] but also returns any pending aux payloads that
-    /// never got drained because their tokens never produced a complete
-    /// codepoint. Callers using [`push_with_aux`] should prefer this on
-    /// the terminal Done event so no payload is silently dropped.
+    /// Same as [`flush`](Self::flush) but also returns any pending aux
+    /// payloads that never got drained because their tokens never produced a
+    /// complete codepoint. Callers using
+    /// [`push_with_aux`](Self::push_with_aux) should prefer this on the
+    /// terminal Done event so no payload is silently dropped.
     pub fn flush_aux(&mut self) -> (String, Vec<Aux>) {
-        let text = self.consume_newly_decoded();
+        let text = self.consume_newly_decoded(true);
         let aux = std::mem::take(&mut self.pending_aux);
         (text, aux)
     }
 
-    /// The full decoded text with special tokens preserved. Tool-call
-    /// protocols such as Gemma 4 use special-token delimiters, so final
-    /// tool-call parsing needs this form even when user-visible deltas use
-    /// normal decoding.
-    pub fn decoded_text_with_special_tokens(&self) -> String {
-        self.tokenizer
-            .decode_with_special_tokens(&self.buffer)
-            .unwrap_or_default()
+    fn decode(&self, ids: &[u32]) -> String {
+        let decoded = if self.keep_special {
+            self.tokenizer.decode_with_special_tokens(ids)
+        } else {
+            self.tokenizer.decode(ids)
+        };
+        decoded.unwrap_or_default()
     }
 
-    /// Advance `emitted` to the current decoded length and return the
-    /// suffix that crossed the boundary. Shared by [`push`] and [`flush`].
-    fn consume_newly_decoded(&mut self) -> String {
-        let decoded = self.tokenizer.decode(&self.buffer).unwrap_or_default();
-        if decoded.len() > self.emitted {
-            let out = decoded[self.emitted..].to_owned();
-            self.emitted = decoded.len();
-            out
-        } else {
-            String::new()
+    /// The text the window adds to what was emitted, advancing the window
+    /// past it. A window that ends in a partial codepoint (U+FFFD) adds
+    /// nothing until `flush`.
+    fn consume_newly_decoded(&mut self, flush: bool) -> String {
+        if self.read_offset >= self.buffer.len() {
+            return String::new();
         }
+        let emitted = self.decode(&self.buffer[self.prefix_offset..self.read_offset]);
+        let window = self.decode(&self.buffer[self.prefix_offset..]);
+        if window.len() <= emitted.len() || (!flush && window.ends_with('\u{fffd}')) {
+            return String::new();
+        }
+        let Some(delta) = window.get(emitted.len()..) else {
+            // The window decodes differently from its prefix (a merge across
+            // the boundary): nothing consistent to emit yet.
+            return String::new();
+        };
+        let delta = delta.to_owned();
+        self.prefix_offset = self.read_offset;
+        self.read_offset = self.buffer.len();
+        delta
     }
 }
 
@@ -131,6 +153,9 @@ pub struct ChannelDelta<Aux> {
     pub content: String,
     /// Aux payloads of the answer tokens behind `content`.
     pub aux: Vec<Aux>,
+    /// Tool calls the decoder itself finished (Harmony messages addressed to
+    /// a function); a decoder that leaves calls in the text leaves this empty.
+    pub calls: Vec<crate::tools::ParsedCall>,
 }
 
 /// An [`IncrementalDecoder`] per channel, fed by the
@@ -145,7 +170,7 @@ pub struct ChannelDecoder<Aux = ()> {
     answer: IncrementalDecoder<Aux>,
     reasoning_started: bool,
     answer_started: bool,
-    tokens: usize,
+    reasoning_tokens: usize,
 }
 
 impl<Aux> ChannelDecoder<Aux> {
@@ -160,17 +185,27 @@ impl<Aux> ChannelDecoder<Aux> {
             answer: IncrementalDecoder::new(tokenizer),
             reasoning_started: false,
             answer_started: false,
-            tokens: 0,
+            reasoning_tokens: 0,
         }
+    }
+
+    /// Keep special tokens in the answer's text (a tool-call protocol
+    /// written in them needs to see them).
+    #[must_use]
+    pub fn keeping_special_tokens(mut self, keep: bool) -> Self {
+        self.answer = self.answer.keeping_special_tokens(keep);
+        self
     }
 
     /// Push a generated token; its aux payload is kept when it belongs to
     /// the answer and dropped otherwise.
     pub fn push_with_aux(&mut self, token_id: u32, aux: Aux) -> ChannelDelta<Aux> {
         use pmetal_data::stream_format::Route;
-        self.tokens += 1;
         let (reasoning, content, aux) = match self.splitter.route(token_id) {
-            Route::Reasoning => (self.reasoning.push(token_id), String::new(), Vec::new()),
+            Route::Reasoning => {
+                self.reasoning_tokens += 1;
+                (self.reasoning.push(token_id), String::new(), Vec::new())
+            }
             Route::Answer => {
                 let (text, aux) = self.answer.push_with_aux(token_id, aux);
                 (String::new(), text, aux)
@@ -187,14 +222,9 @@ impl<Aux> ChannelDecoder<Aux> {
         self.delta(reasoning, content, aux)
     }
 
-    /// The answer decoded with special tokens kept, for tool-call parsing.
-    pub fn answer_with_special_tokens(&self) -> String {
-        self.answer.decoded_text_with_special_tokens()
-    }
-
-    /// Number of tokens generated so far, markers and reasoning included.
-    pub fn token_count(&self) -> usize {
-        self.tokens
+    /// How many of the tokens pushed were reasoning.
+    pub fn reasoning_token_count(&self) -> usize {
+        self.reasoning_tokens
     }
 
     fn delta(&mut self, reasoning: String, content: String, aux: Vec<Aux>) -> ChannelDelta<Aux> {
@@ -202,14 +232,242 @@ impl<Aux> ChannelDecoder<Aux> {
             reasoning: trim_channel_start(reasoning, &mut self.reasoning_started),
             content: trim_channel_start(content, &mut self.answer_started),
             aux,
+            calls: Vec::new(),
         }
     }
 }
 
-impl ChannelDecoder<()> {
-    /// [`push_with_aux`](Self::push_with_aux) without a payload.
-    pub fn push(&mut self, token_id: u32) -> ChannelDelta<()> {
-        self.push_with_aux(token_id, ())
+// ────────────────────────────────────────────────────────────────────────────
+// gpt-oss: Harmony messages
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Where a Harmony stream is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HarmonyState {
+    /// Nothing seen: a model that writes its answer with no header.
+    Fresh,
+    /// After `<|start|>`: the role, up to the channel.
+    Role,
+    /// After `<|channel|>`: the header, up to `<|message|>`.
+    Header,
+    /// Inside a message's body.
+    Body,
+    /// After a message's end, before the next.
+    Between,
+}
+
+/// What a message's body is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HarmonyBody {
+    Reasoning,
+    Content,
+    /// Arguments of a call to this function.
+    Call(String),
+    /// Addressed to a tool the server does not have (a built-in browser).
+    Ignored,
+}
+
+/// Reads gpt-oss's Harmony messages, which the other decoder cannot: a tool
+/// call is a message on the `commentary` channel whose header says who it is
+/// for (`<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>
+/// {...}<|call|>`), and the header is exactly what a channel splitter drops.
+/// `analysis` messages are the reasoning, `final` ones and preambles on
+/// `commentary` the answer, a message to `functions.NAME` a call.
+pub struct HarmonyDecoder<Aux = ()> {
+    tokenizer: Arc<pmetal_data::Tokenizer>,
+    start: Option<u32>,
+    channel: Option<u32>,
+    message: Option<u32>,
+    ends: Vec<u32>,
+    state: HarmonyState,
+    header: Vec<u32>,
+    kind: HarmonyBody,
+    body: IncrementalDecoder<Aux>,
+    call_text: String,
+    reasoning_started: bool,
+    answer_started: bool,
+    reasoning_tokens: usize,
+}
+
+impl<Aux> HarmonyDecoder<Aux> {
+    pub fn new(tokenizer: Arc<pmetal_data::Tokenizer>) -> Self {
+        let id = |name: &str| tokenizer.inner().token_to_id(name);
+        Self {
+            start: id("<|start|>"),
+            channel: id("<|channel|>"),
+            message: id("<|message|>"),
+            ends: ["<|end|>", "<|call|>", "<|return|>"]
+                .iter()
+                .filter_map(|n| id(n))
+                .collect(),
+            state: HarmonyState::Fresh,
+            header: Vec::new(),
+            kind: HarmonyBody::Content,
+            body: IncrementalDecoder::new(Arc::clone(&tokenizer)),
+            tokenizer,
+            call_text: String::new(),
+            reasoning_started: false,
+            answer_started: false,
+            reasoning_tokens: 0,
+        }
+    }
+
+    /// How many of the tokens pushed were reasoning.
+    pub fn reasoning_token_count(&self) -> usize {
+        self.reasoning_tokens
+    }
+
+    /// The body kind a header names.
+    fn kind_of(&self, header: &[u32]) -> HarmonyBody {
+        let text = self
+            .tokenizer
+            .decode_with_special_tokens(header)
+            .unwrap_or_default();
+        let channel = text.split_whitespace().next().unwrap_or_default();
+        let recipient = text
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix("to="));
+        match (channel, recipient) {
+            (_, Some(to)) => match to.strip_prefix("functions.") {
+                Some(name) if !name.is_empty() => HarmonyBody::Call(name.to_owned()),
+                _ => HarmonyBody::Ignored,
+            },
+            ("analysis", None) => HarmonyBody::Reasoning,
+            _ => HarmonyBody::Content,
+        }
+    }
+
+    fn open_body(&mut self, kind: HarmonyBody) {
+        self.kind = kind;
+        self.body = IncrementalDecoder::new(Arc::clone(&self.tokenizer));
+        self.call_text.clear();
+        self.state = HarmonyState::Body;
+    }
+
+    /// Give a body's newly decoded text to where it belongs.
+    fn route(&mut self, text: String, aux: Vec<Aux>, delta: &mut ChannelDelta<Aux>) {
+        if text.is_empty() {
+            return;
+        }
+        match &self.kind {
+            HarmonyBody::Reasoning => delta
+                .reasoning
+                .push_str(&trim_channel_start(text, &mut self.reasoning_started)),
+            HarmonyBody::Content => {
+                let text = trim_channel_start(text, &mut self.answer_started);
+                delta.content.push_str(&text);
+                delta.aux.extend(aux);
+            }
+            HarmonyBody::Call(_) => self.call_text.push_str(&text),
+            HarmonyBody::Ignored => {}
+        }
+    }
+
+    /// The message ends: flush its body, and finish a call.
+    fn end_message(&mut self, delta: &mut ChannelDelta<Aux>) {
+        if self.state != HarmonyState::Body {
+            return;
+        }
+        let (text, aux) = self.body.flush_aux();
+        self.route(text, aux, delta);
+        if let HarmonyBody::Call(name) = &self.kind {
+            if let Some(call) = crate::tools::call_with_arguments(name, &self.call_text) {
+                delta.calls.push(call);
+            }
+        }
+        self.call_text.clear();
+        self.state = HarmonyState::Between;
+    }
+
+    pub fn push_with_aux(&mut self, token: u32, aux: Aux) -> ChannelDelta<Aux> {
+        let mut delta = ChannelDelta {
+            reasoning: String::new(),
+            content: String::new(),
+            aux: Vec::new(),
+            calls: Vec::new(),
+        };
+        if Some(token) == self.start {
+            self.end_message(&mut delta);
+            self.state = HarmonyState::Role;
+        } else if Some(token) == self.channel {
+            self.end_message(&mut delta);
+            self.header.clear();
+            self.state = HarmonyState::Header;
+        } else if Some(token) == self.message {
+            let header = std::mem::take(&mut self.header);
+            let kind = if self.state == HarmonyState::Header {
+                self.kind_of(&header)
+            } else {
+                HarmonyBody::Content
+            };
+            self.end_message(&mut delta);
+            self.open_body(kind);
+        } else if self.ends.contains(&token) {
+            self.end_message(&mut delta);
+            self.state = HarmonyState::Between;
+        } else {
+            match self.state {
+                HarmonyState::Header => self.header.push(token),
+                HarmonyState::Fresh => {
+                    self.open_body(HarmonyBody::Content);
+                    self.feed(token, aux, &mut delta);
+                }
+                HarmonyState::Body => self.feed(token, aux, &mut delta),
+                HarmonyState::Role | HarmonyState::Between => {}
+            }
+        }
+        delta
+    }
+
+    fn feed(&mut self, token: u32, aux: Aux, delta: &mut ChannelDelta<Aux>) {
+        if self.kind == HarmonyBody::Reasoning {
+            self.reasoning_tokens += 1;
+        }
+        let (text, aux) = self.body.push_with_aux(token, aux);
+        self.route(text, aux, delta);
+    }
+
+    /// The stream ends: an unterminated message (the engine stops at
+    /// `<|call|>` before emitting it) ends here.
+    pub fn flush_aux(&mut self) -> ChannelDelta<Aux> {
+        let mut delta = ChannelDelta {
+            reasoning: String::new(),
+            content: String::new(),
+            aux: Vec::new(),
+            calls: Vec::new(),
+        };
+        self.end_message(&mut delta);
+        delta
+    }
+}
+
+/// The decoder an [`Assembler`](crate::assemble::Assembler) reads a reply
+/// with: the channel splitter, or Harmony's message reader.
+pub enum ReplyDecoder<Aux = ()> {
+    Channels(ChannelDecoder<Aux>),
+    Harmony(HarmonyDecoder<Aux>),
+}
+
+impl<Aux> ReplyDecoder<Aux> {
+    pub fn push_with_aux(&mut self, token: u32, aux: Aux) -> ChannelDelta<Aux> {
+        match self {
+            Self::Channels(d) => d.push_with_aux(token, aux),
+            Self::Harmony(d) => d.push_with_aux(token, aux),
+        }
+    }
+
+    pub fn flush_aux(&mut self) -> ChannelDelta<Aux> {
+        match self {
+            Self::Channels(d) => d.flush_aux(),
+            Self::Harmony(d) => d.flush_aux(),
+        }
+    }
+
+    pub fn reasoning_token_count(&self) -> usize {
+        match self {
+            Self::Channels(d) => d.reasoning_token_count(),
+            Self::Harmony(d) => d.reasoning_token_count(),
+        }
     }
 }
 
@@ -230,7 +488,7 @@ fn trim_channel_start(text: String, started: &mut bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_data::tokenizer::testing::word_level;
+    use pmetal_data::tokenizer::testing::{byte_level_bpe, word_level};
 
     #[test]
     fn channels_stream_apart_and_aux_follows_the_answer() {
@@ -262,7 +520,82 @@ mod tests {
         assert_eq!(content, "Paris is here");
         // Only the answer's tokens (3, 4, 5) carry their payloads through.
         assert_eq!(aux, vec![3, 4, 5]);
-        assert_eq!(decoder.token_count(), 6);
-        assert_eq!(decoder.answer_with_special_tokens(), "Paris is here");
+        assert_eq!(decoder.reasoning_token_count(), 2);
+    }
+
+    /// Streaming a byte-level generation gives exactly the text decoding it
+    /// whole gives, however the bytes of a multi-byte character fall across
+    /// tokens.
+    #[test]
+    fn deltas_concatenate_to_the_full_decode() {
+        let tok = Arc::new(byte_level_bpe(&["h i", "\u{120} t"], &["<s>"], None));
+        let text = "hi there, caf\u{e9} \u{4e16}\u{754c} \u{1f980} t\u{e9}";
+        let ids = tok.encode(text).unwrap();
+        // Split the bytes so every multi-byte character spans tokens: one
+        // token per byte (the 256 byte tokens are the first ids).
+        let per_byte: Vec<u32> = text.bytes().map(|b| byte_token(&tok, b)).collect();
+        for tokens in [ids, per_byte] {
+            let mut decoder: IncrementalDecoder = IncrementalDecoder::new(Arc::clone(&tok));
+            let mut streamed = String::new();
+            for token in &tokens {
+                let delta = decoder.push(*token);
+                assert!(
+                    !delta.contains('\u{fffd}'),
+                    "a partial character leaked: {delta:?}"
+                );
+                streamed.push_str(&delta);
+            }
+            streamed.push_str(&decoder.flush());
+            assert_eq!(streamed, tok.decode(&tokens).unwrap());
+            assert_eq!(streamed, text);
+        }
+    }
+
+    fn byte_token(tok: &pmetal_data::Tokenizer, byte: u8) -> u32 {
+        let ids = tok.inner().get_vocab(true);
+        // GPT-2's byte alphabet: printable bytes stand for themselves.
+        let printable = |b: u8| matches!(b, 0x21..=0x7e | 0xa1..=0xac | 0xae..=0xff);
+        let c = if printable(byte) {
+            byte as char
+        } else {
+            let rank = (0..=255u8)
+                .filter(|b| !printable(*b))
+                .position(|b| b == byte)
+                .unwrap();
+            char::from_u32(256 + rank as u32).unwrap()
+        };
+        ids[&c.to_string()]
+    }
+
+    /// A step costs the same deep into a generation as at its start: 30k
+    /// tokens used to decode the whole generation again at every token.
+    #[test]
+    fn a_long_generation_streams_in_linear_time() {
+        let tok = Arc::new(byte_level_bpe(&[], &[], None));
+        let mut decoder: IncrementalDecoder = IncrementalDecoder::new(Arc::clone(&tok));
+        let token = byte_token(&tok, b'a');
+        let started = std::time::Instant::now();
+        let mut len = 0;
+        for _ in 0..30_000 {
+            len += decoder.push(token).len();
+        }
+        len += decoder.flush().len();
+        assert_eq!(len, 30_000);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "30k tokens took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn special_tokens_are_kept_on_request() {
+        let tok = Arc::new(byte_level_bpe(&[], &["<tool_call>"], None));
+        let special = tok.inner().token_to_id("<tool_call>").unwrap();
+        let mut plain: IncrementalDecoder = IncrementalDecoder::new(Arc::clone(&tok));
+        assert_eq!(plain.push(special), "");
+        let mut keeping: IncrementalDecoder =
+            IncrementalDecoder::new(Arc::clone(&tok)).keeping_special_tokens(true);
+        assert_eq!(keeping.push(special), "<tool_call>");
     }
 }

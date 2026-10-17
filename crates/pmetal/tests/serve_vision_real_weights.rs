@@ -161,6 +161,7 @@ fn greedy(max_tokens: usize, logprobs_top_n: Option<usize>) -> SamplingParams {
         stop_sequences: vec![],
         logprobs_top_n,
         logit_bias: Vec::new(),
+        constraint: None,
     }
 }
 

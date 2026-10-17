@@ -1,7 +1,8 @@
 //! OpenAI-compatible request/response types.
 
-use pmetal_data::chat_templates::{ChatTemplateKwargs, FunctionCall, ToolCall, ToolDefinition};
+use pmetal_data::chat_templates::{ChatTemplateKwargs, ToolCall, ToolDefinition};
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{Map, Value};
 
 /// Deserialize a field that may be either a single string or an array of strings.
 ///
@@ -11,45 +12,23 @@ fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Option<Vec<Strin
 where
     D: Deserializer<'de>,
 {
-    use serde::de::{self, Visitor};
-    use std::fmt;
-
-    struct StringOrVec;
-
-    impl<'de> Visitor<'de> for StringOrVec {
-        type Value = Option<Vec<String>>;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("a string or array of strings or null")
-        }
-
-        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
-            Ok(None)
-        }
-
-        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-            Ok(None)
-        }
-
-        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-            Ok(Some(vec![v.to_owned()]))
-        }
-
-        fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
-            Ok(Some(vec![v]))
-        }
-
-        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-            let mut vec = Vec::new();
-            while let Some(s) = seq.next_element::<String>()? {
-                vec.push(s);
-            }
-            Ok(Some(vec))
-        }
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        One(String),
+        Many(Vec<String>),
     }
-
-    deserializer.deserialize_any(StringOrVec)
+    Ok(
+        Option::<StringOrVec>::deserialize(deserializer)?.map(|stop| match stop {
+            StringOrVec::One(one) => vec![one],
+            StringOrVec::Many(many) => many,
+        }),
+    )
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Messages
+// ────────────────────────────────────────────────────────────────────────────
 
 /// Chat message.
 ///
@@ -63,18 +42,16 @@ where
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
-    /// Tool calls made by the assistant. `None` for user/system/tool messages.
-    ///
-    /// When the model emits a structured tool call (best-effort JSON parse of the
-    /// generated text), this is populated and `content` is left empty. OpenAI
-    /// clients that support tools read `tool_calls` and ignore `content`.
+    /// Tool calls made by the assistant, as a request replays them. A call's
+    /// `arguments` arrive as a JSON string (OpenAI's wire form); the chat
+    /// template reads them as an object, which [`crate::media`] hands it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     /// The request's content parts, in order, when they are more than text
     /// (an image, a video, or a part type this server may not accept). Never
     /// serialized: responses carry text.
     #[serde(skip_serializing)]
-    pub parts: Option<Vec<serde_json::Value>>,
+    pub parts: Option<Vec<Value>>,
     /// The thinking behind an assistant turn, sent back apart from its
     /// `content`. Chat templates that render thinking themselves read it,
     /// e.g. to keep earlier turns' thinking under Qwen3.8's
@@ -82,6 +59,9 @@ pub struct ChatMessage {
     /// split out the same way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// Which call a `tool` message answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
@@ -93,6 +73,7 @@ impl ChatMessage {
             tool_calls: None,
             parts: None,
             reasoning_content: None,
+            tool_call_id: None,
         }
     }
 }
@@ -107,6 +88,8 @@ struct WireChatMessage {
     tool_calls: Option<Vec<ToolCall>>,
     #[serde(default)]
     reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_call_id: Option<String>,
 }
 
 /// A message's `content`: a string, `null` (an assistant turn that only
@@ -117,7 +100,7 @@ enum WireContent {
     #[default]
     Null,
     Text(String),
-    Parts(Vec<serde_json::Value>),
+    Parts(Vec<Value>),
 }
 
 impl From<WireChatMessage> for ChatMessage {
@@ -126,7 +109,7 @@ impl From<WireChatMessage> for ChatMessage {
             WireContent::Null => (String::new(), None),
             WireContent::Text(text) => (text, None),
             WireContent::Parts(parts) => {
-                let text = |part: &serde_json::Value| -> Option<String> {
+                let text = |part: &Value| -> Option<String> {
                     (part.get("type")?.as_str()? == "text")
                         .then(|| part.get("text")?.as_str().map(str::to_owned))?
                 };
@@ -141,8 +124,61 @@ impl From<WireChatMessage> for ChatMessage {
             tool_calls: wire.tool_calls,
             parts,
             reasoning_content: wire.reasoning_content,
+            tool_call_id: wire.tool_call_id,
         }
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Request options shared by the generation endpoints
+// ────────────────────────────────────────────────────────────────────────────
+
+/// `stream_options`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct StreamOptions {
+    /// Send a last chunk, before `[DONE]`, with the request's token usage.
+    #[serde(default)]
+    pub include_usage: Option<bool>,
+    /// OpenAI pads streamed deltas with random characters against a
+    /// side channel on the network path; a local server adds none, so the
+    /// option is read and has nothing to switch.
+    #[serde(default)]
+    pub include_obfuscation: Option<bool>,
+}
+
+/// `tool_choice`: a mode, or one named function (or a set of allowed ones).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ToolChoiceParam {
+    /// `"none"`, `"auto"` or `"required"`.
+    Mode(String),
+    /// `{"type": "function", "function": {"name": ...}}`, or
+    /// `{"type": "allowed_tools", "allowed_tools": {...}}`.
+    Object(Map<String, Value>),
+}
+
+/// `response_format`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseFormat {
+    /// Plain text (the default).
+    Text,
+    /// Any valid JSON object.
+    JsonObject,
+    /// JSON that conforms to a schema.
+    JsonSchema { json_schema: JsonSchemaSpec },
+}
+
+/// The `json_schema` of a `response_format`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct JsonSchemaSpec {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub schema: Option<Value>,
+    #[serde(default)]
+    pub strict: Option<bool>,
 }
 
 /// Chat completion request (POST /v1/chat/completions).
@@ -165,8 +201,13 @@ pub struct ChatCompletionRequest {
     pub top_k: Option<usize>,
     #[serde(default)]
     pub min_p: Option<f32>,
+    /// How many replies to generate.
+    #[serde(default)]
+    pub n: Option<usize>,
     #[serde(default)]
     pub stream: Option<bool>,
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
     /// Stop sequences — accepts either a single string or an array of strings.
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub stop: Option<Vec<String>>,
@@ -176,8 +217,9 @@ pub struct ChatCompletionRequest {
     pub frequency_penalty: Option<f32>,
     #[serde(default)]
     pub presence_penalty: Option<f32>,
+    /// A seed makes the draws repeatable (OpenAI sends a signed integer).
     #[serde(default)]
-    pub seed: Option<u64>,
+    pub seed: Option<i64>,
     /// OpenAI's `logit_bias`: token id (as a string) to a bias in
     /// `[-100, 100]` added to that token's logit before sampling. -100 all
     /// but bans a token, 100 all but forces it.
@@ -185,10 +227,23 @@ pub struct ChatCompletionRequest {
     pub logit_bias: Option<std::collections::HashMap<String, f32>>,
     /// OpenAI-compatible tool definitions. When present, the chat template
     /// injects them into the system prompt so the model is aware it may emit
-    /// tool calls. Best-effort JSON parsing of the model's output after
-    /// generation decides whether `tool_calls` or `content` is returned.
+    /// tool calls, and its calls come back as `tool_calls`.
     #[serde(default)]
     pub tools: Option<Vec<ToolDefinition>>,
+    #[serde(default)]
+    pub tool_choice: Option<ToolChoiceParam>,
+    /// With `false`, at most one tool call per reply.
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
+    /// Deprecated spelling of `tools` (one function each).
+    #[serde(default)]
+    pub functions: Option<Vec<pmetal_data::chat_templates::FunctionDefinition>>,
+    /// Deprecated spelling of `tool_choice`: `"none"`, `"auto"` or
+    /// `{"name": ...}`.
+    #[serde(default)]
+    pub function_call: Option<Value>,
+    #[serde(default)]
+    pub response_format: Option<ResponseFormat>,
     /// When `true`, include per-generated-token log-probabilities in the
     /// response. Defaults to `false` — enabling adds one log-softmax
     /// reduction per decode step, so the hot path stays unchanged for
@@ -196,17 +251,15 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub logprobs: Option<bool>,
     /// Number of top alternative logprobs to return per token when
-    /// `logprobs = true`. OpenAI caps this at 20 in their docs; we accept
-    /// any `u8` value and clamp on the generation side. `None` / `Some(0)`
-    /// means chosen-token logprob only.
+    /// `logprobs = true`, up to 20.
     #[serde(default)]
-    pub top_logprobs: Option<u8>,
+    pub top_logprobs: Option<u32>,
     /// Per-request processor overrides (`fps`, pixel budgets, ...), as some
     /// servers take them for vision models. Read only to be refused: media
     /// are preprocessed with the checkpoint's own processor settings, and an
     /// override silently ignored would change what the model sees.
     #[serde(default)]
-    pub mm_processor_kwargs: Option<serde_json::Value>,
+    pub mm_processor_kwargs: Option<Value>,
     /// OpenAI `reasoning_effort`, passed to the chat template as the
     /// `reasoning_effort` kwarg (Qwen3.8: xhigh | medium | low; gpt-oss:
     /// low | medium | high). A value in `chat_template_kwargs` wins.
@@ -217,6 +270,12 @@ pub struct ChatCompletionRequest {
     /// false}`, or anything else the model's template reads.
     #[serde(default)]
     pub chat_template_kwargs: Option<ChatTemplateKwargs>,
+    /// Every field above this list does not name. The ones OpenAI documents
+    /// that change what is generated and this server does not implement
+    /// (`audio`, `prediction`, ...) are refused by name; the ones that only
+    /// label the request (`user`, `metadata`, `store`, ...) are accepted.
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
 }
 
 impl ChatCompletionRequest {
@@ -234,17 +293,16 @@ impl ChatCompletionRequest {
 
 /// Per-token logprob entry as it appears on the wire under
 /// `ChatChoice.logprobs.content`. Matches OpenAI's shape exactly:
-/// `{token, logprob, bytes?, top_logprobs: [{token, logprob, bytes?}]}`.
+/// `{token, logprob, bytes, top_logprobs: [{token, logprob, bytes}]}`.
 #[derive(Debug, Clone, Serialize)]
 pub struct TokenLogprobContent {
     /// The decoded token string.
     pub token: String,
     /// Natural-log probability of this token under the model's distribution.
     pub logprob: f32,
-    /// UTF-8 byte representation. Present so clients can reconstruct the
-    /// byte stream even when `token` contains a replacement character.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bytes: Option<Vec<u8>>,
+    /// The token's UTF-8 bytes, so a client can rebuild the byte stream
+    /// when `token` holds a replacement character for half a character.
+    pub bytes: Vec<u8>,
     /// Alternative tokens considered at this position, sorted descending
     /// by logprob. Excludes the chosen token itself.
     pub top_logprobs: Vec<TopLogprob>,
@@ -255,21 +313,42 @@ pub struct TokenLogprobContent {
 pub struct TopLogprob {
     pub token: String,
     pub logprob: f32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bytes: Option<Vec<u8>>,
+    pub bytes: Vec<u8>,
 }
 
 /// Wrapper object attached to `ChatChoice.logprobs` when requested.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatLogprobs {
     pub content: Vec<TokenLogprobContent>,
+    /// Refusals are not generated by this server.
+    pub refusal: Option<Vec<TokenLogprobContent>>,
+}
+
+impl ChatLogprobs {
+    pub fn new(content: Vec<TokenLogprobContent>) -> Self {
+        Self {
+            content,
+            refusal: None,
+        }
+    }
+}
+
+/// A prompt of the legacy completions API: text, token ids, or a batch of
+/// either.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum CompletionPrompt {
+    Text(String),
+    Tokens(Vec<u32>),
+    Texts(Vec<String>),
+    TokenLists(Vec<Vec<u32>>),
 }
 
 /// Text completion request (POST /v1/completions).
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompletionRequest {
     pub model: String,
-    pub prompt: String,
+    pub prompt: CompletionPrompt,
     /// Output budget; absent means the model's default (see
     /// [`InferenceEngine::default_max_tokens`](crate::engine::InferenceEngine::default_max_tokens)).
     #[serde(default)]
@@ -283,7 +362,11 @@ pub struct CompletionRequest {
     #[serde(default)]
     pub min_p: Option<f32>,
     #[serde(default)]
+    pub n: Option<usize>,
+    #[serde(default)]
     pub stream: Option<bool>,
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
     /// Stop sequences — accepts either a single string or an array of strings.
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub stop: Option<Vec<String>>,
@@ -294,20 +377,36 @@ pub struct CompletionRequest {
     #[serde(default)]
     pub presence_penalty: Option<f32>,
     #[serde(default)]
-    pub seed: Option<u64>,
+    pub seed: Option<i64>,
     /// OpenAI's `logit_bias`: token id (as a string) to a bias in
     /// `[-100, 100]` added to that token's logit before sampling. -100 all
     /// but bans a token, 100 all but forces it.
     #[serde(default)]
     pub logit_bias: Option<std::collections::HashMap<String, f32>>,
     /// OpenAI `/v1/completions` uses a single numeric field for logprobs:
-    /// the number of top alternative tokens to include, per token. `0` means
-    /// only the chosen token's logprob. `None` disables logprob collection.
+    /// the number of top alternative tokens to include, per token (up to 5).
+    /// `0` means only the chosen token's logprob. `None` disables logprob
+    /// collection.
     ///
     /// Note this is distinct from `/v1/chat/completions` which uses a
     /// boolean `logprobs` + integer `top_logprobs` pair.
     #[serde(default)]
-    pub logprobs: Option<u8>,
+    pub logprobs: Option<u32>,
+    /// Return the prompt in front of each completion.
+    #[serde(default)]
+    pub echo: Option<bool>,
+    /// Generate this many candidates and return the best (OpenAI's
+    /// `best_of`); only 1 (or `n`) is accepted, as picking the best needs
+    /// the sequence scores this server does not rank by.
+    #[serde(default)]
+    pub best_of: Option<usize>,
+    /// Text after the completion (insert mode): refused by name.
+    #[serde(default)]
+    pub suffix: Option<String>,
+    #[serde(default)]
+    pub response_format: Option<ResponseFormat>,
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
 }
 
 /// OpenAI `/v1/completions` logprobs object — four parallel arrays, one
@@ -327,102 +426,369 @@ pub struct CompletionLogprobs {
     pub text_offset: Vec<usize>,
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Responses
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Chat completion response.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatCompletionResponse {
+    pub id: String,
+    pub object: String,
+    pub created: i64,
+    pub model: String,
+    pub choices: Vec<ChatChoice>,
+    pub usage: Usage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_fingerprint: Option<String>,
+}
+
+/// A tool call as a response carries it: `arguments` is the call's JSON as a
+/// string, the form OpenAI's clients parse.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct WireToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub function: WireFunctionCall,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct WireFunctionCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+impl WireToolCall {
+    pub fn new(id: String, name: String, arguments: String) -> Self {
+        Self {
+            id,
+            kind: "function",
+            function: WireFunctionCall { name, arguments },
+        }
+    }
+}
+
+/// The assistant message of a chat completion.
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponseMessage {
+    pub role: &'static str,
+    /// The answer; `null` when the reply is tool calls alone.
+    pub content: Option<String>,
+    /// Refusals are not generated by this server.
+    pub refusal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<WireToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+}
+
+/// Choice in a chat completion.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatChoice {
+    pub index: usize,
+    pub message: ResponseMessage,
+    pub finish_reason: Option<String>,
+    /// `null` unless the request had `logprobs: true`.
+    pub logprobs: Option<ChatLogprobs>,
+}
+
+/// Text completion response.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletionResponse {
+    pub id: String,
+    pub object: String,
+    pub created: i64,
+    pub model: String,
+    pub choices: Vec<CompletionChoice>,
+    pub usage: Usage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_fingerprint: Option<String>,
+}
+
+/// Choice in a text completion.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletionChoice {
+    pub index: usize,
+    pub text: String,
+    pub finish_reason: Option<String>,
+    /// `null` unless the request set `logprobs`.
+    pub logprobs: Option<CompletionLogprobs>,
+}
+
+/// Token usage statistics.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Usage {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub total_tokens: usize,
+    pub prompt_tokens_details: PromptTokensDetails,
+    pub completion_tokens_details: CompletionTokensDetails,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PromptTokensDetails {
+    /// Prompt tokens whose keys and values came from the prefix cache.
+    pub cached_tokens: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CompletionTokensDetails {
+    /// Completion tokens spent on reasoning.
+    pub reasoning_tokens: usize,
+}
+
+impl Usage {
+    pub fn new(
+        prompt_tokens: usize,
+        completion_tokens: usize,
+        cached_tokens: usize,
+        reasoning_tokens: usize,
+    ) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+            prompt_tokens_details: PromptTokensDetails { cached_tokens },
+            completion_tokens_details: CompletionTokensDetails { reasoning_tokens },
+        }
+    }
+}
+
+/// Streaming SSE chunk for chat completions.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatCompletionChunk {
+    pub id: String,
+    pub object: String,
+    pub created: i64,
+    pub model: String,
+    pub choices: Vec<ChatChunkChoice>,
+    /// Present (`null` on every chunk but the last) when the request set
+    /// `stream_options.include_usage`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Value>,
+}
+
+/// Delta in a streaming chunk.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatChunkChoice {
+    pub index: usize,
+    pub delta: ChatDelta,
+    pub finish_reason: Option<String>,
+    /// Per-delta logprobs — one entry per token that contributed to this
+    /// delta's `content`. `null` unless the request set `logprobs: true`.
+    pub logprobs: Option<ChatLogprobs>,
+}
+
+/// Delta content in a streaming chunk.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ChatDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// The model's reasoning, streamed apart from `content` as other
+    /// OpenAI-compatible servers stream it: a thinking model's deltas carry
+    /// this first, then `content` with the answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    /// A tool call opening (its `id`, `type` and `name`) or growing (a
+    /// fragment of its `arguments`), by `index`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
+}
+
+/// A step of a tool call in a stream.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolCallDelta {
+    pub index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<&'static str>,
+    pub function: FunctionDelta,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct FunctionDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Embeddings (OpenAI /v1/embeddings)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// OpenAI `/v1/embeddings` accepts `input` as a string, an array of
+/// strings, an array of token ids, or an array of token-id arrays — the
+/// response shape is always a list, one entry per input item in order.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum EmbeddingsInput {
+    Single(String),
+    Batch(Vec<String>),
+    Tokens(Vec<u32>),
+    TokenBatch(Vec<Vec<u32>>),
+}
+
+/// One embedding input: text to tokenize, or token ids as given.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EmbeddingItem {
+    Text(String),
+    Tokens(Vec<u32>),
+}
+
+impl EmbeddingsInput {
+    /// Flatten to the list of inputs regardless of wire shape.
+    pub fn into_batch(self) -> Vec<EmbeddingItem> {
+        match self {
+            Self::Single(s) => vec![EmbeddingItem::Text(s)],
+            Self::Batch(v) => v.into_iter().map(EmbeddingItem::Text).collect(),
+            Self::Tokens(t) => vec![EmbeddingItem::Tokens(t)],
+            Self::TokenBatch(b) => b.into_iter().map(EmbeddingItem::Tokens).collect(),
+        }
+    }
+}
+
+/// `POST /v1/embeddings` request body.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmbeddingsRequest {
+    pub model: String,
+    pub input: EmbeddingsInput,
+    /// Optional pooling strategy. When absent, the model's own: the one its
+    /// sentence-embedding configuration names, else `mean`. Accepted values:
+    /// `"mean"`, `"cls"`, `"max"`, `"last_token"`, `"weighted_mean"`.
+    #[serde(default)]
+    pub pooling: Option<String>,
+    /// `"float"` (the default) or `"base64"`: little-endian f32s, base64.
+    #[serde(default)]
+    pub encoding_format: Option<String>,
+    /// Keep this many leading dimensions of the vector, renormalized
+    /// (Matryoshka truncation), for a model trained for it.
+    #[serde(default)]
+    pub dimensions: Option<usize>,
+    #[serde(default)]
+    pub user: Option<String>,
+}
+
+/// A vector as the response carries it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum EmbeddingVector {
+    Float(Vec<f32>),
+    Base64(String),
+}
+
+/// Single embedding entry in the response list.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbeddingData {
+    pub index: usize,
+    pub object: &'static str,
+    pub embedding: EmbeddingVector,
+}
+
+/// Token counts for an embeddings response. No completion tokens — embeddings
+/// don't generate.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbeddingsUsage {
+    pub prompt_tokens: usize,
+    pub total_tokens: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbeddingsResponse {
+    pub object: &'static str,
+    pub data: Vec<EmbeddingData>,
+    pub model: String,
+    pub usage: EmbeddingsUsage,
+}
+
+/// Parse the wire `pooling` field into a `PoolingMode`. Unknown modes yield
+/// `None` so the handler can 400 rather than silently applying a fallback;
+/// an absent field yields `Some(None)`.
+pub fn parse_pooling_mode(s: Option<&str>) -> Option<Option<pmetal_models::pooling::PoolingMode>> {
+    use pmetal_models::pooling::PoolingMode;
+    let Some(s) = s else {
+        return Some(None);
+    };
+    match s.to_ascii_lowercase().as_str() {
+        "mean" => Some(Some(PoolingMode::Mean)),
+        "cls" => Some(Some(PoolingMode::Cls)),
+        "max" => Some(Some(PoolingMode::Max)),
+        "last_token" | "last" => Some(Some(PoolingMode::LastToken)),
+        "weighted_mean" | "weighted" => Some(Some(PoolingMode::WeightedMean)),
+        _ => None,
+    }
+}
+
+/// Model info for /v1/models.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelInfo {
+    pub id: String,
+    pub object: String,
+    pub created: i64,
+    pub owned_by: String,
+}
+
+/// Model list response.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelListResponse {
+    pub object: String,
+    pub data: Vec<ModelInfo>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn tool_parse_bare_object() {
-        let text = r#"{"name": "get_weather", "arguments": {"city": "SF"}}"#;
-        let calls = try_parse_tool_calls(text).expect("should parse");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].function.name, "get_weather");
-        assert_eq!(calls[0].function.arguments["city"], "SF");
-    }
-
-    #[test]
-    fn tool_parse_wrapped_object() {
-        let text = r#"{"tool_calls": [{"type": "function", "function": {"name": "f", "arguments": {"x": 1}}}]}"#;
-        let calls = try_parse_tool_calls(text).expect("should parse");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].function.name, "f");
-    }
-
-    #[test]
-    fn tool_parse_qwen_xml_call() {
-        let text = r#"<tool_call>
-{"name": "web_search", "arguments": {"query": "qwen mtp", "limit": 5}}
-</tool_call>"#;
-        let calls = try_parse_tool_calls(text).expect("should parse");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].function.name, "web_search");
-        assert_eq!(calls[0].function.arguments["query"], "qwen mtp");
-        assert_eq!(calls[0].function.arguments["limit"], 5);
-    }
-
-    #[test]
-    fn tool_parse_gemma4_custom_call() {
-        let text = r#"<|tool_call>call:web_search{query:<|"|>latest Gemma 4 MTP<|"|>,limit:5}<tool_call|>"#;
-        let calls = try_parse_tool_calls(text).expect("should parse");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].function.name, "web_search");
-        assert_eq!(calls[0].function.arguments["query"], "latest Gemma 4 MTP");
-        assert_eq!(calls[0].function.arguments["limit"], 5);
-    }
-
-    #[test]
-    fn tool_parse_gemma4_multiple_calls_and_nested_args() {
-        let text = concat!(
-            r#"<|tool_call>call:web.search{query:<|"|>qwen mtp<|"|>}<tool_call|>"#,
-            r#"<|tool_call>call:store_result{meta:{source:<|"|>web<|"|>,ok:true},scores:[1,2.5]}<turn|>"#
+    fn embeddings_input_forms_deserialize() {
+        let batch = |json: &str| -> Vec<EmbeddingItem> {
+            serde_json::from_str::<EmbeddingsRequest>(&format!(r#"{{"model":"m","input":{json}}}"#))
+                .unwrap()
+                .input
+                .into_batch()
+        };
+        assert_eq!(
+            batch(r#""hello""#),
+            vec![EmbeddingItem::Text("hello".into())]
         );
-        let calls = try_parse_tool_calls(text).expect("should parse");
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].function.name, "web.search");
-        assert_eq!(calls[1].function.name, "store_result");
-        assert_eq!(calls[1].function.arguments["meta"]["source"], "web");
-        assert_eq!(calls[1].function.arguments["meta"]["ok"], true);
-        assert_eq!(calls[1].function.arguments["scores"][1], 2.5);
-    }
-
-    #[test]
-    fn tool_parse_rejects_plain_text() {
-        assert!(try_parse_tool_calls("Hello, world!").is_none());
-        assert!(try_parse_tool_calls("{invalid json").is_none());
-        assert!(try_parse_tool_calls(r#"{"greeting": "hi"}"#).is_none());
-    }
-
-    #[test]
-    fn embeddings_input_single_string_deserializes() {
-        let req: EmbeddingsRequest =
-            serde_json::from_str(r#"{"model":"m","input":"hello"}"#).unwrap();
-        assert_eq!(req.input.into_batch(), vec!["hello".to_string()]);
-    }
-
-    #[test]
-    fn embeddings_input_array_deserializes() {
-        let req: EmbeddingsRequest =
-            serde_json::from_str(r#"{"model":"m","input":["a","b","c"]}"#).unwrap();
-        assert_eq!(req.input.into_batch().len(), 3);
+        assert_eq!(batch(r#"["a","b","c"]"#).len(), 3);
+        assert_eq!(batch("[1,2,3]"), vec![EmbeddingItem::Tokens(vec![1, 2, 3])]);
+        assert_eq!(
+            batch("[[1],[2,3]]"),
+            vec![
+                EmbeddingItem::Tokens(vec![1]),
+                EmbeddingItem::Tokens(vec![2, 3])
+            ]
+        );
     }
 
     #[test]
     fn pooling_mode_parse_accepts_common_spellings() {
         use pmetal_models::pooling::PoolingMode;
-        assert_eq!(parse_pooling_mode(None), Some(PoolingMode::Mean));
-        assert_eq!(parse_pooling_mode(Some("mean")), Some(PoolingMode::Mean));
-        assert_eq!(parse_pooling_mode(Some("CLS")), Some(PoolingMode::Cls));
+        assert_eq!(parse_pooling_mode(None), Some(None));
+        assert_eq!(
+            parse_pooling_mode(Some("mean")),
+            Some(Some(PoolingMode::Mean))
+        );
+        assert_eq!(
+            parse_pooling_mode(Some("CLS")),
+            Some(Some(PoolingMode::Cls))
+        );
         assert_eq!(
             parse_pooling_mode(Some("last")),
-            Some(PoolingMode::LastToken)
+            Some(Some(PoolingMode::LastToken))
         );
         assert_eq!(
             parse_pooling_mode(Some("last_token")),
-            Some(PoolingMode::LastToken)
+            Some(Some(PoolingMode::LastToken))
         );
         assert_eq!(
             parse_pooling_mode(Some("weighted")),
-            Some(PoolingMode::WeightedMean)
+            Some(Some(PoolingMode::WeightedMean))
         );
         assert_eq!(parse_pooling_mode(Some("unknown")), None);
     }
@@ -459,585 +825,79 @@ mod tests {
     }
 
     #[test]
-    fn chat_request_parses_logprobs_fields() {
-        let req: ChatCompletionRequest =
-            serde_json::from_str(r#"{"model":"m","messages":[],"logprobs":true,"top_logprobs":5}"#)
-                .unwrap();
+    fn chat_request_parses_the_documented_shapes() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[],"logprobs":true,"top_logprobs":5,"n":2,
+                "stop":"x","seed":-3,"stream":true,"stream_options":{"include_usage":true},
+                "tool_choice":{"type":"function","function":{"name":"f"}},
+                "response_format":{"type":"json_schema","json_schema":{"name":"s","schema":{},"strict":true}},
+                "audio":{"voice":"x"}}"#,
+        )
+        .unwrap();
         assert_eq!(req.logprobs, Some(true));
         assert_eq!(req.top_logprobs, Some(5));
+        assert_eq!(req.n, Some(2));
+        assert_eq!(req.stop, Some(vec!["x".to_string()]));
+        assert_eq!(req.seed, Some(-3));
+        assert_eq!(req.stream_options.unwrap().include_usage, Some(true));
+        assert!(matches!(req.tool_choice, Some(ToolChoiceParam::Object(_))));
+        assert!(matches!(
+            req.response_format,
+            Some(ResponseFormat::JsonSchema { .. })
+        ));
+        assert!(req.other.contains_key("audio"));
     }
 
     #[test]
-    fn chat_logprobs_absent_serializes_without_field() {
-        // When logprobs is None on ChatChoice, the JSON must not include
-        // "logprobs": null — legacy clients would reject it.
-        let choice = ChatChoice {
-            index: 0,
-            message: ChatMessage {
-                role: "assistant".into(),
-                content: "hi".into(),
-                tool_calls: None,
-                parts: None,
-                reasoning_content: None,
-            },
-            finish_reason: Some("stop".into()),
-            logprobs: None,
+    fn a_tool_message_keeps_the_call_it_answers() {
+        let msg: ChatMessage = serde_json::from_str(
+            r#"{"role":"tool","tool_call_id":"call_1","content":[{"type":"text","text":"72F"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(msg.tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(msg.content, "72F");
+    }
+
+    #[test]
+    fn completion_prompts_take_all_four_forms() {
+        let prompt = |json: &str| -> CompletionPrompt {
+            serde_json::from_str::<CompletionRequest>(&format!(
+                r#"{{"model":"m","prompt":{json}}}"#
+            ))
+            .unwrap()
+            .prompt
         };
-        let json = serde_json::to_string(&choice).unwrap();
-        assert!(
-            !json.contains("logprobs"),
-            "logprobs field should be omitted when None, got: {json}"
-        );
+        assert!(matches!(prompt(r#""hi""#), CompletionPrompt::Text(_)));
+        assert!(matches!(prompt("[1,2]"), CompletionPrompt::Tokens(_)));
+        assert!(matches!(prompt(r#"["a","b"]"#), CompletionPrompt::Texts(_)));
+        assert!(matches!(
+            prompt("[[1],[2]]"),
+            CompletionPrompt::TokenLists(_)
+        ));
     }
 
     #[test]
-    fn chat_logprobs_serializes_when_present() {
-        let choice = ChatChoice {
-            index: 0,
-            message: ChatMessage {
-                role: "assistant".into(),
-                content: "hi".into(),
-                tool_calls: None,
-                parts: None,
-                reasoning_content: None,
-            },
-            finish_reason: Some("stop".into()),
-            logprobs: Some(ChatLogprobs {
-                content: vec![TokenLogprobContent {
-                    token: "hi".into(),
-                    logprob: -0.5,
-                    bytes: None,
-                    top_logprobs: vec![TopLogprob {
-                        token: "hello".into(),
-                        logprob: -1.2,
-                        bytes: None,
-                    }],
-                }],
-            }),
+    fn response_shapes_match_openai() {
+        let message = ResponseMessage {
+            role: "assistant",
+            content: None,
+            refusal: None,
+            tool_calls: Some(vec![WireToolCall::new(
+                "call_1".into(),
+                "f".into(),
+                r#"{"a":1}"#.into(),
+            )]),
+            reasoning_content: None,
         };
-        let json = serde_json::to_string(&choice).unwrap();
-        assert!(json.contains(r#""logprobs""#));
-        assert!(json.contains(r#""token":"hi""#));
-        assert!(json.contains(r#""logprob":-0.5"#));
+        let json = serde_json::to_value(&message).unwrap();
+        assert!(json["content"].is_null());
+        assert!(json["refusal"].is_null());
+        assert_eq!(json["tool_calls"][0]["type"], "function");
+        // `arguments` is a string of JSON, not an object.
+        assert_eq!(json["tool_calls"][0]["function"]["arguments"], r#"{"a":1}"#);
+        let usage = serde_json::to_value(Usage::new(3, 4, 1, 2)).unwrap();
+        assert_eq!(usage["total_tokens"], 7);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 1);
+        assert_eq!(usage["completion_tokens_details"]["reasoning_tokens"], 2);
     }
-
-    #[test]
-    fn completion_request_parses_numeric_logprobs() {
-        // /v1/completions uses a numeric logprobs field, not a bool.
-        let req: CompletionRequest =
-            serde_json::from_str(r#"{"model":"m","prompt":"p","logprobs":3}"#).unwrap();
-        assert_eq!(req.logprobs, Some(3));
-    }
-
-    #[test]
-    fn completion_request_logprobs_optional() {
-        let req: CompletionRequest = serde_json::from_str(r#"{"model":"m","prompt":"p"}"#).unwrap();
-        assert!(req.logprobs.is_none());
-    }
-
-    #[test]
-    fn completion_logprobs_serializes_parallel_arrays() {
-        use std::collections::HashMap;
-        let mut top0 = HashMap::new();
-        top0.insert("Hi".into(), -1.2_f32);
-        let lp = CompletionLogprobs {
-            tokens: vec!["Hello".into(), " world".into()],
-            token_logprobs: vec![-0.5, -0.3],
-            top_logprobs: vec![top0, HashMap::new()],
-            text_offset: vec![0, 5],
-        };
-        let json = serde_json::to_string(&lp).unwrap();
-        assert!(json.contains(r#""tokens":["Hello"," world"]"#));
-        assert!(json.contains(r#""token_logprobs":[-0.5,-0.3]"#));
-        assert!(json.contains(r#""text_offset":[0,5]"#));
-    }
-
-    #[test]
-    fn tool_parse_allows_whitespace() {
-        let text = "  \n\t{\n  \"name\": \"f\"\n}\n ";
-        let calls = try_parse_tool_calls(text).expect("should parse");
-        assert_eq!(calls[0].function.name, "f");
-    }
-}
-
-/// Chat completion response.
-#[derive(Debug, Clone, Serialize)]
-pub struct ChatCompletionResponse {
-    pub id: String,
-    pub object: String,
-    pub created: i64,
-    pub model: String,
-    pub choices: Vec<ChatChoice>,
-    pub usage: Usage,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub system_fingerprint: Option<String>,
-}
-
-/// Choice in a chat completion.
-#[derive(Debug, Clone, Serialize)]
-pub struct ChatChoice {
-    pub index: usize,
-    pub message: ChatMessage,
-    pub finish_reason: Option<String>,
-    /// Populated only when the request had `logprobs: true`. The field is
-    /// omitted from the response body in the default case so the wire shape
-    /// stays byte-compatible with legacy clients that don't expect it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub logprobs: Option<ChatLogprobs>,
-}
-
-/// Text completion response.
-#[derive(Debug, Clone, Serialize)]
-pub struct CompletionResponse {
-    pub id: String,
-    pub object: String,
-    pub created: i64,
-    pub model: String,
-    pub choices: Vec<CompletionChoice>,
-    pub usage: Usage,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub system_fingerprint: Option<String>,
-}
-
-/// Choice in a text completion.
-#[derive(Debug, Clone, Serialize)]
-pub struct CompletionChoice {
-    pub index: usize,
-    pub text: String,
-    pub finish_reason: Option<String>,
-    /// Populated only when the request set `logprobs`. Same omit-when-None
-    /// rule as `ChatChoice.logprobs` — legacy clients stay byte-compatible.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub logprobs: Option<CompletionLogprobs>,
-}
-
-/// Token usage statistics.
-#[derive(Debug, Clone, Serialize)]
-pub struct Usage {
-    pub prompt_tokens: usize,
-    pub completion_tokens: usize,
-    pub total_tokens: usize,
-}
-
-/// Streaming SSE chunk for chat completions.
-#[derive(Debug, Clone, Serialize)]
-pub struct ChatCompletionChunk {
-    pub id: String,
-    pub object: String,
-    pub created: i64,
-    pub model: String,
-    pub choices: Vec<ChatChunkChoice>,
-}
-
-/// Delta in a streaming chunk.
-#[derive(Debug, Clone, Serialize)]
-pub struct ChatChunkChoice {
-    pub index: usize,
-    pub delta: ChatDelta,
-    pub finish_reason: Option<String>,
-}
-
-/// Delta content in a streaming chunk.
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct ChatDelta {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
-    /// The model's reasoning, streamed apart from `content` as other
-    /// OpenAI-compatible servers stream it: a thinking model's deltas carry
-    /// this first, then `content` with the answer.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_content: Option<String>,
-    /// Tool calls attached to the closing chunk when the model's output parses
-    /// as a function call. Mid-stream token deltas leave this `None`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<ToolCall>>,
-    /// Per-delta logprobs payload — one `TokenLogprobContent` per token that
-    /// contributed to this delta's `content`. Populated only when the request
-    /// set `logprobs: true`. The default omit-when-None rule keeps the wire
-    /// shape unchanged for callers that don't opt in.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub logprobs: Option<ChatLogprobs>,
-}
-
-/// Best-effort parser that converts a raw assistant response into a tool call
-/// when the text matches the OpenAI tool-call shape.
-///
-/// Accepted shapes:
-/// 1. Bare object: `{"name": "...", "arguments": {...}}`
-/// 2. Wrapped object: `{"tool_calls": [{"function": {"name": ..., "arguments": ...}}, ...]}`
-/// 3. Qwen XML envelope: `<tool_call>{"name": "...", "arguments": {...}}</tool_call>`
-/// 4. Gemma 4 native envelope: `<|tool_call>call:name{arg:<|"|>value<|"|>}<tool_call|>`
-///
-/// Returns `None` when the text does not cleanly parse as a tool call. Callers
-/// fall back to returning the raw text as `content`.
-pub fn try_parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
-    let trimmed = text.trim();
-    if let Some(calls) = try_parse_gemma4_tool_calls(trimmed) {
-        return Some(calls);
-    }
-    if let Some(calls) = try_parse_qwen_xml_tool_calls(trimmed) {
-        return Some(calls);
-    }
-    if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
-
-    if let Some(wrapper) = value.get("tool_calls").and_then(|v| v.as_array()) {
-        let calls: Vec<ToolCall> = wrapper
-            .iter()
-            .filter_map(|tc| {
-                let func = tc.get("function")?;
-                Some(ToolCall {
-                    id: tc.get("id").and_then(|v| v.as_str()).map(str::to_owned),
-                    tool_type: tc
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("function")
-                        .to_owned(),
-                    function: FunctionCall {
-                        name: func.get("name")?.as_str()?.to_owned(),
-                        arguments: func
-                            .get("arguments")
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null),
-                    },
-                })
-            })
-            .collect();
-        return (!calls.is_empty()).then_some(calls);
-    }
-
-    let name = value.get("name").and_then(|v| v.as_str())?;
-    let arguments = value
-        .get("arguments")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    Some(vec![ToolCall {
-        id: None,
-        tool_type: "function".to_owned(),
-        function: FunctionCall {
-            name: name.to_owned(),
-            arguments,
-        },
-    }])
-}
-
-fn try_parse_qwen_xml_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
-    const START: &str = "<tool_call>";
-    const END: &str = "</tool_call>";
-
-    let mut calls = Vec::new();
-    let mut offset = 0usize;
-    while let Some(start_rel) = text[offset..].find(START) {
-        let body_start = offset + start_rel + START.len();
-        let rest = &text[body_start..];
-        let end_rel = rest.find(END)?;
-        let body = rest[..end_rel].trim();
-        let value: serde_json::Value = serde_json::from_str(body).ok()?;
-        let name = value.get("name").and_then(|v| v.as_str())?;
-        let arguments = value
-            .get("arguments")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        calls.push(ToolCall {
-            id: None,
-            tool_type: "function".to_owned(),
-            function: FunctionCall {
-                name: name.to_owned(),
-                arguments,
-            },
-        });
-        offset = body_start + end_rel + END.len();
-    }
-
-    (!calls.is_empty()).then_some(calls)
-}
-
-fn try_parse_gemma4_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
-    const START: &str = "<|tool_call>call:";
-    const END: &str = "<tool_call|>";
-    const TURN_END: &str = "<turn|>";
-
-    let mut calls = Vec::new();
-    let mut offset = 0usize;
-    while let Some(start_rel) = text[offset..].find(START) {
-        let start = offset + start_rel + START.len();
-        let after_start = &text[start..];
-        let name_end_rel = after_start.find('{')?;
-        let name = after_start[..name_end_rel].trim();
-        if name.is_empty()
-            || !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-        {
-            offset = start + name_end_rel + 1;
-            continue;
-        }
-
-        let args_start = start + name_end_rel + 1;
-        let args_end_rel = find_gemma4_matching_brace(&text[args_start..])?;
-        let args_end = args_start + args_end_rel;
-        let after_args = &text[args_end + 1..];
-        let consumed_end = if after_args.starts_with(END) {
-            args_end + 1 + END.len()
-        } else if after_args.starts_with(TURN_END) {
-            args_end + 1 + TURN_END.len()
-        } else {
-            args_end + 1
-        };
-
-        calls.push(ToolCall {
-            id: None,
-            tool_type: "function".to_owned(),
-            function: FunctionCall {
-                name: name.to_owned(),
-                arguments: parse_gemma4_arguments(&text[args_start..args_end]),
-            },
-        });
-        offset = consumed_end;
-    }
-
-    (!calls.is_empty()).then_some(calls)
-}
-
-fn find_gemma4_matching_brace(input: &str) -> Option<usize> {
-    const STRING_DELIM: &str = r#"<|"|>"#;
-    let mut idx = 0usize;
-    let mut depth = 0i32;
-    let mut in_string = false;
-    while idx < input.len() {
-        let rest = &input[idx..];
-        if rest.starts_with(STRING_DELIM) {
-            in_string = !in_string;
-            idx += STRING_DELIM.len();
-            continue;
-        }
-        let byte = input.as_bytes()[idx];
-        if !in_string {
-            match byte {
-                b'{' => depth += 1,
-                b'}' if depth == 0 => return Some(idx),
-                b'}' => depth -= 1,
-                _ => {}
-            }
-        }
-        idx += 1;
-    }
-    None
-}
-
-fn parse_gemma4_arguments(input: &str) -> serde_json::Value {
-    let mut object = serde_json::Map::new();
-    for part in split_gemma4_top_level(input, b',') {
-        let trimmed = part.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Some(colon) = find_gemma4_top_level(trimmed, b':') {
-            let key = trimmed[..colon].trim();
-            if key.is_empty() {
-                continue;
-            }
-            object.insert(
-                key.to_owned(),
-                parse_gemma4_value(trimmed[colon + 1..].trim()),
-            );
-        }
-    }
-    serde_json::Value::Object(object)
-}
-
-fn parse_gemma4_value(input: &str) -> serde_json::Value {
-    const STRING_DELIM: &str = r#"<|"|>"#;
-    let trimmed = input.trim();
-    if let Some(inner) = trimmed
-        .strip_prefix(STRING_DELIM)
-        .and_then(|s| s.strip_suffix(STRING_DELIM))
-    {
-        return serde_json::Value::String(inner.to_owned());
-    }
-    if let Some(inner) = trimmed.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-        return parse_gemma4_arguments(inner);
-    }
-    if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-        let values = split_gemma4_top_level(inner, b',')
-            .into_iter()
-            .filter(|part| !part.trim().is_empty())
-            .map(parse_gemma4_value)
-            .collect();
-        return serde_json::Value::Array(values);
-    }
-    match trimmed {
-        "true" => serde_json::Value::Bool(true),
-        "false" => serde_json::Value::Bool(false),
-        "null" => serde_json::Value::Null,
-        _ => {
-            if let Ok(value) = trimmed.parse::<i64>() {
-                serde_json::Value::Number(value.into())
-            } else if let Ok(value) = trimmed.parse::<f64>() {
-                serde_json::Number::from_f64(value)
-                    .map(serde_json::Value::Number)
-                    .unwrap_or_else(|| serde_json::Value::String(trimmed.to_owned()))
-            } else {
-                serde_json::Value::String(trimmed.to_owned())
-            }
-        }
-    }
-}
-
-fn split_gemma4_top_level(input: &str, delimiter: u8) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut start = 0usize;
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut idx = 0usize;
-    while idx < input.len() {
-        let rest = &input[idx..];
-        if rest.starts_with(r#"<|"|>"#) {
-            in_string = !in_string;
-            idx += r#"<|"|>"#.len();
-            continue;
-        }
-        let byte = input.as_bytes()[idx];
-        if !in_string {
-            match byte {
-                b'{' | b'[' => depth += 1,
-                b'}' | b']' => depth -= 1,
-                b if b == delimiter && depth == 0 => {
-                    parts.push(&input[start..idx]);
-                    start = idx + 1;
-                }
-                _ => {}
-            }
-        }
-        idx += 1;
-    }
-    parts.push(&input[start..]);
-    parts
-}
-
-fn find_gemma4_top_level(input: &str, needle: u8) -> Option<usize> {
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut idx = 0usize;
-    while idx < input.len() {
-        let rest = &input[idx..];
-        if rest.starts_with(r#"<|"|>"#) {
-            in_string = !in_string;
-            idx += r#"<|"|>"#.len();
-            continue;
-        }
-        let byte = input.as_bytes()[idx];
-        if !in_string {
-            match byte {
-                b'{' | b'[' => depth += 1,
-                b'}' | b']' => depth -= 1,
-                b if b == needle && depth == 0 => return Some(idx),
-                _ => {}
-            }
-        }
-        idx += 1;
-    }
-    None
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// Embeddings (OpenAI /v1/embeddings)
-// ────────────────────────────────────────────────────────────────────────────
-
-/// OpenAI `/v1/embeddings` accepts `input` as either a single string or an
-/// array of strings — the response shape is always a list, one entry per
-/// input item in order.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum EmbeddingsInput {
-    Single(String),
-    Batch(Vec<String>),
-}
-
-impl EmbeddingsInput {
-    /// Flatten to a single `Vec<String>` regardless of wire shape.
-    pub fn into_batch(self) -> Vec<String> {
-        match self {
-            Self::Single(s) => vec![s],
-            Self::Batch(v) => v,
-        }
-    }
-}
-
-/// `POST /v1/embeddings` request body.
-#[derive(Debug, Clone, Deserialize)]
-pub struct EmbeddingsRequest {
-    pub model: String,
-    pub input: EmbeddingsInput,
-    /// Optional pooling strategy. When absent, defaults to `mean` pooling —
-    /// the most common choice for sentence embeddings. Accepted values:
-    /// `"mean"`, `"cls"`, `"max"`, `"last_token"`, `"weighted_mean"`.
-    #[serde(default)]
-    pub pooling: Option<String>,
-    /// OpenAI compatibility fields — currently ignored but accepted so
-    /// drop-in clients don't 400. `encoding_format` other than `"float"`
-    /// would require output rewriting that's out of scope for Phase S3.
-    #[serde(default)]
-    pub encoding_format: Option<String>,
-    #[serde(default)]
-    pub user: Option<String>,
-}
-
-/// Single embedding entry in the response list.
-#[derive(Debug, Clone, Serialize)]
-pub struct EmbeddingData {
-    pub index: usize,
-    pub object: &'static str,
-    pub embedding: Vec<f32>,
-}
-
-/// Token counts for an embeddings response. No completion tokens — embeddings
-/// don't generate.
-#[derive(Debug, Clone, Serialize)]
-pub struct EmbeddingsUsage {
-    pub prompt_tokens: usize,
-    pub total_tokens: usize,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct EmbeddingsResponse {
-    pub object: &'static str,
-    pub data: Vec<EmbeddingData>,
-    pub model: String,
-    pub usage: EmbeddingsUsage,
-}
-
-/// Parse the wire `pooling` field into a `PoolingMode` with sensible
-/// defaults. Unknown modes yield `None` so the handler can 400 rather than
-/// silently applying a fallback.
-pub fn parse_pooling_mode(s: Option<&str>) -> Option<pmetal_models::pooling::PoolingMode> {
-    use pmetal_models::pooling::PoolingMode;
-    match s.unwrap_or("mean").to_ascii_lowercase().as_str() {
-        "mean" => Some(PoolingMode::Mean),
-        "cls" => Some(PoolingMode::Cls),
-        "max" => Some(PoolingMode::Max),
-        "last_token" | "last" => Some(PoolingMode::LastToken),
-        "weighted_mean" | "weighted" => Some(PoolingMode::WeightedMean),
-        _ => None,
-    }
-}
-
-/// Model info for /v1/models.
-#[derive(Debug, Clone, Serialize)]
-pub struct ModelInfo {
-    pub id: String,
-    pub object: String,
-    pub created: i64,
-    pub owned_by: String,
-}
-
-/// Model list response.
-#[derive(Debug, Clone, Serialize)]
-pub struct ModelListResponse {
-    pub object: String,
-    pub data: Vec<ModelInfo>,
 }

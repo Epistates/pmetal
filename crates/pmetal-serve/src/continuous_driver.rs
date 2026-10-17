@@ -262,6 +262,17 @@ impl ContinuousEngineState {
         config: &GenerationConfig,
         prompt: &[u32],
     ) -> Result<usize, Exception> {
+        self.admit_sampler(slot, config.sampler(prompt))
+    }
+
+    /// [`admit`](Self::admit) with the slot's sampler already built, for a
+    /// request whose sampler carries more than its configuration makes (a
+    /// grammar's logits processor).
+    pub fn admit_sampler(
+        &mut self,
+        slot: SlotId,
+        sampler: DecodeSampler,
+    ) -> Result<usize, Exception> {
         let idx = self.map.allocate(slot).ok_or_else(|| {
             Exception::custom(format!(
                 "ContinuousEngineState::admit: no free batch row for {:?} (capacity {})",
@@ -269,7 +280,7 @@ impl ContinuousEngineState {
                 self.capacity()
             ))
         })?;
-        self.samplers[idx] = Some(config.sampler(prompt));
+        self.samplers[idx] = Some(sampler);
         if let Some(fused) = self.fused_cache.as_mut() {
             fused.release(idx);
         }
@@ -1064,6 +1075,79 @@ mod tests {
         assert!(state.fused_cache().unwrap().memory_usage() > 0);
         state.retire(b);
         assert_eq!(state.fused_cache().unwrap().memory_usage(), 0);
+        pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
+    }
+
+    /// A grammar-style logits processor that follows the tokens its slot
+    /// takes: the next must be one more than the last.
+    struct CountUp {
+        next: u32,
+        vocab: usize,
+    }
+
+    impl pmetal_runtime::logits_processor::LogitsProcessor for CountUp {
+        fn process(&mut self, logits: &Array) -> Array {
+            let mut bias = vec![-1e9f32; self.vocab];
+            bias[self.next as usize] = 0.0;
+            logits
+                .as_dtype(Dtype::Float32.as_i32())
+                .add(&Array::from_f32_slice(&bias, &[1, self.vocab as i32]))
+        }
+        fn accept(&mut self, token: u32) {
+            self.next = token + 1;
+        }
+        fn needs_host_tokens(&self) -> bool {
+            true
+        }
+        fn fork(&self) -> Box<dyn pmetal_runtime::logits_processor::LogitsProcessor> {
+            Box::new(CountUp {
+                next: self.next,
+                vocab: self.vocab,
+            })
+        }
+    }
+
+    /// A slot whose sampler carries a processor that follows its tokens is
+    /// sampled in the block like any other: its row is masked by its own
+    /// state, step after step, and the plain-argmax slot beside it takes the
+    /// argmax of its row.
+    #[test]
+    fn a_constrained_slot_is_sampled_in_the_block_beside_a_plain_one() {
+        let vocab = 20usize;
+        let mut state = ContinuousEngineState::new(2, make_config());
+        let (constrained, plain) = (SlotId(1), SlotId(2));
+        let greedy = GenerationConfig::greedy(8);
+        state
+            .admit_sampler(
+                constrained,
+                greedy
+                    .sampler(&[1])
+                    .with_processor(Box::new(CountUp { next: 5, vocab })),
+            )
+            .unwrap();
+        state.admit(plain, &greedy, &[1]).unwrap();
+
+        let mut rng = 9u64;
+        let mut taken = Vec::new();
+        for step in 0..6 {
+            let data: Vec<f32> = (0..2 * vocab)
+                .map(|_| {
+                    rng = rng
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (rng >> 40) as f32 / (1u64 << 24) as f32
+                })
+                .collect();
+            let logits = Array::from_f32_slice(&data, &[2, vocab as i32]);
+            let block = state.sample_rows(&[constrained, plain], &logits).unwrap();
+            let block = block.as_slice::<u32>().to_vec();
+            taken.push(block[0]);
+            let best = (0..vocab)
+                .max_by(|&a, &b| data[vocab + a].total_cmp(&data[vocab + b]))
+                .unwrap() as u32;
+            assert_eq!(block[1], best, "step {step}: the plain slot's argmax");
+        }
+        assert_eq!(taken, vec![5, 6, 7, 8, 9, 10], "the grammar's own sequence");
         pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
     }
 

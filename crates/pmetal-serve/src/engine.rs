@@ -29,7 +29,7 @@ use std::time::Instant;
 // ────────────────────────────────────────────────────────────────────────────
 
 /// All sampling parameters for a single generation request.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SamplingParams {
     pub max_tokens: usize,
     pub temperature: f32,
@@ -50,6 +50,10 @@ pub struct SamplingParams {
     /// includes the top-`n` alternative logprobs. `None` (default) skips
     /// logprob computation entirely to keep the hot path unchanged.
     pub logprobs_top_n: Option<usize>,
+    /// A grammar the output must conform to (see [`crate::structured`]),
+    /// enforced by masking the logits at every step through the request's own
+    /// sampler, in a batch as well as alone.
+    pub constraint: Option<crate::structured::Constraint>,
 }
 
 /// Per-token logprob data returned from [`InferenceEngine::generate`] when
@@ -80,6 +84,9 @@ pub struct RequestMetrics {
     pub tokens_per_second: f64,
     /// Number of prompt tokens.
     pub prompt_tokens: usize,
+    /// How many of the prompt's tokens the prefix cache supplied: their keys
+    /// and values were restored, not computed (OpenAI's `cached_tokens`).
+    pub cached_prompt_tokens: usize,
     /// Number of completion tokens.
     pub completion_tokens: usize,
 }
@@ -101,6 +108,10 @@ pub enum TokenEvent {
     Done {
         finish_reason: String,
         metrics: RequestMetrics,
+        /// How many of the newest tokens end in a stop sequence. Every token
+        /// is emitted as a `Token` event; where the text is cut is decided
+        /// by [`crate::stop::StopFilter`], which also finds a stop sequence
+        /// that starts inside a token. The single-request path reports 0.
         stripped_tokens: usize,
     },
     /// Generation failed.
@@ -119,18 +130,13 @@ enum StepOutcome {
 
 /// Aggregated result of a single async decode run.
 struct DecodeRun {
-    /// Generated token IDs (already truncated when a stop-sequence matched).
-    generated: Vec<u32>,
-    /// Per-token logprobs when the request opted in; `None` otherwise.
-    logprobs: Option<Vec<TokenLogprobEntry>>,
+    /// Prompt tokens restored from the prefix cache.
+    cached_prompt_tokens: usize,
     /// Finish reason: `"length"`, `"stop"`, or `"cancelled"`.
     finish_reason: &'static str,
-    /// Number of tokens stripped from the tail due to stop-sequence match
-    /// (used by the streaming path to tell the client how many to discard).
-    stripped_tokens: usize,
     /// Milliseconds to first generated token (TTFT).
     first_token_time_ms: Option<f64>,
-    /// Final token count (after stop-sequence truncation).
+    /// How many tokens were generated.
     completion_tokens: usize,
 }
 
@@ -164,11 +170,6 @@ struct ServeCacheModeSelection {
     estimated_weight_bytes: u64,
     estimated_fp16_kv_bytes: u64,
     working_set_bytes: Option<u64>,
-}
-
-#[derive(Debug)]
-struct BackendState {
-    preferred: PreferredGenerationBackend,
 }
 
 fn build_generation_config_from_parts(
@@ -255,6 +256,23 @@ pub(crate) fn detect_stop_sequence_suffix(
     })
 }
 
+/// The `vocab_size` of the checkpoint's config (the width of its logits), 0
+/// when it states none.
+fn model_vocab_size(model_path: &Path) -> usize {
+    let Ok(text) = std::fs::read_to_string(model_path.join("config.json")) else {
+        return 0;
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return 0;
+    };
+    let text_config = config.get("text_config").filter(|c| c.is_object());
+    text_config
+        .and_then(|c| c.get("vocab_size"))
+        .or_else(|| config.get("vocab_size"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as usize
+}
+
 fn estimate_parameter_count(config_json: &serde_json::Value) -> Option<u64> {
     let hidden = config_json.get("hidden_size")?.as_u64()?;
     let layers = config_json.get("num_hidden_layers")?.as_u64()?;
@@ -269,23 +287,30 @@ fn estimate_parameter_count(config_json: &serde_json::Value) -> Option<u64> {
     )
 }
 
+/// The backend `--ane` asks for, or why the model cannot have it.
+///
+/// Asking for the ANE is an instruction, not a hint: a model it cannot run is
+/// an error, and so is every request it later fails, never a quiet fall back
+/// to the GPU that would answer slower than asked and hide that the ANE path
+/// is broken. (A model under ~2B parameters decodes faster on the GPU; that
+/// is logged, and the ANE is used as asked.)
 fn select_accelerated_backend(
     config_json: &serde_json::Value,
     ane_enabled: bool,
-) -> PreferredGenerationBackend {
+) -> Result<PreferredGenerationBackend, String> {
     if !ane_enabled {
-        return PreferredGenerationBackend::Gpu;
+        return Ok(PreferredGenerationBackend::Gpu);
     }
-
-    let prefer_gpu_for_decode = estimate_parameter_count(config_json)
-        .map(|params| params < 2_000_000_000)
-        .unwrap_or(false);
-
-    if !prefer_gpu_for_decode && is_ane_inference_compatible(config_json).is_ok() {
-        return PreferredGenerationBackend::Ane;
+    is_ane_inference_compatible(config_json).map_err(|reason| {
+        format!("--ane was asked for, but the ANE cannot run this model: {reason}")
+    })?;
+    if estimate_parameter_count(config_json).is_some_and(|params| params < 2_000_000_000) {
+        tracing::warn!(
+            "models under ~2B parameters decode faster on the GPU than on the ANE; running on the \
+             ANE as asked"
+        );
     }
-
-    PreferredGenerationBackend::Gpu
+    Ok(PreferredGenerationBackend::Ane)
 }
 
 fn select_serve_cache_mode(
@@ -466,6 +491,15 @@ pub struct InferenceEngine {
     tokenizer: Arc<pmetal_data::Tokenizer>,
     /// Detected chat template.
     chat_template: ChatTemplate,
+    /// What bytes each token stands for, built on first use.
+    vocab: std::sync::OnceLock<Option<Arc<crate::vocab::ByteVocab>>>,
+    /// The grammar compiler for this tokenizer, built by the first request
+    /// that has a grammar.
+    grammar: std::sync::OnceLock<Result<Arc<crate::structured::GrammarFactory>, String>>,
+    /// How many logits the model emits per step (its `vocab_size`).
+    model_vocab: usize,
+    /// How the model embeds text.
+    embedding: EmbeddingDefaults,
     /// How the model reads images and videos, if it can.
     vision: Vision,
     /// Model name/ID for API responses.
@@ -474,12 +508,16 @@ pub struct InferenceEngine {
     model_path: std::path::PathBuf,
     /// Maximum sequence length for KV cache.
     max_seq_len: usize,
+    /// Prompt plus output a request may take: the model's context window,
+    /// within `max_seq_len`.
+    context_tokens: usize,
     /// Fixed ANE bucket cap for accelerated backends.
     ane_max_seq_len: usize,
     /// DFlash draft model drafting for the ANE engine, if any.
     ane_draft_path: Option<std::path::PathBuf>,
-    /// Preferred generation backend; falls back to GPU permanently on failure.
-    backend: Arc<Mutex<BackendState>>,
+    /// Where requests generate: the GPU, or the ANE when `--ane` was asked
+    /// for (and the model can run there). Never changes at run time.
+    backend: PreferredGenerationBackend,
     /// Stop token IDs collected from all available sources.
     stop_token_ids: Vec<u32>,
     /// Model creation timestamp.
@@ -695,6 +733,48 @@ impl crate::continuous_driver::SlotForward for ModelForward<'_> {
     }
 }
 
+/// The padded tokens (sequences times the longest's length) one embedding
+/// batch may hold.
+const EMBED_BATCH_TOKENS: usize = 8192;
+
+/// How a model's embeddings are made, from its sentence-transformers
+/// configuration (`modules.json`, the pooling module, `Normalize`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbeddingDefaults {
+    /// The pooling the model was trained with (mean when it says nothing).
+    pub pooling: pmetal_models::pooling::PoolingMode,
+    /// Whether its vectors are unit length. OpenAI's are, and clients
+    /// compare with a dot product, so a model that states nothing is
+    /// normalized too.
+    pub normalize: bool,
+    /// The longest input it was trained for, if it states one.
+    pub max_input_tokens: Option<usize>,
+}
+
+impl EmbeddingDefaults {
+    fn read(model_path: &Path) -> Self {
+        let defaults = Self {
+            pooling: pmetal_models::pooling::PoolingMode::Mean,
+            normalize: true,
+            max_input_tokens: None,
+        };
+        match pmetal_models::pooling::SentenceTransformerConfig::from_dir(model_path) {
+            Ok(Some(config)) => Self {
+                pooling: config.pooling,
+                normalize: config.normalize,
+                max_input_tokens: config.max_seq_length,
+            },
+            Ok(None) => defaults,
+            Err(e) => {
+                tracing::warn!(
+                    "the sentence-transformers configuration is not usable ({e}); embedding with mean pooling"
+                );
+                defaults
+            }
+        }
+    }
+}
+
 /// One continuous-batching step, run by the model thread between jobs: a
 /// prefill chunk for one slot or a decode step for every decoding slot.
 /// Reports idle when no request is pending or in flight; the job that
@@ -727,6 +807,54 @@ fn continuous_step(state: &mut EngineState) -> Background {
     }
 }
 
+/// Run an accelerated (ANE) generation and report it on `tx`: each token as
+/// `run` hands it over, then `Done`, or `Error` if `run` fails. `run` is
+/// given the callback to call with each token; the callback returns `false`
+/// when the receiver is gone, which `run` must take as the signal to stop.
+fn pump_accelerated<R>(prompt_tokens: usize, tx: &tokio::sync::mpsc::Sender<TokenEvent>, run: R)
+where
+    R: FnOnce(&mut dyn FnMut(u32) -> bool) -> Result<GenerationOutput, String>,
+{
+    let start = Instant::now();
+    let mut first_token_time_ms = None;
+    let mut completion_tokens = 0usize;
+    let mut receiver_dropped = false;
+    let output = run(&mut |token| {
+        if first_token_time_ms.is_none() {
+            first_token_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        completion_tokens += 1;
+        let sent = tx.blocking_send(TokenEvent::Token {
+            id: token,
+            logprob: None,
+        });
+        receiver_dropped = sent.is_err();
+        !receiver_dropped
+    });
+    if receiver_dropped {
+        return;
+    }
+    match output {
+        Ok(output) => {
+            let metrics = InferenceEngine::build_metrics(
+                start,
+                prompt_tokens,
+                completion_tokens,
+                first_token_time_ms,
+            );
+            let _ = tx.blocking_send(TokenEvent::Done {
+                finish_reason: InferenceEngine::finish_reason(&output),
+                metrics,
+                stripped_tokens: 0,
+            });
+        }
+        Err(err) => {
+            tracing::error!("the ANE engine failed after {completion_tokens} tokens: {err}");
+            let _ = tx.blocking_send(TokenEvent::Error(format!("the ANE engine failed: {err}")));
+        }
+    }
+}
+
 // Default prefix-cache budgets. Generous on entries since each one is
 // just a token sequence + a KV fork; the byte budget is the hard cap.
 const DEFAULT_PREFIX_CACHE_ENTRIES: usize = 16;
@@ -748,6 +876,8 @@ struct GpuRequest {
     gen_config: GenerationConfig,
     stop_sequences: Vec<String>,
     logprobs_top_n: Option<usize>,
+    /// The grammar the output must conform to.
+    constraint: Option<crate::structured::Constraint>,
     /// The images and videos the prompt's media tokens stand for.
     media: Option<Arc<PromptMedia>>,
 }
@@ -827,24 +957,17 @@ impl InferenceEngine {
 
         let preferred_backend = match std::fs::read_to_string(model_path.join("config.json")) {
             Ok(config_text) => match serde_json::from_str::<serde_json::Value>(&config_text) {
-                Ok(config_json) => select_accelerated_backend(&config_json, ane_enabled),
-                Err(err) => {
-                    tracing::warn!(
-                        model = %model_path.display(),
-                        "Failed to parse config.json for backend selection: {}",
-                        err
-                    );
-                    PreferredGenerationBackend::Gpu
+                Ok(config_json) => select_accelerated_backend(&config_json, ane_enabled)
+                    .map_err(anyhow::Error::msg)?,
+                Err(err) if ane_enabled => {
+                    anyhow::bail!("--ane was asked for, but config.json does not parse: {err}")
                 }
+                Err(_) => PreferredGenerationBackend::Gpu,
             },
-            Err(err) => {
-                tracing::warn!(
-                    model = %model_path.display(),
-                    "Failed to read config.json for backend selection: {}",
-                    err
-                );
-                PreferredGenerationBackend::Gpu
+            Err(err) if ane_enabled => {
+                anyhow::bail!("--ane was asked for, but config.json cannot be read: {err}")
             }
+            Err(_) => PreferredGenerationBackend::Gpu,
         };
 
         let model = ModelThread::spawn_with_background(
@@ -880,15 +1003,19 @@ impl InferenceEngine {
             model,
             tokenizer: Arc::new(tokenizer),
             chat_template,
+            vocab: std::sync::OnceLock::new(),
+            grammar: std::sync::OnceLock::new(),
+            model_vocab: model_vocab_size(model_path),
+            embedding: EmbeddingDefaults::read(model_path),
             vision: Vision::detect(model_path),
             model_id,
             model_path: model_path.to_path_buf(),
             max_seq_len,
+            context_tokens: pmetal_data::inference_config::context_window(model_path)
+                .map_or(max_seq_len, |window| window.min(max_seq_len)),
             ane_max_seq_len,
             ane_draft_path: None,
-            backend: Arc::new(Mutex::new(BackendState {
-                preferred: preferred_backend,
-            })),
+            backend: preferred_backend,
             stop_token_ids,
             created_at: chrono::Utc::now().timestamp(),
             cache_mode_override: None,
@@ -1019,6 +1146,9 @@ impl InferenceEngine {
         params: SamplingParams,
     ) -> ServeResult<tokio::sync::mpsc::Receiver<TokenEvent>> {
         Self::validate_params(&params, self.max_seq_len)?;
+        if input_ids.is_empty() {
+            return Err(ServeError::BadRequest("the prompt is empty".into()));
+        }
         if !self.continuous_batching_enabled() {
             return Err(ServeError::Internal(
                 "continuous batching not enabled; call enable_continuous_batching first".into(),
@@ -1038,6 +1168,7 @@ impl InferenceEngine {
             gen_config,
             stop_sequences: params.stop_sequences,
             logprobs_top_n: params.logprobs_top_n,
+            constraint: params.constraint,
             media: None,
         };
         let ctx = self.gpu_request_context();
@@ -1055,6 +1186,7 @@ impl InferenceEngine {
                         request.input_ids.clone(),
                         slot_params,
                         request.gen_config.clone(),
+                        request.constraint.clone(),
                         tx.clone(),
                     ),
                     Some(Err(_)) => {
@@ -1158,6 +1290,18 @@ impl InferenceEngine {
         &self.model_id
     }
 
+    /// `Ok` when `requested` names the model this server serves; the 404 of
+    /// the OpenAI and Anthropic APIs otherwise. A request for another model
+    /// answered by this one would hand back text the client believes came
+    /// from the model it asked for.
+    pub fn check_model(&self, requested: &str) -> ServeResult<()> {
+        if requested == self.model_id {
+            Ok(())
+        } else {
+            Err(ServeError::ModelNotFound(requested.to_string()))
+        }
+    }
+
     /// Creation timestamp.
     pub fn created_at(&self) -> i64 {
         self.created_at
@@ -1170,6 +1314,75 @@ impl InferenceEngine {
     /// for decoding tokens inside async streaming closures.
     pub fn tokenizer_arc(&self) -> Arc<pmetal_data::Tokenizer> {
         Arc::clone(&self.tokenizer)
+    }
+
+    /// The bytes each token stands for; `None` for a tokenizer that does not
+    /// spell bytes (a word-level vocabulary).
+    pub fn byte_vocab(&self) -> Option<Arc<crate::vocab::ByteVocab>> {
+        self.vocab
+            .get_or_init(|| crate::vocab::ByteVocab::from_tokenizer(&self.tokenizer).map(Arc::new))
+            .clone()
+    }
+
+    /// Compile `spec` into a constraint for a generation that continues
+    /// `prompt`. `thinks` says the model reasons before it answers.
+    ///
+    /// Compiling a grammar is CPU work (the first call also builds the
+    /// compiler for the tokenizer: a few hundred milliseconds for a large
+    /// vocabulary), so it runs off the async threads.
+    ///
+    /// # Errors
+    ///
+    /// A 400 naming the compiler's complaint when the grammar is not
+    /// supported; a 500 if the tokenizer cannot be put in grammar form.
+    pub async fn compile_constraint(
+        &self,
+        spec: crate::structured::ConstraintSpec,
+        prompt: &[u32],
+        thinks: bool,
+    ) -> ServeResult<crate::structured::Constraint> {
+        let factory = self
+            .grammar
+            .get_or_init(|| {
+                let vocab = self.byte_vocab().ok_or_else(|| {
+                    "the tokenizer's vocabulary has no byte spelling to build a grammar on"
+                        .to_string()
+                })?;
+                crate::structured::GrammarFactory::new(
+                    Arc::clone(&self.tokenizer),
+                    &vocab,
+                    self.model_vocab,
+                    &self.stop_token_ids,
+                )
+                .map(Arc::new)
+            })
+            .clone()
+            .map_err(ServeError::Internal)?;
+        let tokenizer = Arc::clone(&self.tokenizer);
+        let prompt = prompt.to_vec();
+        tokio::task::spawn_blocking(move || factory.compile(&spec, &tokenizer, &prompt, thinks))
+            .await
+            .map_err(|e| ServeError::Internal(e.to_string()))?
+            .map_err(|why| {
+                ServeError::invalid_with_code(
+                    "response_format",
+                    "invalid_json_schema",
+                    format!("the grammar could not be compiled: {why}"),
+                )
+            })
+    }
+
+    /// The control token whose text is `text`, if the vocabulary has one.
+    pub fn token_id(&self, text: &str) -> Option<u32> {
+        self.tokenizer.inner().token_to_id(text)
+    }
+
+    /// The tool-call family the model's chat template writes, if it knows
+    /// tools. A model whose template does not still gets Hermes-style
+    /// `<tool_call>` parsing, the convention most tool-trained models share.
+    pub fn tool_format(&self) -> crate::tools::ToolFormat {
+        crate::tools::ToolFormat::detect(&self.chat_template)
+            .unwrap_or(crate::tools::ToolFormat::Hermes)
     }
 
     /// Format chat messages using the detected template.
@@ -1231,10 +1444,30 @@ impl InferenceEngine {
     /// else 256), within the context window and this server's
     /// `--max-seq-len` once the prompt's `prompt_len` tokens are in.
     pub fn default_max_tokens(&self, thinking: bool, prompt_len: usize) -> usize {
-        let context = pmetal_data::inference_config::context_window(&self.model_path)
-            .map_or(self.max_seq_len, |c| c.min(self.max_seq_len));
         pmetal_data::inference_config::default_max_tokens(&self.model_path, thinking)
-            .for_prompt(prompt_len, Some(context))
+            .for_prompt(prompt_len, Some(self.context_tokens))
+    }
+
+    /// How many tokens can be generated after a `prompt_len`-token prompt:
+    /// the context that is left.
+    ///
+    /// # Errors
+    ///
+    /// `context_length_exceeded` when the prompt alone fills the context.
+    pub fn room_after(&self, prompt_len: usize) -> ServeResult<usize> {
+        // The ANE engine is compiled for a context of at most
+        // `--ane-max-seq-len` tokens.
+        let context = match self.backend {
+            PreferredGenerationBackend::Ane => self.context_tokens.min(self.ane_max_seq_len),
+            PreferredGenerationBackend::Gpu => self.context_tokens,
+        };
+        if prompt_len >= context {
+            return Err(ServeError::ContextLength(format!(
+                "This model's maximum context length is {context} tokens. However, your messages \
+                 resulted in {prompt_len} tokens. Please reduce the length of the messages."
+            )));
+        }
+        Ok(context - prompt_len)
     }
 
     /// The sampling a request gets for every parameter it leaves out: the
@@ -1297,6 +1530,12 @@ impl InferenceEngine {
                 "model '{}' does not accept images or videos: {why}",
                 self.model_id
             )));
+        }
+        if self.backend == PreferredGenerationBackend::Ane {
+            return Err(ServeError::unsupported(
+                "messages",
+                "the ANE engine (--ane) reads text only",
+            ));
         }
         let chat = crate::media::split_messages(messages)?;
         let text = self
@@ -1413,6 +1652,14 @@ impl InferenceEngine {
             .map_err(|e| ServeError::Tokenizer(e.to_string()))
     }
 
+    /// Tokenize text that may name control tokens (`<|im_end|>`) as the
+    /// tokens they are.
+    pub fn tokenize_with_special_tokens(&self, text: &str) -> ServeResult<Vec<u32>> {
+        self.tokenizer
+            .encode_with_special_tokens(text)
+            .map_err(|e| ServeError::Tokenizer(e.to_string()))
+    }
+
     /// Decode token IDs back to text.
     pub fn decode(&self, tokens: &[u32]) -> ServeResult<String> {
         self.tokenizer
@@ -1483,9 +1730,27 @@ impl InferenceEngine {
         Ok(())
     }
 
-    /// Validate sampling parameters against this engine's serving limits.
+    /// Validate sampling parameters against this engine's serving limits and
+    /// its backend: the ANE cannot report log-probabilities or apply a
+    /// grammar, so a request that needs either is refused, not run on the GPU
+    /// behind the operator's back.
     pub fn validate_sampling_params(&self, params: &SamplingParams) -> ServeResult<()> {
-        Self::validate_params(params, self.max_seq_len)
+        Self::validate_params(params, self.max_seq_len)?;
+        if self.backend == PreferredGenerationBackend::Ane {
+            if params.logprobs_top_n.is_some() {
+                return Err(ServeError::unsupported(
+                    "logprobs",
+                    "the ANE engine (--ane) does not report log-probabilities",
+                ));
+            }
+            if params.constraint.is_some() {
+                return Err(ServeError::unsupported(
+                    "response_format",
+                    "the ANE engine (--ane) cannot constrain its output to a grammar",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Build a `GenerationConfig` from API request sampling parameters.
@@ -1495,24 +1760,6 @@ impl InferenceEngine {
     /// `max_tokens` is silently clamped to `max_seq_len` (matches OpenAI behaviour).
     pub fn build_generation_config(&self, params: &SamplingParams) -> GenerationConfig {
         build_generation_config_from_parts(&self.stop_token_ids, self.max_seq_len, params)
-    }
-
-    fn backend_or_gpu(backend: &Arc<Mutex<BackendState>>) -> PreferredGenerationBackend {
-        backend
-            .lock()
-            .map(|state| state.preferred)
-            .unwrap_or(PreferredGenerationBackend::Gpu)
-    }
-
-    fn downgrade_backend(
-        backend: &Arc<Mutex<BackendState>>,
-        failed_backend: PreferredGenerationBackend,
-    ) {
-        if let Ok(mut state) = backend.lock() {
-            if state.preferred == failed_backend {
-                state.preferred = PreferredGenerationBackend::Gpu;
-            }
-        }
     }
 
     fn finish_reason(output: &GenerationOutput) -> String {
@@ -1541,142 +1788,34 @@ impl InferenceEngine {
             total_latency_ms,
             tokens_per_second,
             prompt_tokens,
+            cached_prompt_tokens: 0,
             completion_tokens,
         }
     }
 
-    fn try_accelerated_generate_blocking(
-        backend: &Arc<Mutex<BackendState>>,
-        model_path: &std::path::Path,
-        draft_path: Option<&std::path::Path>,
-        input_ids: &[u32],
-        gen_config: &GenerationConfig,
-        ane_max_seq_len: usize,
-    ) -> ServeResult<Option<(Vec<u32>, String, RequestMetrics)>> {
-        let preferred_backend = Self::backend_or_gpu(backend);
-        if preferred_backend == PreferredGenerationBackend::Gpu {
-            return Ok(None);
-        }
-
-        let prompt_tokens = input_ids.len();
-        let start = Instant::now();
-        let mut first_token_time_ms = None;
-
-        let output = match preferred_backend {
-            PreferredGenerationBackend::Ane => generate_cached_ane_streaming(
-                model_path,
-                draft_path,
-                input_ids,
-                gen_config,
-                ane_max_seq_len,
-                |_| {
-                    if first_token_time_ms.is_none() {
-                        first_token_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
-                    }
-                    true
-                },
-            ),
-            PreferredGenerationBackend::Gpu => unreachable!(),
-        };
-
-        match output {
-            Ok(output) => {
-                let generated = output.token_ids[prompt_tokens..].to_vec();
-                let metrics =
-                    Self::build_metrics(start, prompt_tokens, generated.len(), first_token_time_ms);
-                Ok(Some((generated, Self::finish_reason(&output), metrics)))
-            }
-            Err(err) => {
-                tracing::warn!(
-                    backend = ?preferred_backend,
-                    model = %model_path.display(),
-                    "Accelerated serving backend failed ({}), falling back to GPU",
-                    err
-                );
-                Self::downgrade_backend(backend, preferred_backend);
-                Ok(None)
-            }
-        }
-    }
-
-    fn try_accelerated_streaming_blocking(
-        backend: &Arc<Mutex<BackendState>>,
-        model_path: &std::path::Path,
-        draft_path: Option<&std::path::Path>,
+    /// Run a request on the ANE, streaming its tokens into `tx`, on a
+    /// blocking thread. A failure is the request's error (`TokenEvent::Error`):
+    /// the GPU does not take over, so no token is ever sent twice and a broken
+    /// ANE engine is visible instead of quietly slower.
+    fn stream_on_ane(
+        model_path: &Path,
+        draft_path: Option<&Path>,
         input_ids: &[u32],
         gen_config: &GenerationConfig,
         ane_max_seq_len: usize,
         tx: &tokio::sync::mpsc::Sender<TokenEvent>,
-    ) -> bool {
-        let preferred_backend = Self::backend_or_gpu(backend);
-        if preferred_backend == PreferredGenerationBackend::Gpu {
-            return false;
-        }
-
-        let prompt_tokens = input_ids.len();
-        let start = Instant::now();
-        let mut first_token_time_ms = None;
-        let mut completion_tokens = 0usize;
-        let mut receiver_dropped = false;
-
-        let output = match preferred_backend {
-            PreferredGenerationBackend::Ane => generate_cached_ane_streaming(
+    ) {
+        pump_accelerated(input_ids.len(), tx, |on_token| {
+            generate_cached_ane_streaming(
                 model_path,
                 draft_path,
                 input_ids,
                 gen_config,
                 ane_max_seq_len,
-                |token| {
-                    if first_token_time_ms.is_none() {
-                        first_token_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
-                    }
-                    completion_tokens += 1;
-                    if tx
-                        .blocking_send(TokenEvent::Token {
-                            id: token,
-                            logprob: None,
-                        })
-                        .is_err()
-                    {
-                        receiver_dropped = true;
-                        return false;
-                    }
-                    true
-                },
-            ),
-            PreferredGenerationBackend::Gpu => unreachable!(),
-        };
-
-        if receiver_dropped {
-            return true;
-        }
-
-        match output {
-            Ok(output) => {
-                let metrics = Self::build_metrics(
-                    start,
-                    prompt_tokens,
-                    completion_tokens,
-                    first_token_time_ms,
-                );
-                let _ = tx.blocking_send(TokenEvent::Done {
-                    finish_reason: Self::finish_reason(&output),
-                    metrics,
-                    stripped_tokens: 0,
-                });
-                true
-            }
-            Err(err) => {
-                tracing::warn!(
-                    backend = ?preferred_backend,
-                    model = %model_path.display(),
-                    "Accelerated serving backend failed ({}), falling back to GPU",
-                    err
-                );
-                Self::downgrade_backend(backend, preferred_backend);
-                false
-            }
-        }
+                on_token,
+            )
+            .map_err(|e| e.to_string())
+        });
     }
 
     /// Extract the last-position logits from a model output tensor.
@@ -1894,10 +2033,7 @@ impl InferenceEngine {
         let _stream = GenerationStream::enter();
 
         let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
-        let mut logprobs_out: Option<Vec<TokenLogprobEntry>> =
-            logprobs_top_n.map(|_| Vec::with_capacity(max_tokens));
         let mut first_token_time_ms: Option<f64> = None;
-        let mut stripped_tokens: usize = 0;
         let mut finish_reason: &'static str = "length";
         let mut cancelled = false;
 
@@ -2044,15 +2180,7 @@ impl InferenceEngine {
 
                 generated.push(token);
 
-                // Accumulate logprob for non-streaming return value. We
-                // clone so the owned value can still be handed to the
-                // streaming callback below.
-                if let (Some(entry), Some(out)) = (logprob_entry.as_ref(), logprobs_out.as_mut()) {
-                    out.push(entry.clone());
-                }
-
-                // Emit to caller (moves logprob entry into TokenEvent for
-                // streaming; ignored by non-streaming).
+                // Emit to the caller, logprob entry and all.
                 match on_token(token, logprob_entry) {
                     StepOutcome::Continue => {}
                     StepOutcome::Cancel => {
@@ -2062,11 +2190,11 @@ impl InferenceEngine {
                 }
 
                 // Stop-sequence detection on decoded text (multi-token
-                // suffix match via tokenizer).
-                if let Some(n_strip) =
-                    detect_stop_sequence_suffix(tokenizer, &generated, stop_sequences)
-                {
-                    stripped_tokens = n_strip;
+                // suffix match via tokenizer). The tokens that complete the
+                // match are kept: where the text is cut is the reply's
+                // business (see `crate::stop`), and a token can hold text
+                // before the stop sequence.
+                if detect_stop_sequence_suffix(tokenizer, &generated, stop_sequences).is_some() {
                     finish_reason = "stop";
                     return std::ops::ControlFlow::Break(());
                 }
@@ -2077,27 +2205,16 @@ impl InferenceEngine {
             return Err(decode_error.take().unwrap_or(ServeError::Model(e)));
         }
 
-        // Truncate tail if a stop-sequence was matched. Non-streaming
-        // callers see the truncated vec; streaming callers use
-        // `stripped_tokens` in the Done event to tell the client how many
-        // tokens to drop from the visible stream.
-        let visible_len = generated.len().saturating_sub(stripped_tokens);
-        if let Some(out) = logprobs_out.as_mut() {
-            out.truncate(visible_len);
-        }
-        generated.truncate(visible_len);
-
         if cancelled {
             finish_reason = "cancelled";
         }
 
+        let completion_tokens = generated.len();
         Ok(DecodeRun {
-            generated,
-            logprobs: logprobs_out,
+            cached_prompt_tokens: prefix_hit_len,
             finish_reason,
-            stripped_tokens,
             first_token_time_ms,
-            completion_tokens: visible_len,
+            completion_tokens,
         })
     }
     /// What a GPU request needs on the model thread, besides the model.
@@ -2122,6 +2239,9 @@ impl InferenceEngine {
     where
         E: FnMut(u32, Option<TokenLogprobEntry>) -> StepOutcome,
     {
+        if request.input_ids.is_empty() {
+            return Err(ServeError::BadRequest("the prompt is empty".into()));
+        }
         let start = Instant::now();
         let media = match request.media.as_deref() {
             Some(media) => Some(Self::media_forward(
@@ -2143,6 +2263,9 @@ impl InferenceEngine {
         let stop_tokens = request.gen_config.stop_tokens.clone();
         let prefill_step_size = request.gen_config.prefill_step_size;
         let mut sampler = request.gen_config.sampler(&request.input_ids);
+        if let Some(constraint) = &request.constraint {
+            sampler = sampler.with_processor(constraint.processor());
+        }
         let run = Self::run_async_decode(
             model,
             &mut cache,
@@ -2194,16 +2317,19 @@ impl InferenceEngine {
         if run.finish_reason == "cancelled" {
             return;
         }
-        let metrics = Self::build_metrics(
-            start,
-            prompt_tokens,
-            run.completion_tokens,
-            run.first_token_time_ms,
-        );
+        let metrics = RequestMetrics {
+            cached_prompt_tokens: run.cached_prompt_tokens,
+            ..Self::build_metrics(
+                start,
+                prompt_tokens,
+                run.completion_tokens,
+                run.first_token_time_ms,
+            )
+        };
         let _ = tx.blocking_send(TokenEvent::Done {
             finish_reason: run.finish_reason.to_string(),
             metrics,
-            stripped_tokens: run.stripped_tokens,
+            stripped_tokens: 0,
         });
     }
 
@@ -2231,8 +2357,12 @@ impl InferenceEngine {
     }
 
     /// [`generate`](Self::generate) for a prepared prompt, which may carry
-    /// images or videos (see [`prepare_chat`](Self::prepare_chat)). A prompt
-    /// with media always runs on the GPU.
+    /// images or videos (see [`prepare_chat`](Self::prepare_chat)).
+    ///
+    /// Runs through [`generate_streaming_prompt`](Self::generate_streaming_prompt)
+    /// and collects its tokens, so the two cannot disagree; the stop
+    /// sequences end the generation but the tokens that complete one are
+    /// kept (see [`crate::stop`] for cutting the text).
     pub async fn generate_prompt(
         &self,
         prompt: &PreparedPrompt,
@@ -2244,82 +2374,57 @@ impl InferenceEngine {
         RequestMetrics,
     )> {
         Self::validate_params(&params, self.max_seq_len)?;
-
-        let prompt_tokens = prompt.input_ids.len();
-        let request = GpuRequest {
-            input_ids: prompt.input_ids.clone(),
-            gen_config: self.build_generation_config(&params),
-            stop_sequences: params.stop_sequences,
-            logprobs_top_n: params.logprobs_top_n,
-            media: prompt.media.clone(),
-        };
-
-        // The accelerated ANE engine keeps its own models (on its own
-        // thread), so it runs on the blocking pool. It cannot collect
-        // logprobs, match raw-text stops or read media, and it hands the
-        // request back to the GPU when it fails.
-        if request.logprobs_top_n.is_none()
-            && request.stop_sequences.is_empty()
-            && request.media.is_none()
-            && Self::backend_or_gpu(&self.backend) != PreferredGenerationBackend::Gpu
-        {
-            let backend = Arc::clone(&self.backend);
-            let model_path = self.model_path.clone();
-            let draft_path = self.ane_draft_path.clone();
-            let ane_max_seq_len = self.ane_max_seq_len;
-            let input_ids = request.input_ids.clone();
-            let gen_config = request.gen_config.clone();
-            let accelerated = tokio::task::spawn_blocking(move || {
-                Self::try_accelerated_generate_blocking(
-                    &backend,
-                    &model_path,
-                    draft_path.as_deref(),
-                    &input_ids,
-                    &gen_config,
-                    ane_max_seq_len,
-                )
-            })
-            .await
-            .map_err(|e| ServeError::Internal(e.to_string()))??;
-            if let Some((tokens, reason, metrics)) = accelerated {
-                return Ok((tokens, None, reason, metrics));
+        let wants_logprobs = params.logprobs_top_n.is_some();
+        let mut rx = self.generate_streaming_prompt(prompt, params);
+        let mut tokens = Vec::new();
+        let mut logprobs = wants_logprobs.then(Vec::new);
+        while let Some(event) = rx.recv().await {
+            match event {
+                TokenEvent::Token { id, logprob } => {
+                    tokens.push(id);
+                    if let (Some(all), Some(entry)) = (logprobs.as_mut(), logprob) {
+                        all.push(entry);
+                    }
+                }
+                TokenEvent::Done {
+                    finish_reason,
+                    metrics,
+                    ..
+                } => return Ok((tokens, logprobs, finish_reason, metrics)),
+                TokenEvent::Error(message) => return Err(ServeError::Internal(message)),
             }
         }
-
-        let ctx = self.gpu_request_context();
-        let (reply, answer) = tokio::sync::oneshot::channel();
-        self.model
-            .submit(move |state| {
-                let result =
-                    Self::generate_on_model(state, &ctx, request, |_, _| StepOutcome::Continue)
-                        .map(|(run, start)| {
-                            let metrics = Self::build_metrics(
-                                start,
-                                prompt_tokens,
-                                run.completion_tokens,
-                                run.first_token_time_ms,
-                            );
-                            (
-                                run.generated,
-                                run.logprobs,
-                                run.finish_reason.to_string(),
-                                metrics,
-                            )
-                        });
-                let _ = reply.send(result);
-            })
-            .map_err(|_| ServeError::ModelNotLoaded)?;
-        answer
-            .await
-            .map_err(|_| ServeError::Internal("generation panicked".into()))?
+        Err(ServeError::Internal(
+            "generation ended without a result".into(),
+        ))
     }
 
-    /// Compute pooled sentence embeddings for a batch of texts.
+    /// How this model embeds, as its sentence-transformers files say (or the
+    /// defaults when it ships none): the pooling it was trained with, whether
+    /// its vectors are unit length, and the longest input it takes.
+    pub fn embedding_defaults(&self) -> EmbeddingDefaults {
+        self.embedding
+    }
+
+    /// Tokenize `text` for embedding as the model's tokenizer does: its own
+    /// post-processor adds the special tokens the model was trained with
+    /// (`[CLS]`/`[SEP]` for BERT, the end-of-text token Qwen3-Embedding pools
+    /// its last-token vector at, a BOS for models that take one).
+    pub fn tokenize_for_embedding(&self, text: &str) -> ServeResult<Vec<u32>> {
+        self.tokenizer
+            .encode_with_special_tokens(text)
+            .map_err(|e| ServeError::Tokenizer(e.to_string()))
+    }
+
+    /// Compute pooled sentence embeddings for token sequences.
     ///
-    /// Tokenises each input, forwards through the model's pre-lm-head trunk
-    /// via [`DynamicModel::forward_hidden`], and applies the requested
-    /// pooling strategy. Inputs are padded to the batch max length with a
-    /// right-padding attention mask so the pooler ignores padding positions.
+    /// Forwards the sequences through the model's pre-lm-head trunk
+    /// ([`DynamicModel::forward_hidden`]) and applies the pooling `mode`.
+    /// Sequences are padded to the longest of their batch with a mask the
+    /// pooler respects; a long list is cut into batches of at most
+    /// `EMBED_BATCH_TOKENS` padded tokens, each a job on the model thread of
+    /// its own, so a large request does not hold up generation. The vectors
+    /// come back as the pooler made them (f32, not normalized).
     ///
     /// # Errors
     ///
@@ -2328,37 +2433,40 @@ impl InferenceEngine {
     /// the supported set.
     pub async fn embed(
         &self,
-        inputs: &[String],
+        inputs: &[Vec<u32>],
         mode: pmetal_models::pooling::PoolingMode,
     ) -> ServeResult<Vec<Vec<f32>>> {
-        if inputs.is_empty() {
-            return Ok(Vec::new());
+        let mut vectors = Vec::with_capacity(inputs.len());
+        let mut start = 0;
+        while start < inputs.len() {
+            // As many sequences as fit the padded-token budget (at least one).
+            let mut end = start;
+            let mut longest = 0;
+            while end < inputs.len() {
+                let next = longest.max(inputs[end].len());
+                if end > start && next * (end - start + 1) > EMBED_BATCH_TOKENS {
+                    break;
+                }
+                longest = next;
+                end += 1;
+            }
+            vectors.extend(self.embed_batch(inputs[start..end].to_vec(), mode).await?);
+            start = end;
         }
+        Ok(vectors)
+    }
 
-        // Tokenise every input on the async side (pure CPU, no MLX state),
-        // both ways: an encoder was trained on `[CLS] ... [SEP]` (the
-        // tokenizer's own special tokens), which a causal model's embedding
-        // does not take. Which one the model wants is known on its thread.
-        let plain: Vec<Vec<u32>> = inputs
-            .iter()
-            .map(|s| self.tokenize(s))
-            .collect::<ServeResult<_>>()?;
-        let with_special: Vec<Vec<u32>> = inputs
-            .iter()
-            .map(|s| {
-                self.tokenizer
-                    .encode_with_special_tokens(s)
-                    .map_err(|e| ServeError::Tokenizer(e.to_string()))
-            })
-            .collect::<ServeResult<_>>()?;
-        let batch = inputs.len();
-
+    async fn embed_batch(
+        &self,
+        tokenized: Vec<Vec<u32>>,
+        mode: pmetal_models::pooling::PoolingMode,
+    ) -> ServeResult<Vec<Vec<f32>>> {
+        let batch = tokenized.len();
         let (reply, answer) = tokio::sync::oneshot::channel();
         self.model
             .submit(move |state| {
                 let mut embed = || -> ServeResult<Vec<Vec<f32>>> {
                     let encoder = state.model.takes_padding_mask();
-                    let tokenized = if encoder { &with_special } else { &plain };
                     let seq_max = tokenized.iter().map(Vec::len).max().unwrap_or(0).max(1);
                     // Padded [batch, seq_max] token ids and mask.
                     let mut ids_flat: Vec<i32> = vec![0; batch * seq_max];
@@ -2387,6 +2495,8 @@ impl InferenceEngine {
                     pooled.try_eval().map_err(|e| {
                         ServeError::Model(pmetal_runtime::compat::Exception::custom(e.to_string()))
                     })?;
+                    pmetal_runtime::check_unobserved_error()
+                        .map_err(|e| ServeError::Internal(format!("embedding: {e}")))?;
                     let hidden_dim = pooled.dim(1) as usize;
                     let flat: Vec<f32> = pooled.as_slice::<f32>().to_vec();
                     Ok((0..batch)
@@ -2448,49 +2558,40 @@ impl InferenceEngine {
             gen_config: self.build_generation_config(&params),
             stop_sequences: params.stop_sequences,
             logprobs_top_n: params.logprobs_top_n,
+            constraint: params.constraint.clone(),
             media: prompt.media.clone(),
         };
-        let accelerable = request.stop_sequences.is_empty()
-            && request.media.is_none()
-            && Self::backend_or_gpu(&self.backend) != PreferredGenerationBackend::Gpu;
-        let input_ids = request.input_ids.clone();
-        let gen_config = request.gen_config.clone();
-
         let ctx = self.gpu_request_context();
         let model = self.model.clone();
-        let tx_gpu = tx.clone();
-        let on_gpu = move |tx: tokio::sync::mpsc::Sender<TokenEvent>| {
-            let queued = model.submit(move |state| {
-                Self::stream_on_model(state, &ctx, request, &tx_gpu);
-            });
-            if queued.is_err() {
-                let _ = tx.try_send(TokenEvent::Error("the model thread has exited".into()));
-            }
-        };
 
-        if !accelerable {
-            on_gpu(tx);
+        if self.backend == PreferredGenerationBackend::Ane {
+            // The ANE engine keeps its own models on its own thread, so the
+            // request runs on the blocking pool. What it cannot do
+            // (logprobs, a grammar, media) was refused before it got here.
+            let model_path = self.model_path.clone();
+            let draft_path = self.ane_draft_path.clone();
+            let ane_max_seq_len = self.ane_max_seq_len;
+            let (input_ids, gen_config) = (request.input_ids, request.gen_config);
+            tokio::task::spawn_blocking(move || {
+                Self::stream_on_ane(
+                    &model_path,
+                    draft_path.as_deref(),
+                    &input_ids,
+                    &gen_config,
+                    ane_max_seq_len,
+                    &tx,
+                );
+            });
             return rx;
         }
-        // The accelerated ANE engine keeps its own models, so it runs on the
-        // blocking pool; a request it fails goes to the GPU.
-        let backend = Arc::clone(&self.backend);
-        let model_path = self.model_path.clone();
-        let draft_path = self.ane_draft_path.clone();
-        let ane_max_seq_len = self.ane_max_seq_len;
-        tokio::task::spawn_blocking(move || {
-            if !Self::try_accelerated_streaming_blocking(
-                &backend,
-                &model_path,
-                draft_path.as_deref(),
-                &input_ids,
-                &gen_config,
-                ane_max_seq_len,
-                &tx,
-            ) {
-                on_gpu(tx);
-            }
+
+        let queued = model.submit(move |state| {
+            Self::stream_on_model(state, &ctx, request, &tx);
         });
+        if queued.is_err() {
+            // `tx` moved into the job; the receiver sees the channel close.
+            tracing::error!("the model thread has exited");
+        }
         rx
     }
 }
@@ -2602,12 +2703,15 @@ mod tests {
         assert_eq!(estimated, 12 * 1024 * 1024 * 24 + 1024 * 32768);
     }
 
+    /// `--ane` is an instruction: a small model is run on the ANE as asked
+    /// (with a warning that the GPU is faster), not quietly on the GPU.
     #[test]
-    fn test_select_accelerated_backend_prefers_gpu_for_small_dense_model() {
-        let config = dense_config(1024, 24, 32768);
+    fn test_select_accelerated_backend_honours_ane_for_a_small_model() {
+        let mut config = dense_config(1024, 24, 32768);
+        config["model_type"] = serde_json::json!("qwen3");
         assert_eq!(
             select_accelerated_backend(&config, true),
-            PreferredGenerationBackend::Gpu
+            Ok(PreferredGenerationBackend::Ane)
         );
     }
 
@@ -2617,23 +2721,18 @@ mod tests {
         config["model_type"] = serde_json::json!("qwen3");
         assert_eq!(
             select_accelerated_backend(&config, true),
-            PreferredGenerationBackend::Ane
+            Ok(PreferredGenerationBackend::Ane)
         );
     }
 
     /// The ANE inference engine is Qwen3-shaped: a Llama served there ran with
-    /// q/k norms it doesn't have (#34).
+    /// q/k norms it doesn't have (#34). Asked for with `--ane`, it is an error
+    /// that names the reason, not a quiet GPU run.
     #[test]
-    fn test_select_accelerated_backend_keeps_large_llama_off_the_ane() {
+    fn test_select_accelerated_backend_refuses_a_model_the_ane_cannot_run() {
         let config = dense_config(8192, 80, 128_256);
-        assert_ne!(
-            select_accelerated_backend(&config, true),
-            PreferredGenerationBackend::Ane
-        );
-    }
-
-    #[test]
-    fn test_select_accelerated_backend_keeps_qwen3_next_on_the_gpu() {
+        let err = select_accelerated_backend(&config, true).unwrap_err();
+        assert!(err.starts_with("--ane was asked for"), "{err}");
         let config = serde_json::json!({
             "model_type": "qwen3_next",
             "hidden_size": 1024,
@@ -2642,10 +2741,7 @@ mod tests {
             "num_experts": 0,
             "num_local_experts": 0
         });
-        assert_eq!(
-            select_accelerated_backend(&config, true),
-            PreferredGenerationBackend::Gpu
-        );
+        assert!(select_accelerated_backend(&config, true).is_err());
     }
 
     #[test]
@@ -2653,8 +2749,83 @@ mod tests {
         let config = dense_config(8192, 80, 128_256);
         assert_eq!(
             select_accelerated_backend(&config, false),
-            PreferredGenerationBackend::Gpu
+            Ok(PreferredGenerationBackend::Gpu)
         );
+    }
+
+    fn token_output(len: usize) -> GenerationOutput {
+        GenerationOutput {
+            token_ids: vec![0; len],
+            num_generated: len,
+            stopped_by_token: false,
+            stopped_by_length: true,
+            decode_metrics: None,
+            speculative_metrics: None,
+        }
+    }
+
+    /// An ANE generation that fails after some tokens ends in an error: the
+    /// tokens it sent stand, nothing is sent twice and no GPU run follows.
+    #[test]
+    fn a_failed_ane_run_is_an_error_after_its_tokens_not_a_restart() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        pump_accelerated(2, &tx, |on_token| {
+            for token in [10, 11, 12] {
+                assert!(on_token(token));
+            }
+            Err("the ANE died".to_string())
+        });
+        drop(tx);
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        let tokens: Vec<u32> = events
+            .iter()
+            .filter_map(|e| match e {
+                TokenEvent::Token { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tokens, vec![10, 11, 12]);
+        assert!(matches!(
+            events.last(),
+            Some(TokenEvent::Error(message)) if message.contains("the ANE died")
+        ));
+        assert!(!events.iter().any(|e| matches!(e, TokenEvent::Done { .. })));
+    }
+
+    #[test]
+    fn a_finished_ane_run_reports_its_tokens_and_done() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        pump_accelerated(2, &tx, |on_token| {
+            on_token(5);
+            on_token(6);
+            Ok(token_output(4))
+        });
+        drop(tx);
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            &events[2],
+            TokenEvent::Done { finish_reason, metrics, .. }
+                if finish_reason == "length" && metrics.completion_tokens == 2 && metrics.prompt_tokens == 2
+        ));
+    }
+
+    #[test]
+    fn a_client_that_leaves_stops_an_ane_run() {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        drop(rx);
+        let mut stopped = false;
+        pump_accelerated(1, &tx, |on_token| {
+            stopped = !on_token(1);
+            Ok(token_output(2))
+        });
+        assert!(stopped, "the callback must say the receiver is gone");
     }
 
     #[test]
@@ -2673,6 +2844,7 @@ mod tests {
             stop_sequences: vec![],
             logprobs_top_n: None,
             logit_bias: Vec::new(),
+            constraint: None,
         };
 
         let config = build_generation_config_from_parts(&[1, 2], 32, &params);
@@ -2919,6 +3091,7 @@ mod tests {
             stop_sequences: vec![],
             logprobs_top_n: None,
             logit_bias: Vec::new(),
+            constraint: None,
         }
     }
 
@@ -2975,10 +3148,7 @@ mod tests {
             assert_eq!(task.await.unwrap(), expected);
         }
         let embeddings = engine
-            .embed(
-                &["alpha beta".to_string()],
-                pmetal_models::pooling::PoolingMode::Mean,
-            )
+            .embed(&[vec![1, 2]], pmetal_models::pooling::PoolingMode::Mean)
             .await
             .unwrap();
         assert_eq!(embeddings[0].len(), 32);

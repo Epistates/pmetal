@@ -1,3 +1,42 @@
+/// Who may call the server, and for how long a request may run (the access
+/// flags of `pmetal serve`).
+#[cfg(feature = "serve")]
+pub(crate) struct Access {
+    /// `--api-key`, repeated.
+    pub(crate) api_keys: Vec<String>,
+    /// `--cors-origin`, repeated.
+    pub(crate) cors_origins: Vec<String>,
+    /// `--request-timeout`; 0 for no limit.
+    pub(crate) request_timeout_secs: u64,
+}
+
+#[cfg(feature = "serve")]
+impl Access {
+    /// The server configuration these flags make, with the keys of
+    /// `PMETAL_API_KEY` (comma-separated) added to the flags'.
+    fn into_config(self, port: u16, host: String) -> pmetal_serve::ServeConfig {
+        let mut api_keys = self.api_keys;
+        if let Ok(from_env) = std::env::var("PMETAL_API_KEY") {
+            api_keys.extend(
+                from_env
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|key| !key.is_empty())
+                    .map(str::to_owned),
+            );
+        }
+        pmetal_serve::ServeConfig {
+            port,
+            host,
+            api_keys,
+            cors_allowed_origins: self.cors_origins,
+            request_timeout: (self.request_timeout_secs > 0)
+                .then(|| std::time::Duration::from_secs(self.request_timeout_secs)),
+            ..Default::default()
+        }
+    }
+}
+
 /// Start the OpenAI-compatible inference server.
 #[cfg(feature = "serve")]
 #[expect(clippy::too_many_arguments, reason = "one argument per CLI flag")]
@@ -5,6 +44,7 @@ pub(crate) async fn run_serve(
     model_id: String,
     port: u16,
     host: String,
+    access: Access,
     max_seq_len: Option<usize>,
     experts_dir: Option<String>,
     fp8: bool,
@@ -33,7 +73,7 @@ pub(crate) async fn run_serve(
     tracing::info!("Resolving model: {}", model_id);
     let model_path = pmetal_hub::resolve_model_path(&model_id, None, None).await?;
     if pmetal_models::decision::is_decision_model(&model_path) {
-        return run_decision_serve(model_id, &model_path, port, host).await;
+        return run_decision_serve(model_id, &model_path, access.into_config(port, host)).await;
     }
     let max_seq_len = match max_seq_len {
         Some(tokens) => tokens,
@@ -170,10 +210,8 @@ pub(crate) async fn run_serve(
     };
 
     let config = ServeConfig {
-        port,
-        host,
         continuous_batching,
-        ..Default::default()
+        ..access.into_config(port, host)
     };
 
     pmetal_serve::server::run_server(engine, config).await?;
@@ -189,11 +227,10 @@ pub(crate) async fn run_serve(
 async fn run_decision_serve(
     model_id: String,
     model_path: &std::path::Path,
-    port: u16,
-    host: String,
+    config: pmetal_serve::ServeConfig,
 ) -> anyhow::Result<()> {
     use pmetal_models::decision::DEFAULT_MAX_LENGTH;
-    use pmetal_serve::{DecisionEngine, ServeConfig};
+    use pmetal_serve::DecisionEngine;
 
     tracing::info!("Loading decision model from {:?}...", model_path);
     let started = std::time::Instant::now();
@@ -202,10 +239,5 @@ async fn run_decision_serve(
         "Decision model loaded in {:.1}s; generation endpoints are off, POST /v1/systemone answers",
         started.elapsed().as_secs_f64()
     );
-    let config = ServeConfig {
-        port,
-        host,
-        ..Default::default()
-    };
     pmetal_serve::decision::run_decision_server(engine, config).await
 }

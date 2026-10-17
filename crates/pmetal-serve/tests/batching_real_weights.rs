@@ -104,6 +104,7 @@ fn params(max_tokens: usize) -> SamplingParams {
         stop_sequences: vec![],
         logprobs_top_n: Some(0),
         logit_bias: Vec::new(),
+        constraint: None,
     }
 }
 
@@ -166,8 +167,6 @@ struct Reply {
     logprobs: Vec<f32>,
     first_token: Option<Duration>,
     finish: String,
-    /// Trailing tokens a stop sequence matched, which the client drops.
-    stripped: usize,
 }
 
 async fn collect(mut rx: Receiver<TokenEvent>, start: Instant) -> Reply {
@@ -176,7 +175,6 @@ async fn collect(mut rx: Receiver<TokenEvent>, start: Instant) -> Reply {
         logprobs: Vec::new(),
         first_token: None,
         finish: String::new(),
-        stripped: 0,
     };
     while let Some(event) = rx.recv().await {
         match event {
@@ -187,13 +185,8 @@ async fn collect(mut rx: Receiver<TokenEvent>, start: Instant) -> Reply {
                     reply.logprobs.push(entry.logprob);
                 }
             }
-            TokenEvent::Done {
-                finish_reason,
-                stripped_tokens,
-                ..
-            } => {
+            TokenEvent::Done { finish_reason, .. } => {
                 reply.finish = finish_reason;
-                reply.stripped = stripped_tokens;
                 return reply;
             }
             TokenEvent::Error(e) => panic!("stream failed: {e}"),
@@ -267,7 +260,6 @@ fn assert_same(label: &str, got: &Reply, want: &Reply, tolerance: f32) {
         want.tokens,
     );
     assert_eq!(got.finish, want.finish, "{label}: finish reason");
-    assert_eq!(got.stripped, want.stripped, "{label}: stripped tokens");
     assert!(
         !worst.is_nan() && worst <= tolerance,
         "{label}: log-probabilities differ by {worst}"
@@ -303,7 +295,7 @@ async fn per_slot_decode_is_bit_identical_to_the_single_request_path() {
             .await
             .remove(0),
     );
-    assert!(want[12].stripped > 0, "the stop sequence matched");
+    assert_eq!(want[12].finish, "stop", "the stop sequence matched");
     requests.push(with_sequence);
 
     let got = batched(&engine, &requests, Duration::from_millis(30)).await;

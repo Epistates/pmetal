@@ -38,8 +38,13 @@
 //! - Stop-sequence matching — when a pump is built with a
 //!   `pmetal_data::Tokenizer`, each emitted token triggers a decode of
 //!   the slot's generated stream and a suffix check against the slot's
-//!   `stop_sequences`. A match retires the slot with
-//!   `FinishReason::StopSequence` and propagates `stripped_tokens`.
+//!   `stop_sequences`, with the same check the single-request path makes. A
+//!   match retires the slot with `FinishReason::StopSequence`. Every token is
+//!   emitted, the matching ones included: where the text is cut is the
+//!   reply's business ([`crate::stop::StopFilter`]).
+//! - Grammar constraints — a request's logits processor is part of its
+//!   sampler, so a constrained request is sampled in the batch like any
+//!   other, its row masked by its own grammar state.
 //! - Per-slot logprobs — when `SlotParams.logprobs_top_n` is set, the
 //!   pump computes `token_logprobs` from the raw last-position logits
 //!   and attaches the entry to the emitted `TokenEvent::Token`. Tokens
@@ -61,6 +66,7 @@ use crate::continuous_driver::{
     drive_prefill_step,
 };
 use crate::engine::{TokenEvent, TokenLogprobEntry, detect_stop_sequence_suffix};
+use crate::structured::Constraint;
 use pmetal_cache::kv_cache::{FusedBatchKVCache, KVCache, KVCacheConfig, MambaCache, ROW_STEP};
 use pmetal_cache::prefix_cache::PrefixCache;
 use pmetal_models::generation::{GenerationConfig, token_logprobs};
@@ -96,10 +102,9 @@ struct SlotRecord {
     stop_sequences: Vec<String>,
     /// When set, emit per-token logprobs with top-N alternatives.
     logprobs_top_n: Option<usize>,
-    /// Count of trailing tokens matching the most recent stop sequence.
-    /// Forwarded to the `Done` event so the client can drop the
-    /// matched suffix from its rendered text.
-    stripped_tokens: usize,
+    /// A grammar the output must conform to; its processor joins the slot's
+    /// sampler at admission.
+    constraint: Option<Constraint>,
     /// Time (ms from `start`) at which the first token was emitted.
     /// Populated lazily; reported in the final `RequestMetrics`.
     first_token_ms: Option<f64>,
@@ -226,7 +231,7 @@ impl ContinuousPump {
     ) -> Result<(SlotId, mpsc::Receiver<TokenEvent>), EnqueueError> {
         let capacity = channel_capacity.max(Self::events_capacity(&params));
         let (tx, rx) = mpsc::channel(capacity);
-        let slot = self.enqueue_with_sender(prompt, params, gen_config, tx)?;
+        let slot = self.enqueue_with_sender(prompt, params, gen_config, None, tx)?;
         Ok((slot, rx))
     }
 
@@ -244,6 +249,7 @@ impl ContinuousPump {
         prompt: Vec<u32>,
         params: SlotParams,
         gen_config: GenerationConfig,
+        constraint: Option<Constraint>,
         tx: mpsc::Sender<TokenEvent>,
     ) -> Result<SlotId, EnqueueError> {
         let needed = Self::events_capacity(&params);
@@ -318,7 +324,7 @@ impl ContinuousPump {
                 stop_tokens,
                 stop_sequences,
                 logprobs_top_n,
-                stripped_tokens: 0,
+                constraint,
                 first_token_ms: None,
                 prefix_seed,
                 state_seed,
@@ -549,7 +555,11 @@ impl ContinuousPump {
         let rec = self.records.get(&slot);
         let config = rec.map(|r| r.gen_config.clone()).unwrap_or_default();
         let prompt = rec.map_or(&[][..], |r| r.prompt.as_slice());
-        self.state.admit(slot, &config, prompt)?;
+        let mut sampler = config.sampler(prompt);
+        if let Some(constraint) = rec.and_then(|r| r.constraint.as_ref()) {
+            sampler = sampler.with_processor(constraint.processor());
+        }
+        self.state.admit_sampler(slot, sampler)?;
         let prefix_seed = self
             .records
             .get_mut(&slot)
@@ -682,13 +692,10 @@ impl ContinuousPump {
         let Some(tokenizer) = self.tokenizer.as_ref() else {
             return Ok(false);
         };
-        match detect_stop_sequence_suffix(tokenizer.as_ref(), &rec.generated, &rec.stop_sequences) {
-            Some(n_strip) => {
-                rec.stripped_tokens = n_strip;
-                Ok(true)
-            }
-            None => Ok(false),
-        }
+        Ok(
+            detect_stop_sequence_suffix(tokenizer.as_ref(), &rec.generated, &rec.stop_sequences)
+                .is_some(),
+        )
     }
 
     /// Move every retired slot out of the batcher, free its row, and
@@ -708,10 +715,7 @@ impl ContinuousPump {
                 if finish_reason != "cancelled" {
                     let elapsed = rec.start.elapsed();
                     let total_ms = elapsed.as_secs_f64() * 1000.0;
-                    // `completion_tokens` reports the visible tail —
-                    // tokens matched by a stop sequence are stripped
-                    // from the client-facing count.
-                    let visible = rec.emitted.saturating_sub(rec.stripped_tokens);
+                    let visible = rec.emitted;
                     let metrics = crate::engine::RequestMetrics {
                         first_token_latency_ms: rec.first_token_ms.unwrap_or(0.0),
                         total_latency_ms: total_ms,
@@ -721,12 +725,13 @@ impl ContinuousPump {
                             0.0
                         },
                         prompt_tokens: rec.prompt.len(),
+                        cached_prompt_tokens: rec.prefix_hit_len,
                         completion_tokens: visible,
                     };
                     let _ = rec.tx.try_send(TokenEvent::Done {
                         finish_reason: finish_reason.to_string(),
                         metrics,
-                        stripped_tokens: rec.stripped_tokens,
+                        stripped_tokens: 0,
                     });
                 }
             }
@@ -838,7 +843,13 @@ mod tests {
         let mut pump = ContinuousPump::new(BatcherConfig::default(), cache_cfg(), None);
         let (tx, _rx) = mpsc::channel(8);
         let err = pump
-            .enqueue_with_sender(vec![1], params(20, vec![]), GenerationConfig::default(), tx)
+            .enqueue_with_sender(
+                vec![1],
+                params(20, vec![]),
+                GenerationConfig::default(),
+                None,
+                tx,
+            )
             .unwrap_err();
         assert!(matches!(
             err,
@@ -1062,11 +1073,22 @@ mod tests {
         // 2 restored + 1 suffix + the token the first decode step fed.
         assert_eq!(rows.offset(row), 4);
         while pump.tick(&mut stub).unwrap() == Tick::Ran {}
-        let tokens = drain(&mut rx)
+        let events = drain(&mut rx);
+        let tokens = events
             .iter()
             .filter(|ev| matches!(ev, TokenEvent::Token { .. }))
             .count();
         assert_eq!(tokens, 3);
+        // The reply says how much of the prompt the cache supplied.
+        match events.last() {
+            Some(TokenEvent::Done { metrics, .. }) => {
+                assert_eq!(
+                    (metrics.prompt_tokens, metrics.cached_prompt_tokens),
+                    (3, 2)
+                );
+            }
+            other => panic!("expected Done, got {:?}", other.is_some()),
+        }
         pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
     }
 

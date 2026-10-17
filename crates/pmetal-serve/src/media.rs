@@ -26,6 +26,9 @@
 //! server does not read its own disk for a client), video files (`video_url`:
 //! decode the frames and send those), audio, and any other part type.
 //!
+//! Images are bounded before anything is decoded: at most [`MAX_IMAGE_PIXELS`]
+//! each, [`MAX_REQUEST_PIXELS`] and [`MAX_MEDIA_ITEMS`] items in a request.
+//!
 //! Each image and video goes to the chat template as an item of its message,
 //! where the client put it among the text, so the template places the model's
 //! own placeholder exactly as the reference processor's `apply_chat_template`
@@ -78,7 +81,22 @@ pub(crate) fn template_message(message: &ChatMessage, parts: Option<Vec<ContentP
         Some(parts) => Message::with_parts(message.role.clone(), parts),
         None => Message::new(message.role.clone(), message.content.clone()),
     };
-    out.tool_calls = message.tool_calls.clone();
+    out.tool_calls = message.tool_calls.clone().map(|calls| {
+        calls
+            .into_iter()
+            .map(|mut call| {
+                // OpenAI sends a call's arguments as a string of JSON; chat
+                // templates iterate them as an object (`arguments|items`).
+                if let Value::String(text) = &call.function.arguments {
+                    if let Ok(object @ Value::Object(_)) = serde_json::from_str::<Value>(text) {
+                        call.function.arguments = object;
+                    }
+                }
+                call
+            })
+            .collect()
+    });
+    out.tool_call_id = message.tool_call_id.clone();
     out.reasoning_content = message.reasoning_content.clone();
     out
 }
@@ -261,36 +279,127 @@ fn image_payload(url: &str, at: &str) -> ServeResult<String> {
     Ok(payload.to_owned())
 }
 
+/// The largest image the server decodes, in pixels (50 megapixels: 7000 by
+/// 7000). A PNG a few kilobytes long can declare far more, and decoding it
+/// would take gigabytes.
+pub const MAX_IMAGE_PIXELS: u64 = 50_000_000;
+
+/// The most pixels all the images and video frames of one request may hold
+/// together (decoded, they take three bytes each).
+pub const MAX_REQUEST_PIXELS: u64 = 200_000_000;
+
+/// The most images and video frames in one request.
+pub const MAX_MEDIA_ITEMS: usize = 512;
+
+/// An image's bytes and what its header says of its size.
+struct Encoded {
+    bytes: Vec<u8>,
+    pixels: u64,
+}
+
+/// Decode a payload's base64 and read the image's dimensions from its
+/// header, refusing one over [`MAX_IMAGE_PIXELS`] before any of it is
+/// decoded.
+fn read_header(payload: &str, what: &str) -> ServeResult<Encoded> {
+    let compact: String = payload.chars().filter(|c| !c.is_whitespace()).collect();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(compact.as_bytes())
+        .map_err(|e| bad(what, format!("invalid base64: {e}")))?;
+    let (width, height) = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()
+        .map_err(|e| bad(what, format!("could not decode image: {e}")))?
+        .into_dimensions()
+        .map_err(|e| bad(what, format!("could not decode image: {e}")))?;
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels > MAX_IMAGE_PIXELS {
+        return Err(bad(
+            what,
+            format!(
+                "the image is {width}x{height}; the server decodes images of at most \
+                 {} megapixels",
+                MAX_IMAGE_PIXELS / 1_000_000
+            ),
+        ));
+    }
+    Ok(Encoded { bytes, pixels })
+}
+
 /// Decode every image and video frame. CPU work, for the blocking pool.
+///
+/// What a request may ask for is bounded before anything is decoded: at most
+/// [`MAX_MEDIA_ITEMS`] images and frames, each at most [`MAX_IMAGE_PIXELS`],
+/// [`MAX_REQUEST_PIXELS`] in all.
 pub fn decode_media(sources: &[MediaSource]) -> ServeResult<Vec<DecodedMedia>> {
-    let mut images = 0;
-    let mut videos = 0;
-    sources
+    let items: usize = sources
         .iter()
         .map(|source| match source {
+            MediaSource::Image(_) => 1,
+            MediaSource::Video { frames, .. } => frames.len(),
+        })
+        .sum();
+    if items > MAX_MEDIA_ITEMS {
+        return Err(ServeError::BadRequest(format!(
+            "the request holds {items} images and video frames; the most is {MAX_MEDIA_ITEMS}"
+        )));
+    }
+    // Headers first: the whole request's size is known before any decode.
+    let mut images = 0;
+    let mut videos = 0;
+    let mut total_pixels = 0u64;
+    let mut encoded = Vec::with_capacity(sources.len());
+    for source in sources {
+        match source {
             MediaSource::Image(payload) => {
                 images += 1;
-                decode_payload(payload, &format!("image {images}")).map(DecodedMedia::Image)
+                let image = read_header(payload, &format!("image {images}"))?;
+                total_pixels += image.pixels;
+                encoded.push(vec![image]);
             }
-            MediaSource::Video { frames, fps } => {
+            MediaSource::Video { frames, .. } => {
                 videos += 1;
-                let frames = frames
+                let mut video = Vec::with_capacity(frames.len());
+                for (k, frame) in frames.iter().enumerate() {
+                    let image = read_header(frame, &format!("video {videos}, frame {k}"))?;
+                    total_pixels += image.pixels;
+                    video.push(image);
+                }
+                encoded.push(video);
+            }
+        }
+        if total_pixels > MAX_REQUEST_PIXELS {
+            return Err(ServeError::BadRequest(format!(
+                "the images and video frames of the request hold more than {} megapixels in \
+                 all; the server decodes at most that",
+                MAX_REQUEST_PIXELS / 1_000_000
+            )));
+        }
+    }
+    let (mut images, mut videos) = (0, 0);
+    sources
+        .iter()
+        .zip(encoded)
+        .map(|(source, mut raw)| match source {
+            MediaSource::Image(_) => {
+                images += 1;
+                let image = raw.remove(0);
+                decode_image(&image.bytes)
+                    .map(DecodedMedia::Image)
+                    .map_err(|e| bad(&format!("image {images}"), e))
+            }
+            MediaSource::Video { fps, .. } => {
+                videos += 1;
+                let frames = raw
                     .iter()
                     .enumerate()
-                    .map(|(k, frame)| decode_payload(frame, &format!("video {videos}, frame {k}")))
+                    .map(|(k, frame)| {
+                        decode_image(&frame.bytes)
+                            .map_err(|e| bad(&format!("video {videos}, frame {k}"), e))
+                    })
                     .collect::<ServeResult<Vec<_>>>()?;
                 Ok(DecodedMedia::Video(VideoFrames { frames, fps: *fps }))
             }
         })
         .collect()
-}
-
-fn decode_payload(payload: &str, what: &str) -> ServeResult<RgbImage> {
-    let compact: String = payload.chars().filter(|c| !c.is_whitespace()).collect();
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(compact.as_bytes())
-        .map_err(|e| bad(what, format!("invalid base64: {e}")))?;
-    decode_image(&bytes).map_err(|e| bad(what, e))
 }
 
 #[cfg(test)]
@@ -467,6 +576,59 @@ mod tests {
                 "{part}: {error}"
             );
         }
+    }
+
+    /// A grayscale PNG of `width` by `height`: tiny to send, large to decode.
+    fn gray_png(width: u32, height: u32) -> String {
+        let image = image::GrayImage::new(width, height);
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageLuma8(image)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    /// An image that declares more pixels than the server decodes is refused
+    /// from its header, and so is a request whose images add up to more.
+    #[test]
+    fn media_is_bounded_before_it_is_decoded() {
+        let refused = |sources: &[MediaSource]| match decode_media(sources) {
+            Err(ServeError::BadRequest(message)) => message,
+            other => panic!("expected a 400, got {other:?}"),
+        };
+        let huge = [MediaSource::Image(gray_png(9000, 9000))];
+        assert!(
+            refused(&huge).contains("at most 50 megapixels"),
+            "{}",
+            refused(&huge)
+        );
+
+        // Four images of 36 megapixels are inside every limit; six are over
+        // the request's 200.
+        let big = gray_png(6000, 6000);
+        let four = vec![MediaSource::Image(big.clone()); 4];
+        assert_eq!(decode_media(&four).unwrap().len(), 4);
+        let six = vec![MediaSource::Image(big); 6];
+        assert!(
+            refused(&six).contains("200 megapixels"),
+            "{}",
+            refused(&six)
+        );
+
+        // And a request of too many frames.
+        let frame = png_base64(2, 2);
+        let many = [MediaSource::Video {
+            frames: vec![frame; MAX_MEDIA_ITEMS + 1],
+            fps: None,
+        }];
+        assert!(
+            refused(&many).contains("the most is 512"),
+            "{}",
+            refused(&many)
+        );
     }
 
     #[test]
