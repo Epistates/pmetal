@@ -9,7 +9,8 @@ use crate::request::{
     MAX_STOP_SEQUENCES, SamplingRequest, check_choices, reject_unsupported, resolve_stop_sequences,
     sampling_params,
 };
-use crate::tools::{ParsedCall, ToolChoice as ToolSelection, ToolPlan};
+use crate::structured::{Constraint, ConstraintSpec, ToolSchema, tool_call_grammar};
+use crate::tools::{ParsedCall, ToolChoice as ToolSelection, ToolFormat, ToolPlan};
 use crate::types::*;
 use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -48,16 +49,15 @@ pub struct ServingMetrics {
 
 /// Whether a request is compatible with the continuous-batching path.
 ///
-/// Since Phase 1 the pump implements per-slot stop-sequence string
-/// matching, per-slot top-N logprobs, and per-slot repetition /
-/// frequency / presence penalties, so the gate is permissive: every
-/// currently-supported `SamplingParams` shape is batched-eligible.
-///
-/// The function is kept as a seam in case a future feature ships behind
-/// a temporary gate before the pump learns to handle it; callers still
-/// fall back to `generate_streaming` when this returns `false`.
-pub(crate) fn is_batched_compatible(_params: &SamplingParams) -> bool {
-    true
+/// The pump implements per-slot stop-sequence string matching, per-slot
+/// top-N logprobs, and per-slot repetition / frequency / presence penalties,
+/// so every `SamplingParams` shape is batched-eligible but a grammar
+/// constraint. This is the seam for a feature the pump has not learned yet;
+/// callers fall back to `generate_streaming` when it returns `false`.
+pub(crate) fn is_batched_compatible(params: &SamplingParams) -> bool {
+    // A grammar's mask is computed from each token the sampler has just
+    // taken, which the pump's batched sampling does not hand to a processor.
+    params.constraint.is_none()
 }
 
 /// Pick the right streaming receiver: the continuous-batching pump
@@ -476,16 +476,77 @@ fn plan_tools(
         engine.tool_format(),
     )
     .map_err(|why| ServeError::invalid("tool_choice", why))?;
-    if matches!(
+    Ok(plan)
+}
+
+/// The grammar a chat request's output must follow: the calls a required or
+/// named `tool_choice` demands, or the `response_format`.
+pub(crate) async fn chat_constraint(
+    engine: &InferenceEngine,
+    response_format: Option<&ResponseFormat>,
+    plan: &ToolPlan,
+    prompt: &[u32],
+    thinks: bool,
+) -> Result<Option<Constraint>, ServeError> {
+    let forced = matches!(
         plan.choice,
         ToolSelection::Required | ToolSelection::Named(_)
-    ) {
+    );
+    let structured = !matches!(response_format, None | Some(ResponseFormat::Text));
+    if structured && (forced || plan.prompt.is_some()) {
         return Err(ServeError::unsupported(
-            "tool_choice",
-            "`required` and named tool choices need constrained decoding",
+            "response_format",
+            "it cannot be combined with `tools`; the reply is either a structured answer or tool calls",
         ));
     }
-    Ok(plan)
+    let spec = if forced {
+        let named = match &plan.choice {
+            ToolSelection::Named(name) => Some(name.as_str()),
+            _ => None,
+        };
+        let schemas: Vec<ToolSchema> = plan
+            .prompt
+            .iter()
+            .flatten()
+            .filter(|tool| named.is_none_or(|name| tool.function.name == name))
+            .map(|tool| ToolSchema {
+                name: tool.function.name.clone(),
+                parameters: tool.function.parameters.clone(),
+            })
+            .collect();
+        let format = plan.parse.as_ref().map_or(ToolFormat::Hermes, |(f, _)| *f);
+        let lark = tool_call_grammar(format, &schemas, !plan.single_call, &|text| {
+            engine.token_id(text)
+        })
+        .ok_or_else(|| {
+            ServeError::unsupported(
+                "tool_choice",
+                format!(
+                    "this model writes its tool calls in the {format:?} syntax, which cannot be \
+                     enforced; use `auto`"
+                ),
+            )
+        })?;
+        ConstraintSpec::Lark(lark)
+    } else {
+        match response_format {
+            None | Some(ResponseFormat::Text) => return Ok(None),
+            Some(ResponseFormat::JsonObject) => ConstraintSpec::JsonObject,
+            Some(ResponseFormat::JsonSchema { json_schema }) => {
+                let schema = json_schema.schema.clone().ok_or_else(|| {
+                    ServeError::invalid(
+                        "response_format.json_schema.schema",
+                        "a `json_schema` response format needs its `schema`",
+                    )
+                })?;
+                ConstraintSpec::JsonSchema(schema)
+            }
+        }
+    };
+    engine
+        .compile_constraint(spec, prompt, thinks)
+        .await
+        .map(Some)
 }
 
 /// The roles a chat message may have, with `developer` read as `system`
@@ -584,21 +645,17 @@ pub async fn chat_completions(
     let tool_plan = plan_tools(&req, &state.engine)?;
     let permit = state.try_acquire_request_permit()?;
 
-    // Format messages using chat template, optionally including tool
-    // definitions and the request's template kwargs, and preprocess any
-    // images and videos.
+    // The chat template renders the messages (and the tools the request
+    // offers), media are preprocessed, a grammar is compiled, and the
+    // sampling is settled against the context that is left.
     let template_kwargs = req.template_kwargs();
-    let prompt = state
-        .engine
-        .prepare_chat(&messages, tool_plan.prompt.as_deref(), &template_kwargs)
-        .await?;
-    let prompt_tokens = prompt.input_ids.len();
-
-    let thinking = state.engine.thinks_with(&template_kwargs);
     let stops =
         resolve_stop_sequences(req.stop.as_deref(), Some(MAX_STOP_SEQUENCES), &state.engine)?;
-    let params = sampling_params(
-        &state.engine,
+    let generate::Prepared { prompt, params } = generate::prepare(
+        &state,
+        &messages,
+        &tool_plan,
+        &template_kwargs,
         &SamplingRequest {
             temperature: req.temperature,
             top_p: req.top_p,
@@ -613,10 +670,10 @@ pub async fn chat_completions(
             logprobs_top_n,
         },
         &stops,
-        thinking,
-        prompt_tokens,
-    )?;
-    state.engine.validate_sampling_params(&params)?;
+        req.response_format.as_ref(),
+    )
+    .await?;
+    let prompt_tokens = prompt.input_ids.len();
 
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let model_id = state.engine.model_id().to_string();
@@ -1179,49 +1236,149 @@ fn completion_logprobs(
 // POST /v1/embeddings
 // ────────────────────────────────────────────────────────────────────────────
 
-/// `POST /v1/embeddings` — OpenAI-compatible sentence embeddings.
+/// The most inputs one embeddings request may hold (OpenAI's limit).
+const MAX_EMBEDDING_INPUTS: usize = 2048;
+
+/// The most tokens one embeddings request may hold in all (OpenAI's limit).
+const MAX_EMBEDDING_TOKENS: usize = 300_000;
+
+/// Scale `vector` to unit length (a zero vector stays zero).
+fn l2_normalize(vector: &mut [f32]) {
+    let norm = vector
+        .iter()
+        .map(|v| f64::from(*v) * f64::from(*v))
+        .sum::<f64>()
+        .sqrt();
+    if norm > 0.0 {
+        let scale = (1.0 / norm) as f32;
+        vector.iter_mut().for_each(|v| *v *= scale);
+    }
+}
+
+/// A vector as the response carries it: a list of floats, or (OpenAI's
+/// `encoding_format: "base64"`) its little-endian f32 bytes in base64.
+fn embedding_vector(vector: Vec<f32>, base64: bool) -> EmbeddingVector {
+    use base64::Engine as _;
+    if base64 {
+        let bytes: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
+        EmbeddingVector::Base64(base64::engine::general_purpose::STANDARD.encode(bytes))
+    } else {
+        EmbeddingVector::Float(vector)
+    }
+}
+
+/// `POST /v1/embeddings` — OpenAI-compatible embeddings.
 ///
-/// Accepts a single string or an array via [`EmbeddingsInput`]; returns one
-/// embedding entry per input. Uses mean pooling by default. The model's
-/// pre-lm-head trunk is pulled through [`InferenceEngine::embed`], which
-/// errors cleanly for architectures that don't expose hidden states
-/// (Flux, Qwen3MoE, hybrid attn+mamba variants — see
-/// `DynamicModel::forward_hidden` for the supported set).
+/// `input` is a string, a list of strings, token ids, or a list of token-id
+/// lists; the reply holds one vector per input, in order. Text is tokenized
+/// as the model's tokenizer does (its own special tokens included), pooled
+/// the way the model's sentence-transformers files say (else by mean) and
+/// scaled to unit length. `dimensions` keeps the leading components and
+/// renormalizes (Matryoshka truncation, for a model trained so);
+/// `encoding_format: "base64"` sends each vector as little-endian f32 bytes.
+/// The model's pre-lm-head trunk is pulled through
+/// [`InferenceEngine::embed`], which errors cleanly for architectures that
+/// don't expose hidden states (see `DynamicModel::forward_hidden` for the
+/// supported set).
 pub async fn embeddings(
     State(state): State<Arc<AppState>>,
     ApiJson(req): ApiJson<EmbeddingsRequest>,
 ) -> Result<Json<EmbeddingsResponse>, ServeError> {
     state.engine.check_model(&req.model)?;
-    let _permit = state.try_acquire_request_permit()?;
-
+    let base64 = match req.encoding_format.as_deref() {
+        None | Some("float") => false,
+        Some("base64") => true,
+        Some(other) => {
+            return Err(ServeError::invalid_with_code(
+                "encoding_format",
+                "invalid_value",
+                format!("`encoding_format` is `float` or `base64`, not `{other}`"),
+            ));
+        }
+    };
+    if req.dimensions == Some(0) {
+        return Err(ServeError::invalid_with_code(
+            "dimensions",
+            "invalid_value",
+            "`dimensions` must be at least 1",
+        ));
+    }
+    let defaults = state.engine.embedding_defaults();
     let mode = crate::types::parse_pooling_mode(req.pooling.as_deref())
         .ok_or_else(|| ServeError::invalid("pooling", "unknown pooling mode"))?
-        .unwrap_or(pmetal_models::pooling::PoolingMode::Mean);
-    let inputs = req
-        .input
-        .into_batch()
-        .into_iter()
-        .map(|item| match item {
-            EmbeddingItem::Text(text) => Ok(text),
-            EmbeddingItem::Tokens(_) => Err(ServeError::unsupported(
-                "input",
-                "token-id inputs are not supported",
-            )),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if inputs.is_empty() {
-        return Err(ServeError::invalid("input", "input must be non-empty"));
+        .unwrap_or(defaults.pooling);
+    let inputs = req.input.into_batch();
+    if inputs.is_empty() || inputs.len() > MAX_EMBEDDING_INPUTS {
+        return Err(ServeError::invalid(
+            "input",
+            format!("`input` holds 1 to {MAX_EMBEDDING_INPUTS} inputs"),
+        ));
+    }
+    let permit = state.try_acquire_request_permit()?;
+
+    let max_input = defaults
+        .max_input_tokens
+        .unwrap_or(usize::MAX)
+        .min(state.engine.room_after(0).unwrap_or(usize::MAX));
+    let mut tokenized = Vec::with_capacity(inputs.len());
+    for (i, item) in inputs.into_iter().enumerate() {
+        let ids = match item {
+            EmbeddingItem::Text(text) => {
+                if text.is_empty() {
+                    return Err(ServeError::invalid(
+                        format!("input.{i}"),
+                        "an input must not be empty",
+                    ));
+                }
+                state.engine.tokenize_for_embedding(&text)?
+            }
+            EmbeddingItem::Tokens(ids) => ids,
+        };
+        if ids.is_empty() {
+            return Err(ServeError::invalid(
+                format!("input.{i}"),
+                "an input must not be empty",
+            ));
+        }
+        if ids.len() > max_input {
+            return Err(ServeError::invalid_with_code(
+                format!("input.{i}"),
+                "context_length_exceeded",
+                format!(
+                    "an input is {} tokens; this model takes at most {max_input}",
+                    ids.len()
+                ),
+            ));
+        }
+        tokenized.push(ids);
+    }
+    let prompt_tokens: usize = tokenized.iter().map(Vec::len).sum();
+    if prompt_tokens > MAX_EMBEDDING_TOKENS {
+        return Err(ServeError::invalid(
+            "input",
+            format!("`input` holds {prompt_tokens} tokens in all; at most {MAX_EMBEDDING_TOKENS}"),
+        ));
     }
 
-    // Count prompt tokens once (tokenisation is fast + deterministic).
-    let prompt_tokens: usize = inputs
-        .iter()
-        .map(|s| state.engine.tokenize(s).map(|ids| ids.len()))
-        .collect::<Result<Vec<_>, _>>()?
-        .iter()
-        .sum();
-
-    let vectors = state.engine.embed(&inputs, mode).await?;
+    let mut vectors = state.engine.embed(&tokenized, mode).await?;
+    drop(permit);
+    if let Some(dimensions) = req.dimensions {
+        let width = vectors.first().map_or(0, Vec::len);
+        if dimensions > width {
+            return Err(ServeError::invalid_with_code(
+                "dimensions",
+                "invalid_value",
+                format!(
+                    "this model's embeddings have {width} dimensions; `dimensions` cannot be {dimensions}"
+                ),
+            ));
+        }
+        vectors.iter_mut().for_each(|v| v.truncate(dimensions));
+    }
+    // Truncating cuts the length, so a truncated vector is scaled again.
+    if defaults.normalize || req.dimensions.is_some() {
+        vectors.iter_mut().for_each(|v| l2_normalize(v));
+    }
 
     let data = vectors
         .into_iter()
@@ -1229,7 +1386,7 @@ pub async fn embeddings(
         .map(|(index, embedding)| EmbeddingData {
             index,
             object: "embedding",
-            embedding: EmbeddingVector::Float(embedding),
+            embedding: embedding_vector(embedding, base64),
         })
         .collect();
 
@@ -1263,6 +1420,7 @@ mod batching_gate_tests {
             stop_sequences: vec![],
             logprobs_top_n: None,
             logit_bias: Vec::new(),
+            constraint: None,
         }
     }
 

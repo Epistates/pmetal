@@ -237,6 +237,7 @@ pub fn sampling_params(
         stop_sequences: stops.sequences.clone(),
         logprobs_top_n: req.logprobs_top_n,
         logit_bias: parse_logit_bias(req.logit_bias)?,
+        constraint: None,
     })
 }
 

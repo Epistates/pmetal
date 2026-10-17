@@ -23,9 +23,11 @@ use serde_json::{Map, Value};
 /// How a model family writes its tool calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolFormat {
-    /// `<tool_call>` ... `</tool_call>` around a JSON object, or around the
-    /// `<function=NAME>` XML of Qwen 3.5 and Qwen3-Coder.
+    /// `<tool_call>` ... `</tool_call>` around a JSON object.
     Hermes,
+    /// `<tool_call>` ... `</tool_call>` around the `<function=NAME>` XML of
+    /// Qwen 3.5 and Qwen3-Coder (the parser reads either body).
+    QwenXml,
     /// `<|python_tag|>` before JSON objects, or a reply that is one.
     Llama3,
     /// `[TOOL_CALLS]` before a JSON array, or `NAME[ARGS]{...}`.
@@ -55,6 +57,9 @@ impl ToolFormat {
             if source.contains("<|python_tag|>") {
                 return Some(Self::Llama3);
             }
+            if source.contains("<tool_call>") && source.contains("<function=") {
+                return Some(Self::QwenXml);
+            }
             if source.contains("<tool_call>") {
                 return Some(Self::Hermes);
             }
@@ -72,7 +77,7 @@ impl ToolFormat {
     /// The text that opens a call, when there is one.
     fn start(self) -> Option<&'static str> {
         match self {
-            Self::Hermes => Some("<tool_call>"),
+            Self::Hermes | Self::QwenXml => Some("<tool_call>"),
             Self::Llama3 => Some("<|python_tag|>"),
             Self::Mistral => Some("[TOOL_CALLS]"),
             Self::Gemma4 => Some("<|tool_call>"),
@@ -84,7 +89,7 @@ impl ToolFormat {
     /// the reply.
     fn end(self) -> Option<&'static str> {
         match self {
-            Self::Hermes => Some("</tool_call>"),
+            Self::Hermes | Self::QwenXml => Some("</tool_call>"),
             Self::Gemma4 => Some("<tool_call|>"),
             Self::Harmony => Some("<|call|>"),
             Self::Llama3 | Self::Mistral => None,
@@ -428,7 +433,7 @@ impl ToolStream {
 
     fn parse_format(&self, body: &str, bare: bool) -> Option<Vec<ParsedCall>> {
         match self.format {
-            ToolFormat::Hermes => {
+            ToolFormat::Hermes | ToolFormat::QwenXml => {
                 let body = body.trim();
                 if body.starts_with("<function=") {
                     parse_qwen_xml(body, &self.tools).map(|c| vec![c])
@@ -1066,8 +1071,10 @@ mod tests {
     #[test]
     fn detect_reads_the_template() {
         let mut template = ChatTemplate::new(ChatTemplateType::ChatMl);
-        template.jinja_source = Some("... <tool_call>\n<function= ...".into());
+        template.jinja_source = Some("... <tool_call>\n{ ...".into());
         assert_eq!(ToolFormat::detect(&template), Some(ToolFormat::Hermes));
+        template.jinja_source = Some("... <tool_call>\n<function= ...".into());
+        assert_eq!(ToolFormat::detect(&template), Some(ToolFormat::QwenXml));
         template.jinja_source = Some("[TOOL_CALLS] ...".into());
         assert_eq!(ToolFormat::detect(&template), Some(ToolFormat::Mistral));
         template.jinja_source = Some("... <|tool_call> ...".into());

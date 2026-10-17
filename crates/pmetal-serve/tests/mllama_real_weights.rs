@@ -104,6 +104,7 @@ async fn serve_replies_to_an_image_as_transformers_does() {
                 stop_sequences: vec![],
                 logprobs_top_n: None,
                 logit_bias: Vec::new(),
+                constraint: None,
             },
         )
         .await

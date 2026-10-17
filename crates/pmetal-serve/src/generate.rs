@@ -15,9 +15,58 @@ use futures::stream::StreamExt;
 
 use crate::assemble::{Assembler, ChoiceDone, ChoiceEvent, Failure, Piece, run_choice};
 use crate::engine::{PreparedPrompt, SamplingParams, TokenLogprobEntry};
-use crate::error::ServeError;
-use crate::routes::{AppState, stream_tokens};
-use crate::tools::ParsedCall;
+use crate::error::{ServeError, ServeResult};
+use crate::request::{ResolvedStops, SamplingRequest, sampling_params};
+use crate::routes::{AppState, chat_constraint, stream_tokens};
+use crate::tools::{ParsedCall, ToolPlan};
+use crate::types::{ChatMessage, ResponseFormat};
+use pmetal_data::chat_templates::ChatTemplateKwargs;
+
+/// A chat request made ready to generate: its prompt, and the sampling it
+/// asks for with the grammar it must follow.
+pub(crate) struct Prepared {
+    pub prompt: PreparedPrompt,
+    pub params: SamplingParams,
+}
+
+/// Render `messages` (with the tools of `plan`) into a prompt, compile the
+/// grammar the request demands (a forced tool call or a `response_format`),
+/// and settle the sampling parameters against the context that is left. The
+/// three chat-shaped endpoints (chat completions, messages, responses) share
+/// this.
+pub(crate) async fn prepare(
+    state: &Arc<AppState>,
+    messages: &[ChatMessage],
+    plan: &ToolPlan,
+    kwargs: &ChatTemplateKwargs,
+    sampling: &SamplingRequest<'_>,
+    stops: &ResolvedStops,
+    response_format: Option<&ResponseFormat>,
+) -> ServeResult<Prepared> {
+    let prompt = state
+        .engine
+        .prepare_chat(messages, plan.prompt.as_deref(), kwargs)
+        .await?;
+    let thinking = state.engine.thinks_with(kwargs);
+    let constraint = chat_constraint(
+        &state.engine,
+        response_format,
+        plan,
+        &prompt.input_ids,
+        thinking,
+    )
+    .await?;
+    let mut params = sampling_params(
+        &state.engine,
+        sampling,
+        stops,
+        thinking,
+        prompt.input_ids.len(),
+    )?;
+    params.constraint = constraint;
+    state.engine.validate_sampling_params(&params)?;
+    Ok(Prepared { prompt, params })
+}
 
 /// Start `n` generations of `prompt`; stream `i` is read through
 /// `assemblers(i)`. Seeds step by one per choice, so a seeded request is

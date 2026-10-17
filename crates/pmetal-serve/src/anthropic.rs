@@ -18,7 +18,7 @@ use crate::engine::InferenceEngine;
 use crate::error::ServeError;
 use crate::extract::ApiJson;
 use crate::generate;
-use crate::request::{SamplingRequest, resolve_stop_sequences, sampling_params};
+use crate::request::{SamplingRequest, resolve_stop_sequences};
 use crate::routes::{AppState, StreamTotals, merged_sse};
 use crate::tools::{ParsedCall, ToolChoice, ToolPlan};
 use crate::types::ChatMessage;
@@ -502,12 +502,6 @@ fn plan_tools(req: &MessagesRequest, engine: &InferenceEngine) -> Result<ToolPla
         .unwrap_or(false);
     let plan = ToolPlan::new(defs, choice, single, engine.tool_format())
         .map_err(|why| ServeError::invalid("tool_choice", why))?;
-    if matches!(plan.choice, ToolChoice::Required | ToolChoice::Named(_)) {
-        return Err(ServeError::unsupported(
-            "tool_choice",
-            "`any` and `tool` need constrained decoding",
-        ));
-    }
     Ok(plan)
 }
 
@@ -556,15 +550,12 @@ pub async fn messages(
     }
 
     let template_kwargs = req.template_kwargs()?;
-    let prompt = state
-        .engine
-        .prepare_chat(&messages, tool_plan.prompt.as_deref(), &template_kwargs)
-        .await?;
-    let prompt_tokens = prompt.input_ids.len();
-    let thinking = state.engine.thinks_with(&template_kwargs);
     let stops = resolve_stop_sequences(req.stop_sequences.as_deref(), None, &state.engine)?;
-    let params = sampling_params(
-        &state.engine,
+    let generate::Prepared { prompt, params } = generate::prepare(
+        &state,
+        &messages,
+        &tool_plan,
+        &template_kwargs,
         &SamplingRequest {
             temperature: req.temperature,
             top_p: req.top_p,
@@ -573,10 +564,10 @@ pub async fn messages(
             ..SamplingRequest::default()
         },
         &stops,
-        thinking,
-        prompt_tokens,
-    )?;
-    state.engine.validate_sampling_params(&params)?;
+        None,
+    )
+    .await?;
+    let prompt_tokens = prompt.input_ids.len();
 
     let request_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
     let model_id = state.engine.model_id().to_string();

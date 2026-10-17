@@ -52,6 +52,12 @@ pub fn special(name: &str) -> u32 {
     256 + MERGES.len() as u32 + SPECIALS.iter().position(|s| *s == name).unwrap() as u32
 }
 
+/// The files of the tiny model's directory, for a test that builds its own
+/// engine.
+pub fn write_model_dir_for_tests(dir: &Path) {
+    write_model_dir(dir, 256);
+}
+
 fn write_model_dir(dir: &Path, max_positions: usize) {
     std::fs::write(
         dir.join("config.json"),
@@ -127,8 +133,15 @@ pub fn app(max_seq_len: usize) -> (Router, tempfile::TempDir) {
 }
 
 pub fn tiny(max_seq_len: usize) -> Tiny {
+    tiny_with(max_seq_len, |_| {})
+}
+
+/// Like [`tiny`], with `setup` adding files to the model directory before
+/// the engine reads it.
+pub fn tiny_with(max_seq_len: usize, setup: impl FnOnce(&Path)) -> Tiny {
     let dir = tempfile::tempdir().unwrap();
     write_model_dir(dir.path(), max_seq_len);
+    setup(dir.path());
     let engine = InferenceEngine::new_with_backend(
         tiny_llama,
         tokenizer(),

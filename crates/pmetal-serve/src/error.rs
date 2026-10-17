@@ -282,6 +282,13 @@ impl IntoResponse for ServeError {
     fn into_response(self) -> Response {
         let info = self.describe();
         let mut response = (info.status, axum::Json(info.openai_body())).into_response();
+        if matches!(self, Self::Busy) {
+            // Every request slot is taken; one frees as soon as a reply ends.
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+        }
         // Kept for [`crate::server`], which re-renders it for the Anthropic API.
         response.extensions_mut().insert(info);
         response

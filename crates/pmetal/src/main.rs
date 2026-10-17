@@ -1553,6 +1553,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 host,
                 api_key,
                 cors_origin,
+                request_timeout,
                 max_seq_len,
                 experts_dir,
                 fp8,
@@ -1594,6 +1595,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 commands::serve::Access {
                     api_keys: api_key,
                     cors_origins: cors_origin,
+                    request_timeout_secs: request_timeout,
                 },
                 max_seq_len,
                 experts_dir,

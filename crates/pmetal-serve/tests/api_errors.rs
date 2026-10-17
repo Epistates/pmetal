@@ -5,10 +5,12 @@
 
 mod support;
 
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use pmetal_serve::ServeConfig;
 use serde_json::{Value, json};
 use support::*;
+use tower::ServiceExt as _;
 
 fn chat(extra: Value) -> Value {
     let mut body = json!({
@@ -231,6 +233,52 @@ async fn the_api_key_gates_every_route_but_health() {
     let models = get(&router, "/v1/models").await;
     assert_eq!(models.status, StatusCode::UNAUTHORIZED);
     assert_no_unobserved_error();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_server_says_when_to_retry() {
+    let config = ServeConfig {
+        max_concurrent: 1,
+        ..ServeConfig::default()
+    };
+    let (router, _dir) = tiny(512).router(&config);
+    // A stream nobody reads holds the only request slot.
+    let held = router
+        .clone()
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    chat(json!({"stream": true, "max_tokens": 300})).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(held.status(), StatusCode::OK);
+    let reply = post(&router, "/v1/chat/completions", &chat(json!({}))).await;
+    let body = assert_openai_error(&reply, StatusCode::TOO_MANY_REQUESTS, "rate_limit_error");
+    assert_eq!(body["error"]["code"], "rate_limit_exceeded");
+    assert_eq!(reply.headers["retry-after"], "1");
+    // Letting the stream go frees the slot (and cancels its generation).
+    drop(held);
+    let mut freed = false;
+    for _ in 0..50 {
+        if post(
+            &router,
+            "/v1/chat/completions",
+            &chat(json!({"max_tokens": 1})),
+        )
+        .await
+        .status
+            == StatusCode::OK
+        {
+            freed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(freed, "the slot of a dropped stream was never released");
 }
 
 #[tokio::test(flavor = "multi_thread")]

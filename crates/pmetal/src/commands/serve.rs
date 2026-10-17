@@ -1,10 +1,13 @@
-/// Who may call the server (the access flags of `pmetal serve`).
+/// Who may call the server, and for how long a request may run (the access
+/// flags of `pmetal serve`).
 #[cfg(feature = "serve")]
 pub(crate) struct Access {
     /// `--api-key`, repeated.
     pub(crate) api_keys: Vec<String>,
     /// `--cors-origin`, repeated.
     pub(crate) cors_origins: Vec<String>,
+    /// `--request-timeout`; 0 for no limit.
+    pub(crate) request_timeout_secs: u64,
 }
 
 #[cfg(feature = "serve")]
@@ -27,6 +30,8 @@ impl Access {
             host,
             api_keys,
             cors_allowed_origins: self.cors_origins,
+            request_timeout: (self.request_timeout_secs > 0)
+                .then(|| std::time::Duration::from_secs(self.request_timeout_secs)),
             ..Default::default()
         }
     }

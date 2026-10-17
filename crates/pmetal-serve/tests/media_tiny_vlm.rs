@@ -187,17 +187,7 @@ fn greedy(max_tokens: usize) -> SamplingParams {
     SamplingParams {
         max_tokens,
         temperature: 0.0,
-        top_k: None,
-        top_p: None,
-        min_p: None,
-        repetition_penalty: None,
-        frequency_penalty: None,
-        presence_penalty: None,
-        seed: None,
-        extra_stop_token_ids: vec![],
-        stop_sequences: vec![],
-        logprobs_top_n: None,
-        logit_bias: Vec::new(),
+        ..SamplingParams::default()
     }
 }
 

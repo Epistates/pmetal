@@ -53,6 +53,7 @@ fn greedy() -> SamplingParams {
         stop_sequences: vec![],
         logprobs_top_n: None,
         logit_bias: Vec::new(),
+        constraint: None,
     }
 }
 

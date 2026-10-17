@@ -614,100 +614,58 @@ pub(crate) async fn run_inference(
         // ANE branch: separate engine with its own weight loading and KV cache
         #[cfg(feature = "ane")]
         let ane_output: Option<GenerationOutput> = if ane {
-            let param_count_too_small =
-                match std::fs::read_to_string(model_path.join("config.json")) {
-                    Ok(config_text) => {
-                        match serde_json::from_str::<serde_json::Value>(&config_text) {
-                            Ok(config_json) => {
-                                let hidden = config_json
-                                    .get("hidden_size")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
-                                let layers = config_json
-                                    .get("num_hidden_layers")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
-                                let vocab = config_json
-                                    .get("vocab_size")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
-                                let est_params = 12 * hidden * hidden * layers + hidden * vocab;
-                                est_params < 2_000_000_000
-                            }
-                            Err(_) => false,
-                        }
-                    }
-                    Err(_) => false,
-                };
-
-            if param_count_too_small {
-                tracing::warn!(
-                    "--ane ignored: models under ~2B parameters decode faster on the GPU, so they \
-                     always use it"
-                );
-                None
-            } else {
-                // --ane was asked for, so every reason not to use it is a warning.
-                // An unreadable config used to count as compatible.
-                let ane_compatible = match std::fs::read_to_string(model_path.join("config.json"))
-                    .map_err(|e| e.to_string())
+            // --ane is an instruction: a model the ANE cannot run, or a run
+            // that fails, is an error. Falling back to the GPU would answer
+            // slower than asked, hide a broken ANE path, and (after a
+            // failure part-way) print the reply twice.
+            let config_json: serde_json::Value =
+                std::fs::read_to_string(model_path.join("config.json"))
+                    .map_err(|e| anyhow::anyhow!("--ane: can't read config.json: {e}"))
                     .and_then(|text| {
-                        serde_json::from_str::<serde_json::Value>(&text).map_err(|e| e.to_string())
-                    }) {
-                    Ok(config_json) => {
-                        match pmetal_models::is_ane_inference_compatible(&config_json) {
-                            Ok(()) => true,
-                            Err(reason) => {
-                                tracing::warn!("--ane ignored: {reason}");
-                                false
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("--ane ignored: can't read config.json: {e}");
-                        false
-                    }
-                };
-
-                if ane_compatible {
-                    tracing::info!("Generating on the ANE");
-                    let tokenizer = &runner.tokenizer;
-                    let show_thinking = use_chat && !hide_thinking && !no_thinking;
-                    let mut formatter =
-                        pmetal_data::stream_format::StreamFormatter::new(tokenizer, show_thinking);
-                    match pmetal_models::generate_cached_ane_streaming(
-                        &model_path,
-                        draft_path.as_deref().filter(|_| dflash_draft),
-                        &input_ids,
-                        &gen_config,
-                        ane_max_seq_len,
-                        |token_id| {
-                            use std::io::Write;
-                            first_token_at.get_or_insert_with(std::time::Instant::now);
-                            if gen_config.stop_tokens.contains(&token_id) {
-                                return true;
-                            }
-                            let delta = formatter.push_token(tokenizer, token_id);
-                            if !delta.is_empty() {
-                                let _ = std::io::stdout().write_all(delta.as_bytes());
-                                let _ = std::io::stdout().flush();
-                            }
-                            true
-                        },
-                    ) {
-                        Ok(output) => {
-                            already_streamed = true;
-                            Some(output)
-                        }
-                        Err(e) => {
-                            tracing::warn!("ANE inference failed ({}), falling back to GPU", e);
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
+                        serde_json::from_str(&text)
+                            .map_err(|e| anyhow::anyhow!("--ane: config.json does not parse: {e}"))
+                    })?;
+            pmetal_models::is_ane_inference_compatible(&config_json).map_err(|reason| {
+                anyhow::anyhow!("--ane: the ANE cannot run this model: {reason}")
+            })?;
+            let get = |key: &str| config_json.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+            let est_params =
+                12 * get("hidden_size") * get("hidden_size") * get("num_hidden_layers")
+                    + get("hidden_size") * get("vocab_size");
+            if est_params < 2_000_000_000 {
+                tracing::warn!(
+                    "models under ~2B parameters decode faster on the GPU than on the ANE; \
+                     running on the ANE as asked"
+                );
             }
+            tracing::info!("Generating on the ANE");
+            let tokenizer = &runner.tokenizer;
+            let show_thinking = use_chat && !hide_thinking && !no_thinking;
+            let mut formatter =
+                pmetal_data::stream_format::StreamFormatter::new(tokenizer, show_thinking);
+            let output = pmetal_models::generate_cached_ane_streaming(
+                &model_path,
+                draft_path.as_deref().filter(|_| dflash_draft),
+                &input_ids,
+                &gen_config,
+                ane_max_seq_len,
+                |token_id| {
+                    use std::io::Write;
+                    first_token_at.get_or_insert_with(std::time::Instant::now);
+                    if gen_config.stop_tokens.contains(&token_id) {
+                        return true;
+                    }
+                    let delta = formatter.push_token(tokenizer, token_id);
+                    if !delta.is_empty() {
+                        let _ = std::io::stdout().write_all(delta.as_bytes());
+                        let _ = std::io::stdout().flush();
+                    }
+                    true
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("ANE inference failed: {e}"))?;
+            already_streamed = true;
+            Some(output)
         } else {
             None
         };

@@ -73,6 +73,9 @@ async-trait = "0.1"
 # HTTP server (pmetal-serve)
 axum = "0.8"
 tower-http = "0.7"
+# Grammar-constrained decoding (pmetal-serve): JSON-schema and Lark grammars
+# compiled to token masks.
+llguidance = "1.9"
 # Drives the server's router in-process in tests (`ServiceExt::oneshot`).
 tower = { version = "0.5", features = ["util"] }
 

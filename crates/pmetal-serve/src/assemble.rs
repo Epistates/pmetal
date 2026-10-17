@@ -7,7 +7,7 @@
 //! in one place:
 //!
 //! 1. the tokens are decoded to text, UTF-8 safe, the reasoning split from
-//!    the answer ([`ChannelDecoder`]);
+//!    the answer (`ChannelDecoder`);
 //! 2. the answer is cut at the first stop sequence, in the text, however the
 //!    tokens fell ([`StopFilter`]);
 //! 3. when the request offered tools, the answer is split into text and

@@ -9,6 +9,8 @@
 //!   Qwen3.5-family vision models also read images and videos, Llama 3.2
 //!   Vision images (see [`media`])
 //! - `POST /v1/completions` — raw text completions
+//! - `POST /v1/responses` — the OpenAI Responses API
+//! - `POST /v1/embeddings` — embeddings
 //! - `POST /v1/messages` — Anthropic-compatible message generation
 //! - `GET /v1/models` — list loaded models
 //! - `GET /v1/metrics` — rolling serving metrics (tok/s, latencies, request counts)
@@ -29,10 +31,12 @@ pub mod extract;
 pub(crate) mod generate;
 pub mod media;
 pub mod request;
+pub mod responses;
 pub mod routes;
 pub mod server;
 pub(crate) mod sse;
 pub mod stop;
+pub mod structured;
 pub mod tools;
 pub mod types;
 pub mod vocab;
