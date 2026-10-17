@@ -49,10 +49,10 @@ impl AdaptedModel {
     /// Attach adapters to a model that is already built and loaded.
     ///
     /// Every projection whose *name* — the last segment of its path — appears in
-    /// `config.target_modules` gets one. An empty `target_modules` adapts every
-    /// projection except the output layer (the LM head), as PEFT's
-    /// `all-linear` does; name it (`lm_head`) to adapt it. MoE routers and
-    /// routed experts are never adapted.
+    /// `config.target_modules` gets one. An empty `target_modules` (the
+    /// default) or `all-linear` adapts every projection except the output
+    /// layer (the LM head), as PEFT's `all-linear` does; name it (`lm_head`)
+    /// to adapt it. MoE routers and routed experts are never adapted.
     pub fn attach(mut model: DynamicModel, config: LoraConfig) -> Result<Self, LoraError> {
         let rank = config.r as i32;
         if rank <= 0 {
@@ -61,7 +61,12 @@ impl AdaptedModel {
             )));
         }
 
-        let targets = &config.target_modules;
+        // `all-linear` is the spelling PEFT uses for an empty list.
+        let targets: &[String] = if config.targets_all_linear() {
+            &[]
+        } else {
+            &config.target_modules
+        };
         let output = if targets.is_empty() {
             model.output_projection_path()
         } else {

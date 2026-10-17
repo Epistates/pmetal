@@ -107,7 +107,7 @@ architectures. The LM head, MoE routers and routed experts stay as loaded.
 | `r` | LoRA rank | 8 |
 | `alpha` | Scaling factor | 16.0 |
 | `dropout` | Dropout rate | 0.0 |
-| `target_modules` | Projections to adapt, by name; empty adapts every linear layer but the LM head | `q_proj`, `k_proj`, `v_proj`, `o_proj` |
+| `target_modules` | Projections to adapt, by name; empty (or `all-linear`) adapts every linear layer but the LM head | empty |
 
 ## Modules
 

@@ -226,6 +226,17 @@ impl LoraConfig {
                 );
             }
         }
+        if self.target_modules.len() > 1
+            && self
+                .target_modules
+                .iter()
+                .any(|m| m == LoraConfig::ALL_LINEAR)
+        {
+            p.add(
+                &key("target_modules"),
+                "`all-linear` stands for every linear layer and can't be combined with names",
+            );
+        }
         if self.bias != LoraBias::None {
             p.add(
                 &key("bias"),

@@ -175,10 +175,17 @@ pub struct LoraConfig {
     #[serde(default)]
     pub dropout: f32,
 
-    /// Projections to adapt, by name (`q_proj`, `gate_proj`, ...). Empty
-    /// adapts every linear layer except the output layer (the LM head); name
-    /// `lm_head` to adapt the head.
-    #[serde(default = "default_target_modules")]
+    /// Projections to adapt, by name (`q_proj`, `gate_proj`, ...).
+    ///
+    /// Empty (the default), or the single entry `all-linear` as in PEFT's
+    /// `target_modules`, adapts every linear layer except the output layer
+    /// (the LM head), MoE routers and anything else that must stay exact;
+    /// name `lm_head` to adapt the head. Adapting the MLP as well as
+    /// attention is what matches full fine-tuning: attention-only LoRA
+    /// underperforms even at equal parameter count, and adding attention to
+    /// an MLP-only LoRA gains nothing (Schulman et al., 2025, "LoRA Without
+    /// Regret"; Dettmers et al., 2023, QLoRA).
+    #[serde(default, deserialize_with = "deserialize_target_modules")]
     pub target_modules: Vec<String>,
 
     /// Use rslora scaling.
@@ -215,7 +222,7 @@ impl Default for LoraConfig {
             r: default_lora_r(),
             alpha: default_lora_alpha(),
             dropout: 0.0,
-            target_modules: default_target_modules(),
+            target_modules: Vec::new(),
             use_rslora: false,
             use_dora: false,
             bias: LoraBias::default(),
@@ -226,6 +233,22 @@ impl Default for LoraConfig {
 }
 
 impl LoraConfig {
+    /// The `target_modules` entry that stands for every linear layer, as in
+    /// PEFT.
+    pub const ALL_LINEAR: &'static str = "all-linear";
+
+    /// Whether `target_modules` asks for every linear layer (but the output
+    /// layer, routers and the like): empty, or just
+    /// [`ALL_LINEAR`](Self::ALL_LINEAR).
+    #[must_use]
+    pub fn targets_all_linear(&self) -> bool {
+        match self.target_modules.as_slice() {
+            [] => true,
+            [only] => only == Self::ALL_LINEAR,
+            _ => false,
+        }
+    }
+
     /// Compute the LoRA scaling factor.
     #[must_use]
     pub fn scaling(&self) -> f32 {
@@ -727,13 +750,21 @@ fn default_lora_r() -> usize {
 fn default_lora_alpha() -> f32 {
     defaults::LORA_ALPHA
 }
-fn default_target_modules() -> Vec<String> {
-    vec![
-        "q_proj".into(),
-        "k_proj".into(),
-        "v_proj".into(),
-        "o_proj".into(),
-    ]
+/// `target_modules` as a list of names, or as the bare string `all-linear`
+/// the way a PEFT `adapter_config.json` can spell it.
+fn deserialize_target_modules<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Targets {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match Targets::deserialize(deserializer)? {
+        Targets::One(name) => vec![name],
+        Targets::Many(names) => names,
+    })
 }
 fn default_lr() -> f64 {
     defaults::LEARNING_RATE
@@ -830,6 +861,31 @@ mod tests {
         );
         let err = "cosin".parse::<LrSchedulerType>().unwrap_err();
         assert!(err.contains("cosin") && err.contains("wsd"), "{err}");
+    }
+
+    /// Adapting only attention underperforms full fine-tuning, so the default
+    /// reaches every linear layer, and every surface that builds a
+    /// `LoraConfig` inherits it from here.
+    #[test]
+    fn the_default_adapts_every_linear_layer() {
+        let config = LoraConfig::default();
+        assert!(config.target_modules.is_empty());
+        assert!(config.targets_all_linear());
+        let from_empty: LoraConfig = serde_saphyr::from_str("r: 8").unwrap();
+        assert!(from_empty.targets_all_linear());
+    }
+
+    #[test]
+    fn target_modules_reads_a_list_or_peft_s_all_linear_string() {
+        let list: LoraConfig =
+            serde_saphyr::from_str("target_modules: [q_proj, v_proj]").unwrap();
+        assert_eq!(list.target_modules, ["q_proj", "v_proj"]);
+        assert!(!list.targets_all_linear());
+        let word: LoraConfig = serde_saphyr::from_str("target_modules: all-linear").unwrap();
+        assert!(word.targets_all_linear());
+        let json: LoraConfig =
+            serde_json::from_str(r#"{"target_modules": ["all-linear"]}"#).unwrap();
+        assert!(json.targets_all_linear());
     }
 
     #[test]

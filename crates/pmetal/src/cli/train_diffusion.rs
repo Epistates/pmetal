@@ -33,13 +33,9 @@ pub struct TrainDiffusionArgs {
     pub lora_alpha: f32,
 
     /// Comma-separated projections to adapt, by name (`q_proj`, `gate_proj`,
-    /// ...), in the encoder and the decoder. MoE routers and experts are never
-    /// adapted.
-    #[arg(
-        long = "lora-targets",
-        value_delimiter = ',',
-        default_value = "q_proj,k_proj,v_proj,o_proj"
-    )]
+    /// ...), in the encoder and the decoder. Omitted, every linear layer but
+    /// the output head is adapted. MoE routers and experts are never adapted.
+    #[arg(long = "lora-targets", value_delimiter = ',')]
     pub lora_targets: Vec<String>,
 
     /// Total optimiser steps (the dataset is cycled to reach this count).

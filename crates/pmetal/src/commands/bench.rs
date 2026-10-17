@@ -2498,15 +2498,7 @@ async fn benchmark_real_training(
     let collector = StepMetricsCollector::new();
     let callback = collector.clone();
 
-    let mut lora = LoraConfig::default();
-    if lora.target_modules.is_empty() {
-        lora.target_modules = vec![
-            "q_proj".to_string(),
-            "k_proj".to_string(),
-            "v_proj".to_string(),
-            "o_proj".to_string(),
-        ];
-    }
+    let lora = LoraConfig::default();
 
     let training_start = Instant::now();
     let result = run_training(
@@ -3515,12 +3507,6 @@ pub(crate) fn generate_sample_config(output: &str) -> anyhow::Result<()> {
         lora: LoraConfig {
             r: 16,
             alpha: 32.0,
-            target_modules: vec![
-                "q_proj".to_string(),
-                "k_proj".to_string(),
-                "v_proj".to_string(),
-                "o_proj".to_string(),
-            ],
             ..Default::default()
         },
         training: TrainingConfig {

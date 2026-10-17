@@ -68,9 +68,9 @@ pub struct TrainDiffusionSpec {
         group = "LoRA",
         argv = "--lora-targets",
         csv,
-        help = "Projections to adapt in the encoder and decoder; MoE routers and experts never are"
+        help = "Projections to adapt in the encoder and decoder; empty adapts every linear layer. MoE routers and experts never are"
     )]
-    #[serde(default = "default_lora_targets")]
+    #[serde(default)]
     pub lora_targets: Vec<String>,
 
     #[job(
@@ -196,7 +196,7 @@ impl Default for TrainDiffusionSpec {
             output: default_output(),
             lora_r: default_lora_r(),
             lora_alpha: default_lora_alpha(),
-            lora_targets: default_lora_targets(),
+            lora_targets: Vec::new(),
             quantization: default_quantization(),
             quant_block_size: default_quant_block_size(),
             double_quant: false,
@@ -234,11 +234,6 @@ fn default_lora_r() -> usize {
 fn default_lora_alpha() -> f32 {
     crate::defaults::LORA_ALPHA
 }
-fn default_lora_targets() -> Vec<String> {
-    ["q_proj", "k_proj", "v_proj", "o_proj"]
-        .map(String::from)
-        .to_vec()
-}
 fn default_quantization() -> String {
     "none".to_string()
 }
@@ -269,15 +264,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_default_targets_are_the_attention_projections() {
+    fn the_default_adapts_every_linear_layer() {
         let spec = TrainDiffusionSpec {
             model: "m".into(),
             dataset: "d".into(),
             ..Default::default()
         };
         let argv = spec.to_argv();
-        let at = argv.iter().position(|a| a == "--lora-targets").unwrap();
-        assert_eq!(argv[at + 1], "q_proj,k_proj,v_proj,o_proj");
+        assert!(
+            !argv.iter().any(|a| a == "--lora-targets"),
+            "an empty list is the default and says nothing: {argv:?}"
+        );
     }
 
     #[test]
