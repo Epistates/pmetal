@@ -27,7 +27,7 @@ use futures::stream::{self, Stream};
 use tokio::sync::mpsc::Receiver;
 
 use crate::engine::{RequestMetrics, TokenEvent, TokenLogprobEntry};
-use crate::sse::{ChannelDecoder, ChannelDelta};
+use crate::sse::{ChannelDecoder, ChannelDelta, HarmonyDecoder, ReplyDecoder};
 use crate::stop::StopFilter;
 use crate::tools::{ParsedCall, ToolEvent, ToolFormat, ToolSet, ToolStream};
 
@@ -70,7 +70,7 @@ pub struct Finish {
 }
 
 pub struct Assembler {
-    decoder: ChannelDecoder<Option<TokenLogprobEntry>>,
+    decoder: ReplyDecoder<Option<TokenLogprobEntry>>,
     filter: StopFilter,
     tools: Option<ToolStream>,
     single_tool_call: bool,
@@ -90,12 +90,23 @@ pub struct Assembler {
 impl Assembler {
     pub fn new(config: AssemblerConfig) -> Self {
         let keep_special = config.tools.is_some();
+        // Harmony's calls are messages the decoder reads itself; every other
+        // family writes them into the answer text for the tool stream.
+        let harmony = matches!(config.tools, Some((ToolFormat::Harmony, _)));
+        let decoder = if harmony {
+            ReplyDecoder::Harmony(HarmonyDecoder::new(config.tokenizer))
+        } else {
+            ReplyDecoder::Channels(
+                ChannelDecoder::new(config.tokenizer, &config.prompt)
+                    .keeping_special_tokens(keep_special),
+            )
+        };
         Self {
-            decoder: ChannelDecoder::new(config.tokenizer, &config.prompt)
-                .keeping_special_tokens(keep_special),
+            decoder,
             filter: StopFilter::new(&config.stops),
             tools: config
                 .tools
+                .filter(|_| !harmony)
                 .map(|(format, tools)| ToolStream::new(format, tools)),
             single_tool_call: config.single_tool_call,
             tokens: 0,
@@ -171,6 +182,13 @@ impl Assembler {
     fn take(&mut self, delta: ChannelDelta<Option<TokenLogprobEntry>>, out: &mut Vec<Piece>) {
         if !delta.reasoning.is_empty() {
             out.push(Piece::Reasoning(delta.reasoning));
+        }
+        for call in delta.calls {
+            if self.single_tool_call && self.calls >= 1 {
+                continue;
+            }
+            self.calls += 1;
+            out.push(Piece::ToolCall(call));
         }
         if delta.content.is_empty() {
             return;
@@ -530,5 +548,102 @@ mod tests {
         assert_eq!(reasoning, "hmm");
         assert_eq!(content, "hi");
         assert!(finish.reasoning_tokens >= 3);
+    }
+
+    // ── gpt-oss: Harmony messages ────────────────────────────────────────────
+
+    fn harmony_tokenizer() -> Arc<pmetal_data::Tokenizer> {
+        Arc::new(byte_level_bpe(
+            &[],
+            &[
+                "<|start|>",
+                "<|end|>",
+                "<|channel|>",
+                "<|message|>",
+                "<|call|>",
+                "<|return|>",
+                "<|constrain|>",
+            ],
+            None,
+        ))
+    }
+
+    /// Run `text` through a Harmony assembler; returns reasoning, content, calls and how it finished.
+    fn harmony(text: &str) -> (String, String, Vec<ParsedCall>, Finish) {
+        let tok = harmony_tokenizer();
+        let prompt = tok
+            .encode_with_special_tokens("<|start|>assistant")
+            .unwrap();
+        let tools = ToolSet::new(&[]);
+        let mut asm = Assembler::new(AssemblerConfig {
+            tokenizer: Arc::clone(&tok),
+            prompt,
+            stops: Vec::new(),
+            tools: Some((ToolFormat::Harmony, tools)),
+            single_tool_call: false,
+        });
+        let ids = tok.encode_with_special_tokens(text).unwrap();
+        let (mut reasoning, mut content, mut calls) = (String::new(), String::new(), Vec::new());
+        let mut take = |pieces: Vec<Piece>| {
+            for piece in pieces {
+                match piece {
+                    Piece::Reasoning(t) => reasoning.push_str(&t),
+                    Piece::Content { text, .. } => content.push_str(&text),
+                    Piece::ToolCall(c) => calls.push(c),
+                }
+            }
+        };
+        for id in ids {
+            take(asm.push(id, None));
+        }
+        let (rest, finish) = asm.finish("stop");
+        take(rest);
+        (reasoning, content, calls, finish)
+    }
+
+    #[test]
+    fn harmony_channels_split_into_reasoning_and_answer() {
+        let (reasoning, content, calls, finish) = harmony(
+            "<|channel|>analysis<|message|>think hard<|end|><|start|>assistant\
+             <|channel|>final<|message|>Hi there<|return|>",
+        );
+        assert_eq!(reasoning, "think hard");
+        assert_eq!(content, "Hi there");
+        assert!(calls.is_empty());
+        assert_eq!(finish.reason, "stop");
+    }
+
+    #[test]
+    fn a_harmony_function_call_is_a_call_not_text() {
+        for text in [
+            // The engine stops at `<|call|>` before emitting it ...
+            "<|channel|>analysis<|message|>need weather<|end|><|start|>assistant\
+             <|channel|>commentary to=functions.get_weather <|constrain|>json\
+             <|message|>{\"city\": \"SF\"}",
+            // ... and a model that does emit it ends the message there.
+            "<|channel|>commentary to=functions.get_weather <|constrain|>json\
+             <|message|>{\"city\": \"SF\"}<|call|>",
+        ] {
+            let (_, content, calls, finish) = harmony(text);
+            assert_eq!(content, "", "{text}");
+            assert_eq!(
+                calls,
+                vec![ParsedCall {
+                    name: "get_weather".into(),
+                    arguments: r#"{"city":"SF"}"#.into()
+                }]
+            );
+            assert_eq!(finish.reason, "tool_calls");
+        }
+    }
+
+    #[test]
+    fn a_commentary_preamble_is_text() {
+        let (_, content, calls, _) = harmony(
+            "<|channel|>commentary<|message|>Let me check.<|end|><|start|>assistant\
+             <|channel|>commentary to=functions.f <|constrain|>json<|message|>{}<|call|>",
+        );
+        assert_eq!(content, "Let me check.");
+        assert_eq!(calls.len(), 1);
     }
 }

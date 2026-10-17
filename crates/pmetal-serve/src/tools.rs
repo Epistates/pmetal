@@ -500,6 +500,19 @@ fn call_from_object(value: &Value) -> Option<ParsedCall> {
     })
 }
 
+/// The call of `name` with `arguments` written as JSON text (empty for none).
+pub(crate) fn call_with_arguments(name: &str, arguments: &str) -> Option<ParsedCall> {
+    let value: Value = if arguments.trim().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(arguments.trim()).ok()?
+    };
+    Some(ParsedCall {
+        name: name.to_owned(),
+        arguments: arguments_text(value)?,
+    })
+}
+
 /// One call object, an array of them, or `{"tool_calls": [...]}`.
 pub(crate) fn parse_json_calls(text: &str) -> Option<Vec<ParsedCall>> {
     let value: Value = serde_json::from_str(text.trim()).ok()?;

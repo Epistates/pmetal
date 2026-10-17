@@ -153,6 +153,9 @@ pub struct ChannelDelta<Aux> {
     pub content: String,
     /// Aux payloads of the answer tokens behind `content`.
     pub aux: Vec<Aux>,
+    /// Tool calls the decoder itself finished (Harmony messages addressed to
+    /// a function); a decoder that leaves calls in the text leaves this empty.
+    pub calls: Vec<crate::tools::ParsedCall>,
 }
 
 /// An [`IncrementalDecoder`] per channel, fed by the
@@ -229,6 +232,241 @@ impl<Aux> ChannelDecoder<Aux> {
             reasoning: trim_channel_start(reasoning, &mut self.reasoning_started),
             content: trim_channel_start(content, &mut self.answer_started),
             aux,
+            calls: Vec::new(),
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// gpt-oss: Harmony messages
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Where a Harmony stream is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HarmonyState {
+    /// Nothing seen: a model that writes its answer with no header.
+    Fresh,
+    /// After `<|start|>`: the role, up to the channel.
+    Role,
+    /// After `<|channel|>`: the header, up to `<|message|>`.
+    Header,
+    /// Inside a message's body.
+    Body,
+    /// After a message's end, before the next.
+    Between,
+}
+
+/// What a message's body is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HarmonyBody {
+    Reasoning,
+    Content,
+    /// Arguments of a call to this function.
+    Call(String),
+    /// Addressed to a tool the server does not have (a built-in browser).
+    Ignored,
+}
+
+/// Reads gpt-oss's Harmony messages, which the other decoder cannot: a tool
+/// call is a message on the `commentary` channel whose header says who it is
+/// for (`<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>
+/// {...}<|call|>`), and the header is exactly what a channel splitter drops.
+/// `analysis` messages are the reasoning, `final` ones and preambles on
+/// `commentary` the answer, a message to `functions.NAME` a call.
+pub struct HarmonyDecoder<Aux = ()> {
+    tokenizer: Arc<pmetal_data::Tokenizer>,
+    start: Option<u32>,
+    channel: Option<u32>,
+    message: Option<u32>,
+    ends: Vec<u32>,
+    state: HarmonyState,
+    header: Vec<u32>,
+    kind: HarmonyBody,
+    body: IncrementalDecoder<Aux>,
+    call_text: String,
+    reasoning_started: bool,
+    answer_started: bool,
+    reasoning_tokens: usize,
+}
+
+impl<Aux> HarmonyDecoder<Aux> {
+    pub fn new(tokenizer: Arc<pmetal_data::Tokenizer>) -> Self {
+        let id = |name: &str| tokenizer.inner().token_to_id(name);
+        Self {
+            start: id("<|start|>"),
+            channel: id("<|channel|>"),
+            message: id("<|message|>"),
+            ends: ["<|end|>", "<|call|>", "<|return|>"]
+                .iter()
+                .filter_map(|n| id(n))
+                .collect(),
+            state: HarmonyState::Fresh,
+            header: Vec::new(),
+            kind: HarmonyBody::Content,
+            body: IncrementalDecoder::new(Arc::clone(&tokenizer)),
+            tokenizer,
+            call_text: String::new(),
+            reasoning_started: false,
+            answer_started: false,
+            reasoning_tokens: 0,
+        }
+    }
+
+    /// How many of the tokens pushed were reasoning.
+    pub fn reasoning_token_count(&self) -> usize {
+        self.reasoning_tokens
+    }
+
+    /// The body kind a header names.
+    fn kind_of(&self, header: &[u32]) -> HarmonyBody {
+        let text = self
+            .tokenizer
+            .decode_with_special_tokens(header)
+            .unwrap_or_default();
+        let channel = text.split_whitespace().next().unwrap_or_default();
+        let recipient = text
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix("to="));
+        match (channel, recipient) {
+            (_, Some(to)) => match to.strip_prefix("functions.") {
+                Some(name) if !name.is_empty() => HarmonyBody::Call(name.to_owned()),
+                _ => HarmonyBody::Ignored,
+            },
+            ("analysis", None) => HarmonyBody::Reasoning,
+            _ => HarmonyBody::Content,
+        }
+    }
+
+    fn open_body(&mut self, kind: HarmonyBody) {
+        self.kind = kind;
+        self.body = IncrementalDecoder::new(Arc::clone(&self.tokenizer));
+        self.call_text.clear();
+        self.state = HarmonyState::Body;
+    }
+
+    /// Give a body's newly decoded text to where it belongs.
+    fn route(&mut self, text: String, aux: Vec<Aux>, delta: &mut ChannelDelta<Aux>) {
+        if text.is_empty() {
+            return;
+        }
+        match &self.kind {
+            HarmonyBody::Reasoning => delta
+                .reasoning
+                .push_str(&trim_channel_start(text, &mut self.reasoning_started)),
+            HarmonyBody::Content => {
+                let text = trim_channel_start(text, &mut self.answer_started);
+                delta.content.push_str(&text);
+                delta.aux.extend(aux);
+            }
+            HarmonyBody::Call(_) => self.call_text.push_str(&text),
+            HarmonyBody::Ignored => {}
+        }
+    }
+
+    /// The message ends: flush its body, and finish a call.
+    fn end_message(&mut self, delta: &mut ChannelDelta<Aux>) {
+        if self.state != HarmonyState::Body {
+            return;
+        }
+        let (text, aux) = self.body.flush_aux();
+        self.route(text, aux, delta);
+        if let HarmonyBody::Call(name) = &self.kind {
+            if let Some(call) = crate::tools::call_with_arguments(name, &self.call_text) {
+                delta.calls.push(call);
+            }
+        }
+        self.call_text.clear();
+        self.state = HarmonyState::Between;
+    }
+
+    pub fn push_with_aux(&mut self, token: u32, aux: Aux) -> ChannelDelta<Aux> {
+        let mut delta = ChannelDelta {
+            reasoning: String::new(),
+            content: String::new(),
+            aux: Vec::new(),
+            calls: Vec::new(),
+        };
+        if Some(token) == self.start {
+            self.end_message(&mut delta);
+            self.state = HarmonyState::Role;
+        } else if Some(token) == self.channel {
+            self.end_message(&mut delta);
+            self.header.clear();
+            self.state = HarmonyState::Header;
+        } else if Some(token) == self.message {
+            let header = std::mem::take(&mut self.header);
+            let kind = if self.state == HarmonyState::Header {
+                self.kind_of(&header)
+            } else {
+                HarmonyBody::Content
+            };
+            self.end_message(&mut delta);
+            self.open_body(kind);
+        } else if self.ends.contains(&token) {
+            self.end_message(&mut delta);
+            self.state = HarmonyState::Between;
+        } else {
+            match self.state {
+                HarmonyState::Header => self.header.push(token),
+                HarmonyState::Fresh => {
+                    self.open_body(HarmonyBody::Content);
+                    self.feed(token, aux, &mut delta);
+                }
+                HarmonyState::Body => self.feed(token, aux, &mut delta),
+                HarmonyState::Role | HarmonyState::Between => {}
+            }
+        }
+        delta
+    }
+
+    fn feed(&mut self, token: u32, aux: Aux, delta: &mut ChannelDelta<Aux>) {
+        if self.kind == HarmonyBody::Reasoning {
+            self.reasoning_tokens += 1;
+        }
+        let (text, aux) = self.body.push_with_aux(token, aux);
+        self.route(text, aux, delta);
+    }
+
+    /// The stream ends: an unterminated message (the engine stops at
+    /// `<|call|>` before emitting it) ends here.
+    pub fn flush_aux(&mut self) -> ChannelDelta<Aux> {
+        let mut delta = ChannelDelta {
+            reasoning: String::new(),
+            content: String::new(),
+            aux: Vec::new(),
+            calls: Vec::new(),
+        };
+        self.end_message(&mut delta);
+        delta
+    }
+}
+
+/// The decoder an [`Assembler`](crate::assemble::Assembler) reads a reply
+/// with: the channel splitter, or Harmony's message reader.
+pub enum ReplyDecoder<Aux = ()> {
+    Channels(ChannelDecoder<Aux>),
+    Harmony(HarmonyDecoder<Aux>),
+}
+
+impl<Aux> ReplyDecoder<Aux> {
+    pub fn push_with_aux(&mut self, token: u32, aux: Aux) -> ChannelDelta<Aux> {
+        match self {
+            Self::Channels(d) => d.push_with_aux(token, aux),
+            Self::Harmony(d) => d.push_with_aux(token, aux),
+        }
+    }
+
+    pub fn flush_aux(&mut self) -> ChannelDelta<Aux> {
+        match self {
+            Self::Channels(d) => d.flush_aux(),
+            Self::Harmony(d) => d.flush_aux(),
+        }
+    }
+
+    pub fn reasoning_token_count(&self) -> usize {
+        match self {
+            Self::Channels(d) => d.reasoning_token_count(),
+            Self::Harmony(d) => d.reasoning_token_count(),
         }
     }
 }
