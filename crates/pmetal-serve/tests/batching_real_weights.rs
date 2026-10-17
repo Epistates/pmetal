@@ -166,6 +166,8 @@ struct Reply {
     logprobs: Vec<f32>,
     first_token: Option<Duration>,
     finish: String,
+    /// Trailing tokens a stop sequence matched, which the client drops.
+    stripped: usize,
 }
 
 async fn collect(mut rx: Receiver<TokenEvent>, start: Instant) -> Reply {
@@ -174,6 +176,7 @@ async fn collect(mut rx: Receiver<TokenEvent>, start: Instant) -> Reply {
         logprobs: Vec::new(),
         first_token: None,
         finish: String::new(),
+        stripped: 0,
     };
     while let Some(event) = rx.recv().await {
         match event {
@@ -184,8 +187,13 @@ async fn collect(mut rx: Receiver<TokenEvent>, start: Instant) -> Reply {
                     reply.logprobs.push(entry.logprob);
                 }
             }
-            TokenEvent::Done { finish_reason, .. } => {
+            TokenEvent::Done {
+                finish_reason,
+                stripped_tokens,
+                ..
+            } => {
                 reply.finish = finish_reason;
+                reply.stripped = stripped_tokens;
                 return reply;
             }
             TokenEvent::Error(e) => panic!("stream failed: {e}"),
@@ -259,6 +267,7 @@ fn assert_same(label: &str, got: &Reply, want: &Reply, tolerance: f32) {
         want.tokens,
     );
     assert_eq!(got.finish, want.finish, "{label}: finish reason");
+    assert_eq!(got.stripped, want.stripped, "{label}: stripped tokens");
     assert!(
         !worst.is_nan() && worst <= tolerance,
         "{label}: log-probabilities differ by {worst}"
@@ -284,6 +293,18 @@ async fn per_slot_decode_is_bit_identical_to_the_single_request_path() {
     requests[2].1.extra_stop_token_ids = vec![want[2].tokens[10]];
     want[2] = alone(&engine, &requests[2..3]).await.remove(0);
     assert_eq!(want[2].finish, "stop");
+    // A stop sequence of text from the middle of another reply.
+    let tokenizer = pmetal_data::Tokenizer::from_model_dir(&dir).unwrap();
+    let phrase = tokenizer.decode(&want[0].tokens[9..13]).unwrap();
+    let mut with_sequence = requests[0].clone();
+    with_sequence.1.stop_sequences = vec![phrase];
+    want.push(
+        alone(&engine, std::slice::from_ref(&with_sequence))
+            .await
+            .remove(0),
+    );
+    assert!(want[12].stripped > 0, "the stop sequence matched");
+    requests.push(with_sequence);
 
     let got = batched(&engine, &requests, Duration::from_millis(30)).await;
     for (i, (got, want)) in got.iter().zip(&want).enumerate() {
