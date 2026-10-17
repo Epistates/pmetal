@@ -29,9 +29,7 @@ use pmetal_runtime::impl_module_params;
 use pmetal_runtime::nn::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 use serde::{Deserialize, Serialize};
 
-use crate::architectures::utils::{
-    Activation, additive_padding_mask, resolve_activation,
-};
+use crate::architectures::utils::{Activation, additive_padding_mask, resolve_activation};
 
 // ---------------------------------------------------------------------------
 // Configuration

@@ -160,8 +160,8 @@ pub(crate) async fn run_train_diffusion(args: TrainDiffusionArgs) -> Result<()> 
 
     // 7. Save the final adapters: a PEFT directory, which `infer --lora`,
     //    `fuse` and `PeftModel.from_pretrained` all read.
-    let final_path =
-        save_adapter(&model, output_dir, &lora_cfg, Some(&args.model)).with_context(|| "save adapters")?;
+    let final_path = save_adapter(&model, output_dir, &lora_cfg, Some(&args.model))
+        .with_context(|| "save adapters")?;
     println!(
         "DiffusionGemma LoRA adapters saved to {} (final ema loss={:.4})",
         final_path.display(),

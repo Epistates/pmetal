@@ -64,9 +64,15 @@ fn resolved_activations_keep_the_input_dtype() {
     ] {
         let act = resolve_activation(name).unwrap_or_else(|| panic!("{name} does not resolve"));
         for dtype in [Dtype::Bfloat16, Dtype::Float16, Dtype::Float32] {
-            let x = Array::from_f32_slice(&[-2.0, -0.5, 0.5, 3.0], &[1, 4]).as_dtype(dtype.as_i32());
+            let x =
+                Array::from_f32_slice(&[-2.0, -0.5, 0.5, 3.0], &[1, 4]).as_dtype(dtype.as_i32());
             let y = act(&x);
-            assert_eq!(y.dtype(), dtype, "{name} on {dtype:?} returned {:?}", y.dtype());
+            assert_eq!(
+                y.dtype(),
+                dtype,
+                "{name} on {dtype:?} returned {:?}",
+                y.dtype()
+            );
         }
     }
     drain();
@@ -90,7 +96,11 @@ fn gemma4_vision_mlp_rounds_the_activation_before_the_product() {
     let rounded = nn::gelu_tanh_approximate(&gate).as_dtype(bf16());
     let want = mlp.down_proj.forward(&rounded.multiply(&up));
     assert_eq!(got.dtype(), Dtype::Bfloat16);
-    assert_eq!(max_diff(&got, &want), 0.0, "differs from the bf16 reference");
+    assert_eq!(
+        max_diff(&got, &want),
+        0.0,
+        "differs from the bf16 reference"
+    );
 
     // The fixture can tell the two orders apart: the f32 stream differs.
     let f32_stream = mlp
@@ -126,6 +136,10 @@ fn diffusion_gemma_self_conditioning_rounds_the_activation_before_the_product() 
         .forward(&gate.multiply(&sc.up_proj.forward(&normed)));
     let want = fast::rms_norm_opt(&embeds.add(&delta), None, sc.eps);
     assert_eq!(got.dtype(), Dtype::Bfloat16);
-    assert_eq!(max_diff(&got, &want), 0.0, "differs from the bf16 reference");
+    assert_eq!(
+        max_diff(&got, &want),
+        0.0,
+        "differs from the bf16 reference"
+    );
     drain();
 }

@@ -1509,8 +1509,7 @@ fn load_model_with_lora(
     ),
     Exception,
 > {
-    let lora_config =
-        lora_config_for_adapter(Path::new(lora_path)).map_err(Exception::custom)?;
+    let lora_config = lora_config_for_adapter(Path::new(lora_path)).map_err(Exception::custom)?;
 
     tracing::info!(
         r = lora_config.r,

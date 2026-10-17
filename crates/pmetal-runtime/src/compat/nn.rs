@@ -1,8 +1,7 @@
 // Layer types, activations and autograd, under one `nn` path.
 pub use super::layers::{
     Conv1d, Conv1dBuilder, Conv2d, Conv2dBuilder, Embedding, GroupNorm, GroupNormBuilder,
-    LayerNorm, LayerNormBuilder, Linear, LinearBuilder, RmsNorm, RmsNormBuilder,
-    WeightlessRmsNorm,
+    LayerNorm, LayerNormBuilder, Linear, LinearBuilder, RmsNorm, RmsNormBuilder, WeightlessRmsNorm,
 };
 
 use super::{Array, Exception};

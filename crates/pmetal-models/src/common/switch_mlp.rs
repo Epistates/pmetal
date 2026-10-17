@@ -128,12 +128,7 @@ impl ModuleParameters for SwitchMlp {
 }
 
 impl pmetal_runtime::compat::VisitLinears for SwitchMlp {
-    fn visit_linears_mut(
-        &mut self,
-        _prefix: &str,
-        _f: &mut dyn FnMut(&str, &mut nn::Linear),
-    ) {
-    }
+    fn visit_linears_mut(&mut self, _prefix: &str, _f: &mut dyn FnMut(&str, &mut nn::Linear)) {}
 
     fn visit_experts_mut(
         &mut self,
@@ -231,12 +226,7 @@ impl ModuleParameters for PlainSwitchMlp {
 }
 
 impl pmetal_runtime::compat::VisitLinears for PlainSwitchMlp {
-    fn visit_linears_mut(
-        &mut self,
-        _prefix: &str,
-        _f: &mut dyn FnMut(&str, &mut nn::Linear),
-    ) {
-    }
+    fn visit_linears_mut(&mut self, _prefix: &str, _f: &mut dyn FnMut(&str, &mut nn::Linear)) {}
 
     fn visit_experts_mut(
         &mut self,

@@ -20,7 +20,7 @@ use pmetal_runtime::compat::{
     Array, ModuleParameters, ModuleParametersExt, NestedValue, VisitLinears,
 };
 
-use crate::init::initialise;
+use crate::init::{Quantizer, initialise};
 use crate::peft::{
     ADAPTER_WEIGHTS, LEGACY_ADAPTER_WEIGHTS, PEFT_PREFIX, find_adapter_weights, hf_module_name,
     peft_tensor_name, write_adapter_config,
@@ -160,15 +160,14 @@ impl AdaptedModel {
                 _ => init,
             };
             let dtype = linear.weight.value.dtype();
-            let round_trip = quantizer.map(|q| {
-                move |dense: &Array| q.round_trip(&dense.as_dtype(dtype.as_i32()))
-            });
+            let round_trip = quantizer
+                .map(|q| move |dense: &Array| q.round_trip(&dense.as_dtype(dtype.as_i32())));
             let fitted = initialise(
                 linear,
                 init,
                 round_trip
                     .as_ref()
-                    .map(|f| f as &dyn Fn(&Array) -> Result<Array, LoraError>),
+                    .map(|f| f as &Quantizer<'_>),
             );
             if let Err(e) = fitted {
                 failure = Some(e);
@@ -350,8 +349,11 @@ impl AdaptedModel {
     /// is exact where a bare projection name would also match the modules a
     /// model has more of than this one adapts (a MoE layer's experts).
     pub fn adapter_target_modules(&self) -> Vec<String> {
-        let names: std::collections::BTreeSet<String> =
-            self.adapted.iter().map(|path| hf_module_name(path)).collect();
+        let names: std::collections::BTreeSet<String> = self
+            .adapted
+            .iter()
+            .map(|path| hf_module_name(path))
+            .collect();
         names.into_iter().collect()
     }
 
@@ -364,7 +366,10 @@ impl AdaptedModel {
             let stem = adapter_key(module);
             let part = |suffix: &str| params.get(format!("{stem}.{suffix}").as_str());
             let missing = || LoraError::InvalidState(format!("`{module}` has no adapter tensors"));
-            let (a, b) = (part("lora_a").ok_or_else(missing)?, part("lora_b").ok_or_else(missing)?);
+            let (a, b) = (
+                part("lora_a").ok_or_else(missing)?,
+                part("lora_b").ok_or_else(missing)?,
+            );
             if self.experts.contains(module) {
                 // A stacked projection has a factor pair per expert, which
                 // PEFT's `lora_A.weight` (one `[r, in]` matrix) cannot hold;
@@ -398,7 +403,12 @@ impl AdaptedModel {
         std::fs::create_dir_all(dir)
             .map_err(|e| LoraError::Io(format!("{}: {e}", dir.display())))?;
         self.save_lora_weights(dir.join(ADAPTER_WEIGHTS))?;
-        write_adapter_config(dir, &self.config, &self.adapter_target_modules(), base_model)
+        write_adapter_config(
+            dir,
+            &self.config,
+            &self.adapter_target_modules(),
+            base_model,
+        )
     }
 
     /// Read adapters back: a PEFT adapter directory or weights file, or one in

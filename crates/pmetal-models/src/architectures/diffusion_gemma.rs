@@ -46,7 +46,6 @@ use serde::{Deserialize, Serialize};
 
 use std::collections::HashMap;
 
-use super::utils::gelu_tanh;
 use super::gemma4::{
     Gemma4Attention, Gemma4Config, Gemma4Mlp, Gemma4RmsNorm, Gemma4RopeConfig,
     Gemma4RopeLayerConfig, LoadReport, rms_norm_noscale,
@@ -54,6 +53,7 @@ use super::gemma4::{
 use super::gemma4_vision::{
     Gemma4MultimodalEmbedder, Gemma4VisionConfig, Gemma4VisionModel, load_gemma4_vision_weights,
 };
+use super::utils::gelu_tanh;
 
 /// Default `image_token_id` for `google/diffusiongemma-26B-A4B-it` — the token
 /// whose embedding slots are replaced by projected vision soft tokens.

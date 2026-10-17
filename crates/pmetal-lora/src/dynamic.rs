@@ -128,6 +128,16 @@ impl DynamicLoraModel {
         })
     }
 
+    /// Write the adapter as a PEFT directory (`adapter_model.safetensors` and
+    /// `adapter_config.json`), naming `base_model` when it is known.
+    pub fn save_adapter(
+        &self,
+        dir: impl AsRef<Path>,
+        base_model: Option<&str>,
+    ) -> Result<(), LoraError> {
+        self.inner.save_adapter(dir, base_model)
+    }
+
     /// The adapted model underneath, for callers that need the inference API.
     pub fn adapted(&self) -> &AdaptedModel {
         &self.inner

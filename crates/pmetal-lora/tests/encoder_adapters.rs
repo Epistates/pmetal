@@ -69,7 +69,12 @@ fn randomize(model: &mut AdaptedModel) {
     params.sort_by(|a, b| a.0.cmp(&b.0));
     let set: HashMap<Rc<str>, Array> = params
         .into_iter()
-        .map(|(k, p)| (k, random::uniform_range(-0.1, 0.1, p.shape(), Dtype::Float32)))
+        .map(|(k, p)| {
+            (
+                k,
+                random::uniform_range(-0.1, 0.1, p.shape(), Dtype::Float32),
+            )
+        })
         .collect();
     model.set_lora_parameters(&set);
 }
@@ -77,7 +82,10 @@ fn randomize(model: &mut AdaptedModel) {
 /// Mean-pooled, unit-length embeddings of the real tokens.
 fn embed(hidden: &Array, mask: &Array) -> Array {
     let m = mask.as_dtype(Dtype::Float32.as_i32()).expand_dims(-1);
-    let sum = hidden.as_dtype(Dtype::Float32.as_i32()).multiply(&m).sum_axis(1, false);
+    let sum = hidden
+        .as_dtype(Dtype::Float32.as_i32())
+        .multiply(&m)
+        .sum_axis(1, false);
     let mean = sum.divide(&m.sum_axis(1, false));
     let norm = mean.square().sum_axis(-1, true).sqrt();
     mean.divide(&norm)
@@ -94,7 +102,10 @@ fn encoders_take_adapters_and_start_unchanged() {
         assert!(adapted.len() >= 6, "{name}: {adapted:?}");
         let got = model.forward(&ids, Some(&mask)).unwrap();
         assert_eq!(got.shape(), want.shape(), "{name}");
-        assert!(max_abs_diff(&got, &want) < 1e-6, "{name}: fresh adapters moved the output");
+        assert!(
+            max_abs_diff(&got, &want) < 1e-6,
+            "{name}: fresh adapters moved the output"
+        );
         drain();
     }
 }
@@ -118,7 +129,10 @@ fn encoder_adapters_reach_the_output_and_padding_stays_masked() {
                 b.add(&random::uniform_range(0.2, 0.4, b.shape(), Dtype::Float32)),
             )]);
             model.set_lora_parameters(&nudged);
-            let moved = max_abs_diff(&embed(&model.forward(&ids, Some(&mask)).unwrap(), &mask), &reference);
+            let moved = max_abs_diff(
+                &embed(&model.forward(&ids, Some(&mask)).unwrap(), &mask),
+                &reference,
+            );
             model.set_lora_parameters(&HashMap::from([(key.clone(), b.clone())]));
             assert!(moved.is_finite() && moved > 0.0, "{name}: {key} is silent");
         }

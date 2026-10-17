@@ -101,7 +101,10 @@ fn a_saved_adapter_carries_peft_names_and_shapes() {
     // The tiny Llama: hidden 64, 4 heads of 16, 2 kv heads, intermediate 128.
     assert_eq!(tensors[&format!("{q}.lora_A.weight")].shape(), &[4, 64]);
     assert_eq!(tensors[&format!("{q}.lora_B.weight")].shape(), &[64, 4]);
-    assert_eq!(tensors[&format!("{q}.lora_magnitude_vector")].shape(), &[64]);
+    assert_eq!(
+        tensors[&format!("{q}.lora_magnitude_vector")].shape(),
+        &[64]
+    );
     assert_eq!(tensors[&format!("{down}.lora_A.weight")].shape(), &[4, 128]);
     assert_eq!(tensors[&format!("{down}.lora_B.weight")].shape(), &[64, 4]);
 
@@ -163,7 +166,11 @@ fn an_adapter_round_trips_through_its_directory() {
         let got = loaded.forward(&ids, None).unwrap();
 
         same_adapters(&model, &loaded);
-        assert_eq!(max_abs_diff(&want, &got), 0.0, "dora={dora} rslora={rslora}");
+        assert_eq!(
+            max_abs_diff(&want, &got),
+            0.0,
+            "dora={dora} rslora={rslora}"
+        );
         drain();
     }
 }
@@ -229,7 +236,10 @@ fn a_language_model_prefix_is_accepted() {
         .into_iter()
         .map(|(k, v)| {
             (
-                k.replace("base_model.model.model.", "base_model.model.model.language_model."),
+                k.replace(
+                    "base_model.model.model.",
+                    "base_model.model.model.language_model.",
+                ),
                 v,
             )
         })
@@ -250,7 +260,9 @@ fn gemma_variant_prefixes_do_not_reach_the_file() {
     model.save_adapter(dir.path(), None).unwrap();
     let names = tensor_names(&dir.path().join(ADAPTER_WEIGHTS));
     assert!(
-        names.iter().all(|n| !n.contains("gemma1") && !n.contains("gemma2")),
+        names
+            .iter()
+            .all(|n| !n.contains("gemma1") && !n.contains("gemma2")),
         "{names:?}"
     );
     assert!(names.contains("base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"));
@@ -277,7 +289,10 @@ fn full_module_names_select_their_modules() {
     adapted.sort();
     assert_eq!(
         adapted,
-        ["model.layers.0.self_attn.q_proj", "model.layers.1.mlp.down_proj"]
+        [
+            "model.layers.0.self_attn.q_proj",
+            "model.layers.1.mlp.down_proj"
+        ]
     );
 }
 
@@ -307,9 +322,11 @@ fn oracle_agrees_with_peft() {
         )
         .unwrap();
         let config = peft::lora_config_from_peft(&config_json).expect("config");
-        let base = DynamicModel::load(&root.join("base")).expect("load base");
+        let base = DynamicModel::load(root.join("base")).expect("load base");
         let mut model = AdaptedModel::attach(base, config).expect("attach");
-        model.load_lora_weights(&dir).expect("load the PEFT adapter");
+        model
+            .load_lora_weights(&dir)
+            .expect("load the PEFT adapter");
         let got = model.forward(&ids, None).unwrap();
         let want = load_safetensors_map(dir.join("logits.safetensors")).unwrap()["logits"].clone();
         let diff = max_abs_diff(&got, &want);

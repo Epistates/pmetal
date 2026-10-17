@@ -105,7 +105,10 @@ fn expert_adapters_start_neutral_and_merge_exactly() {
 
         let mut model = AdaptedModel::attach(build(name), lora(8)).unwrap();
         let fresh = model.forward(&ids, None).unwrap();
-        assert!(max_abs_diff(&fresh, &want) < 1e-5, "{name}: fresh adapters moved the logits");
+        assert!(
+            max_abs_diff(&fresh, &want) < 1e-5,
+            "{name}: fresh adapters moved the logits"
+        );
 
         randomize(&mut model);
         let adapted = model.forward(&ids, None).unwrap();
@@ -124,7 +127,10 @@ fn expert_adapters_start_neutral_and_merge_exactly() {
         model.fuse().expect("fuse");
         let fused = model.forward(&ids, None).unwrap();
         assert!(max_abs_diff(&fused, &adapted) < 5e-4, "{name}: fuse");
-        assert!(model.lora_parameters().is_empty(), "{name}: fuse left adapters");
+        assert!(
+            model.lora_parameters().is_empty(),
+            "{name}: fuse left adapters"
+        );
         drain();
     }
 }
@@ -141,12 +147,15 @@ fn expert_adapters_round_trip_through_a_file() {
 
     let dir = tempfile::tempdir().unwrap();
     model.save_adapter(dir.path(), None).unwrap();
-    let names: Vec<String> = pmetal_lora::load_safetensors_map(dir.path().join("adapter_model.safetensors"))
-        .unwrap()
-        .into_keys()
-        .collect();
+    let names: Vec<String> =
+        pmetal_lora::load_safetensors_map(dir.path().join("adapter_model.safetensors"))
+            .unwrap()
+            .into_keys()
+            .collect();
     assert!(
-        names.iter().any(|n| n.ends_with("switch_mlp.gate_proj.lora_expert_A")),
+        names
+            .iter()
+            .any(|n| n.ends_with("switch_mlp.gate_proj.lora_expert_A")),
         "{names:?}"
     );
 

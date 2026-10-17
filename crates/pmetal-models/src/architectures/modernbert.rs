@@ -23,9 +23,7 @@ use pmetal_runtime::rope::RotaryEmbedding;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::architectures::utils::{
-    Activation, additive_mask, padding_keep, resolve_activation,
-};
+use crate::architectures::utils::{Activation, additive_mask, padding_keep, resolve_activation};
 
 /// The released models' rotary bases.
 const DEFAULT_GLOBAL_ROPE_THETA: f64 = 160_000.0;

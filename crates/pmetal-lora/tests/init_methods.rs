@@ -168,5 +168,8 @@ fn attach_quantized_with_the_standard_start_is_quantize_then_attach() {
     let b = together.forward(&ids, None).unwrap();
     drain();
     assert_eq!(max_abs_diff(&a, &b), 0.0);
-    assert_eq!(by_hand.adapted_projections(), together.adapted_projections());
+    assert_eq!(
+        by_hand.adapted_projections(),
+        together.adapted_projections()
+    );
 }

@@ -51,7 +51,10 @@ fn no_parameter_the_loader_leaves_at_its_init_is_trainable() {
 #[test]
 fn parameter_free_norms_have_no_parameters() {
     for (name, banned) in [
-        ("llama4", ["self_attn.q_norm", "self_attn.k_norm"].as_slice()),
+        (
+            "llama4",
+            ["self_attn.q_norm", "self_attn.k_norm"].as_slice(),
+        ),
         ("cohere", ["layernorm.bias", "norm.bias"].as_slice()),
     ] {
         let case = cases()

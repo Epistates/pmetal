@@ -146,12 +146,14 @@ pub fn lora_config_from_peft(config: &Value) -> Result<LoraConfig, LoraError> {
     {
         return refuse(&format!("peft_type {kind:?} (only LORA)"));
     }
-    let non_empty =
-        |key: &str| config[key].as_object().is_some_and(|m| !m.is_empty());
+    let non_empty = |key: &str| config[key].as_object().is_some_and(|m| !m.is_empty());
     if non_empty("rank_pattern") || non_empty("alpha_pattern") {
         return refuse("a per-module rank or alpha (rank_pattern, alpha_pattern)");
     }
-    if config["modules_to_save"].as_array().is_some_and(|m| !m.is_empty()) {
+    if config["modules_to_save"]
+        .as_array()
+        .is_some_and(|m| !m.is_empty())
+    {
         return refuse("modules_to_save");
     }
     if config["fan_in_fan_out"].as_bool() == Some(true) {
@@ -252,7 +254,10 @@ mod tests {
             json!({"bias": "all"}),
             json!({"peft_type": "IA3"}),
         ] {
-            assert!(lora_config_from_peft(&base(extra.clone())).is_err(), "{extra}");
+            assert!(
+                lora_config_from_peft(&base(extra.clone())).is_err(),
+                "{extra}"
+            );
         }
         // The older spelling of alpha, and `all-linear` as a bare string.
         let old = json!({"r": 4, "alpha": 8.0, "target_modules": "all-linear"});

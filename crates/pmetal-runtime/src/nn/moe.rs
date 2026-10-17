@@ -67,12 +67,7 @@ impl ExpertLora {
         };
         let bound = 1.0_f32 / (in_features as f32).sqrt();
         Ok(Self {
-            a: random::uniform_range(
-                -bound,
-                bound,
-                &[experts, rank, in_features],
-                Dtype::Float32,
-            ),
+            a: random::uniform_range(-bound, bound, &[experts, rank, in_features], Dtype::Float32),
             b: ops::zeros(&[experts, out_features, rank], Dtype::Float32),
             rank,
             scale,
@@ -176,8 +171,7 @@ impl Linear {
         let (experts, out_features, in_features) = self.stack_shape().ok_or_else(|| {
             Exception::custom("an expert adapter attaches to a stacked [experts, out, in] weight")
         })?;
-        let adapter =
-            ExpertLora::new(experts, in_features, out_features, rank, alpha, use_rslora)?;
+        let adapter = ExpertLora::new(experts, in_features, out_features, rank, alpha, use_rslora)?;
         Ok(self.adapter.insert(adapter))
     }
 

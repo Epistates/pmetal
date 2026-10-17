@@ -1666,7 +1666,12 @@ pub fn save_adapter<M: pmetal_lora::TrainableModel>(
     std::fs::create_dir_all(dir)?;
     let weights = dir.join(pmetal_lora::peft::ADAPTER_WEIGHTS);
     model.save_lora_weights(&weights)?;
-    pmetal_lora::peft::write_adapter_config(dir, lora, &model.adapter_target_modules(), base_model)?;
+    pmetal_lora::peft::write_adapter_config(
+        dir,
+        lora,
+        &model.adapter_target_modules(),
+        base_model,
+    )?;
     tracing::info!("Saved adapter to {:?}", dir);
     Ok(weights)
 }
@@ -1807,7 +1812,10 @@ mod tests {
         assert_eq!(written["r"], 8);
         assert_eq!(written["lora_alpha"], 16.0);
         assert_eq!(written["use_rslora"], true);
-        assert_eq!(written["target_modules"], serde_json::json!(["q_proj", "v_proj"]));
+        assert_eq!(
+            written["target_modules"],
+            serde_json::json!(["q_proj", "v_proj"])
+        );
         assert_eq!(written["base_model_name_or_path"], "Qwen/Qwen3-0.6B");
     }
 

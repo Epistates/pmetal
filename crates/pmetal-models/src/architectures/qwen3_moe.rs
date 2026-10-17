@@ -1273,9 +1273,15 @@ mod tests {
         let mut twin = Qwen3MoEBlock::new(&config).unwrap();
         twin.gate.weight = block.gate.weight.clone();
         for (live, dense) in [
-            (&mut block.switch_mlp.gate_proj, &mut twin.switch_mlp.gate_proj),
+            (
+                &mut block.switch_mlp.gate_proj,
+                &mut twin.switch_mlp.gate_proj,
+            ),
             (&mut block.switch_mlp.up_proj, &mut twin.switch_mlp.up_proj),
-            (&mut block.switch_mlp.down_proj, &mut twin.switch_mlp.down_proj),
+            (
+                &mut block.switch_mlp.down_proj,
+                &mut twin.switch_mlp.down_proj,
+            ),
         ] {
             let adapter = live.adapter.as_mut().unwrap();
             adapter.b = random::uniform_range(-0.3, 0.3, adapter.b.shape(), Dtype::Float32);

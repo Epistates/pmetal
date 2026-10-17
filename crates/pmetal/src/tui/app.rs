@@ -3273,9 +3273,13 @@ impl App {
 /// Check if a model directory is a LoRA adapter (has adapter_model.safetensors,
 /// lora_weights.safetensors or adapter_config.json).
 fn is_lora_adapter(path: &std::path::Path) -> bool {
-    ["adapter_model.safetensors", "lora_weights.safetensors", "adapter_config.json"]
-        .iter()
-        .any(|name| path.join(name).exists())
+    [
+        "adapter_model.safetensors",
+        "lora_weights.safetensors",
+        "adapter_config.json",
+    ]
+    .iter()
+    .any(|name| path.join(name).exists())
 }
 
 /// Extract the value following a flag in a CLI args list (e.g., `--model` → the next arg).

@@ -38,6 +38,9 @@ const OVERSAMPLE: i32 = 16;
 /// Alternations of LoftQ's quantize / SVD loop (the paper's `T`).
 pub const LOFTQ_ITERATIONS: usize = 5;
 
+/// What a dense weight becomes once the base is packed: pack, then unpack.
+pub(crate) type Quantizer<'a> = dyn Fn(&Array) -> Result<Array, LoraError> + 'a;
+
 /// The factors and the new base an initialisation produces, in f32.
 pub(crate) struct Factors {
     /// `[rank, in]`.
@@ -75,11 +78,7 @@ fn orthonormal_basis(y: &Array) -> Array {
 /// few columns of oversampling (Halko et al., 2011, algorithm 4.4 with the
 /// SVD of the small projected matrix), which costs a few matmuls and a QR of
 /// a tall-skinny matrix where the exact one is cubic in the short side.
-pub fn truncated_svd(
-    w: &Array,
-    rank: i32,
-    niter: i32,
-) -> Result<(Array, Array, Array), LoraError> {
+pub fn truncated_svd(w: &Array, rank: i32, niter: i32) -> Result<(Array, Array, Array), LoraError> {
     let (m, n) = (w.dim(0), w.dim(1));
     let short = m.min(n);
     if rank <= 0 || rank > short {
@@ -165,7 +164,7 @@ pub(crate) fn loftq(
     rank: i32,
     scale: f32,
     iterations: usize,
-    quantize: &dyn Fn(&Array) -> Result<Array, LoraError>,
+    quantize: &Quantizer<'_>,
 ) -> Result<Factors, LoraError> {
     let w = f32_of(w);
     let mut a = Array::zeros(&[rank, w.dim(1)], Dtype::Float32.as_i32());
@@ -189,7 +188,7 @@ pub(crate) fn loftq(
 pub(crate) fn initialise(
     linear: &mut Linear,
     init: LoraInit,
-    quantize: Option<&dyn Fn(&Array) -> Result<Array, LoraError>>,
+    quantize: Option<&Quantizer<'_>>,
 ) -> Result<(), LoraError> {
     if init == LoraInit::Standard {
         return Ok(());

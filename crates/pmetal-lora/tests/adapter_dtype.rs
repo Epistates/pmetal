@@ -95,7 +95,10 @@ fn merging_into_a_bf16_base_keeps_it_bf16_and_the_output() {
             .max(None)
             .item_f32();
         let diff = max_abs_diff(&adapted, &merged);
-        assert!(diff <= 0.05 * scale.max(1.0), "{name}: merge moved the logits by {diff} (scale {scale})");
+        assert!(
+            diff <= 0.05 * scale.max(1.0),
+            "{name}: merge moved the logits by {diff} (scale {scale})"
+        );
 
         model.fuse().unwrap_or_else(|e| panic!("{name}: {e}"));
         for (key, weight) in model.model().flatten_params() {
@@ -118,7 +121,11 @@ fn training_a_bf16_base_keeps_the_adapters_f32_and_finite() {
             .collect();
         assert!(losses.iter().all(|l| l.is_finite()), "{name}: {losses:?}");
         for (key, value) in model.lora_parameters() {
-            assert_eq!(value.dtype(), Dtype::Float32, "{name}: {key} after training");
+            assert_eq!(
+                value.dtype(),
+                Dtype::Float32,
+                "{name}: {key} after training"
+            );
         }
         drain(name);
     }

@@ -133,7 +133,9 @@ impl<'de> Deserialize<'de> for LoraInit {
             type Value = LoraInit;
 
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("`true` or the name of a LoRA initialisation (standard, pissa, olora, loftq)")
+                f.write_str(
+                    "`true` or the name of a LoRA initialisation (standard, pissa, olora, loftq)",
+                )
             }
 
             fn visit_bool<E: de::Error>(self, v: bool) -> Result<LoraInit, E> {
@@ -875,8 +877,7 @@ mod tests {
 
     #[test]
     fn target_modules_reads_a_list_or_peft_s_all_linear_string() {
-        let list: LoraConfig =
-            serde_saphyr::from_str("target_modules: [q_proj, v_proj]").unwrap();
+        let list: LoraConfig = serde_saphyr::from_str("target_modules: [q_proj, v_proj]").unwrap();
         assert_eq!(list.target_modules, ["q_proj", "v_proj"]);
         assert!(!list.targets_all_linear());
         let word: LoraConfig = serde_saphyr::from_str("target_modules: all-linear").unwrap();
