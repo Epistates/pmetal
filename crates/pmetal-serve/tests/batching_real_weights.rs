@@ -777,3 +777,62 @@ async fn a_hybrid_conversation_reuses_the_state_its_earlier_prompt_left() {
     assert!(worst <= 0.3, "log-probabilities differ by {worst}");
     pmetal_runtime::check_unobserved_error().unwrap();
 }
+
+/// The fastest of 40 steps of the fused forward by number of rows, with 128
+/// tokens of context in each (the matmul kernel MLX picks depends on the
+/// number of rows, and with it the cost of a row), beside the serial step for
+/// one row. Run alone on the machine.
+#[test]
+#[ignore = "diagnostic: run with --ignored on an idle machine"]
+fn fused_step_cost_by_rows() {
+    use pmetal_cache::kv_cache::FusedBatchKVCache;
+    use pmetal_runtime::compat::Array;
+
+    let Some(dir) = checkpoint() else { return };
+    let mut model = DynamicModel::load(&dir).unwrap();
+    let base = prompts(&dir).remove(3);
+    let mut tokens = Vec::new();
+    while tokens.len() < 128 {
+        tokens.extend_from_slice(&base);
+    }
+    tokens.truncate(128);
+    let mut cache = model.create_cache(2048);
+    let ids = Array::from_u32_slice(&tokens, &[1, 128]);
+    model
+        .forward_with_cache_last(&ids, None, Some(&mut cache))
+        .unwrap()
+        .eval();
+    let config = cache.config().clone();
+
+    let token = Array::from_i32_slice(&[1234]).reshape(&[1, 1]);
+    let mut serial = cache.fork();
+    let mut best = f64::MAX;
+    for _ in 0..40 {
+        let out = model
+            .forward_with_cache_last(&token, None, Some(&mut serial))
+            .unwrap();
+        let t = Instant::now();
+        out.eval();
+        best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    println!("rows | step ms | tokens/s");
+    println!("serial 1 | {best:.2} | {:.0}", 1000.0 / best);
+    for n in [1usize, 2, 3, 4, 6, 8, 10, 12, 14, 16, 24, 32] {
+        let mut fused = FusedBatchKVCache::new(config.clone(), 32).unwrap();
+        for row in 0..n {
+            fused.admit(row).unwrap();
+            fused.load_slot(row, &cache).unwrap();
+        }
+        let ids = Array::from_i32_slice(&vec![1234; n]).reshape(&[n as i32, 1]);
+        let active: Vec<usize> = (0..n).collect();
+        let mut best = f64::MAX;
+        for _ in 0..40 {
+            let out = model.forward_batched(&ids, &active, &mut fused).unwrap();
+            let t = Instant::now();
+            out.eval();
+            best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        println!("{n:>4} | {best:.2} | {:.0}", n as f64 * 1000.0 / best);
+    }
+    pmetal_runtime::check_unobserved_error().unwrap();
+}

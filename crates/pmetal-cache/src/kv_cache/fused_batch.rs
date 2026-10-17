@@ -835,6 +835,66 @@ mod tests {
         assert!(cache.load_slot(0, &empty).is_err());
     }
 
+    /// Growing the cache does not hold two of it: MLX frees each layer's old
+    /// buffer as its replacement is built, so a step that grows every layer
+    /// peaks a layer or two above the grown cache, not a whole cache.
+    #[test]
+    fn growing_does_not_hold_the_cache_twice() {
+        use pmetal_runtime::inline_array::{get_active_memory, get_peak_memory, reset_peak_memory};
+
+        let (layers, heads, dim, tokens) = (12usize, 8usize, 64usize, 2048usize);
+        let config = KVCacheConfig::new(layers, 4096, heads, dim).with_dtype(Dtype::Bfloat16);
+        let mut cache = FusedBatchKVCache::new(config.clone(), 4).unwrap();
+        let mut source = KVCache::new(config.clone());
+        let ctx = ops::zeros(
+            &[1, heads as i32, tokens as i32, dim as i32],
+            Dtype::Bfloat16,
+        );
+        for layer in 0..layers {
+            source.update_and_fetch(layer, &ctx, &ctx).unwrap();
+        }
+        cache.admit(0).unwrap();
+        // 2048 tokens and room for one more: a whole step of capacity.
+        cache.load_slot(0, &source).unwrap();
+        let new = ops::zeros(&[1, heads as i32, 1, dim as i32], Dtype::Bfloat16);
+        let step = |cache: &mut FusedBatchKVCache| {
+            let mut outs = Vec::new();
+            for layer in 0..layers {
+                let (k, v, _) = cache
+                    .update_and_fetch_batched(layer, &[0], &new, &new)
+                    .unwrap();
+                outs.push(k);
+                outs.push(v);
+            }
+            for out in &outs {
+                out.eval();
+            }
+        };
+        // Fill the capacity there is, then take the step that grows it.
+        while cache.offset(0) < cache.capacity() {
+            step(&mut cache);
+        }
+        let cache_bytes = cache.memory_usage();
+        assert!(cache_bytes > 20 << 20, "the cache is big enough to measure");
+        reset_peak_memory();
+        let before = get_active_memory();
+        let capacity = cache.capacity();
+        step(&mut cache);
+        assert!(cache.capacity() > capacity, "the step grew the cache");
+        let extra_peak = get_peak_memory().saturating_sub(before);
+        let grown_by = cache.memory_usage() - cache_bytes;
+        // The growth itself, and one layer's buffers twice over; not the
+        // whole old cache beside the new.
+        assert!(
+            extra_peak < grown_by + cache_bytes / 4,
+            "growing a {} MiB cache peaked {} MiB above it (it grew by {} MiB)",
+            cache_bytes >> 20,
+            extra_peak >> 20,
+            grown_by >> 20
+        );
+        pmetal_runtime::check_unobserved_error().unwrap();
+    }
+
     /// A decode step writes into the buffer it already has: the K/V of every
     /// request is not copied per token.
     #[test]
