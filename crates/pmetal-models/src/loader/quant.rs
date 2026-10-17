@@ -4,7 +4,7 @@
 //! is unpacked as it is read. Three families ship, and each stores the scales
 //! somewhere different:
 //!
-//! * **MLX** (`mlx-community` and every checkpoint `mlx_lm.convert` writes):
+//! * **MLX** (`mlx-community` and every checkpoint MLX's converter writes):
 //!   a quantized module's parameters are *siblings*, `mlp.up_proj.weight`
 //!   (the packed words) beside `mlp.up_proj.scales` and, in affine mode,
 //!   `mlp.up_proj.biases`. `config.json` carries the width, group size and mode
