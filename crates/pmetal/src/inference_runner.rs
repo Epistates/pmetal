@@ -1478,37 +1478,19 @@ fn turboquant_config_from_mode(
 
 /// The LoRA hyperparameters an adapter was trained with, from the
 /// `adapter_config.json` beside it. `lora_path` may be the adapter directory or
-/// its weights file. Falls back to the defaults when the config is missing.
+/// its weights file. PEFT's keys and the ones earlier adapters carried are both
+/// read. Falls back to the defaults when there is no config, and refuses one
+/// that describes something a uniform `LoraConfig` cannot (per-module ranks,
+/// extra trained modules; see [`pmetal_lora::peft::lora_config_from_peft`]).
 #[cfg(feature = "lora")]
-pub fn lora_config_for_adapter(lora_path: &Path) -> pmetal_core::LoraConfig {
-    let adapter_dir = if lora_path.is_dir() {
-        lora_path
-    } else {
-        lora_path.parent().unwrap_or(Path::new("."))
+pub fn lora_config_for_adapter(lora_path: &Path) -> Result<pmetal_core::LoraConfig, String> {
+    let dir = pmetal_lora::peft::adapter_dir(lora_path);
+    let Ok(text) = std::fs::read_to_string(dir.join(pmetal_lora::peft::ADAPTER_CONFIG)) else {
+        return Ok(pmetal_core::LoraConfig::default());
     };
-    let Some(cfg) = std::fs::read_to_string(adapter_dir.join("adapter_config.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-    else {
-        return pmetal_core::LoraConfig::default();
-    };
-    pmetal_core::LoraConfig {
-        r: cfg["r"].as_u64().unwrap_or(16) as usize,
-        alpha: cfg["alpha"]
-            .as_f64()
-            .or_else(|| cfg["lora_alpha"].as_f64())
-            .unwrap_or(32.0) as f32,
-        target_modules: cfg["target_modules"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        use_rslora: cfg["use_rslora"].as_bool().unwrap_or(false),
-        ..pmetal_core::LoraConfig::default()
-    }
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("adapter_config.json: {e}"))?;
+    pmetal_lora::peft::lora_config_from_peft(&value).map_err(|e| e.to_string())
 }
 
 /// Load a model with LoRA weights merged in.
@@ -1527,7 +1509,7 @@ fn load_model_with_lora(
     ),
     Exception,
 > {
-    let lora_config = lora_config_for_adapter(Path::new(lora_path));
+    let lora_config = lora_config_for_adapter(Path::new(lora_path)).map_err(Exception::custom)?;
 
     tracing::info!(
         r = lora_config.r,

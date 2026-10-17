@@ -226,11 +226,20 @@ pub trait TrainableModel: ModuleParameters {
     /// This is used for restoring from checkpoints.
     fn set_lora_parameters(&mut self, params: &HashMap<Rc<str>, Array>);
 
-    /// Save LoRA weights to a safetensors file.
+    /// Save LoRA weights to a safetensors file, in PEFT's layout.
     fn save_lora_weights(&self, path: impl AsRef<std::path::Path>) -> Result<(), LoraError>;
 
-    /// Load LoRA weights from a safetensors file.
+    /// Load LoRA weights from a safetensors file or an adapter directory, in
+    /// PEFT's layout or the one earlier releases wrote.
     fn load_lora_weights(&mut self, path: impl AsRef<std::path::Path>) -> Result<(), LoraError>;
+
+    /// The modules carrying an adapter, as `target_modules` spells them. What an
+    /// `adapter_config.json` has to list, since an empty `target_modules` in a
+    /// training config means "every linear layer" and a PEFT config can't say
+    /// that by omission.
+    fn adapter_target_modules(&self) -> Vec<String> {
+        Vec::new()
+    }
 
     /// Enable gradient checkpointing for memory-efficient training.
     ///

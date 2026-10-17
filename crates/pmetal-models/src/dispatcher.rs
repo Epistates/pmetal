@@ -245,28 +245,6 @@ impl ModelArchitecture {
     pub fn load_policy(self) -> LoadPolicy {
         let policy = LoadPolicy::strict();
         match self {
-            Self::Cohere => policy.allowing_unloaded_params(&[
-                Exemption::new(
-                    "*layernorm.bias",
-                    "Cohere's LayerNorm has no bias in any release; the parameter stays at its zero init",
-                ),
-                Exemption::new(
-                    "model.norm.bias",
-                    "Cohere's LayerNorm has no bias in any release; the parameter stays at its zero init",
-                ),
-            ]),
-            Self::Llama4 => policy.allowing_unloaded_params(&[
-                Exemption::new(
-                    "*self_attn.q_norm.weight",
-                    "Llama 4's QK norm is a parameter-free L2 norm; the model holds it as an \
-                     RMSNorm whose weight stays at its identity init of ones",
-                ),
-                Exemption::new(
-                    "*self_attn.k_norm.weight",
-                    "Llama 4's QK norm is a parameter-free L2 norm; the model holds it as an \
-                     RMSNorm whose weight stays at its identity init of ones",
-                ),
-            ]),
             Self::NemotronH => policy.allowing_unused_tensors(&[Exemption::new(
                 "mtp.*",
                 "the multi-token-prediction head some Nemotron 3 releases bundle; the model \
@@ -2764,6 +2742,30 @@ impl pmetal_runtime::compat::VisitLinears for DynamicModel {
     ) {
         dispatch_uniform!(self, visit_linears_mut, prefix, f)
     }
+
+    fn visit_experts_mut(
+        &mut self,
+        prefix: &str,
+        top_k: usize,
+        f: &mut dyn FnMut(&str, usize, &mut pmetal_runtime::nn::moe::Linear),
+    ) {
+        dispatch_uniform!(self, visit_experts_mut, prefix, top_k, f)
+    }
+}
+
+/// Remove the router parameters from a parameter tree, in place.
+fn drop_routers(tree: &mut pmetal_runtime::compat::module::ModuleParamRef<'_>, prefix: &str) {
+    use pmetal_runtime::compat::{NestedValue, child_path};
+    tree.retain(|name, value| {
+        let path = child_path(prefix, name);
+        if crate::moe_routing::is_router_path(&path) {
+            return false;
+        }
+        if let NestedValue::Map(inner) = value {
+            drop_routers(inner, &path);
+        }
+        true
+    });
 }
 
 impl ModuleParameters for DynamicModel {
@@ -2771,8 +2773,14 @@ impl ModuleParameters for DynamicModel {
         dispatch_uniform!(self, parameters)
     }
 
+    /// Everything an optimizer may move, which is every parameter but a MoE
+    /// router's: its argmax picks which computation runs, and a gradient step
+    /// (or weight decay) on it reroutes tokens the experts were never tuned
+    /// for. Buffers and parameter-free layers are absent from the tree already.
     fn trainable_parameters(&self) -> pmetal_runtime::compat::module::ModuleParamRef<'_> {
-        dispatch_uniform!(self, trainable_parameters)
+        let mut tree = dispatch_uniform!(self, trainable_parameters);
+        drop_routers(&mut tree, "");
+        tree
     }
 
     fn parameters_mut(&mut self) -> pmetal_runtime::compat::module::ModuleParamMut<'_> {

@@ -69,15 +69,11 @@ pub(crate) async fn run_eval(
         ),
         Some(lp) => {
             let lp = std::path::Path::new(lp);
-            let lora_config = pmetal::inference_runner::lora_config_for_adapter(lp);
-            let lora_file = if lp.is_dir() {
-                lp.join("lora_weights.safetensors")
-            } else {
-                lp.to_path_buf()
-            };
+            let lora_config = pmetal::inference_runner::lora_config_for_adapter(lp)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             let mut model = DynamicLoraModel::from_pretrained(&model_path, lora_config)?;
             model
-                .load_lora_weights(&lora_file)
+                .load_lora_weights(lp)
                 .map_err(|e| anyhow::anyhow!("Failed to load LoRA weights: {}", e))?;
             EvalModel::Adapted(model)
         }

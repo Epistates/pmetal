@@ -77,11 +77,11 @@ leaves it out.
 | `r` | integer | `16` | LoRA rank |
 | `alpha` | float | `32.0` | LoRA scaling factor |
 | `dropout` | float | `0.0` | Dropout on the adapter input, in [0, 1) |
-| `target_modules` | list | `q_proj, k_proj, v_proj, o_proj` | Projections to adapt; an empty list adapts every linear layer but the output head |
+| `target_modules` | list | `[]` (every linear layer) | Projections to adapt. Empty, or `all-linear`, adapts every linear layer (attention and MLP) but the output head, MoE routers and routed experts; name `lm_head` to adapt the head |
 | `use_rslora` | bool | `false` | Scale by `alpha / sqrt(r)` |
 | `use_dora` | bool | `false` | Weight-decomposed LoRA |
 | `loraplus_lr_ratio` | float | unset | LoRA+ learning-rate ratio for the `B` matrices (the paper uses 16) |
-| `init_lora_weights` | `true` | `true` | Initialisation of `A` and `B` (`true` is the standard one) |
+| `init_lora_weights` | `true` or name | `true` | Initialisation of `A` and `B`: `true` (the standard one: `A` random, `B` zero), `pissa` (principal singular components), `olora` (QR factors), `loftq` (quantization-aware; needs `quantization`) |
 
 ### training
 

@@ -8,6 +8,7 @@
 
 use crate::InlineArray;
 use crate::native_weight::LayerWeight;
+use crate::nn::moe::ExpertLora;
 
 /// The top-k softmax router of Qwen3-MoE and the Qwen3.5 family, as
 /// transformers' `Qwen3MoeTopKRouter` and `Qwen3_5MoeTopKRouter` compute it:
@@ -170,7 +171,64 @@ pub fn switch_glu_grouped(
         scores,
         activation,
         grouped,
+        ExpertAdapters::default(),
     )
+}
+
+/// [`switch_glu_with`] with a per-expert adapter on any of the three
+/// projections. The adapter's contribution is added to each projection's
+/// gather matmul, before the activation (gate, up) or the router's weighting
+/// (down), so it trains and merges as an adapter on the stacked weight.
+#[allow(clippy::too_many_arguments)]
+pub fn switch_glu_adapted(
+    x_flat: &InlineArray,
+    gate: &LayerWeight,
+    up: &LayerWeight,
+    down: &LayerWeight,
+    adapters: ExpertAdapters<'_>,
+    inds: &InlineArray,
+    scores: &InlineArray,
+    activation: impl Fn(&InlineArray, &InlineArray, &InlineArray) -> InlineArray,
+) -> InlineArray {
+    let grouped = x_flat.dim(0) * inds.dim(1) >= GROUPING_THRESHOLD;
+    switch_glu_projected(
+        x_flat,
+        &GateUp::Split { gate, up },
+        down,
+        inds,
+        scores,
+        activation,
+        grouped,
+        adapters,
+    )
+}
+
+/// Per-expert low-rank adapters on the projections of a routed layer, each
+/// beside the stacked weight it adapts. `gate` is the first projection of a
+/// layer with only one before its activation (Nemotron-H's `fc1`).
+#[derive(Clone, Copy, Default)]
+pub struct ExpertAdapters<'a> {
+    /// On the gate projection (or the only up-projection of a gateless expert).
+    pub gate: Option<&'a ExpertLora>,
+    /// On the up projection.
+    pub up: Option<&'a ExpertLora>,
+    /// On the down projection.
+    pub down: Option<&'a ExpertLora>,
+}
+
+/// `base`, the projection's output for `rows` routed to `ids`, with the
+/// expert adapter's contribution added if there is one.
+fn adapted(
+    base: InlineArray,
+    lora: Option<&ExpertLora>,
+    rows: &InlineArray,
+    ids: &InlineArray,
+    sorted: bool,
+) -> InlineArray {
+    match lora {
+        Some(lora) => lora.apply(base, rows, ids, sorted),
+        None => base,
+    }
 }
 
 /// How a routed layer holds its gate and up projections.
@@ -203,14 +261,33 @@ impl GateUp<'_> {
         rows: &InlineArray,
         ids: &InlineArray,
         sorted: bool,
+        adapters: ExpertAdapters<'_>,
     ) -> (InlineArray, InlineArray) {
         match self {
             Self::Split { gate, up } => (
-                gate.gather_mm_from(rows, None, Some(ids), sorted),
-                up.gather_mm_from(rows, None, Some(ids), sorted),
+                adapted(
+                    gate.gather_mm_from(rows, None, Some(ids), sorted),
+                    adapters.gate,
+                    rows,
+                    ids,
+                    sorted,
+                ),
+                adapted(
+                    up.gather_mm_from(rows, None, Some(ids), sorted),
+                    adapters.up,
+                    rows,
+                    ids,
+                    sorted,
+                ),
             ),
             Self::Single(up) => {
-                let projected = up.gather_mm_from(rows, None, Some(ids), sorted);
+                let projected = adapted(
+                    up.gather_mm_from(rows, None, Some(ids), sorted),
+                    adapters.gate,
+                    rows,
+                    ids,
+                    sorted,
+                );
                 (projected.clone(), projected)
             }
             Self::Fused(gate_up) => {
@@ -248,6 +325,7 @@ pub fn switch_glu_fused(
         scores,
         |gate, up, _| activation(gate, up),
         grouped,
+        ExpertAdapters::default(),
     )
 }
 
@@ -275,6 +353,31 @@ pub fn switch_mlp(
         scores,
         |projected, _, _| activation(projected),
         grouped,
+        ExpertAdapters::default(),
+    )
+}
+
+/// [`switch_mlp`] with per-expert adapters: `adapters.gate` on `up`,
+/// `adapters.down` on `down`.
+pub fn switch_mlp_adapted(
+    x_flat: &InlineArray,
+    up: &LayerWeight,
+    down: &LayerWeight,
+    adapters: ExpertAdapters<'_>,
+    inds: &InlineArray,
+    scores: &InlineArray,
+    activation: impl Fn(&InlineArray) -> InlineArray,
+) -> InlineArray {
+    let grouped = x_flat.dim(0) * inds.dim(1) >= GROUPING_THRESHOLD;
+    switch_glu_projected(
+        x_flat,
+        &GateUp::Single(up),
+        down,
+        inds,
+        scores,
+        |projected, _, _| activation(projected),
+        grouped,
+        adapters,
     )
 }
 
@@ -307,6 +410,7 @@ pub fn switch_glu_gated_input(
             &ones,
             |gate, up, _| activation(gate, up),
             grouped,
+            ExpertAdapters::default(),
         );
         routed = Some(match routed {
             Some(sum) => sum.add(&y),
@@ -316,6 +420,7 @@ pub fn switch_glu_gated_input(
     routed.expect("top_k is at least 1")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn switch_glu_projected(
     x_flat: &InlineArray,
     gate_up: &GateUp<'_>,
@@ -324,12 +429,13 @@ fn switch_glu_projected(
     scores: &InlineArray,
     activation: impl Fn(&InlineArray, &InlineArray, &InlineArray) -> InlineArray,
     grouped: bool,
+    adapters: ExpertAdapters<'_>,
 ) -> InlineArray {
     let (s, top_k) = (x_flat.dim(0), inds.dim(1));
     let per_expert = if grouped {
-        per_expert_grouped(x_flat, gate_up, down, inds, &activation)
+        per_expert_grouped(x_flat, gate_up, down, inds, &activation, adapters)
     } else {
-        per_expert_in_router_order(x_flat, gate_up, down, inds, &activation)
+        per_expert_in_router_order(x_flat, gate_up, down, inds, &activation, adapters)
     };
 
     per_expert
@@ -345,15 +451,22 @@ fn per_expert_in_router_order(
     down: &LayerWeight,
     inds: &InlineArray,
     activation: &impl Fn(&InlineArray, &InlineArray, &InlineArray) -> InlineArray,
+    adapters: ExpertAdapters<'_>,
 ) -> InlineArray {
     // [S, 1, 1, hidden] -> [S, top_k, 1, intermediate]
     let switch_in = switch_glu_input(x_flat);
-    let (gated, upped) = gate_up.project(&switch_in, inds, false);
+    let (gated, upped) = gate_up.project(&switch_in, inds, false, adapters);
     let activated = activation(&gated, &upped, inds);
 
     // [S, top_k, 1, hidden] -> [S, top_k, hidden]
-    down.gather_mm_from(&activated, None, Some(inds), false)
-        .squeeze(-2)
+    adapted(
+        down.gather_mm_from(&activated, None, Some(inds), false),
+        adapters.down,
+        &activated,
+        inds,
+        false,
+    )
+    .squeeze(-2)
 }
 
 /// [`per_expert_in_router_order`] with the `(token, expert)` pairs sorted by
@@ -364,6 +477,7 @@ fn per_expert_grouped(
     down: &LayerWeight,
     inds: &InlineArray,
     activation: &impl Fn(&InlineArray, &InlineArray, &InlineArray) -> InlineArray,
+    adapters: ExpertAdapters<'_>,
 ) -> InlineArray {
     let (s, top_k) = (inds.dim(0), inds.dim(1));
     let pairs = s * top_k;
@@ -385,9 +499,15 @@ fn per_expert_grouped(
 
     // [S * top_k, 1, hidden] -> [S * top_k, 1, intermediate] -> [S * top_k, 1, hidden]
     let rows = x_flat.take_axis(&sorted_tokens, 0).expand_dims(1);
-    let (gated, upped) = gate_up.project(&rows, &sorted_experts, true);
+    let (gated, upped) = gate_up.project(&rows, &sorted_experts, true, adapters);
     let activated = activation(&gated, &upped, &sorted_experts);
-    let down = down.gather_mm_from(&activated, None, Some(&sorted_experts), true);
+    let down = adapted(
+        down.gather_mm_from(&activated, None, Some(&sorted_experts), true),
+        adapters.down,
+        &activated,
+        &sorted_experts,
+        true,
+    );
 
     let hidden = down.dim(-1);
     down.take_axis(&inverse, 0).reshape(&[s, top_k, hidden])
@@ -702,6 +822,7 @@ mod tests {
             &down,
             &inds,
             &|g, u, _| InlineArray::fused_swiglu(g, u),
+            ExpertAdapters::default(),
         )
         .multiply(&scores.reshape(&[tokens as i32, 2, 1]))
         .sum_axis(-2, false);

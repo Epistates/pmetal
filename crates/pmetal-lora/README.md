@@ -42,7 +42,8 @@ fn train(model_dir: &str, batches: &[Array]) -> Result<(), Box<dyn std::error::E
         // Compute loss and backprop...
     }
 
-    model.save_lora_weights("output/lora_weights.safetensors")?;
+    // A PEFT adapter directory: adapter_model.safetensors + adapter_config.json.
+    model.save_adapter("output", Some(model_dir))?;
     Ok(())
 }
 ```
@@ -68,7 +69,7 @@ fn qlora(model_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
         "{} projections packed, {} -> {} bytes",
         packed.packed, packed.dense_bytes, packed.packed_bytes
     );
-    model.save_lora_weights("output/lora_weights.safetensors")?;
+    model.save_adapter("output", Some(model_dir))?;
     Ok(())
 }
 ```
@@ -81,15 +82,21 @@ use pmetal_core::LoraConfig;
 use pmetal_lora::{DynamicLoraModel, TrainableModel};
 
 fn infer(model_dir: &str, input_ids: &Array) -> Result<Array, Box<dyn std::error::Error>> {
-    let config = LoraConfig::default();
-
-    // Build the base model with LoRA structure, then fill the adapters.
+    // Build the model from the adapter's own config, then fill the adapters.
+    let config = pmetal_lora::peft::lora_config_from_peft(&serde_json::from_str(
+        &std::fs::read_to_string("output/adapter_config.json")?,
+    )?)?;
     let mut model = DynamicLoraModel::from_pretrained(model_dir, config)?;
-    model.load_lora_weights("output/lora_weights.safetensors")?;
+    model.load_lora_weights("output")?;
 
     Ok(model.forward(input_ids, None)?)
 }
 ```
+
+Adapters are saved and read in the layout `peft` uses: `PeftModel.from_pretrained(base, "output")`
+loads one trained here, and one `peft` wrote loads here (a plain, rsLoRA or DoRA LoRA with one
+rank and alpha; per-module ranks and `modules_to_save` are refused rather than loaded wrong).
+Adapters from earlier releases (`lora_weights.safetensors`) still load.
 
 ## Architecture Support
 
@@ -98,16 +105,25 @@ adapters attached to its projections. Every architecture `DynamicModel` loads ca
 this way, so a fine-tune trains exactly the forward pass `pmetal infer` and `pmetal serve` run.
 
 QLoRA is the same model with its projections packed first (`quantize_base`), so it covers the same
-architectures. The LM head, MoE routers and routed experts stay as loaded.
+architectures. The LM head, MoE routers and routed experts stay as loaded. A checkpoint that is
+already packed (NVIDIA ModelOpt NVFP4 or FP8) keeps its projections packed on load, and an adapter
+on one is QLoRA with no dense copy of the base.
+
+The default adapts every linear layer (attention and MLP), and the routed experts of Qwen3-MoE,
+DeepSeek and Nemotron-H with one adapter per expert at rank `r / top_k`. MoE routers and the LM head
+are left alone.
 
 ## Configuration
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `r` | LoRA rank | 8 |
-| `alpha` | Scaling factor | 16.0 |
+| `r` | LoRA rank | 16 |
+| `alpha` | Scaling factor | 32.0 |
 | `dropout` | Dropout rate | 0.0 |
-| `target_modules` | Projections to adapt, by name; empty adapts every linear layer but the LM head | `q_proj`, `k_proj`, `v_proj`, `o_proj` |
+| `target_modules` | Projections to adapt, by name or full module name; empty (or `all-linear`) adapts every linear layer but the LM head | empty |
+| `use_rslora` | Scale by `alpha / sqrt(r)` | false |
+| `use_dora` | Weight-decomposed LoRA (dense projections) | false |
+| `init_lora_weights` | `true` (A random, B zero), `pissa`, `olora`, `loftq` | `true` |
 
 ## Modules
 
@@ -116,6 +132,7 @@ architectures. The LM head, MoE routers and routed experts stay as loaded.
 | `adapted` | `AdaptedModel`: LoRA adapters attached to a `DynamicModel` |
 | `dynamic` | `DynamicLoraModel`, the trainer-facing shell over `AdaptedModel` |
 | `qlora` | `quantize_base` and the QLoRA schemes |
+| `peft` | The PEFT adapter layout: `adapter_config.json`, tensor names, `lora_config_from_peft` |
 | `lora` | `LoraError` and adapter-file IO |
 | `trainable` | `TrainableModel` trait definition |
 

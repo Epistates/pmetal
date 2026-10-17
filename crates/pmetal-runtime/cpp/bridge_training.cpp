@@ -532,6 +532,30 @@ void mlx_inline_svd(
     }
 }
 
+void mlx_inline_qr(
+    mlx_inline_array* dst_q,
+    mlx_inline_array* dst_r,
+    const mlx_inline_array* a)
+{
+    // Reduced QR, always on the CPU stream (no GPU QR in MLX): for `a` of
+    // `[m, n]`, Q is `[m, k]` and R `[k, n]` with `k = min(m, n)`.
+    try {
+        mlx::core::StreamOrDevice cpu_stream{mlx::core::Device(mlx::core::Device::cpu)};
+        auto result = mlx::core::linalg::qr(as_arr(a), cpu_stream);
+        new (dst_q->buf) array(result.first);
+        new (dst_r->buf) array(result.second);
+        pmetal_runtime_clear_error_internal();
+    } catch (const std::exception& e) {
+        pmetal_runtime_set_last_error("qr", e.what());
+        new (dst_q->buf) array(0.0f);
+        bridge_placeholder(dst_r);
+    } catch (...) {
+        pmetal_runtime_set_last_error("qr", "unknown C++ exception");
+        new (dst_q->buf) array(0.0f);
+        bridge_placeholder(dst_r);
+    }
+}
+
 // ── Autograd: value_and_grad ─────────────────────────────────────────────────
 //
 // Callback-based autograd bridge. The Rust caller provides a function pointer

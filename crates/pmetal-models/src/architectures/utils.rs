@@ -151,13 +151,17 @@ pub type Activation = fn(&Array) -> Array;
 ///
 /// Returns `None` for names no architecture in this crate needs yet, so callers
 /// fail loudly at load time rather than silently substituting a default.
+///
+/// Every function returned keeps its input's dtype (see [`activate`]), as
+/// PyTorch's activations do: a bf16 MLP stays bf16 from the gate to the down
+/// projection.
 pub fn resolve_activation(name: &str) -> Option<Activation> {
     Some(match name {
-        "gelu" | "gelu_python" => nn::gelu_erf,
+        "gelu" | "gelu_python" => gelu_erf,
         "gelu_new" | "gelu_pytorch_tanh" | "gelu_python_tanh" | "gelu_fast" | "gelu_accurate" => {
-            nn::gelu_tanh_approximate
+            gelu_tanh
         }
-        "quick_gelu" => nn::gelu_fast_approximate,
+        "quick_gelu" => gelu_quick,
         "relu" => nn::relu,
         "silu" | "swish" => nn::silu,
         "tanh" => ops::tanh,
@@ -169,12 +173,28 @@ pub fn resolve_activation(name: &str) -> Option<Activation> {
 /// Apply `act` to `x`, keeping `x`'s dtype.
 ///
 /// The GELUs evaluate a half-precision input in f32 and return f32 (see
-/// `compat::nn::gelu`). An encoder that fed that result to its next projection
-/// would run the rest of the forward pass in f32 against bf16 weights: twice
-/// the memory traffic for a result the reference computes in bf16. This casts
-/// back, which is a no-op for an f32 model.
+/// `compat::nn::gelu`). A layer that fed that result on would run the rest of
+/// the forward pass, and the backward pass's copy of the activation, in f32
+/// against bf16 weights: twice the memory traffic for a result the reference
+/// computes in bf16. Rounding back once is what PyTorch does inside its GELU
+/// kernel. A no-op for an f32 model.
 pub fn activate(act: Activation, x: &Array) -> Array {
     act(x).as_dtype(x.dtype().as_i32())
+}
+
+/// Exact (erf) GELU in `x`'s dtype: `ACT2FN["gelu"]`.
+pub fn gelu_erf(x: &Array) -> Array {
+    activate(nn::gelu_erf, x)
+}
+
+/// Tanh-approximation GELU in `x`'s dtype: `ACT2FN["gelu_pytorch_tanh"]`.
+pub fn gelu_tanh(x: &Array) -> Array {
+    activate(nn::gelu_tanh_approximate, x)
+}
+
+/// Sigmoid-approximation GELU in `x`'s dtype: `ACT2FN["quick_gelu"]`.
+pub fn gelu_quick(x: &Array) -> Array {
+    activate(nn::gelu_fast_approximate, x)
 }
 
 /// The most negative value `dtype` holds that a softmax can still subtract a

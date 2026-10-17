@@ -462,6 +462,7 @@ impl Qwen3MoEBlock {
                 num_experts,
                 config.hidden_size,
                 config.get_moe_intermediate_size(),
+                config.num_experts_per_tok as usize,
             ),
         })
     }
@@ -530,6 +531,18 @@ impl VisitLinears for Qwen3MoEFeedForward {
         match self {
             Self::Dense(mlp) => mlp.visit_linears_mut(prefix, f),
             Self::MoE(moe) => moe.visit_linears_mut(prefix, f),
+        }
+    }
+
+    fn visit_experts_mut(
+        &mut self,
+        prefix: &str,
+        top_k: usize,
+        f: &mut dyn FnMut(&str, usize, &mut pmetal_runtime::nn::moe::Linear),
+    ) {
+        match self {
+            Self::Dense(mlp) => mlp.visit_experts_mut(prefix, top_k, f),
+            Self::MoE(moe) => moe.visit_experts_mut(prefix, top_k, f),
         }
     }
 }
@@ -1224,6 +1237,90 @@ mod tests {
             max_diff(&after, &before) > 1e-3,
             "zeroing every gate projection changed nothing"
         );
+    }
+
+    /// Per-expert adapters, by definition: the gather matmuls that add
+    /// `s·(x·A_eᵀ)·B_eᵀ` for the expert each row was routed to compute what the
+    /// dense loop computes over experts whose weights are `W_e + s·B_e·A_e`,
+    /// in both dispatch orders, and folding the adapters in (`merge_lora`)
+    /// gives the same output. The block starts out unchanged (`B = 0`).
+    #[test]
+    #[serial]
+    fn test_expert_adapters_match_the_dense_reference_and_merge() {
+        use pmetal_runtime::compat::{Dtype, random};
+        random::seed(15);
+        let config = tiny_moe_config();
+        let mut block = Qwen3MoEBlock::new(&config).unwrap();
+        let draw = |tokens| {
+            random::uniform_range(-1.0, 1.0, &[2, tokens, config.hidden_size], Dtype::Float32)
+        };
+        let (short, long) = (draw(5), draw(80));
+        let plain = block.forward(&short).unwrap();
+
+        for projection in [
+            &mut block.switch_mlp.gate_proj,
+            &mut block.switch_mlp.up_proj,
+            &mut block.switch_mlp.down_proj,
+        ] {
+            projection.attach_lora(2, 8.0, false).unwrap();
+        }
+        assert!(
+            max_diff(&block.forward(&short).unwrap(), &plain) < 1e-6,
+            "B = 0 changed the block"
+        );
+
+        // Give every adapter a value, and build the dense twin from W + s·B·A.
+        let mut twin = Qwen3MoEBlock::new(&config).unwrap();
+        twin.gate.weight = block.gate.weight.clone();
+        for (live, dense) in [
+            (
+                &mut block.switch_mlp.gate_proj,
+                &mut twin.switch_mlp.gate_proj,
+            ),
+            (&mut block.switch_mlp.up_proj, &mut twin.switch_mlp.up_proj),
+            (
+                &mut block.switch_mlp.down_proj,
+                &mut twin.switch_mlp.down_proj,
+            ),
+        ] {
+            let adapter = live.adapter.as_mut().unwrap();
+            adapter.b = random::uniform_range(-0.3, 0.3, adapter.b.shape(), Dtype::Float32);
+            dense.weight = live.weight.add(&adapter.delta());
+        }
+        for (tokens, x) in [(5, &short), (80, &long)] {
+            let adapted = block.forward(x).unwrap();
+            let reference = twin.forward_reference(x).unwrap();
+            pmetal_runtime::check_unobserved_error().expect("runtime error");
+            assert!(
+                max_diff(&adapted, &reference) < 2e-4,
+                "expert adapters differ from the dense reference at {tokens} tokens"
+            );
+            assert!(
+                max_diff(&adapted, &block_without_adapters(&block, x)) > 1e-3,
+                "the adapters changed nothing, so this test proves nothing"
+            );
+        }
+
+        // Merge: the weights now carry the update and the output is the same.
+        let before = block.forward(&long).unwrap();
+        for projection in [
+            &mut block.switch_mlp.gate_proj,
+            &mut block.switch_mlp.up_proj,
+            &mut block.switch_mlp.down_proj,
+        ] {
+            projection.merge_lora().unwrap();
+        }
+        assert!(max_diff(&block.forward(&long).unwrap(), &before) < 2e-4);
+    }
+
+    /// `block`'s output with its adapters ignored.
+    fn block_without_adapters(block: &Qwen3MoEBlock, x: &Array) -> Array {
+        let mut copy = Qwen3MoEBlock::new(&tiny_moe_config()).unwrap();
+        copy.gate.weight = block.gate.weight.clone();
+        copy.switch_mlp.gate_proj.weight = block.switch_mlp.gate_proj.weight.clone();
+        copy.switch_mlp.up_proj.weight = block.switch_mlp.up_proj.weight.clone();
+        copy.switch_mlp.down_proj.weight = block.switch_mlp.down_proj.weight.clone();
+        copy.forward(x).unwrap()
     }
 
     /// The routing weights are in the activation dtype, as the experts'

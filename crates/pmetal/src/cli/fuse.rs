@@ -9,7 +9,7 @@ pub struct FuseArgs {
     #[arg(short, long = "model")]
     pub model: String,
 
-    /// LoRA adapter path (directory containing lora_weights.safetensors, or the file itself)
+    /// LoRA adapter path (directory containing adapter_model.safetensors, or the file itself)
     #[arg(short, long = "lora")]
     pub lora: String,
 

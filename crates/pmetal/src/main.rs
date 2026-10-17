@@ -2851,7 +2851,7 @@ mod argv_roundtrip {
             let Commands::TrainDiffusion(args) = parsed else {
                 panic!("not train-diffusion")
             };
-            assert_eq!(args.lora_targets, ["q_proj", "k_proj", "v_proj", "o_proj"]);
+            assert!(args.lora_targets.is_empty());
         }
     }
 

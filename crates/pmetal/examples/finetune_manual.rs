@@ -65,7 +65,7 @@ async fn main() -> BoxResult<()> {
 
     // 5. Load model with LoRA adapters
     println!("Loading model with LoRA...");
-    let model = DynamicLoraModel::from_pretrained(&model_path, lora_config)
+    let model = DynamicLoraModel::from_pretrained(&model_path, lora_config.clone())
         .map_err(|e| format!("Failed to load LoRA model: {e}"))?;
 
     // 6. Configure training
@@ -109,10 +109,14 @@ async fn main() -> BoxResult<()> {
         .map_err(|e| format!("Training failed: {e}"))?;
 
     // 9. Save LoRA weights
-    let weights_path = output_dir.join("lora_weights.safetensors");
-    model
-        .save_lora_weights(&weights_path)
-        .map_err(|e| format!("Failed to save weights: {e}"))?;
+    // A PEFT adapter directory: adapter_model.safetensors and adapter_config.json.
+    let weights_path = pmetal::trainer::orchestrator::save_adapter(
+        &model,
+        &output_dir,
+        &lora_config,
+        Some(&model_path.to_string_lossy()),
+    )
+    .map_err(|e| format!("Failed to save weights: {e}"))?;
 
     println!("\nTraining complete!");
     println!("  Final loss:   {:.4}", training_loop.current_loss());

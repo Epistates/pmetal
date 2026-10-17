@@ -248,6 +248,192 @@ pub(crate) fn dequantize_sidecar_weights(
     Ok(())
 }
 
+/// One ModelOpt-quantized `Linear`, lifted out of a checkpoint still packed:
+/// its words, block scales and the per-tensor factor that multiplies the
+/// product.
+#[derive(Debug)]
+pub(crate) struct PackedLinear {
+    weight: Array,
+    scales: Array,
+    tensor_scale: Array,
+    params: QuantParams,
+}
+
+/// The ModelOpt-quantized `Linear`s of a checkpoint, by module path, and the
+/// dtype the model computes in.
+#[derive(Debug, Default)]
+pub(crate) struct PackedLinears {
+    modules: HashMap<String, PackedLinear>,
+    dtype: Option<pmetal_runtime::compat::Dtype>,
+}
+
+impl PackedLinears {
+    /// Whether nothing was lifted out.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.modules.is_empty()
+    }
+
+    /// The module paths, for a loader to account for their `weight`s.
+    pub(crate) fn modules(&self) -> impl Iterator<Item = &str> {
+        self.modules.keys().map(String::as_str)
+    }
+
+    /// Rename the module paths (a loader that canonicalizes checkpoint keys
+    /// has to canonicalize these the same way).
+    pub(crate) fn rename(&mut self, f: impl Fn(&str) -> String) {
+        self.modules = std::mem::take(&mut self.modules)
+            .into_iter()
+            .map(|(module, packed)| (f(&module), packed))
+            .collect();
+    }
+
+    /// Put each packed weight on the `Linear` at its module path: the words in
+    /// place of the dense weight, the scales and the per-tensor factor beside
+    /// them, so the layer runs MLX's quantized matmul and an adapter on it is
+    /// QLoRA. Fails if a module names no projection (or an ambiguous one), or
+    /// the shapes disagree.
+    pub(crate) fn install<M: pmetal_runtime::compat::VisitLinears + ?Sized>(
+        mut self,
+        model: &mut M,
+    ) -> Result<usize, LoadError> {
+        let wanted: Vec<String> = self.modules.keys().cloned().collect();
+        let mut installed: HashMap<String, usize> = HashMap::new();
+        let mut failure: Option<LoadError> = None;
+        model.visit_linears_mut("", &mut |path, linear| {
+            // The module a checkpoint names may sit under a namespace the
+            // model's tree adds (`model.`) or drops.
+            let Some(module) = wanted.iter().find(|m| {
+                path == m.as_str()
+                    || path.ends_with(&format!(".{m}"))
+                    || m.ends_with(&format!(".{path}"))
+            }) else {
+                return;
+            };
+            *installed.entry(module.clone()).or_default() += 1;
+            let Some(packed) = self.modules.remove(module) else {
+                return; // a second match; reported below
+            };
+            let dtype = self
+                .dtype
+                .unwrap_or(pmetal_runtime::compat::Dtype::Bfloat16);
+            let (out, input) = (
+                packed.weight.dim(0),
+                packed.weight.dim(1) * 32 / packed.params.bits,
+            );
+            if linear.shape() != (out, input) {
+                failure = Some(LoadError::ShapeMismatch {
+                    key: format!("{path}.weight"),
+                    expected: vec![linear.shape().0, linear.shape().1],
+                    actual: vec![out, input],
+                });
+                return;
+            }
+            linear.weight.value = packed.weight;
+            // The packed words are not the weight's dtype; the layer keeps
+            // computing in the dtype its model does.
+            linear.quant = Some(pmetal_runtime::compat::LinearQuant {
+                scales: packed.scales,
+                biases: None,
+                params: packed.params,
+                dtype,
+                tensor_scale: Some(packed.tensor_scale),
+                codebook: None,
+            });
+        });
+        if let Some(e) = failure {
+            return Err(e);
+        }
+        let mut unplaced: Vec<&String> = wanted
+            .iter()
+            .filter(|m| installed.get(*m).copied().unwrap_or(0) != 1)
+            .collect();
+        unplaced.sort();
+        if !unplaced.is_empty() {
+            return Err(LoadError::SafeTensors(format!(
+                "quantized modules that name no single projection of the model: {:?}",
+                &unplaced[..unplaced.len().min(10)]
+            )));
+        }
+        Ok(installed.len())
+    }
+}
+
+/// Lift the ModelOpt-quantized projections out of `weights` and keep them
+/// packed, where [`dequantize_sidecar_weights`] would unpack them to a dense
+/// copy: an NVFP4 checkpoint of a 27B model is 15 GB packed and 54 GB dense.
+///
+/// nvfp4 is a bitcast of ModelOpt's bytes onto MLX's kernel, per-tensor fp8
+/// runs on its mxfp8 kernel with unit block scales, and the per-tensor factor
+/// multiplies the product (see `ModelOptWeight::into_native`). A projection
+/// no packed kernel can tile, and the routed experts (stacked elsewhere), go
+/// back into `weights` dense, as the shared dequantizer would leave them.
+pub(crate) fn take_packed_linears(
+    weights: &mut HashMap<String, Array>,
+) -> Result<PackedLinears, LoadError> {
+    use pmetal_runtime::native_loader::{NativeModelOpt, take_modelopt_weights};
+
+    if !weights
+        .keys()
+        .any(|key| key.ends_with(".weight_scale") || key.ends_with(".weight_scale_2"))
+    {
+        return Ok(PackedLinears::default());
+    }
+    let dtype_code = pmetal_runtime::native_weight::detect_model_dtype(|key| {
+        weights.get(key).map(|w| w.dtype_raw())
+    });
+    let dtype = pmetal_runtime::compat::Dtype::from_raw(dtype_code);
+    let mut out = PackedLinears {
+        modules: HashMap::new(),
+        dtype: Some(dtype),
+    };
+    // The routed experts are stacked by the loader that owns them: their
+    // tensors wait here, untouched, while the projections are lifted out.
+    const EXPERT_SUFFIXES: [&str; 4] = [
+        ".weight",
+        ".weight_scale",
+        ".weight_scale_2",
+        ".input_scale",
+    ];
+    let experts: Vec<String> = weights
+        .keys()
+        .filter(|key| key.contains(".experts.") && EXPERT_SUFFIXES.iter().any(|s| key.ends_with(s)))
+        .cloned()
+        .collect();
+    let held: Vec<(String, Array)> = experts
+        .into_iter()
+        .filter_map(|key| weights.remove(&key).map(|value| (key, value)))
+        .collect();
+    let taken = take_modelopt_weights(weights).map_err(LoadError::SafeTensors);
+    weights.extend(held);
+    for (base, weight) in taken? {
+        match weight
+            .into_native(dtype_code)
+            .map_err(|e| LoadError::SafeTensors(format!("{base}.weight: {e}")))?
+        {
+            NativeModelOpt::Packed {
+                weight,
+                scales,
+                tensor_scale,
+                params,
+            } => {
+                out.modules.insert(
+                    base,
+                    PackedLinear {
+                        weight,
+                        scales,
+                        tensor_scale,
+                        params,
+                    },
+                );
+            }
+            NativeModelOpt::Dense(dense) => {
+                weights.insert(format!("{base}.weight"), dense);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Whether `key`, or the tensor it belongs to, is one `keep` wants: a packed
 /// tensor's scales and biases have to come along with it, or it arrives still
 /// packed. The packed tensor may be named either way (see

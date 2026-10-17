@@ -4,7 +4,6 @@ use std::sync::Arc;
 use chrono::Utc;
 use futures::FutureExt;
 use pmetal::prelude::{JobFields, TrainingCallback};
-use pmetal_runtime::compat::ops;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
@@ -2657,13 +2656,7 @@ fn try_add_adapter(
     }
 
     let has_config = dir.join("adapter_config.json").exists();
-    let weights_file = if dir.join("lora_weights.safetensors").exists() {
-        Some(dir.join("lora_weights.safetensors"))
-    } else if dir.join("adapter_model.safetensors").exists() {
-        Some(dir.join("adapter_model.safetensors"))
-    } else {
-        None
-    };
+    let weights_file = pmetal::lora::peft::find_adapter_weights(&dir);
 
     if !has_config && weights_file.is_none() {
         return;
@@ -2692,7 +2685,7 @@ fn try_add_adapter(
             .map(|v| v as f32);
         let bm = cfg
             .as_ref()
-            .and_then(|c| c["base_model"].as_str().map(String::from));
+            .and_then(pmetal::lora::peft::adapter_base_model);
         (r, a, bm)
     } else {
         (None, None, None)
@@ -3254,22 +3247,11 @@ async fn run_distillation_in_process(
         )
         .map_err(|e| AppError(e.to_string()))?;
 
-    let output_dir = PathBuf::from(&spec.output_dir);
-    std::fs::create_dir_all(&output_dir).map_err(|e| AppError(e.to_string()))?;
-    let lora_output = output_dir.join("lora_weights.safetensors");
-    student_model
-        .save_lora_weights(&lora_output)
-        .map_err(|e| AppError(e.to_string()))?;
-    let adapter_config = serde_json::json!({
-        "r": student_lora_config.r,
-        "alpha": student_lora_config.alpha,
-        "target_modules": student_lora_config.target_modules,
-        "use_rslora": student_lora_config.use_rslora,
-        "base_model": spec.student,
-    });
-    std::fs::write(
-        output_dir.join("adapter_config.json"),
-        serde_json::to_string_pretty(&adapter_config).map_err(|e| AppError(e.to_string()))?,
+    pmetal::trainer::orchestrator::save_adapter(
+        &student_model,
+        &PathBuf::from(&spec.output_dir),
+        &student_lora_config,
+        Some(&spec.student),
     )
     .map_err(|e| AppError(e.to_string()))?;
 
@@ -3406,22 +3388,11 @@ async fn run_grpo_in_process(
         )
         .map_err(|e| AppError(e.to_string()))?;
 
-    let output_dir = PathBuf::from(output_dir);
-    std::fs::create_dir_all(&output_dir).map_err(|e| AppError(e.to_string()))?;
-    let lora_output = output_dir.join("lora_weights.safetensors");
-    model
-        .save_lora_weights(&lora_output)
-        .map_err(|e| AppError(e.to_string()))?;
-    let adapter_config = serde_json::json!({
-        "r": lora_config.r,
-        "alpha": lora_config.alpha,
-        "target_modules": lora_config.target_modules,
-        "use_rslora": lora_config.use_rslora,
-        "base_model": spec.model,
-    });
-    std::fs::write(
-        output_dir.join("adapter_config.json"),
-        serde_json::to_string_pretty(&adapter_config).map_err(|e| AppError(e.to_string()))?,
+    pmetal::trainer::orchestrator::save_adapter(
+        &model,
+        &PathBuf::from(output_dir),
+        &lora_config,
+        Some(&spec.model),
     )
     .map_err(|e| AppError(e.to_string()))?;
 
@@ -3433,158 +3404,24 @@ fn run_fuse_in_process(
     lora_path: &str,
     output_path: &str,
 ) -> std::result::Result<(), AppError> {
-    use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
+    use pmetal::merge::{AccurateMergeConfig, streaming_lora_merge};
 
     // The caller (`fuse_lora`) has already resolved remote model IDs to local
     // cache paths, so model_path is always a local directory at this point.
-    let model_dir: PathBuf = PathBuf::from(model_path);
+    // The adapter is a directory, or one of its weight files.
+    let adapter_dir = pmetal::lora::peft::adapter_dir(lora_path);
 
-    let lora_file = if Path::new(lora_path).is_dir() {
-        let f = Path::new(lora_path).join("lora_weights.safetensors");
-        if !f.exists() {
-            return Err(AppError(format!(
-                "No lora_weights.safetensors found in {lora_path}"
-            )));
-        }
-        f
-    } else {
-        PathBuf::from(lora_path)
-    };
-
-    let mut base_weights =
-        pmetal::models::loader::load_weights(&model_dir).map_err(|e| AppError(e.to_string()))?;
-    let lora_file_str = lora_file
-        .to_str()
-        .ok_or_else(|| AppError(format!("non-UTF-8 LoRA path: {}", lora_file.display())))?;
-    let lora_weights: HashMap<String, pmetal_runtime::compat::Array> =
-        pmetal_runtime::inline_array::load_safetensors_shard(lora_file_str)
-            .map(|pairs| pairs.into_iter().collect())
-            .ok_or_else(|| {
-                AppError(format!(
-                    "failed to load safetensors: {}",
-                    lora_file.display()
-                ))
-            })?;
-
-    let lora_dir = if Path::new(lora_path).is_dir() {
-        PathBuf::from(lora_path)
-    } else {
-        Path::new(lora_path)
-            .parent()
-            .unwrap_or(Path::new("."))
-            .to_path_buf()
-    };
-    let adapter_config = std::fs::read_to_string(lora_dir.join("adapter_config.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-
-    let rank = adapter_config
-        .as_ref()
-        .and_then(|cfg| cfg["r"].as_u64())
-        .map(|r| r as usize)
-        .or_else(|| {
-            lora_weights
-                .iter()
-                .filter(|(k, _)| k.contains("self_attn") && k.contains("lora_a"))
-                .map(|(_, v)| *v.shape().iter().min().unwrap_or(&16) as usize)
-                .next()
-        })
-        .unwrap_or(16);
-    let alpha = adapter_config
-        .as_ref()
-        .and_then(|cfg| cfg["alpha"].as_f64())
-        .map(|a| a as f32)
-        .unwrap_or(rank as f32);
-    let scale = alpha / rank as f32;
-
-    let mut lora_a_map: HashMap<String, &pmetal_runtime::compat::Array> = HashMap::new();
-    let mut lora_b_map: HashMap<String, &pmetal_runtime::compat::Array> = HashMap::new();
-    for (name, array) in &lora_weights {
-        if let Some(base_name) = name.strip_suffix(".lora_a") {
-            lora_a_map.insert(base_name.to_string(), array);
-        } else if let Some(base_name) = name.strip_suffix(".lora_b") {
-            lora_b_map.insert(base_name.to_string(), array);
-        }
-    }
-
-    for (layer_name, &lora_a) in &lora_a_map {
-        let Some(&lora_b) = lora_b_map.get(layer_name) else {
-            continue;
-        };
-        let base_key = if layer_name.starts_with("model.") {
-            format!("{layer_name}.weight")
-        } else {
-            format!("model.{layer_name}.weight")
-        };
-        let Some(base_weight) = base_weights.get(&base_key) else {
-            continue;
-        };
-
-        let base_dtype = base_weight.dtype_raw();
-        let delta = ops::matmul(lora_b, lora_a);
-        let scaled_delta = ops::multiply(&delta, &pmetal_runtime::compat::Array::from_f32(scale));
-        let fused = ops::add(base_weight, &scaled_delta);
-        // Cast back to base dtype (LoRA is f32, base is typically bf16/f16 —
-        // without this cast the fused model is 2x larger than necessary)
-        let fused = if fused.dtype_raw() != base_dtype {
-            fused.as_dtype(base_dtype)
-        } else {
-            fused
-        };
-        base_weights.insert(base_key, fused);
-    }
-
-    let output_dir = Path::new(output_path);
-    std::fs::create_dir_all(output_dir)?;
-    for entry in std::fs::read_dir(&model_dir)
-        .map_err(|e| AppError(e.to_string()))?
-        .flatten()
-    {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if name_str.ends_with(".safetensors")
-            || name_str == "model.safetensors.index.json"
-            || name_str.starts_with('.')
-        {
-            continue;
-        }
-        let dest = output_dir.join(&name);
-        if entry.path().is_file() {
-            std::fs::copy(entry.path(), &dest).map_err(|e| AppError(e.to_string()))?;
-        }
-    }
-
-    let output_file = output_dir.join("model.safetensors");
-    let output_file_str = output_file
-        .to_str()
-        .ok_or_else(|| AppError(format!("non-UTF-8 output path: {}", output_file.display())))?;
-    let entries: Vec<(&str, &pmetal_runtime::compat::Array)> = base_weights
-        .iter()
-        .map(|(key, value)| (key.as_str(), value))
-        .collect();
-    pmetal_runtime::compat::Array::save_safetensors(output_file_str, &entries)
-        .map_err(|e| AppError(e.to_string()))?;
-
-    // Generate model.safetensors.index.json (required by many model loaders)
-    let mut weight_map = serde_json::Map::new();
-    let mut total_size: u64 = 0;
-    for (key, arr) in &base_weights {
-        weight_map.insert(
-            key.clone(),
-            serde_json::Value::String("model.safetensors".to_string()),
-        );
-        total_size += arr.nbytes() as u64;
-    }
-    let index = serde_json::json!({
-        "metadata": { "total_size": total_size },
-        "weight_map": weight_map,
-    });
-    std::fs::write(
-        output_dir.join("model.safetensors.index.json"),
-        serde_json::to_string_pretty(&index).map_err(|e| AppError(e.to_string()))?,
-    )?;
-    Ok(())
+    // The same streaming merge `pmetal fuse` runs: scale, rsLoRA and DoRA from
+    // the adapter itself, the base's tensor layout kept, and an adapter tensor
+    // that cannot be applied an error rather than a skipped layer.
+    let config = AccurateMergeConfig::new(
+        PathBuf::from(model_path),
+        adapter_dir,
+        PathBuf::from(output_path),
+    );
+    streaming_lora_merge(&config)
+        .map(|_| ())
+        .map_err(|e| AppError(format!("LoRA fuse failed: {e}")))
 }
 
 // ---------------------------------------------------------------------------

@@ -12,8 +12,8 @@ use pmetal_runtime::compat::{Array, ModuleParameters, ModuleParametersExt};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use super::LoadError;
 use super::audit::{LoadPolicy, ParamSnapshot};
-use super::{LoadError, load_weights};
 use crate::architectures::utils::LoadReport;
 
 const PARAM_EVAL_BATCH_SIZE: usize = 128;
@@ -183,7 +183,9 @@ pub(crate) fn assign_checked<M: ModuleParameters + ModuleParametersExt>(
 }
 
 /// Load generic weights using safetensors.
-pub fn load_generic_weights<M: ModuleParameters + ModuleParametersExt>(
+pub fn load_generic_weights<
+    M: ModuleParameters + ModuleParametersExt + pmetal_runtime::compat::VisitLinears,
+>(
     model: &mut M,
     model_dir: impl AsRef<Path>,
 ) -> Result<(), LoadError> {
@@ -200,19 +202,49 @@ pub fn load_generic_weights<M: ModuleParameters + ModuleParametersExt>(
 /// shard, and the namespace shift is detected once for the whole checkpoint
 /// rather than per shard. Reading is lazy, so assembling the map costs headers,
 /// not bytes.
-pub fn load_generic_weights_with<M: ModuleParameters + ModuleParametersExt>(
+///
+/// The projections of an NVIDIA ModelOpt NVFP4 (or per-tensor FP8) checkpoint
+/// stay packed on their `Linear`s, running MLX's quantized matmul, where every
+/// other quantized format is unpacked to dense as it is read. An adapter on
+/// such a layer is QLoRA on that checkpoint, with no dense copy ever made.
+pub fn load_generic_weights_with<
+    M: ModuleParameters + ModuleParametersExt + pmetal_runtime::compat::VisitLinears,
+>(
     model: &mut M,
     model_dir: impl AsRef<Path>,
     policy: &LoadPolicy,
 ) -> Result<(), LoadError> {
     let model_dir = model_dir.as_ref();
     let snapshot = ParamSnapshot::of(model);
-    let loaded = load_weights(model_dir)?;
-    let report = assign_checked(model, loaded, policy, &snapshot)
+    let (loaded, packed) = super::load_weights_keeping_packed(model_dir)?;
+    let report = assign_checked_with_packed(model, loaded, packed, policy, &snapshot)
         .map_err(|e| e.with_quantization_hint(model_dir))?;
     eval_loaded_parameters(model)?;
     report.log_summary(model_dir);
     Ok(())
+}
+
+/// [`assign_checked`], then the packed projections put on their layers before
+/// the parameters are held to account: each one's `weight` is replaced, which
+/// is what fills it, and its scales are parameters the model gained.
+fn assign_checked_with_packed<
+    M: ModuleParameters + ModuleParametersExt + pmetal_runtime::compat::VisitLinears,
+>(
+    model: &mut M,
+    weights: HashMap<String, Array>,
+    packed: super::PackedLinears,
+    policy: &LoadPolicy,
+    snapshot: &ParamSnapshot,
+) -> Result<LoadReport, LoadError> {
+    let report = assign_loaded_weights(model, weights);
+    let mut unconsumed = policy.unconsumed(&report.skipped);
+    unconsumed.retain(|key| !tied_head_is_unused(model, key));
+    if !packed.is_empty() {
+        let count = packed.install(model)?;
+        tracing::info!("{count} projections stay packed (ModelOpt)");
+    }
+    snapshot.require_complete(model, policy, unconsumed)?;
+    Ok(report)
 }
 ///
 /// This is the in-memory dual of [`load_generic_weights`]: the safetensors path

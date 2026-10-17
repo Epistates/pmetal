@@ -954,6 +954,9 @@ bridge_extern! {
         a: *const RawBuf,
     );
 
+    // ── Linalg: QR ──
+    pub(super) fn mlx_inline_qr(dst_q: *mut RawBuf, dst_r: *mut RawBuf, a: *const RawBuf);
+
     // ── Missing ops for pmetal-models migration ──
     pub(super) fn mlx_inline_rsqrt(dst: *mut RawBuf, a: *const RawBuf);
     pub(super) fn mlx_inline_zeros_like(dst: *mut RawBuf, a: *const RawBuf);

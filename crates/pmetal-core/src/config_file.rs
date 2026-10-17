@@ -450,8 +450,8 @@ dataset:
         let text = error("training:\n  learning_rate: -1\n  optimizer: muon\n");
         assert!(text.contains("training.learning_rate"), "{text}");
         assert!(text.contains("training.optimizer"), "{text}");
-        let text = error("lora:\n  init_lora_weights: pissa\n");
-        assert!(text.contains("lora.init_lora_weights"), "{text}");
+        let text = error("lora:\n  bias: all\n");
+        assert!(text.contains("lora.bias"), "{text}");
     }
 
     #[test]

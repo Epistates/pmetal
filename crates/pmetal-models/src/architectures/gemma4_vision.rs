@@ -38,6 +38,7 @@ use pmetal_runtime::impl_module_params;
 use serde::{Deserialize, Serialize};
 
 use super::gemma4::{Gemma4RmsNorm, LoadReport, rms_norm_noscale};
+use super::utils::gelu_tanh;
 
 // ----------------------------------------------------------------------------
 // Config
@@ -277,7 +278,7 @@ impl Gemma4VisionMLP {
     }
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let gate = nn::gelu_tanh_approximate(&self.gate_proj.forward(x));
+        let gate = gelu_tanh(&self.gate_proj.forward(x));
         Ok(self
             .down_proj
             .forward(&gate.multiply(&self.up_proj.forward(x))))

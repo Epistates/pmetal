@@ -28,6 +28,19 @@
 use pmetal_runtime::compat::{Array, Exception};
 use pmetal_runtime::native_moe;
 
+/// Whether a parameter (or layer) path belongs to a MoE router: any segment
+/// is `router`, `gate` or `shared_expert_gate`. Qwen's and DeepSeek's router is
+/// `mlp.gate`, GPT-OSS's `mlp.router`, Granite 4's `router.layer`, Gemma 4's
+/// `router.proj`, and the gated shared expert's scalar gate is
+/// `shared_expert_gate`. (A SwiGLU's `gate_proj` is a different segment.)
+///
+/// A router is frozen under fine-tuning, and out of reach of an adapter: it
+/// picks experts by argmax, so a small change to it reroutes tokens.
+pub fn is_router_path(path: &str) -> bool {
+    path.split('.')
+        .any(|segment| matches!(segment, "router" | "gate" | "shared_expert_gate"))
+}
+
 /// Top-k selection + optional renormalisation, shared across MoE variants.
 ///
 /// * `scores` — per-expert scores, already activation-applied (softmax or

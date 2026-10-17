@@ -53,6 +53,7 @@ use super::gemma4::{
 use super::gemma4_vision::{
     Gemma4MultimodalEmbedder, Gemma4VisionConfig, Gemma4VisionModel, load_gemma4_vision_weights,
 };
+use super::utils::gelu_tanh;
 
 /// Default `image_token_id` for `google/diffusiongemma-26B-A4B-it` — the token
 /// whose embedding slots are replaced by projected vision soft tokens.
@@ -365,7 +366,7 @@ impl DiffusionGemmaSelfConditioning {
         self_conditioning_signal: &Array,
     ) -> Result<Array, Exception> {
         let normed = self.pre_norm.forward(self_conditioning_signal);
-        let gate = nn::gelu_tanh_approximate(&self.gate_proj.forward(&normed));
+        let gate = gelu_tanh(&self.gate_proj.forward(&normed));
         let sc = self
             .down_proj
             .forward(&gate.multiply(&self.up_proj.forward(&normed)));

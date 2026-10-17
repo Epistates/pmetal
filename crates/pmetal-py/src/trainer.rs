@@ -238,8 +238,11 @@ impl PyTrainer {
                     let model = {
                         let _span =
                             info_span!("load_model", path = %model_path.display()).entered();
-                        pmetal_lora::DynamicLoraModel::from_pretrained(&model_path, lora_config)
-                            .map_err(model_err)?
+                        pmetal_lora::DynamicLoraModel::from_pretrained(
+                            &model_path,
+                            lora_config.clone(),
+                        )
+                        .map_err(model_err)?
                     };
 
                     // Set up checkpoint manager
@@ -324,10 +327,15 @@ impl PyTrainer {
                     let weights_path = {
                         let _span = info_span!("save_weights", output_dir = %output_dir.display())
                             .entered();
-                        use pmetal_lora::TrainableModel;
-                        let path = output_dir.join("lora_weights.safetensors");
-                        model.save_lora_weights(&path).map_err(training_err)?;
-                        path
+                        // A PEFT adapter directory: `adapter_model.safetensors`
+                        // and `adapter_config.json`.
+                        pmetal_trainer::orchestrator::save_adapter(
+                            &model,
+                            &output_dir,
+                            &lora_config,
+                            Some(&model_id),
+                        )
+                        .map_err(|e| training_err(e.to_string()))?
                     };
 
                     Ok::<_, pmetal_core::PMetalError>((

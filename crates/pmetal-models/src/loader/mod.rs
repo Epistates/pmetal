@@ -35,7 +35,7 @@ pub use encoder::*;
 pub use families::*;
 
 pub(crate) use checkpoint::validate_shard_path;
-pub(crate) use quant::dequantize_sidecar_weights;
+pub(crate) use quant::{PackedLinears, dequantize_sidecar_weights, take_packed_linears};
 
 use checkpoint::Checkpoint;
 use quant::QuantConfig;
@@ -194,6 +194,20 @@ where
         .into_iter()
         .filter(|(key, _)| keep(key))
         .collect())
+}
+
+/// [`load_weights`], except that the projections of a ModelOpt (NVIDIA)
+/// NVFP4 or per-tensor FP8 checkpoint come back still packed, for the loader
+/// to put on the model's `Linear`s ([`quant::PackedLinears::install`]) instead
+/// of a dense copy four times the size.
+pub(crate) fn load_weights_keeping_packed(
+    model_dir: &Path,
+) -> Result<(HashMap<String, Array>, quant::PackedLinears), LoadError> {
+    let mut weights = load_weights_filtered_raw(model_dir, |_| true)?;
+    unpack_mlx_quantized_weights(model_dir, &mut weights)?;
+    let packed = quant::take_packed_linears(&mut weights)?;
+    dequantize_sidecar_weights(&mut weights)?;
+    Ok((weights, packed))
 }
 
 /// Load all weights from a model directory, unpacked to dense tensors.

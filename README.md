@@ -73,7 +73,7 @@ pmetal train \
 # Inference with LoRA adapter
 pmetal infer \
   --model Qwen/Qwen3-0.6B \
-  --lora ./output/lora_weights.safetensors \
+  --lora ./output/adapter_model.safetensors \
   --prompt "Explain quantum entanglement" \
   --chat
 
@@ -117,7 +117,7 @@ pmetal quantize \
 # Fuse LoRA into base model
 pmetal fuse \
   --model Qwen/Qwen3-0.6B \
-  --lora ./output/lora_weights.safetensors
+  --lora ./output/adapter_model.safetensors
 
 # Evaluate perplexity
 pmetal eval \
@@ -286,7 +286,7 @@ print(text)
 text = pmetal.infer(
     "Qwen/Qwen3-0.6B",
     "Explain quantum entanglement",
-    lora="./output/lora_weights.safetensors",
+    lora="./output/adapter_model.safetensors",
 )
 ```
 

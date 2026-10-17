@@ -1375,6 +1375,7 @@ async fn is_model_dir(dir: &PathBuf) -> bool {
 /// Check if a directory is a trained/fine-tuned model output.
 async fn is_trained_dir(dir: &Path) -> bool {
     dir.join("adapter_config.json").exists()
+        || dir.join("adapter_model.safetensors").exists()
         || dir.join("lora_weights.safetensors").exists()
         || dir.join("training_state.json").exists()
 }

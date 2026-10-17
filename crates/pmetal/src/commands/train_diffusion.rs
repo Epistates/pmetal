@@ -17,7 +17,7 @@ use pmetal_data::Tokenizer;
 use pmetal_lora::{AdaptedModel, QLoraConfig, QLoraScheme};
 use pmetal_models::DynamicModel;
 use pmetal_runtime::compat::Array;
-use pmetal_trainer::orchestrator::save_adapter_config;
+use pmetal_trainer::orchestrator::save_adapter;
 use pmetal_trainer::{
     DiffusionGemmaTrainConfig, DiffusionGemmaTrainer, quantize_diffusion_gemma_base,
 };
@@ -152,44 +152,22 @@ pub(crate) async fn run_train_diffusion(args: TrainDiffusionArgs) -> Result<()> 
         }
 
         if args.checkpoint_every > 0 && step > 0 && step % args.checkpoint_every == 0 {
-            let ckpt = output_dir.join("lora_weights.safetensors");
-            save_adapters(&model, &lora_cfg, &ckpt, &args.model)
+            save_adapter(&model, output_dir, &lora_cfg, Some(&args.model))
                 .with_context(|| "checkpoint save")?;
-            tracing::info!("checkpoint at step {step} → {}", ckpt.display());
+            tracing::info!("checkpoint at step {step} → {}", output_dir.display());
         }
     }
 
-    // 7. Save the final adapters.
-    let final_path = output_dir.join("lora_weights.safetensors");
-    save_adapters(&model, &lora_cfg, &final_path, &args.model).with_context(|| "save adapters")?;
+    // 7. Save the final adapters: a PEFT directory, which `infer --lora`,
+    //    `fuse` and `PeftModel.from_pretrained` all read.
+    let final_path = save_adapter(&model, output_dir, &lora_cfg, Some(&args.model))
+        .with_context(|| "save adapters")?;
     println!(
         "DiffusionGemma LoRA adapters saved to {} (final ema loss={:.4})",
         final_path.display(),
         running_loss
     );
     Ok(())
-}
-
-/// Write the adapters and the `adapter_config.json` beside them that
-/// `infer --lora` and `fuse` read their rank, alpha and targets from, as
-/// `pmetal train` does.
-fn save_adapters(
-    model: &AdaptedModel,
-    lora: &LoraConfig,
-    path: &Path,
-    base_model: &str,
-) -> Result<()> {
-    model
-        .save_lora_weights(path)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    save_adapter_config(
-        path,
-        lora.r,
-        lora.alpha,
-        &lora.target_modules,
-        lora.use_rslora,
-        Some(base_model),
-    )
 }
 
 /// Build the encoder context `[1, ctx]` from a prompt's token ids, truncated to

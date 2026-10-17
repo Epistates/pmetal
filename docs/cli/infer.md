@@ -22,7 +22,7 @@ pmetal infer --model Qwen/Qwen3-0.6B --prompt "What is 2+2?"
 # Interactive chat with LoRA
 pmetal infer \
   --model Qwen/Qwen3-0.6B \
-  --lora ./output/lora_weights.safetensors \
+  --lora ./output/adapter_model.safetensors \
   --chat
 
 # FP8 quantized inference (2× memory reduction)

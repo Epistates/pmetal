@@ -39,7 +39,7 @@ use pmetal_data::qwen_vl_processing::{ProcessedMedia, QwenVlProcessor};
 use pmetal_runtime::compat::{Array, Dtype, Exception, Param, nn, ops};
 use serde::Deserialize;
 
-use super::utils::{Activation, resolve_activation};
+use super::utils::{Activation, gelu_erf, resolve_activation};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -690,7 +690,7 @@ impl Qwen3_5VisionModel {
             .norm
             .forward(&x)
             .reshape(&[n / (m * m) as i32, merged]);
-        let x = nn::gelu_erf(&self.merger.fc1.forward(&x));
+        let x = gelu_erf(&self.merger.fc1.forward(&x));
         Ok(self.merger.fc2.forward(&x))
     }
 

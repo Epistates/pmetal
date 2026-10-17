@@ -671,6 +671,7 @@ fn is_model_dir(path: &std::path::Path) -> bool {
         || path.join("model.safetensors").exists()
         || path.join("model.safetensors.index.json").exists()
         || path.join("lora_weights.safetensors").exists()
+        || path.join("adapter_model.safetensors").exists()
         || has_gguf_files(path)
 }
 
@@ -688,7 +689,9 @@ fn has_gguf_files(path: &std::path::Path) -> bool {
 
 /// Check if a directory looks like a trained/fine-tuned output directory.
 fn is_trained_dir(path: &std::path::Path) -> bool {
-    path.join("adapter_config.json").exists() || path.join("lora_weights.safetensors").exists()
+    path.join("adapter_config.json").exists()
+        || path.join("adapter_model.safetensors").exists()
+        || path.join("lora_weights.safetensors").exists()
 }
 
 /// Build a ModelEntry from a model directory path.

@@ -762,6 +762,7 @@ impl DeepSeekMoE {
                 config.n_routed_experts.unwrap_or(8),
                 config.hidden_size,
                 config.moe_intermediate_size,
+                config.num_experts_per_tok.max(1) as usize,
             ),
             shared_experts,
         })
@@ -835,6 +836,18 @@ impl VisitLinears for DeepSeekMLPType {
         match self {
             Self::Dense(mlp) => mlp.visit_linears_mut(prefix, f),
             Self::MoE(moe) => moe.visit_linears_mut(prefix, f),
+        }
+    }
+
+    fn visit_experts_mut(
+        &mut self,
+        prefix: &str,
+        top_k: usize,
+        f: &mut dyn FnMut(&str, usize, &mut pmetal_runtime::nn::moe::Linear),
+    ) {
+        match self {
+            Self::Dense(mlp) => mlp.visit_experts_mut(prefix, top_k, f),
+            Self::MoE(moe) => moe.visit_experts_mut(prefix, top_k, f),
         }
     }
 }

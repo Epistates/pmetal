@@ -23,9 +23,7 @@ use pmetal_runtime::rope::RotaryEmbedding;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::architectures::utils::{
-    Activation, activate, additive_mask, padding_keep, resolve_activation,
-};
+use crate::architectures::utils::{Activation, additive_mask, padding_keep, resolve_activation};
 
 /// The released models' rotary bases.
 const DEFAULT_GLOBAL_ROPE_THETA: f64 = 160_000.0;
@@ -373,7 +371,7 @@ impl ModernBertMLP {
 
     pub fn forward(&mut self, x: &Array) -> Array {
         let halves = ops::split(&self.Wi.forward(x), 2, -1);
-        let gated = activate(self.act, &halves[0]).multiply(&halves[1]);
+        let gated = (self.act)(&halves[0]).multiply(&halves[1]);
         self.Wo.forward(&gated)
     }
 }

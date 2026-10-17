@@ -7,28 +7,277 @@
 //! fills ([`Expert`]), and the step that sums the routed experts' outputs with
 //! the gated shared expert ([`moe_combine`]).
 
-use crate::compat::{Array, Dtype, Exception, ops};
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use crate::compat::{
+    Array, Dtype, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue, ops,
+    random,
+};
 use crate::impl_module_params;
 
-/// Minimal linear layer: weight [out, in], no bias, zero-initialised.
+/// A low-rank adapter on a stacked expert projection, one per expert.
+///
+/// LoRA's `y = x·Wᵀ + s·(x·Aᵀ)·Bᵀ` for each expert `e` separately:
+/// `A` is `[experts, rank, in]` and `B` `[experts, out, rank]`, so the update
+/// is `s·B_e·A_e` for the expert a token was routed to and nothing for the
+/// others. With `top_k` experts active per token a per-expert rank of
+/// `total_rank / top_k` keeps the rank a token sees at the total, which is how
+/// the adapters are sized for a mixture of experts (Schulman et al., 2025,
+/// "LoRA Without Regret").
+///
+/// `B` starts at zero, so a fresh adapter changes nothing. Both factors are
+/// f32 whatever the experts' dtype, as the dense adapter's are, and the layer's
+/// output keeps the experts' dtype.
+#[derive(Debug, Clone)]
+pub struct ExpertLora {
+    /// Down-projections, `[experts, rank, in]`.
+    pub a: Array,
+    /// Up-projections, `[experts, out, rank]`. Zero at initialisation.
+    pub b: Array,
+    /// Rank of each expert's adapter.
+    pub rank: i32,
+    /// `alpha / rank`, or `alpha / sqrt(rank)` under rsLoRA.
+    pub scale: f32,
+    /// Set once folded into the experts' weight, after which it contributes
+    /// nothing further.
+    pub merged: bool,
+}
+
+impl ExpertLora {
+    /// An adapter for `experts` projections of shape `[out, in]`, like
+    /// [`LoraAdapter::new`](crate::compat::LoraAdapter::new) for each.
+    pub fn new(
+        experts: i32,
+        in_features: i32,
+        out_features: i32,
+        rank: i32,
+        alpha: f32,
+        use_rslora: bool,
+    ) -> Result<Self, Exception> {
+        if rank <= 0 {
+            return Err(Exception::custom(format!(
+                "expert LoRA rank must be positive, got {rank}"
+            )));
+        }
+        let scale = if use_rslora {
+            alpha / (rank as f32).sqrt()
+        } else {
+            alpha / rank as f32
+        };
+        let bound = 1.0_f32 / (in_features as f32).sqrt();
+        Ok(Self {
+            a: random::uniform_range(-bound, bound, &[experts, rank, in_features], Dtype::Float32),
+            b: ops::zeros(&[experts, out_features, rank], Dtype::Float32),
+            rank,
+            scale,
+            merged: false,
+        })
+    }
+
+    /// `s·B_e·A_e` for every expert, `[experts, out, in]`: the dense update.
+    pub fn delta(&self) -> Array {
+        self.b.matmul(&self.a).mul_scalar(self.scale)
+    }
+
+    /// The adapter's contribution to the rows `x` routed to experts `ids`:
+    /// `s·(x·A_eᵀ)·B_eᵀ` with each row through its own expert, computed as two
+    /// gather matmuls and never as a dense update. `x` and `ids` are laid out
+    /// as for the base projection's gather matmul (`sorted` is the same flag),
+    /// and the result has the same shape as its output, in f32.
+    pub fn contribution(&self, x: &Array, ids: &Array, sorted: bool) -> Array {
+        let down = self.a.swap_axes(-1, -2);
+        let up = self.b.swap_axes(-1, -2);
+        x.gather_mm(&down, None, Some(ids), sorted)
+            .gather_mm(&up, None, Some(ids), sorted)
+            .mul_scalar(self.scale)
+    }
+
+    /// Add the adapter's contribution to `base`, the projection's own output
+    /// for the same rows, keeping `base`'s dtype.
+    pub fn apply(&self, base: Array, x: &Array, ids: &Array, sorted: bool) -> Array {
+        if self.merged {
+            return base;
+        }
+        let dtype = base.dtype_raw();
+        let y = base.add(&self.contribution(x, ids, sorted));
+        if y.dtype_raw() == dtype {
+            y
+        } else {
+            y.as_dtype(dtype)
+        }
+    }
+
+    /// Number of trainable elements.
+    pub fn num_trainable_params(&self) -> usize {
+        let count = |arr: &Array| arr.shape().iter().map(|d| *d as usize).product::<usize>();
+        count(&self.a) + count(&self.b)
+    }
+}
+
+/// A stacked projection `[experts, out, in]`, or (for a single [`Expert`]) one
+/// `[out, in]`, with no bias. Zero-initialised; a checkpoint fills it.
+///
+/// A stacked one can carry an [`ExpertLora`]. The adapter is applied by the
+/// gather matmuls that read the weight ([`crate::native_moe`]), which take it
+/// beside the weight; [`forward`](Self::forward) is the single expert's.
 #[derive(Debug, Clone)]
 pub struct Linear {
-    /// Weight matrix, shape `[out_features, in_features]`.
+    /// Weight matrix, shape `[out_features, in_features]`, or
+    /// `[experts, out_features, in_features]` stacked.
     pub weight: Array,
+    /// Per-expert low-rank adapters, when attached to a stacked projection.
+    pub adapter: Option<ExpertLora>,
 }
-impl_module_params!(Linear; weight);
 
 impl Linear {
     /// Create a zero-initialised linear layer.
     pub fn new(in_features: i32, out_features: i32) -> Self {
         Self {
             weight: ops::zeros(&[out_features, in_features], Dtype::Float32),
+            adapter: None,
+        }
+    }
+
+    /// A stacked projection holding `weight`, no adapter.
+    pub fn stacked(weight: Array) -> Self {
+        Self {
+            weight,
+            adapter: None,
         }
     }
 
     /// `y = x @ W^T`
     pub fn forward(&self, x: &Array) -> Array {
         x.matmul(&self.weight.t())
+    }
+
+    /// `(experts, out_features, in_features)` of a stacked projection.
+    pub fn stack_shape(&self) -> Option<(i32, i32, i32)> {
+        match self.weight.shape() {
+            [e, o, i] => Some((*e, *o, *i)),
+            _ => None,
+        }
+    }
+
+    /// Attach a per-expert adapter of the given rank, replacing any existing
+    /// one. Only a stacked projection can take one.
+    pub fn attach_lora(
+        &mut self,
+        rank: i32,
+        alpha: f32,
+        use_rslora: bool,
+    ) -> Result<&mut ExpertLora, Exception> {
+        let (experts, out_features, in_features) = self.stack_shape().ok_or_else(|| {
+            Exception::custom("an expert adapter attaches to a stacked [experts, out, in] weight")
+        })?;
+        let adapter = ExpertLora::new(experts, in_features, out_features, rank, alpha, use_rslora)?;
+        Ok(self.adapter.insert(adapter))
+    }
+
+    /// Whether an adapter is attached.
+    pub fn is_adapted(&self) -> bool {
+        self.adapter.is_some()
+    }
+
+    /// Fold the adapter into the weight, keeping it attached (reversible with
+    /// [`unmerge_lora`](Self::unmerge_lora)). The weight must be floating
+    /// point, not packed or FP8 bytes: those are dequantized by the caller
+    /// first.
+    pub fn merge_lora(&mut self) -> Result<(), Exception> {
+        let Some(adapter) = self.adapter.as_mut().filter(|a| !a.merged) else {
+            return Ok(());
+        };
+        if !matches!(
+            self.weight.dtype(),
+            Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16
+        ) {
+            return Err(Exception::custom(
+                "an expert adapter folds into a floating-point weight; this one is packed",
+            ));
+        }
+        let dtype = self.weight.dtype_raw();
+        self.weight = self.weight.add(&adapter.delta()).as_dtype(dtype);
+        adapter.merged = true;
+        Ok(())
+    }
+
+    /// Undo [`merge_lora`](Self::merge_lora).
+    pub fn unmerge_lora(&mut self) {
+        let Some(adapter) = self.adapter.as_mut().filter(|a| a.merged) else {
+            return;
+        };
+        let dtype = self.weight.dtype_raw();
+        self.weight = self.weight.subtract(&adapter.delta()).as_dtype(dtype);
+        adapter.merged = false;
+    }
+
+    /// Fold the adapter in and drop it.
+    pub fn fuse_lora(&mut self) -> Result<(), Exception> {
+        self.merge_lora()?;
+        self.adapter = None;
+        Ok(())
+    }
+}
+
+// Hand-written, as `compat::Linear`'s is, so the adapter flattens beside the
+// weight (`gate_proj.lora_a`) and an adapted projection trains its adapter
+// and nothing else.
+impl ModuleParameters for Linear {
+    fn num_parameters(&self) -> usize {
+        1 + self.adapter.as_ref().map_or(0, |_| 2)
+    }
+
+    fn parameters(&self) -> ModuleParamRef<'_> {
+        let mut out = HashMap::new();
+        out.insert(Rc::from("weight"), NestedValue::Value(&self.weight));
+        if let Some(adapter) = &self.adapter {
+            out.insert(Rc::from("lora_a"), NestedValue::Value(&adapter.a));
+            out.insert(Rc::from("lora_b"), NestedValue::Value(&adapter.b));
+        }
+        out
+    }
+
+    fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
+        let mut out = HashMap::new();
+        out.insert(Rc::from("weight"), NestedValue::Value(&mut self.weight));
+        if let Some(adapter) = &mut self.adapter {
+            out.insert(Rc::from("lora_a"), NestedValue::Value(&mut adapter.a));
+            out.insert(Rc::from("lora_b"), NestedValue::Value(&mut adapter.b));
+        }
+        out
+    }
+
+    fn trainable_parameters(&self) -> ModuleParamRef<'_> {
+        let Some(adapter) = &self.adapter else {
+            return self.parameters();
+        };
+        let mut out = HashMap::new();
+        out.insert(Rc::from("lora_a"), NestedValue::Value(&adapter.a));
+        out.insert(Rc::from("lora_b"), NestedValue::Value(&adapter.b));
+        out
+    }
+}
+
+// The walk for `Linear`s stops here: a stacked projection is not a
+// `compat::Linear`. Adapters on it are reached by `visit_experts_mut`.
+impl crate::compat::VisitLinears for Linear {
+    fn visit_linears_mut(
+        &mut self,
+        _prefix: &str,
+        _f: &mut dyn FnMut(&str, &mut crate::compat::Linear),
+    ) {
+    }
+
+    fn visit_experts_mut(
+        &mut self,
+        prefix: &str,
+        top_k: usize,
+        f: &mut dyn FnMut(&str, usize, &mut Linear),
+    ) {
+        if self.stack_shape().is_some() {
+            f(prefix, top_k, self);
+        }
     }
 }
 

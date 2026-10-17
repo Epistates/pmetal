@@ -14,13 +14,20 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
-use pmetal_core::LoraConfig;
+use pmetal_core::{LoraConfig, LoraInit};
 use pmetal_models::dispatcher::DynamicModel;
 use pmetal_runtime::compat::{
-    Array, Exception, ModuleParameters, ModuleParametersExt, NestedValue, VisitLinears,
+    Array, ModuleParameters, ModuleParametersExt, NestedValue, VisitLinears,
 };
 
-use crate::{LoraError, load_safetensors_map, save_safetensors_map};
+use crate::init::{Quantizer, initialise};
+use crate::peft::{
+    ADAPTER_WEIGHTS, LEGACY_ADAPTER_WEIGHTS, PEFT_PREFIX, find_adapter_weights, hf_module_name,
+    peft_tensor_name, write_adapter_config,
+};
+use crate::{
+    LoraError, PackedBase, QLoraConfig, load_safetensors_map, quantize_base, save_safetensors_map,
+};
 
 /// Prefix the dispatcher's parameter tree puts in front of the decoder stack.
 ///
@@ -32,8 +39,12 @@ const TRUNK_PREFIX: &str = "model.";
 pub struct AdaptedModel {
     model: DynamicModel,
     config: LoraConfig,
-    /// Parameter paths of the projections carrying an adapter, in walk order.
+    /// Parameter paths of the projections carrying an adapter, in walk order:
+    /// the `Linear`s, then the stacked expert projections.
     adapted: Vec<String>,
+    /// The paths among `adapted` that are stacked expert projections, whose
+    /// adapters hold one factor pair per expert.
+    experts: std::collections::BTreeSet<String>,
 }
 
 impl std::fmt::Debug for AdaptedModel {
@@ -49,11 +60,49 @@ impl AdaptedModel {
     /// Attach adapters to a model that is already built and loaded.
     ///
     /// Every projection whose *name* — the last segment of its path — appears in
-    /// `config.target_modules` gets one. An empty `target_modules` adapts every
-    /// projection except the output layer (the LM head), as PEFT's
-    /// `all-linear` does; name it (`lm_head`) to adapt it. MoE routers and
-    /// routed experts are never adapted.
-    pub fn attach(mut model: DynamicModel, config: LoraConfig) -> Result<Self, LoraError> {
+    /// `config.target_modules` gets one. An empty `target_modules` (the
+    /// default) or `all-linear` adapts every projection except the output
+    /// layer (the LM head), as PEFT's `all-linear` does; name it (`lm_head`)
+    /// to adapt it. MoE routers and routed experts are never adapted.
+    ///
+    /// `config.init_lora_weights` says how the adapters start. PiSSA and
+    /// OLoRA move part of each adapted weight into its adapter and need a
+    /// dense base; LoftQ is fitted to a quantizer and goes through
+    /// [`attach_quantized`](Self::attach_quantized).
+    pub fn attach(model: DynamicModel, config: LoraConfig) -> Result<Self, LoraError> {
+        Self::attach_fitted(model, config, None)
+    }
+
+    /// Pack the base for QLoRA and attach adapters: the whole of QLoRA, in the
+    /// order its initialisation needs.
+    ///
+    /// With the standard initialisation the base is packed first, so a DoRA
+    /// magnitude is seeded from the weight each layer computes with. PiSSA and
+    /// OLoRA split the *dense* weight and pack the residual they leave (QPiSSA
+    /// and QOLoRA: the principal part stays out of the quantizer), and LoftQ
+    /// fits the adapter to the quantizer's round trip, so for those the
+    /// adapters come first and the pack second.
+    pub fn attach_quantized(
+        mut model: DynamicModel,
+        config: LoraConfig,
+        qlora: &QLoraConfig,
+    ) -> Result<(Self, PackedBase), LoraError> {
+        qlora.validate()?;
+        if config.init_lora_weights == LoraInit::Standard {
+            let packed = quantize_base(&mut model, qlora)?;
+            return Ok((Self::attach(model, config)?, packed));
+        }
+        let mut adapted = Self::attach_fitted(model, config, Some(qlora))?;
+        let packed = quantize_base(&mut adapted.model, qlora)?;
+        Ok((adapted, packed))
+    }
+
+    /// [`attach`](Self::attach), with the quantizer LoftQ fits its adapter to.
+    fn attach_fitted(
+        mut model: DynamicModel,
+        config: LoraConfig,
+        quantizer: Option<&QLoraConfig>,
+    ) -> Result<Self, LoraError> {
         let rank = config.r as i32;
         if rank <= 0 {
             return Err(LoraError::InvalidState(format!(
@@ -61,19 +110,25 @@ impl AdaptedModel {
             )));
         }
 
-        let targets = &config.target_modules;
-        let output = if targets.is_empty() {
+        // `all-linear` is the spelling PEFT uses for an empty list.
+        let targets: &[String] = if config.targets_all_linear() {
+            &[]
+        } else {
+            &config.target_modules
+        };
+        let output = if targets.is_empty() || quantizer.is_some() {
             model.output_projection_path()
         } else {
             None
         };
         let mut adapted = Vec::new();
-        let mut failure: Option<Exception> = None;
+        let mut failure: Option<LoraError> = None;
 
         let use_dora = config.use_dora;
         let dropout = config.dropout;
         let alpha = config.alpha;
         let use_rslora = config.use_rslora;
+        let init = config.init_lora_weights;
 
         model.visit_linears_mut("", &mut |path, linear| {
             if failure.is_some() || !is_targeted(path, targets, output.as_deref()) {
@@ -91,13 +146,59 @@ impl AdaptedModel {
                     }
                     adapted.push(path.to_string());
                 }
-                Err(e) => failure = Some(e),
+                Err(e) => {
+                    failure = Some(LoraError::Mlx(e));
+                    return;
+                }
+            }
+            // A projection QLoRA leaves unpacked (the head, a narrow one) has
+            // no quantization error for LoftQ to correct.
+            let init = match quantizer {
+                Some(q) if init == LoraInit::Loftq && !q.packs(path, linear, output.as_deref()) => {
+                    LoraInit::Standard
+                }
+                _ => init,
+            };
+            let dtype = linear.weight.value.dtype();
+            let round_trip = quantizer
+                .map(|q| move |dense: &Array| q.round_trip(&dense.as_dtype(dtype.as_i32())));
+            let fitted = initialise(
+                linear,
+                init,
+                round_trip.as_ref().map(|f| f as &Quantizer<'_>),
+            );
+            if let Err(e) = fitted {
+                failure = Some(e);
             }
         });
 
         if let Some(e) = failure {
-            return Err(LoraError::Mlx(e));
+            return Err(e);
         }
+
+        // The routed experts, which are stacked weights read by gather
+        // matmuls and not `Linear`s. Each expert gets its own adapter, of the
+        // configured rank divided by the experts a token is routed to, so the
+        // rank a token sees is the configured one. They start from the
+        // standard initialisation whatever `init` says, and are plain LoRA
+        // under DoRA: a magnitude per expert row would need each expert's
+        // dense weight on every forward.
+        let mut experts = Vec::new();
+        model.visit_experts_mut("", 1, &mut |path, top_k, projection| {
+            if failure.is_some() || !is_targeted(path, targets, output.as_deref()) {
+                return;
+            }
+            let expert_rank = (rank / top_k.max(1) as i32).max(1);
+            match projection.attach_lora(expert_rank, alpha, use_rslora) {
+                Ok(_) => experts.push(path.to_string()),
+                Err(e) => failure = Some(LoraError::Mlx(e)),
+            }
+        });
+        if let Some(e) = failure {
+            return Err(e);
+        }
+        adapted.extend(experts.iter().cloned());
+        let experts: std::collections::BTreeSet<String> = experts.into_iter().collect();
 
         if adapted.is_empty() {
             return Err(LoraError::InvalidState(format!(
@@ -110,6 +211,7 @@ impl AdaptedModel {
             model,
             config,
             adapted,
+            experts,
         })
     }
 
@@ -153,25 +255,45 @@ impl AdaptedModel {
     /// Reversible with [`unmerge`](Self::unmerge). A merged model runs one
     /// matmul per projection instead of three, which is worth it for an
     /// evaluation pass mid-run.
-    pub fn merge(&mut self) {
+    ///
+    /// Fails if a routed expert's weight is packed or FP8, which an adapter
+    /// cannot be folded into without unpacking the whole stack.
+    pub fn merge(&mut self) -> Result<(), LoraError> {
         self.model
             .visit_linears_mut("", &mut |_, linear| linear.merge_lora());
+        let mut failure = None;
+        self.model.visit_experts_mut("", 1, &mut |path, _, expert| {
+            if failure.is_none()
+                && let Err(e) = expert.merge_lora()
+            {
+                failure = Some(LoraError::InvalidState(format!("merging `{path}`: {e}")));
+            }
+        });
+        failure.map_or(Ok(()), Err)
     }
 
     /// Undo [`merge`](Self::merge) and resume training.
     pub fn unmerge(&mut self) {
         self.model
             .visit_linears_mut("", &mut |_, linear| linear.unmerge_lora());
+        self.model
+            .visit_experts_mut("", 1, &mut |_, _, expert| expert.unmerge_lora());
     }
 
     /// Fold every adapter in and drop it, leaving a plain dense model.
     ///
     /// This is what `pmetal fuse` produces: servable without pmetal-lora in the
-    /// picture, and not reversible.
-    pub fn fuse(&mut self) {
+    /// picture, and not reversible. Fails as [`merge`](Self::merge) does.
+    pub fn fuse(&mut self) -> Result<(), LoraError> {
+        self.merge()?;
         self.model
             .visit_linears_mut("", &mut |_, linear| linear.fuse_lora());
+        self.model.visit_experts_mut("", 1, &mut |_, _, expert| {
+            expert.adapter = None;
+        });
         self.adapted.clear();
+        self.experts.clear();
+        Ok(())
     }
 
     /// Forward pass. Identical to what inference runs, because it *is* what
@@ -220,27 +342,121 @@ impl AdaptedModel {
             .sum()
     }
 
-    /// Write the adapters to a safetensors file.
-    pub fn save_lora_weights(&self, path: impl AsRef<Path>) -> Result<(), LoraError> {
-        save_safetensors_map(path, &self.lora_parameters())
+    /// The adapted modules by full name in the Hugging Face model, sorted: how
+    /// PEFT's own `adapter_config.json` lists what `all-linear` matched. A name
+    /// is exact where a bare projection name would also match the modules a
+    /// model has more of than this one adapts (a MoE layer's experts).
+    pub fn adapter_target_modules(&self) -> Vec<String> {
+        let names: std::collections::BTreeSet<String> = self
+            .adapted
+            .iter()
+            .map(|path| hf_module_name(path))
+            .collect();
+        names.into_iter().collect()
     }
 
-    /// Read adapters back from a safetensors file.
+    /// Write the adapters to a safetensors file in PEFT's layout
+    /// (`base_model.model.<module>.lora_A.weight`, ...; see [`crate::peft`]).
+    pub fn save_lora_weights(&self, path: impl AsRef<Path>) -> Result<(), LoraError> {
+        let params = self.lora_parameters();
+        let mut out: HashMap<String, Array> = HashMap::new();
+        for module in &self.adapted {
+            let stem = adapter_key(module);
+            let part = |suffix: &str| params.get(format!("{stem}.{suffix}").as_str());
+            let missing = || LoraError::InvalidState(format!("`{module}` has no adapter tensors"));
+            let (a, b) = (
+                part("lora_a").ok_or_else(missing)?,
+                part("lora_b").ok_or_else(missing)?,
+            );
+            if self.experts.contains(module) {
+                // A stacked projection has a factor pair per expert, which
+                // PEFT's `lora_A.weight` (one `[r, in]` matrix) cannot hold;
+                // the names are ours, and `peft` leaves them alone.
+                out.insert(peft_tensor_name(module, "lora_expert_A"), a.clone());
+                out.insert(peft_tensor_name(module, "lora_expert_B"), b.clone());
+                continue;
+            }
+            out.insert(peft_tensor_name(module, "lora_A.weight"), a.clone());
+            out.insert(peft_tensor_name(module, "lora_B.weight"), b.clone());
+            if let Some(magnitude) = part("lora_magnitude") {
+                // PEFT holds the DoRA magnitude as one value per output row.
+                let rows = magnitude.shape().iter().product::<i32>();
+                out.insert(
+                    peft_tensor_name(module, "lora_magnitude_vector"),
+                    magnitude.reshape(&[rows]),
+                );
+            }
+        }
+        save_safetensors_map(path, &out)
+    }
+
+    /// Write an adapter directory PEFT can load: `adapter_model.safetensors`
+    /// and `adapter_config.json`, which names `base_model` when it is known.
+    pub fn save_adapter(
+        &self,
+        dir: impl AsRef<Path>,
+        base_model: Option<&str>,
+    ) -> Result<(), LoraError> {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir)
+            .map_err(|e| LoraError::Io(format!("{}: {e}", dir.display())))?;
+        self.save_lora_weights(dir.join(ADAPTER_WEIGHTS))?;
+        write_adapter_config(
+            dir,
+            &self.config,
+            &self.adapter_target_modules(),
+            base_model,
+        )
+    }
+
+    /// Read adapters back: a PEFT adapter directory or weights file, or one in
+    /// the layout earlier releases wrote.
     ///
-    /// Fails if the file holds an adapter tensor this model has no slot for:
-    /// dropping it would serve a different model than the one trained.
+    /// Fails if the file holds an adapter tensor this model has no slot for,
+    /// or one of another shape (a different rank): dropping or reshaping it
+    /// would serve a different model than the one trained.
     pub fn load_lora_weights(&mut self, path: impl AsRef<Path>) -> Result<(), LoraError> {
-        let loaded = load_safetensors_map(path)?;
+        let path = path.as_ref();
+        let file = find_adapter_weights(path).ok_or_else(|| {
+            LoraError::Io(format!(
+                "no {ADAPTER_WEIGHTS} (or {LEGACY_ADAPTER_WEIGHTS}) at {}",
+                path.display()
+            ))
+        })?;
+        let loaded = load_safetensors_map(&file)?;
         let ours = self.lora_parameters();
-        let mut unmatched: Vec<&str> = loaded
-            .keys()
-            .map(String::as_str)
-            .filter(|k| {
-                is_adapter_key(k)
-                    && !ours.contains_key(*k)
-                    && !ours.contains_key(adapter_key(k).as_str())
-            })
-            .collect();
+        let modules = self.module_index();
+
+        let mut keyed: HashMap<Rc<str>, Array> = HashMap::new();
+        let mut unmatched: Vec<String> = Vec::new();
+        for (name, value) in loaded {
+            let Some(key) = native_key(&name, &modules, &ours) else {
+                if name.contains("lora_") || name.starts_with(PEFT_PREFIX) {
+                    unmatched.push(name);
+                }
+                continue;
+            };
+            let slot = &ours[key.as_str()];
+            // PEFT's DoRA magnitude is `[out]`; ours is `[out, 1]`.
+            let value = if value.shape() != slot.shape()
+                && value.shape().iter().product::<i32>() == slot.shape().iter().product::<i32>()
+                && key.ends_with(".lora_magnitude")
+            {
+                value.reshape(slot.shape())
+            } else {
+                value
+            };
+            if value.shape() != slot.shape() {
+                return Err(LoraError::ShapeMismatch(format!(
+                    "adapter tensor {name} is {:?}, this model's {key} is {:?}; the adapter was \
+                     trained at another rank or width, so build the model with the adapter's \
+                     adapter_config.json",
+                    value.shape(),
+                    slot.shape()
+                )));
+            }
+            keyed.insert(Rc::from(key.as_str()), value);
+        }
         if !unmatched.is_empty() {
             unmatched.sort_unstable();
             return Err(LoraError::InvalidState(format!(
@@ -252,12 +468,17 @@ impl AdaptedModel {
                 if unmatched.len() > 4 { ", ..." } else { "" },
             )));
         }
-        let keyed: HashMap<Rc<str>, Array> = loaded
-            .into_iter()
-            .map(|(k, v)| (Rc::from(k.as_str()), v))
-            .collect();
         self.set_lora_parameters(&keyed);
         Ok(())
+    }
+
+    /// Adapted modules by their canonical Hugging Face name, to the stem of
+    /// their in-memory adapter keys.
+    fn module_index(&self) -> HashMap<String, String> {
+        self.adapted
+            .iter()
+            .map(|path| (canonical_module(&hf_module_name(path)), adapter_key(path)))
+            .collect()
     }
 
     /// Materialise every parameter, so the next forward does not re-evaluate the
@@ -290,8 +511,11 @@ impl AdaptedModel {
 
 /// Whether a projection at `path` should carry an adapter.
 ///
-/// Matches on the final path segment, which is the projection's name as a
-/// checkpoint and `target_modules` both spell it (`q_proj`, `gate_proj`).
+/// A target matches a module whose name it equals or ends, at a `.`
+/// boundary: PEFT's rule, so a projection's name (`q_proj`, `gate_proj`) and a
+/// full module name (`model.layers.0.mlp.down_proj`, how PEFT lists the
+/// modules `all-linear` found) both work.
+///
 /// No targets means every projection but `output`, the model's output layer
 /// (see [`DynamicModel::output_projection_path`]). MoE routers and routed
 /// experts never do; see [`moe_role`].
@@ -302,8 +526,14 @@ fn is_targeted(path: &str, targets: &[String], output: Option<&str>) -> bool {
     if targets.is_empty() {
         return output != Some(path);
     }
-    let name = path.rsplit('.').next().unwrap_or(path);
-    targets.iter().any(|t| t == name)
+    let module = canonical_module(&hf_module_name(path));
+    targets.iter().any(|target| {
+        let target = canonical_module(target);
+        module == target
+            || module
+                .strip_suffix(target.as_str())
+                .is_some_and(|rest| rest.ends_with('.'))
+    })
 }
 
 /// What a projection does in a mixture-of-experts block that puts it out of
@@ -318,17 +548,52 @@ fn is_targeted(path: &str, targets: &[String], output: Option<&str>) -> bool {
 /// field named `layer`, so its path ends `router.layer`, and Gemma 4's (and
 /// DiffusionGemma's) in one named `proj`, so its path ends `router.proj`.
 pub(crate) fn moe_role(path: &str) -> Option<&'static str> {
-    let name = path.rsplit('.').next().unwrap_or(path);
-    if matches!(name, "gate" | "router" | "shared_expert_gate")
-        || path.ends_with(".router.layer")
-        || path.ends_with(".router.proj")
-    {
+    if pmetal_models::moe_routing::is_router_path(path) {
         return Some("a router picks experts by argmax");
     }
     if path.contains(".experts.") {
         return Some("routed experts are read by the stacked expert kernels");
     }
     None
+}
+
+/// A module name with the spellings that differ between a text model and the
+/// multimodal wrapper around it removed: `model.language_model.layers.0.x` and
+/// `model.layers.0.x` and `layers.0.x` are the same module.
+fn canonical_module(name: &str) -> String {
+    let name = name.replace("model.language_model.", "model.");
+    name.strip_prefix(TRUNK_PREFIX).unwrap_or(&name).to_string()
+}
+
+/// The in-memory key (see [`AdaptedModel::lora_parameters`]) an adapter file's
+/// tensor `name` is for, in PEFT's layout or the earlier one, or `None` if
+/// this model has no such slot.
+fn native_key(
+    name: &str,
+    modules: &HashMap<String, String>,
+    ours: &HashMap<Rc<str>, Array>,
+) -> Option<String> {
+    if let Some(rest) = name.strip_prefix(PEFT_PREFIX) {
+        const PARTS: [(&str, &str); 6] = [
+            (".lora_A.weight", ".lora_a"),
+            (".lora_B.weight", ".lora_b"),
+            (".lora_expert_A", ".lora_a"),
+            (".lora_expert_B", ".lora_b"),
+            (".lora_magnitude_vector.weight", ".lora_magnitude"),
+            (".lora_magnitude_vector", ".lora_magnitude"),
+        ];
+        let (module, native) = PARTS
+            .iter()
+            .find_map(|(suffix, native)| rest.strip_suffix(suffix).map(|m| (m, *native)))?;
+        let key = format!("{}{native}", modules.get(&canonical_module(module))?);
+        return ours.contains_key(key.as_str()).then_some(key);
+    }
+    if !is_adapter_key(name) {
+        return None;
+    }
+    [name.to_string(), adapter_key(name)]
+        .into_iter()
+        .find(|key| ours.contains_key(key.as_str()))
 }
 
 fn is_adapter_key(path: &str) -> bool {
@@ -370,6 +635,10 @@ impl crate::TrainableModel for AdaptedModel {
 
     fn load_lora_weights(&mut self, path: impl AsRef<Path>) -> Result<(), LoraError> {
         AdaptedModel::load_lora_weights(self, path)
+    }
+
+    fn adapter_target_modules(&self) -> Vec<String> {
+        AdaptedModel::adapter_target_modules(self)
     }
 
     fn forward_with_cache(

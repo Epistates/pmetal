@@ -713,8 +713,8 @@ mod tests {
         );
     }
 
-    /// The adapter file holds the keys the dedicated adapter mechanism this
-    /// replaced wrote, `{encoder|decoder}.layers.{i}.self_attn.{proj}.lora_{a,b}`,
+    /// The adapter file holds PEFT's keys,
+    /// `base_model.model.{encoder|decoder}.layers.{i}.self_attn.{proj}.lora_{A,B}.weight`,
     /// and loads the way `pmetal infer --lora` loads one: attach to a fresh
     /// copy of the base, read the file, merge.
     #[test]
@@ -737,12 +737,15 @@ mod tests {
                 matches!(
                     parts.as_slice(),
                     [
+                        "base_model",
+                        "model",
                         "encoder" | "decoder",
                         "layers",
                         _,
                         "self_attn",
                         "q_proj" | "k_proj" | "v_proj" | "o_proj",
-                        "lora_a" | "lora_b"
+                        "lora_A" | "lora_B",
+                        "weight"
                     ]
                 ),
                 "unexpected adapter key {key}"
@@ -757,7 +760,7 @@ mod tests {
             "training did not change the forward"
         );
         fresh.load_lora_weights(&path).unwrap();
-        fresh.merge();
+        fresh.merge().unwrap();
         let restored = logits_vec(&mut fresh, &context, &x_t);
         let diff = max_diff(&trained, &restored);
         assert!(

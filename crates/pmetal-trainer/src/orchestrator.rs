@@ -919,16 +919,20 @@ pub async fn run_training(
 
         println!("\nNext steps:");
         println!(
-            "  Inference:  pmetal infer -m {} --lora {}/lora_weights.safetensors -p \"Your prompt\"",
-            full_config.model.model_id, output_dir
+            "  Inference:  pmetal infer -m {} --lora {}/{} -p \"Your prompt\"",
+            full_config.model.model_id,
+            output_dir,
+            pmetal_lora::peft::ADAPTER_WEIGHTS
         );
         println!(
-            "  Quantize:   pmetal quantize -m {} --lora {}/lora_weights.safetensors -o model.gguf",
-            full_config.model.model_id, output_dir
+            "  Quantize:   pmetal quantize -m {} --lora {}/{} -o model.gguf",
+            full_config.model.model_id,
+            output_dir,
+            pmetal_lora::peft::ADAPTER_WEIGHTS
         );
     }
 
-    let lora_weights_path = PathBuf::from(&output_dir).join("lora_weights.safetensors");
+    let lora_weights_path = PathBuf::from(&output_dir).join(pmetal_lora::peft::ADAPTER_WEIGHTS);
 
     emit_phase(phase_cb, TrainingPhase::Complete);
 
@@ -1121,15 +1125,10 @@ fn run_lora_path(
             Some(checkpoint_manager),
         )?;
 
-        let final_path = PathBuf::from(output_dir).join("lora_weights.safetensors");
-        model.save_lora_weights(&final_path)?;
-        tracing::info!("Saved LoRA weights to {:?}", final_path);
-        save_adapter_config(
-            &final_path,
-            config.lora.r,
-            config.lora.alpha,
-            &config.lora.target_modules,
-            config.lora.use_rslora,
+        save_adapter(
+            &model,
+            Path::new(output_dir),
+            &config.lora,
             Some(&full_config.model.model_id),
         )?;
     } else if (config.dispatch.fused || config.dispatch.jit_compilation)
@@ -1142,15 +1141,10 @@ fn run_lora_path(
             Some(checkpoint_manager),
         )?;
 
-        let final_path = PathBuf::from(output_dir).join("lora_weights.safetensors");
-        model.save_lora_weights(&final_path)?;
-        tracing::info!("Saved LoRA weights to {:?}", final_path);
-        save_adapter_config(
-            &final_path,
-            config.lora.r,
-            config.lora.alpha,
-            &config.lora.target_modules,
-            config.lora.use_rslora,
+        save_adapter(
+            &model,
+            Path::new(output_dir),
+            &config.lora,
             Some(&full_config.model.model_id),
         )?;
     } else if config.dispatch.metal_fused_optimizer {
@@ -1162,15 +1156,10 @@ fn run_lora_path(
             Some(checkpoint_manager),
         )?;
 
-        let final_path = PathBuf::from(output_dir).join("lora_weights.safetensors");
-        model.save_lora_weights(&final_path)?;
-        tracing::info!("Saved LoRA weights to {:?}", final_path);
-        save_adapter_config(
-            &final_path,
-            config.lora.r,
-            config.lora.alpha,
-            &config.lora.target_modules,
-            config.lora.use_rslora,
+        save_adapter(
+            &model,
+            Path::new(output_dir),
+            &config.lora,
             Some(&full_config.model.model_id),
         )?;
     } else {
@@ -1188,15 +1177,10 @@ fn run_lora_path(
             Some(checkpoint_manager),
         )?;
 
-        let final_path = PathBuf::from(output_dir).join("lora_weights.safetensors");
-        model.save_lora_weights(&final_path)?;
-        tracing::info!("Saved LoRA weights to {:?}", final_path);
-        save_adapter_config(
-            &final_path,
-            config.lora.r,
-            config.lora.alpha,
-            &config.lora.target_modules,
-            config.lora.use_rslora,
+        save_adapter(
+            &model,
+            Path::new(output_dir),
+            &config.lora,
             Some(&full_config.model.model_id),
         )?;
     }
@@ -1668,32 +1652,28 @@ pub async fn resolve_dataset_path(dataset_id: &str) -> anyhow::Result<PathBuf> {
 // Helper: save adapter config
 // ---------------------------------------------------------------------------
 
-/// Write `adapter_config.json` beside the LoRA weights at `lora_weights_path`,
-/// naming the base model it was trained on when known.
-pub fn save_adapter_config(
-    lora_weights_path: &Path,
-    r: usize,
-    alpha: f32,
-    target_modules: &[String],
-    use_rslora: bool,
+/// Write a trained adapter into `dir` as PEFT reads it: `adapter_model.safetensors`
+/// and an `adapter_config.json` that names the base model it was trained on when
+/// known and lists the modules that actually carry an adapter (an empty
+/// `target_modules` in a training config means every linear layer, which a
+/// PEFT config can only say by listing them). Returns the weights file.
+pub fn save_adapter<M: pmetal_lora::TrainableModel>(
+    model: &M,
+    dir: &Path,
+    lora: &LoraConfig,
     base_model: Option<&str>,
-) -> anyhow::Result<()> {
-    let mut adapter_config = serde_json::json!({
-        "r": r,
-        "alpha": alpha,
-        "target_modules": target_modules,
-        "use_rslora": use_rslora,
-    });
-    if let Some(bm) = base_model {
-        adapter_config["base_model"] = serde_json::Value::String(bm.to_string());
-    }
-    let config_path = lora_weights_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join("adapter_config.json");
-    std::fs::write(&config_path, serde_json::to_string_pretty(&adapter_config)?)?;
-    tracing::info!("Saved adapter config to {:?}", config_path);
-    Ok(())
+) -> anyhow::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let weights = dir.join(pmetal_lora::peft::ADAPTER_WEIGHTS);
+    model.save_lora_weights(&weights)?;
+    pmetal_lora::peft::write_adapter_config(
+        dir,
+        lora,
+        &model.adapter_target_modules(),
+        base_model,
+    )?;
+    tracing::info!("Saved adapter to {:?}", dir);
+    Ok(weights)
 }
 
 // ---------------------------------------------------------------------------
@@ -1810,23 +1790,33 @@ mod tests {
     #[test]
     fn the_adapter_config_names_its_base_model() {
         let dir = tempfile::tempdir().unwrap();
-        let weights = dir.path().join("lora_weights.safetensors");
+        let lora = LoraConfig {
+            r: 8,
+            alpha: 16.0,
+            use_rslora: true,
+            ..LoraConfig::default()
+        };
         let targets = vec!["q_proj".to_string(), "v_proj".to_string()];
-        save_adapter_config(&weights, 8, 16.0, &targets, true, Some("Qwen/Qwen3-0.6B")).unwrap();
+        pmetal_lora::peft::write_adapter_config(
+            dir.path(),
+            &lora,
+            &targets,
+            Some("Qwen/Qwen3-0.6B"),
+        )
+        .unwrap();
         let written: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.path().join("adapter_config.json")).unwrap(),
         )
         .unwrap();
+        assert_eq!(written["peft_type"], "LORA");
+        assert_eq!(written["r"], 8);
+        assert_eq!(written["lora_alpha"], 16.0);
+        assert_eq!(written["use_rslora"], true);
         assert_eq!(
-            written,
-            serde_json::json!({
-                "r": 8,
-                "alpha": 16.0,
-                "target_modules": ["q_proj", "v_proj"],
-                "use_rslora": true,
-                "base_model": "Qwen/Qwen3-0.6B",
-            })
+            written["target_modules"],
+            serde_json::json!(["q_proj", "v_proj"])
         );
+        assert_eq!(written["base_model_name_or_path"], "Qwen/Qwen3-0.6B");
     }
 
     #[test]

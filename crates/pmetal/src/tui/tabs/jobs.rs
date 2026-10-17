@@ -417,7 +417,10 @@ fn read_training_meta(path: &std::path::Path) -> (Option<String>, Option<String>
     let config_path = path.join("adapter_config.json");
     if let Ok(content) = std::fs::read_to_string(&config_path) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-            let model = json["base_model"].as_str().map(String::from);
+            let model = json["base_model_name_or_path"]
+                .as_str()
+                .or_else(|| json["base_model"].as_str())
+                .map(String::from);
             let method = json["method"].as_str().map(String::from);
             return (model, method, None);
         }
