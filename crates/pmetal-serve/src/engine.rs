@@ -1112,6 +1112,18 @@ impl InferenceEngine {
         &self.model_id
     }
 
+    /// `Ok` when `requested` names the model this server serves; the 404 of
+    /// the OpenAI and Anthropic APIs otherwise. A request for another model
+    /// answered by this one would hand back text the client believes came
+    /// from the model it asked for.
+    pub fn check_model(&self, requested: &str) -> ServeResult<()> {
+        if requested == self.model_id {
+            Ok(())
+        } else {
+            Err(ServeError::ModelNotFound(requested.to_string()))
+        }
+    }
+
     /// Creation timestamp.
     pub fn created_at(&self) -> i64 {
         self.created_at

@@ -14,7 +14,7 @@ This crate provides a drop-in local inference backend compatible with the OpenAI
 | `/v1/completions` | POST | Raw text completions |
 | `/v1/embeddings` | POST | Pooled sentence embeddings |
 | `/v1/messages` | POST | Anthropic-compatible messages, with image blocks |
-| `/v1/models` | GET | List loaded models |
+| `/v1/models`, `/v1/models/{id}` | GET | List loaded models; fetch one |
 | `/v1/metrics` | GET | Rolling serving metrics (tok/s, latencies, request counts) |
 | `/health` | GET | Liveness check |
 
@@ -69,7 +69,10 @@ async fn serve(model_dir: &str) -> anyhow::Result<()> {
         port: 8080,
         host: "127.0.0.1".to_string(),
         max_concurrent: 16,
-        continuous_batching: None,
+        // Required as `Authorization: Bearer <key>` or `x-api-key: <key>`
+        // when not empty.
+        api_keys: vec![],
+        ..ServeConfig::default()
     };
 
     run_server(engine, config).await
@@ -83,6 +86,13 @@ async fn serve(model_dir: &str) -> anyhow::Result<()> {
 | `port` | Port to listen on | 8080 |
 | `host` | Host to bind to | `127.0.0.1` |
 | `max_concurrent` | Maximum concurrent requests | 16 |
+| `api_keys` | Keys accepted as `Authorization: Bearer` or `x-api-key`; empty leaves the server open (`/health` is always open) | none |
+| `cors_allowed_origins` | Browser origins allowed to call the server, or `*`; empty sends no CORS headers | none |
+| `max_body_bytes` | Largest request body | 64 MiB |
+
+Errors are the APIs' own: OpenAI's `{"error": {"message", "type", "param", "code"}}` on every
+route but `/v1/messages`, whose errors are Anthropic's `{"type": "error", "error": {"type",
+"message"}}`. A request naming a model the server does not serve is a 404 `model_not_found`.
 
 ## Modules
 

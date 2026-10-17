@@ -12,6 +12,7 @@
 //! out of scope.
 
 use crate::error::ServeError;
+use crate::extract::ApiJson;
 use crate::routes::{AppState, resolve_stop_sequences, split_reply};
 use crate::types::try_parse_tool_calls;
 use axum::extract::State;
@@ -336,8 +337,9 @@ struct MessageDeltaPayload {
 /// `POST /v1/messages` — Anthropic-compatible message generation.
 pub async fn messages(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<MessagesRequest>,
+    ApiJson(req): ApiJson<MessagesRequest>,
 ) -> Result<axum::response::Response, ServeError> {
+    state.engine.check_model(&req.model)?;
     let permit = state.try_acquire_request_permit()?;
 
     // Assemble the internal chat-message list: optional system prompt first,

@@ -2,6 +2,7 @@
 
 use crate::engine::{InferenceEngine, PreparedPrompt, RequestMetrics, SamplingParams, TokenEvent};
 use crate::error::ServeError;
+use crate::extract::ApiJson;
 use crate::sse::{ChannelDecoder, ChannelDelta, IncrementalDecoder};
 use crate::types::*;
 use axum::extract::State;
@@ -183,19 +184,30 @@ pub async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
 }
 
-/// GET /v1/models
-pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelListResponse> {
-    let model = ModelInfo {
+fn served_model(state: &AppState) -> ModelInfo {
+    ModelInfo {
         id: state.engine.model_id().to_string(),
         object: "model".to_string(),
         created: state.engine.created_at(),
         owned_by: "pmetal".to_string(),
-    };
+    }
+}
 
+/// GET /v1/models
+pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelListResponse> {
     Json(ModelListResponse {
         object: "list".to_string(),
-        data: vec![model],
+        data: vec![served_model(&state)],
     })
+}
+
+/// GET /v1/models/{id}
+pub async fn get_model(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<ModelInfo>, ServeError> {
+    state.engine.check_model(&id)?;
+    Ok(Json(served_model(&state)))
 }
 
 /// GET /v1/metrics
@@ -216,8 +228,9 @@ pub async fn serving_metrics(State(state): State<Arc<AppState>>) -> impl IntoRes
 /// Wire format follows the OpenAI streaming protocol.
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<ChatCompletionRequest>,
+    ApiJson(req): ApiJson<ChatCompletionRequest>,
 ) -> Result<impl IntoResponse, ServeError> {
+    state.engine.check_model(&req.model)?;
     let permit = state.try_acquire_request_permit()?;
 
     if req
@@ -441,8 +454,9 @@ fn parse_logit_bias(
 /// POST /v1/completions
 pub async fn completions(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<CompletionRequest>,
+    ApiJson(req): ApiJson<CompletionRequest>,
 ) -> Result<impl IntoResponse, ServeError> {
+    state.engine.check_model(&req.model)?;
     let permit = state.try_acquire_request_permit()?;
 
     let prompt = PreparedPrompt::from_tokens(state.engine.tokenize(&req.prompt)?);
@@ -1034,8 +1048,9 @@ fn build_completion_logprobs(
 /// `DynamicModel::forward_hidden` for the supported set).
 pub async fn embeddings(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<EmbeddingsRequest>,
+    ApiJson(req): ApiJson<EmbeddingsRequest>,
 ) -> Result<Json<EmbeddingsResponse>, ServeError> {
+    state.engine.check_model(&req.model)?;
     let _permit = state.try_acquire_request_permit()?;
 
     let mode = parse_pooling_mode(req.pooling.as_deref())

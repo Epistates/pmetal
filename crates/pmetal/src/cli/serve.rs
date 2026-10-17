@@ -17,6 +17,18 @@ pub struct ServeArgs {
     #[arg(long = "host", default_value = "127.0.0.1")]
     pub host: String,
 
+    /// API key clients must send (`Authorization: Bearer <key>` or
+    /// `x-api-key: <key>`); repeat for several. The PMETAL_API_KEY environment
+    /// variable (comma-separated) sets the same, without the key appearing in
+    /// the process list. With none, the server is open: bind it to loopback.
+    #[arg(long = "api-key")]
+    pub api_key: Vec<String>,
+
+    /// Browser origin whose pages may call the server (CORS), or `*` for
+    /// any; repeat for several. Without one, no CORS headers are sent.
+    #[arg(long = "cors-origin")]
+    pub cors_origin: Vec<String>,
+
     /// Context length the server holds per sequence (prompt plus output).
     /// Default: the model's context window (max_position_embeddings, or the
     /// YaRN-stretched length), capped by what the device's memory holds for

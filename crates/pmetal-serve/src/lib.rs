@@ -24,6 +24,7 @@ pub mod continuous_pump;
 pub mod decision;
 pub mod engine;
 pub mod error;
+pub mod extract;
 pub mod media;
 pub mod routes;
 pub mod server;
