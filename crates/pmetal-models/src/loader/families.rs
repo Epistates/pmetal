@@ -7,7 +7,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use super::{
-    LoadError, dequantize_sidecar_weights, load_weights_filtered_raw, unpack_mlx_quantized_weights,
+    LoadError, dequantize_sidecar_weights, load_weights_filtered_raw, take_packed_linears,
+    unpack_mlx_quantized_weights,
 };
 use crate::architectures::gemma::GemmaForCausalLM;
 use crate::architectures::phi::PhiConfig;
@@ -76,6 +77,15 @@ pub fn load_qwen3_next_weights_with_options(
     let keep = |key: &str| should_keep_qwen3_next_raw_weight(key, options);
     let mut weights = load_weights_filtered_raw(model_dir, keep)?;
     unpack_mlx_quantized_weights(model_dir, &mut weights)?;
+    // The dense projections of a ModelOpt checkpoint stay packed as well,
+    // unless the caller asked for everything unpacked: a 27B NVFP4 release is
+    // 15 GB on its kernels and 54 GB as dense bf16. They come out first, with
+    // the experts' tensors left where they are for `take_packed_experts`.
+    let mut packed_linears = if options.skip_routed_experts || options.unpack_quantized_experts {
+        super::PackedLinears::default()
+    } else {
+        take_packed_linears(&mut weights)?
+    };
     let packed = if options.skip_routed_experts || options.unpack_quantized_experts {
         HashMap::new()
     } else {
@@ -83,6 +93,15 @@ pub fn load_qwen3_next_weights_with_options(
     };
     dequantize_sidecar_weights(&mut weights)?;
     weights.retain(|key, _| keep(key));
+    // `sanitize_weights` renames the checkpoint's keys (the vision-language
+    // wrapper's prefix); the packed modules are named the same way.
+    packed_linears.rename(|module| {
+        let key = pmetal_runtime::qwen3_native::family::canonical_checkpoint_key(&format!(
+            "{module}.weight"
+        ));
+        key.strip_suffix(".weight").unwrap_or(&key).to_string()
+    });
+    let packed_modules: Vec<String> = packed_linears.modules().map(str::to_owned).collect();
     sanitize_weights(
         &mut weights,
         config,
@@ -139,9 +158,25 @@ pub fn load_qwen3_next_weights_with_options(
         )));
     }
 
+    drop(params);
+    if !packed_linears.is_empty() {
+        let count = packed_linears.install(model)?;
+        tracing::info!("{count} projections stay packed (ModelOpt)");
+    }
+    // A packed projection's `weight` is replaced by its words, not loaded
+    // from the map.
+    let is_packed_weight = |key: &str| {
+        key.strip_suffix(".weight").is_some_and(|path| {
+            packed_modules
+                .iter()
+                .any(|m| path == m || path.ends_with(&format!(".{m}")))
+        })
+    };
+
     let missing: Vec<String> = expected_keys
         .difference(&loaded_param_keys)
         .filter(|key| !is_qwen3_next_allowed_missing_param(key, options))
+        .filter(|key| !is_packed_weight(key))
         .filter(|key| !packed_prefixes.iter().any(|p| key.starts_with(p.as_str())))
         .take(20)
         .cloned()
