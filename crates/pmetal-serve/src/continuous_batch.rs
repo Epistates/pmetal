@@ -79,9 +79,11 @@
 //! gated-delta-net, NemotronH and Granite 4.0-H Mamba2) take the per-slot
 //! path, each slot with its own recurrent state beside its KV cache
 //! ([`crate::continuous_driver::ContinuousEngineState::with_recurrent_state`]),
-//! reset when the slot is freed. They keep no prefix cache, since a KV
-//! snapshot can't restore recurrent state. The fused `[N, 1]` decode
-//! carries no recurrent state and refuses them.
+//! reset when the slot is freed. Their prefix cache entries hold the
+//! recurrent state of the end of the prompt beside the KV snapshot, and serve
+//! a request that repeats the whole of an earlier prompt (state cannot be cut
+//! back to a shorter prefix). The fused `[N, 1]` decode carries no recurrent
+//! state and refuses them.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};

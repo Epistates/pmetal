@@ -338,6 +338,27 @@ impl ContinuousEngineState {
         Some((cache, recurrent))
     }
 
+    /// The slot's recurrent state, for a hybrid model.
+    pub fn recurrent_for(&self, slot: SlotId) -> Option<&MambaCache> {
+        let idx = self.map.get(slot)?;
+        self.recurrent.as_ref()?.get(idx)
+    }
+
+    /// Replace a slot's recurrent state with the state a prefix left.
+    pub fn replace_recurrent(&mut self, slot: SlotId, state: MambaCache) -> Result<(), Exception> {
+        let idx = self.map.get(slot).ok_or_else(|| {
+            Exception::custom(format!(
+                "replace recurrent state: slot {slot:?} not admitted"
+            ))
+        })?;
+        let rows = self
+            .recurrent
+            .as_mut()
+            .ok_or_else(|| Exception::custom("replace recurrent state: the model carries none"))?;
+        rows[idx] = state;
+        Ok(())
+    }
+
     /// Replace a slot's KV cache with a forked prefix cache.
     pub fn replace_cache(&mut self, slot: SlotId, cache: KVCache) -> Result<(), Exception> {
         let idx = self.map.get(slot).ok_or_else(|| {

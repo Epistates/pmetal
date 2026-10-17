@@ -1,4 +1,4 @@
-//! D.3 — request pump for continuous batching.
+//! The request pump for continuous batching.
 //!
 //! Glues [`ContinuousBatcher`](crate::continuous_batch) (pure-Rust
 //! scheduler) and [`ContinuousEngineState`](crate::continuous_driver)
@@ -13,7 +13,7 @@
 //!     │                                         │  Receiver<TokenEvent>
 //!     └──────◀──── per-slot events ◀────────────┘
 //!
-//!   driver thread:
+//!   model thread, between jobs:
 //!     loop {
 //!         match pump.tick(&mut forward)? {
 //!             Tick::Ran  => continue,   // we did useful work
@@ -22,13 +22,14 @@
 //!     }
 //! ```
 //!
-//! A dedicated driver thread calls [`ContinuousPump::tick`] in a loop.
-//! Each tick pulls the next instruction from the batcher, runs one
-//! prefill chunk or one batched decode step, advances slot state, and
-//! drains any retired slots — delivering `Done`/`Error` events to the
-//! request's channel.
+//! The model thread calls [`ContinuousPump::tick`] in a loop. Each tick drops
+//! the requests whose clients have hung up, then runs one iteration of the
+//! scheduler: a decode step for every decoding request (one fused forward, or
+//! one per request; see [`crate::continuous_driver`]) and one chunk of the
+//! prompt that is prefilling, advances slot state, and drains any retired
+//! slots, delivering `Done`/`Error` events to the request's channel.
 //!
-//! # Per-slot features (Phase 1)
+//! # Per-slot features
 //!
 //! The pump tracks per-slot history and per-slot text state so each
 //! request gets the same generation semantics as the single-slot
@@ -104,6 +105,9 @@ struct SlotRecord {
     first_token_ms: Option<f64>,
     /// Forked prefix cache to install into the slot at admit time.
     prefix_seed: Option<KVCache>,
+    /// For a hybrid model, the recurrent state the prefix left, installed
+    /// beside it.
+    state_seed: Option<MambaCache>,
     /// Number of prompt tokens restored from `prefix_seed`.
     prefix_hit_len: usize,
 }
@@ -171,12 +175,12 @@ impl ContinuousPump {
 
     /// Give each slot its own recurrent (Mamba / gated-delta-net) state,
     /// for a hybrid model; `template` is the model's empty
-    /// `create_mamba_cache()`. Such a pump keeps no prefix cache, since a KV
-    /// snapshot can't restore the recurrent layers' state.
+    /// `create_mamba_cache()`. Its prefix cache entries hold the recurrent
+    /// state beside the KV snapshot and serve a request that repeats a whole
+    /// earlier prompt (see [`PrefixCache::insert_with_state`]).
     pub fn with_recurrent_state(self, template: &MambaCache) -> Self {
         Self {
             state: self.state.with_recurrent_state(template),
-            prefix_cache: None,
             ..self
         }
     }
@@ -256,14 +260,20 @@ impl ContinuousPump {
 
         let mut scheduler_prompt = prompt.clone();
         let mut prefix_seed = None;
+        let mut state_seed = None;
         let mut prefix_hit_len = 0usize;
+        let hybrid = self.state.has_recurrent_state();
         if let Some(prefix_cache) = self.prefix_cache.as_ref() {
             match prefix_cache.lock() {
                 Ok(mut guard) => match guard.find_longest_prefix(&prompt, &self.cache_config) {
+                    // An entry of the other kind (with recurrent state for a
+                    // model without, or the reverse) is not this model's.
+                    Ok(Some(hit)) if hit.restored_state.is_some() != hybrid => {}
                     Ok(Some(hit)) => {
                         prefix_hit_len = hit.prefix_len;
                         scheduler_prompt = prompt[prefix_hit_len..].to_vec();
                         prefix_seed = Some(hit.restored_cache);
+                        state_seed = hit.restored_state;
                         tracing::debug!(
                             target: "pmetal_serve::continuous_pump",
                             restored = prefix_hit_len,
@@ -311,6 +321,7 @@ impl ContinuousPump {
                 stripped_tokens: 0,
                 first_token_ms: None,
                 prefix_seed,
+                state_seed,
                 prefix_hit_len,
             },
         );
@@ -546,6 +557,13 @@ impl ContinuousPump {
         if let Some(cache) = prefix_seed {
             self.state.replace_cache(slot, cache)?;
         }
+        let state_seed = self
+            .records
+            .get_mut(&slot)
+            .and_then(|r| r.state_seed.take());
+        if let Some(state) = state_seed {
+            self.state.replace_recurrent(slot, state)?;
+        }
         Ok(())
     }
 
@@ -560,12 +578,14 @@ impl ContinuousPump {
         else {
             return;
         };
+        // For a hybrid model, the recurrent state as the prompt left it.
+        let state = self.state.recurrent_for(slot).cloned();
         let Some(cache) = self.state.cache_for(slot) else {
             return;
         };
         match prefix_cache.lock() {
             Ok(mut guard) => {
-                guard.insert(&tokens, cache);
+                guard.insert_with_state(&tokens, cache, state.as_ref());
                 if prefix_hit_len > 0 {
                     tracing::debug!(
                         target: "pmetal_serve::continuous_pump",
@@ -1047,6 +1067,77 @@ mod tests {
             .filter(|ev| matches!(ev, TokenEvent::Token { .. }))
             .count();
         assert_eq!(tokens, 3);
+        pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
+    }
+
+    /// A hybrid model's prefix entries carry the recurrent state of the end
+    /// of the prompt: a request that repeats the whole of an earlier prompt
+    /// restores it, runs only the rest, and starts its recurrent layers from
+    /// that state; one that diverges inside it runs everything from scratch.
+    #[tokio::test]
+    async fn a_hybrid_request_repeating_a_prompt_restores_its_recurrent_state() {
+        /// Marks the state after every forward with the number of tokens it
+        /// has run, and records what each forward saw.
+        struct Counting {
+            seen: Vec<(Vec<u32>, usize)>,
+        }
+        impl SlotForward for Counting {
+            fn forward(
+                &mut self,
+                tokens: &[u32],
+                cache: &mut KVCache,
+                recurrent: Option<&mut MambaCache>,
+            ) -> Result<Array, Exception> {
+                let recurrent = recurrent.expect("a hybrid slot has recurrent state");
+                let entry = recurrent.get_mut(0).unwrap();
+                let before = entry
+                    .ssm_state
+                    .as_ref()
+                    .map_or(0, |s| s.item_f32() as usize);
+                self.seen.push((tokens.to_vec(), before));
+                entry.ssm_state = Some(Array::from_f32((before + tokens.len()) as f32));
+                let (h, d) = {
+                    let c = cache.config();
+                    (c.num_kv_heads as i32, c.head_dim as i32)
+                };
+                let s = tokens.len() as i32;
+                let kv = Array::zeros_f32(&[1, h, s, d]);
+                cache.update_and_fetch(0, &kv, &kv)?;
+                cache.update_and_fetch(1, &kv, &kv)?;
+                Ok(Array::zeros_f32(&[1, s, 8]))
+            }
+        }
+
+        let prefix_cache = Arc::new(Mutex::new(PrefixCache::new(8, 0)));
+        let mut pump = ContinuousPump::new_with_prefix_cache(
+            BatcherConfig::default(),
+            cache_cfg(),
+            None,
+            Some(Arc::clone(&prefix_cache)),
+        )
+        .with_recurrent_state(&MambaCache::new(1));
+        let mut stub = Counting { seen: Vec::new() };
+        let mut run = |pump: &mut ContinuousPump, prompt: Vec<u32>| {
+            let (_slot, mut rx) = pump
+                .enqueue(prompt, params(1, vec![]), GenerationConfig::default(), 8)
+                .unwrap();
+            stub.seen.clear();
+            while pump.tick(&mut stub).unwrap() == Tick::Ran {}
+            if let Some(TokenEvent::Error(e)) = drain(&mut rx).first() {
+                panic!("the request failed: {e}");
+            }
+            stub.seen.clone()
+        };
+
+        assert_eq!(run(&mut pump, vec![1, 2, 3]), vec![(vec![1, 2, 3], 0)]);
+        // The whole of the first prompt again, and more: only the more runs,
+        // from the 3 tokens of state the first left.
+        assert_eq!(run(&mut pump, vec![1, 2, 3, 4, 5]), vec![(vec![4, 5], 3)]);
+        // A prompt that leaves the first one half way runs from scratch.
+        assert_eq!(
+            run(&mut pump, vec![1, 2, 9, 9]),
+            vec![(vec![1, 2, 9, 9], 0)]
+        );
         pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
     }
 

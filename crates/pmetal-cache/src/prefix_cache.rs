@@ -38,7 +38,13 @@
 //!   quantized as it was, so the logits equal a cold run's within the
 //!   cache's quantization error, not bit for bit.
 //! - Models with recurrent state (Mamba, GDN) hold state that is not
-//!   per-token and cannot be cut: do not cache them here.
+//!   per-token and cannot be cut back. Their entries
+//!   ([`insert_with_state`](PrefixCache::insert_with_state)) carry the
+//!   recurrent state as it was at the end of the prompt, and serve only a
+//!   request that begins with the whole of it (a chat's next turn, which
+//!   repeats the conversation so far); the state is restored beside the KV
+//!   cache and the rest of the request runs from there. A request that
+//!   diverges inside a stateful entry cannot use it.
 //!
 //! # Eviction
 //!
@@ -49,12 +55,14 @@
 
 use pmetal_runtime::compat::Exception;
 
-use crate::kv_cache::{KVCache, KVCacheConfig};
+use crate::kv_cache::{KVCache, KVCacheConfig, MambaCache};
 
 /// One cached prefix.
 struct Entry {
     tokens: Vec<u32>,
     cache: KVCache,
+    /// The recurrent state at the end of `tokens`, for a hybrid model.
+    state: Option<MambaCache>,
     /// Monotonic counter; higher is more recently touched.
     last_used: u64,
     /// Memory held, measured once at insert.
@@ -69,6 +77,9 @@ pub struct PrefixHit {
     /// The restored cache, ready for the rest of the request. Its
     /// `total_tokens` equals `prefix_len`.
     pub restored_cache: KVCache,
+    /// For a hybrid model, the recurrent state at `prefix_len`, ready for the
+    /// rest of the request.
+    pub restored_state: Option<MambaCache>,
 }
 
 /// Bounded prefix cache; see the module docs.
@@ -138,8 +149,18 @@ impl PrefixCache {
             .iter()
             .enumerate()
             .filter_map(|(i, entry)| {
-                let usable =
-                    common_prefix(&entry.tokens, incoming).min(incoming.len().saturating_sub(1));
+                let shared = common_prefix(&entry.tokens, incoming);
+                let usable = if entry.state.is_some() {
+                    // State is not per-token: it serves a request that begins
+                    // with all of the entry and has a token left to run.
+                    if shared == entry.tokens.len() && incoming.len() > shared {
+                        shared
+                    } else {
+                        0
+                    }
+                } else {
+                    shared.min(incoming.len().saturating_sub(1))
+                };
                 (usable > 0).then_some((usable, i))
             })
             .collect();
@@ -165,6 +186,7 @@ impl PrefixCache {
             return Ok(Some(PrefixHit {
                 prefix_len: usable,
                 restored_cache: restored,
+                restored_state: self.entries[idx].state.clone(),
             }));
         }
         self.misses = self.misses.saturating_add(1);
@@ -179,13 +201,32 @@ impl PrefixCache {
     /// wrong RoPE offset and corrupt the next prefill, so it is skipped. An
     /// entry with the same tokens is replaced, which refreshes it.
     pub fn insert(&mut self, tokens: &[u32], cache: &KVCache) {
+        self.insert_with_state(tokens, cache, None);
+    }
+
+    /// [`insert`](Self::insert) for a hybrid model, with the recurrent state
+    /// the prompt left (at the same boundary as the cache). A hit restores
+    /// both; see the module docs for what such an entry can serve.
+    pub fn insert_with_state(
+        &mut self,
+        tokens: &[u32],
+        cache: &KVCache,
+        state: Option<&MambaCache>,
+    ) {
         if tokens.is_empty() || self.max_entries == 0 {
             return;
         }
-        if cache.total_tokens() != tokens.len() {
+        // A hybrid model's first layers may keep no KV, so the tokens its
+        // attention layers hold are the longest of any layer's.
+        let held = if state.is_some() {
+            cache.seq_len()
+        } else {
+            cache.total_tokens()
+        };
+        if held != tokens.len() {
             tracing::debug!(
                 target = "pmetal_cache::prefix_cache",
-                cache_tokens = cache.total_tokens(),
+                cache_tokens = held,
                 token_len = tokens.len(),
                 "skipping prefix save: the cache does not hold the tokens it was given"
             );
@@ -198,12 +239,14 @@ impl PrefixCache {
         }
 
         let cached = cache.fork();
-        let bytes = cached.memory_usage();
+        let state = state.cloned();
+        let bytes = cached.memory_usage() + state.as_ref().map_or(0, MambaCache::memory_usage);
         let last_used = self.tick();
         self.current_bytes = self.current_bytes.saturating_add(bytes);
         self.entries.push(Entry {
             tokens: tokens.to_vec(),
             cache: cached,
+            state,
             last_used,
             bytes,
         });
@@ -395,6 +438,61 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    fn state_with(layers: usize) -> MambaCache {
+        let mut state = MambaCache::new(layers);
+        for layer in 0..layers {
+            let entry = state.get_mut(layer).unwrap();
+            entry.conv_state = Some(Array::zeros_f32(&[1, 3, 8]));
+            entry.set_ssm_state(Array::zeros_f32(&[1, 2, 4, 4]));
+        }
+        state
+    }
+
+    /// A hybrid entry carries the recurrent state of the end of its prompt,
+    /// and serves only a request that begins with all of it.
+    #[test]
+    fn a_stateful_entry_serves_only_a_request_that_extends_all_of_it() {
+        let mut pc = PrefixCache::new(8, 0);
+        let state = state_with(3);
+        pc.insert_with_state(&[1, 2, 3, 4], &cache_with_len(4), Some(&state));
+
+        let hit = pc
+            .find_longest_prefix(&[1, 2, 3, 4, 5, 6], &config())
+            .unwrap()
+            .expect("the request extends the entry");
+        assert_eq!(hit.prefix_len, 4);
+        assert_eq!(hit.restored_cache.total_tokens(), 4);
+        let restored = hit.restored_state.expect("the state comes back");
+        assert!(!restored.is_empty());
+        assert!(
+            !restored.sequence_key().belongs_to(&state),
+            "the restored state is a sequence of its own"
+        );
+
+        // Diverging inside the entry, or equalling it, leaves nothing to
+        // reuse: the state is not per-token and cannot be cut back.
+        for incoming in [&[1u32, 2, 3, 9, 9][..], &[1, 2, 3, 4][..], &[1, 2][..]] {
+            assert!(
+                pc.find_longest_prefix(incoming, &config())
+                    .unwrap()
+                    .is_none(),
+                "{incoming:?} should find nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stateful_entry_counts_its_state_in_the_byte_budget() {
+        let mut pc = PrefixCache::new(8, 0);
+        pc.insert(&[1, 2, 3], &cache_with_len(3));
+        let plain = pc.bytes();
+        let state = state_with(3);
+        let mut with_state = PrefixCache::new(8, 0);
+        with_state.insert_with_state(&[1, 2, 3], &cache_with_len(3), Some(&state));
+        assert_eq!(with_state.bytes(), plain + state.memory_usage());
+        assert!(state.memory_usage() > 0);
     }
 
     #[test]

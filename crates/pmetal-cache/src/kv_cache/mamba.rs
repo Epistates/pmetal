@@ -158,6 +158,16 @@ impl MambaCache {
         self.sequence = Arc::new(());
     }
 
+    /// Bytes of state the cache holds now.
+    pub fn memory_usage(&self) -> usize {
+        self.layers
+            .iter()
+            .flat_map(|e| [&e.conv_state, &e.ssm_state])
+            .flatten()
+            .map(Array::nbytes)
+            .sum()
+    }
+
     /// Check if the cache is empty (no state stored).
     pub fn is_empty(&self) -> bool {
         self.layers
