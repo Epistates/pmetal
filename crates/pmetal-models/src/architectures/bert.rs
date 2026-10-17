@@ -30,7 +30,7 @@ use pmetal_runtime::nn::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 use serde::{Deserialize, Serialize};
 
 use crate::architectures::utils::{
-    Activation, activate, additive_padding_mask, resolve_activation,
+    Activation, additive_padding_mask, resolve_activation,
 };
 
 // ---------------------------------------------------------------------------
@@ -449,7 +449,7 @@ impl BertIntermediate {
     }
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        Ok(activate(self.act, &self.dense.forward(x)))
+        Ok((self.act)(&self.dense.forward(x)))
     }
 }
 

@@ -46,6 +46,7 @@ use serde::{Deserialize, Serialize};
 
 use std::collections::HashMap;
 
+use super::utils::gelu_tanh;
 use super::gemma4::{
     Gemma4Attention, Gemma4Config, Gemma4Mlp, Gemma4RmsNorm, Gemma4RopeConfig,
     Gemma4RopeLayerConfig, LoadReport, rms_norm_noscale,
@@ -365,7 +366,7 @@ impl DiffusionGemmaSelfConditioning {
         self_conditioning_signal: &Array,
     ) -> Result<Array, Exception> {
         let normed = self.pre_norm.forward(self_conditioning_signal);
-        let gate = nn::gelu_tanh_approximate(&self.gate_proj.forward(&normed));
+        let gate = gelu_tanh(&self.gate_proj.forward(&normed));
         let sc = self
             .down_proj
             .forward(&gate.multiply(&self.up_proj.forward(&normed)));

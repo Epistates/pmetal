@@ -22,7 +22,7 @@ use pmetal_runtime::nn::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 use serde::{Deserialize, Serialize};
 
 use crate::architectures::utils::{
-    Activation, activate, additive_padding_mask, resolve_activation,
+    Activation, additive_padding_mask, resolve_activation,
 };
 
 /// T5 encoder configuration, with the defaults of `transformers`' `T5Config`
@@ -263,9 +263,9 @@ impl T5FeedForward {
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let hidden = match (&mut self.wi, &mut self.wi_0, &mut self.wi_1) {
             (_, Some(wi_0), Some(wi_1)) => {
-                activate(self.act, &wi_0.forward(x)).multiply(&wi_1.forward(x))
+                (self.act)(&wi_0.forward(x)).multiply(&wi_1.forward(x))
             }
-            (Some(wi), _, _) => activate(self.act, &wi.forward(x)),
+            (Some(wi), _, _) => (self.act)(&wi.forward(x)),
             _ => {
                 return Err(Exception::custom(
                     "t5: feed-forward has no input projection",

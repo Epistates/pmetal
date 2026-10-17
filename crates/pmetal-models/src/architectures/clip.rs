@@ -13,7 +13,7 @@ use pmetal_runtime::impl_module_params;
 use pmetal_runtime::nn::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 use serde::{Deserialize, Serialize};
 
-use crate::architectures::utils::{Activation, activate, resolve_activation};
+use crate::architectures::utils::{Activation, resolve_activation};
 
 /// CLIP text encoder configuration, in the field names of the text half of a
 /// `transformers` CLIP `config.json` (`hidden_size`, `num_hidden_layers`,
@@ -203,7 +203,7 @@ impl CLIPMLP {
     }
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let x = activate(self.act, &self.fc1.forward(x));
+        let x = (self.act)(&self.fc1.forward(x));
         Ok(self.fc2.forward(&x))
     }
 }

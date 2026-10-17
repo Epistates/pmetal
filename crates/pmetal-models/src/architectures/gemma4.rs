@@ -466,13 +466,14 @@ pub(crate) fn rms_norm_noscale(x: &Array, eps: f32) -> Array {
 /// `gelu_tanh(gate) * up`, in `gate`'s dtype: Gemma 4's gated activation, with
 /// the tanh-approximation GELU rather than the exact erf one.
 ///
-/// The activation is evaluated in f32 and returns f32 for a bf16 gate, which a
-/// [`nn::Linear`] after it absorbs by casting its input back down. The routed
-/// experts do not go through one (they are a `matmul` or `gather_qmm` against
-/// the stacked weights), so without the cast their f32 would run the experts
-/// in f32 and carry f32 into the residual stream.
+/// The activation is rounded to the gate's dtype before the product, as the
+/// reference does (`act_fn(gate) * up` on bf16 tensors), so the whole gated
+/// activation, and the backward pass's copy of it, is half width under a half
+/// width model rather than f32. The routed experts matter most here: they are
+/// a `matmul` or `gather_qmm` against the stacked weights, with no `Linear`
+/// after the activation to absorb an f32 one.
 fn geglu(gate: &Array, up: &Array) -> Array {
-    nn::gelu_tanh_approximate(gate)
+    super::utils::gelu_tanh(gate)
         .multiply(up)
         .as_dtype(gate.dtype_raw())
 }

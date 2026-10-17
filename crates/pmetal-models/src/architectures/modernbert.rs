@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::architectures::utils::{
-    Activation, activate, additive_mask, padding_keep, resolve_activation,
+    Activation, additive_mask, padding_keep, resolve_activation,
 };
 
 /// The released models' rotary bases.
@@ -373,7 +373,7 @@ impl ModernBertMLP {
 
     pub fn forward(&mut self, x: &Array) -> Array {
         let halves = ops::split(&self.Wi.forward(x), 2, -1);
-        let gated = activate(self.act, &halves[0]).multiply(&halves[1]);
+        let gated = (self.act)(&halves[0]).multiply(&halves[1]);
         self.Wo.forward(&gated)
     }
 }
