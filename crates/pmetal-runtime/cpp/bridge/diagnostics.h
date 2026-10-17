@@ -21,6 +21,9 @@ int mlx_inline_new_stream(void);  // Returns stream index
 void mlx_inline_set_default_stream(int index);
 void mlx_inline_reset_default_stream(void);  // Restore original default stream
 void mlx_inline_synchronize(void);
+// Give back the streams (and the worker thread of each CPU stream) MLX made
+// for the calling thread. See `release_thread_streams` in Rust.
+void mlx_inline_release_thread_streams(void);
 
 // ── Memory management ────────────────────────────────────────────────────
 // Matches Python's mx.metal.clear_cache(), mx.metal.set_cache_limit().

@@ -320,6 +320,54 @@ fn fused_batched_matches_serial_on_llama_n1() {
     let _ = (serial_decode, fused_decode);
 }
 
+/// A request prefilled on the single-request path and loaded into the fused
+/// cache decodes on, step after step, exactly as it would have on its own
+/// cache. Each layer must rotate the new token at the position its own cache
+/// reaches: reading layer 0's offset for every layer (which has moved on by
+/// the time layer 1 asks) shifts every later layer by one position, which a
+/// cache filled by the fused path alone hides, since a uniform shift is
+/// invisible to RoPE, but a prefilled cache's keys do not move with it.
+#[test]
+fn fused_decode_continues_a_serial_prefill() {
+    let config = LlamaConfig {
+        num_hidden_layers: 4,
+        ..tiny_config()
+    };
+    let mut model = LlamaForCausalLM::new(config.clone()).unwrap();
+    let cache_config = KVCacheConfig::new(
+        config.num_hidden_layers as usize,
+        config.max_position_embeddings as usize,
+        config.num_kv_heads() as usize,
+        config.get_head_dim() as usize,
+    );
+
+    let prompt = Array::from_i32_slice(&[3_i32, 5, 7, 11, 13, 2, 19]).reshape(&[1, 7]);
+    let mut serial_cache = KVCache::new(cache_config.clone());
+    model
+        .forward_with_cache(&prompt, None, Some(&mut serial_cache))
+        .unwrap()
+        .eval();
+    let mut fused_cache = FusedBatchKVCache::new(cache_config, 3).unwrap();
+    fused_cache.admit(1).unwrap();
+    fused_cache.load_slot(1, &serial_cache).unwrap();
+
+    for token in [17_i32, 23, 29, 31] {
+        let ids = Array::from_i32_slice(&[token]).reshape(&[1, 1]);
+        let serial = model
+            .forward_with_cache(&ids, None, Some(&mut serial_cache))
+            .unwrap();
+        let fused = model
+            .forward_batched_impl(&ids, &[1], &mut fused_cache)
+            .unwrap();
+        let diff = max_abs_diff(&last_logits(&serial), &last_logits(&fused));
+        assert!(
+            diff < 5e-4,
+            "decoding {token} after a prefill: fused and serial logits differ by {diff}"
+        );
+    }
+    pmetal_runtime::check_unobserved_error().unwrap();
+}
+
 fn tiny_qwen2_config() -> Qwen2Config {
     Qwen2Config {
         vocab_size: 64,

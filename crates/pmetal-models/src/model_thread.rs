@@ -125,6 +125,9 @@ impl<S: 'static> ModelThread<S> {
                 let _ = ready.send(Ok(()));
                 drop(ready);
                 run(&mut state, &queue, background);
+                // The state's arrays go first, then the streams they ran on.
+                drop(state);
+                pmetal_runtime::inline_array::release_thread_streams();
             })
             .map_err(ModelThreadStartError::Spawn)?;
         match built.recv() {

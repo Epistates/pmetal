@@ -47,24 +47,10 @@ pub struct ServingMetrics {
     pub sum_prompt_tokens: AtomicU64,
 }
 
-/// Whether a request is compatible with the continuous-batching path.
-///
-/// The pump implements per-slot stop-sequence string matching, per-slot
-/// top-N logprobs, and per-slot repetition / frequency / presence penalties,
-/// so every `SamplingParams` shape is batched-eligible but a grammar
-/// constraint. This is the seam for a feature the pump has not learned yet;
-/// callers fall back to `generate_streaming` when it returns `false`.
-pub(crate) fn is_batched_compatible(params: &SamplingParams) -> bool {
-    // A grammar's mask is computed from each token the sampler has just
-    // taken, which the pump's batched sampling does not hand to a processor.
-    params.constraint.is_none()
-}
-
 /// Pick the right streaming receiver: the continuous-batching pump
-/// when enabled and the request is compatible, else the single-request
-/// path. Falls through to the legacy path if the pump rejects (e.g.
-/// queue saturated) so saturation degrades to higher latency rather
-/// than 5xx errors.
+/// when enabled, else the single-request path. Falls through to the
+/// single-request path if the pump rejects (e.g. queue saturated) so
+/// saturation degrades to higher latency rather than 5xx errors.
 ///
 /// A prompt with images or videos always takes the single-request path: the
 /// pump drives each slot by token ids alone, so it has no way to feed the
@@ -74,8 +60,7 @@ pub(crate) fn stream_tokens(
     prompt: &PreparedPrompt,
     params: SamplingParams,
 ) -> tokio::sync::mpsc::Receiver<TokenEvent> {
-    if !prompt.has_media() && engine.continuous_batching_enabled() && is_batched_compatible(&params)
-    {
+    if !prompt.has_media() && engine.continuous_batching_enabled() {
         match engine.generate_batched(&prompt.input_ids, params.clone()) {
             Ok(rx) => return rx,
             Err(e) => {
@@ -1399,81 +1384,4 @@ pub async fn embeddings(
             total_tokens: prompt_tokens,
         },
     }))
-}
-
-#[cfg(test)]
-mod batching_gate_tests {
-    use super::*;
-
-    fn base_params() -> SamplingParams {
-        SamplingParams {
-            max_tokens: 16,
-            temperature: 0.7,
-            top_k: None,
-            top_p: None,
-            min_p: None,
-            repetition_penalty: None,
-            frequency_penalty: None,
-            presence_penalty: None,
-            seed: None,
-            extra_stop_token_ids: vec![],
-            stop_sequences: vec![],
-            logprobs_top_n: None,
-            logit_bias: Vec::new(),
-            constraint: None,
-        }
-    }
-
-    #[test]
-    fn default_params_are_batched_compatible() {
-        assert!(is_batched_compatible(&base_params()));
-    }
-
-    #[test]
-    fn stop_sequences_remain_batched() {
-        // Phase 1a: pump now runs per-slot stop-sequence matching via
-        // an `IncrementalDecoder` + `Tokenizer` on the emit path.
-        let mut p = base_params();
-        p.stop_sequences = vec!["\n\n".into()];
-        assert!(is_batched_compatible(&p));
-    }
-
-    #[test]
-    fn logprobs_remain_batched() {
-        // Phase 1c: pump computes `token_logprobs` from last-position
-        // logits and attaches them to `TokenEvent::Token`.
-        let mut p = base_params();
-        p.logprobs_top_n = Some(3);
-        assert!(is_batched_compatible(&p));
-    }
-
-    #[test]
-    fn penalties_remain_batched() {
-        // Each slot keeps its own `DecodePenalties` on the GPU, so
-        // repetition / frequency / presence penalties work in the batched
-        // path.
-        for (rep, freq, pres) in [
-            (Some(1.1), None, None),
-            (None, Some(0.5), None),
-            (None, None, Some(0.3)),
-        ] {
-            let mut p = base_params();
-            p.repetition_penalty = rep;
-            p.frequency_penalty = freq;
-            p.presence_penalty = pres;
-            assert!(
-                is_batched_compatible(&p),
-                "penalties rep={rep:?} freq={freq:?} pres={pres:?} should stay batched"
-            );
-        }
-    }
-
-    #[test]
-    fn neutral_penalty_values_are_compatible() {
-        let mut p = base_params();
-        p.repetition_penalty = Some(1.0);
-        p.frequency_penalty = Some(0.0);
-        p.presence_penalty = Some(0.0);
-        assert!(is_batched_compatible(&p));
-    }
 }

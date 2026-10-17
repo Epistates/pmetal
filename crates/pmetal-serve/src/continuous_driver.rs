@@ -1,35 +1,46 @@
-//! D.2 — per-slot KV cache + batched decode driver.
+//! Per-slot caches and the decode step.
 //!
 //! This module bridges the pure-Rust [`crate::continuous_batch`]
 //! scheduler and the MLX model forward pass. It owns:
 //!
-//! - A [`SlotIdxMap`] that tracks which `SlotId` lives in which row of
-//!   a [`BatchKVCache`].
-//! - A [`ContinuousEngineState`] that bundles the batched KV cache
-//!   with a per-slot [`DecodeSampler`] so each slot has its own
-//!   temperature / top-p settings and its own penalty history on the
-//!   GPU.
-//! - A [`SlotForward`] trait that decouples the driver from
-//!   `DynamicModel` so unit tests can stub the forward pass.
-//! - Drivers [`drive_prefill_step`] and [`drive_decode_step`] that the
-//!   engine's request pump (D.3) calls with the instructions produced
-//!   by [`crate::continuous_batch::ContinuousBatcher::next_instruction`].
+//! - A [`SlotIdxMap`] that tracks which `SlotId` lives in which batch row.
+//! - A [`ContinuousEngineState`] that bundles the KV caches with a per-slot
+//!   [`DecodeSampler`] so each slot has its own temperature / top-p settings
+//!   and its own penalty history on the GPU.
+//! - A [`SlotForward`] trait that decouples the driver from `DynamicModel`
+//!   so unit tests can stub the forward pass.
+//! - Drivers [`drive_prefill_step`], [`drive_decode_step`] and
+//!   [`drive_fused_decode_step`] that the pump calls with the instructions
+//!   produced by [`crate::continuous_batch::ContinuousBatcher::next_step`].
 //!
-//! # Today's batched-decode strategy
+//! # Two decode paths
 //!
-//! The driver runs forward **once per slot** inside a single
-//! generation stream, schedules `async_eval` on the batch of returned
-//! logit tensors, and only then samples. This gives us back-to-back
-//! kernel dispatches on the GPU stream without per-slot host syncs.
-//! It is *not* yet a single fused batched matmul — that's a future
-//! upgrade that requires every architecture to accept a `[N, 1]` input
-//! and batched cache, which we'll take as a separate change so it can
-//! ship incrementally arch-by-arch.
+//! A request prefills on its own [`KVCache`], one chunk at a time. What
+//! happens after that depends on the model:
+//!
+//! - **Fused.** For a model with a fused `[N, 1]` forward and a plain dense
+//!   cache ([`DynamicModel::supports_fused_batched`]), the finished prefill is
+//!   copied into a row of a shared [`FusedBatchKVCache`]
+//!   ([`ContinuousEngineState::promote`]) and the request's own cache is
+//!   freed. A decode step is then **one** forward over every decoding
+//!   request, reading the weights once however many there are
+//!   ([`drive_fused_decode_step`]).
+//! - **Per slot.** Everything else (hybrid models with recurrent state,
+//!   quantized, TurboQuant and sliding-window caches, architectures without a
+//!   fused forward) decodes one forward per slot on the slot's own cache
+//!   ([`drive_decode_step`]), the forwards queued back to back on the GPU
+//!   before anything is read.
+//!
+//! Both sample the same way: each slot's sampler draws its token from its own
+//! row of the logits, and the step reads the sampled tokens back in one go,
+//! the only values to leave the GPU.
+//!
+//! [`DynamicModel::supports_fused_batched`]: pmetal_models::dispatcher::DynamicModel::supports_fused_batched
 
 use crate::continuous_batch::SlotId;
 use pmetal_cache::kv_cache::{BatchKVCache, FusedBatchKVCache, KVCache, KVCacheConfig, MambaCache};
 use pmetal_models::generation::GenerationConfig;
-use pmetal_runtime::compat::{Array, Exception};
+use pmetal_runtime::compat::{Array, Dtype, Exception, ops};
 use pmetal_runtime::decode::DecodeSampler;
 use std::collections::HashMap;
 
@@ -53,6 +64,25 @@ pub trait SlotForward {
         cache: &mut KVCache,
         recurrent: Option<&mut MambaCache>,
     ) -> Result<Array, Exception>;
+
+    /// One fused `[N_active, 1]` decode forward over every active slot,
+    /// writing into the shared [`FusedBatchKVCache`]. `input_ids` is the
+    /// `[N_active, 1]` int32 token ids and `active_indices` their rows in the
+    /// cache; the logits are `[N_active, 1, vocab]`.
+    ///
+    /// Called only for a pump built with
+    /// [`enable_fused_decode`](crate::continuous_pump::ContinuousPump::enable_fused_decode),
+    /// which the engine does for models that support it.
+    fn forward_batched(
+        &mut self,
+        _input_ids: &Array,
+        _active_indices: &[usize],
+        _cache: &mut FusedBatchKVCache,
+    ) -> Result<Array, Exception> {
+        Err(Exception::custom(
+            "this forward has no fused batched decode path",
+        ))
+    }
 }
 
 impl<F> SlotForward for F
@@ -66,39 +96,6 @@ where
         recurrent: Option<&mut MambaCache>,
     ) -> Result<Array, Exception> {
         self(tokens, cache, recurrent)
-    }
-}
-
-/// Trait for fused `[N_active, 1]` batched decode.
-///
-/// Implementors run one forward per tick over all active slots, writing
-/// into the shared [`FusedBatchKVCache`]. Input is `[N_active, 1]` int32
-/// token ids; output is `[N_active, 1, vocab_size]` logits.
-///
-/// The driver picks this path only when the model reports
-/// `supports_fused_batched = true` and the engine has allocated a
-/// `FusedBatchKVCache`. Serial fallback via [`SlotForward`] is the
-/// universal path for all other archs.
-pub trait FusedBatchForward {
-    fn forward_batched(
-        &mut self,
-        input_ids: &Array,
-        active_indices: &[usize],
-        cache: &mut FusedBatchKVCache,
-    ) -> Result<Array, Exception>;
-}
-
-impl<F> FusedBatchForward for F
-where
-    F: FnMut(&Array, &[usize], &mut FusedBatchKVCache) -> Result<Array, Exception>,
-{
-    fn forward_batched(
-        &mut self,
-        input_ids: &Array,
-        active_indices: &[usize],
-        cache: &mut FusedBatchKVCache,
-    ) -> Result<Array, Exception> {
-        self(input_ids, active_indices, cache)
     }
 }
 
@@ -176,9 +173,9 @@ pub struct ContinuousEngineState {
     /// model, `None` for a pure-attention one. Reset when a row is freed,
     /// like its KV cache, so the next request starts from nothing.
     recurrent: Option<Vec<MambaCache>>,
-    /// Fused per-layer KV cache used when the model supports fused
-    /// batched decode. When `None`, the driver falls back to the
-    /// per-slot `caches` path.
+    /// The shared KV cache the decoding slots live in when the model
+    /// decodes fused. A slot prefills on its own cache in `caches` and moves
+    /// here when its prefill ends; `None` when every slot decodes on its own.
     fused_cache: Option<FusedBatchKVCache>,
     /// Each slot's sampler: its penalties hold the slot's prompt and every
     /// token sampled for it on the GPU, so a slot's history lives with its
@@ -215,28 +212,29 @@ impl ContinuousEngineState {
         self.recurrent.is_some()
     }
 
-    /// Create engine state that also owns a [`FusedBatchKVCache`] for
-    /// models that implement fused batched decode. The per-slot
-    /// `caches` path is still allocated so prefill (serial) and
-    /// fallback archs can share the same state.
-    pub fn new_with_fused_cache(
-        max_slots: usize,
-        cache_config: KVCacheConfig,
-        fused_cache: FusedBatchKVCache,
-    ) -> Self {
-        let mut state = Self::new(max_slots, cache_config);
-        state.fused_cache = Some(fused_cache);
-        state
+    /// Decode the slots that have finished prefilling together, as one fused
+    /// forward over a shared [`FusedBatchKVCache`] (see the module docs).
+    ///
+    /// # Errors
+    /// For a hybrid model: the fused forward carries no recurrent state.
+    pub fn enable_fused_cache(&mut self, fused: FusedBatchKVCache) -> Result<(), Exception> {
+        if self.recurrent.is_some() {
+            return Err(Exception::custom(
+                "fused decode carries no recurrent state; hybrid models decode per slot",
+            ));
+        }
+        self.fused_cache = Some(fused);
+        Ok(())
     }
 
-    /// Whether this state has a fused KV cache wired in.
+    /// Whether the decoding slots share a fused KV cache.
     pub fn has_fused_cache(&self) -> bool {
         self.fused_cache.is_some()
     }
 
-    /// Borrow the fused cache mutably if present.
-    pub fn fused_cache_mut(&mut self) -> Option<&mut FusedBatchKVCache> {
-        self.fused_cache.as_mut()
+    /// The fused cache, if there is one.
+    pub fn fused_cache(&self) -> Option<&FusedBatchKVCache> {
+        self.fused_cache.as_ref()
     }
 
     /// Total number of rows (active + free).
@@ -264,6 +262,17 @@ impl ContinuousEngineState {
         config: &GenerationConfig,
         prompt: &[u32],
     ) -> Result<usize, Exception> {
+        self.admit_sampler(slot, config.sampler(prompt))
+    }
+
+    /// [`admit`](Self::admit) with the slot's sampler already built, for a
+    /// request whose sampler carries more than its configuration makes (a
+    /// grammar's logits processor).
+    pub fn admit_sampler(
+        &mut self,
+        slot: SlotId,
+        sampler: DecodeSampler,
+    ) -> Result<usize, Exception> {
         let idx = self.map.allocate(slot).ok_or_else(|| {
             Exception::custom(format!(
                 "ContinuousEngineState::admit: no free batch row for {:?} (capacity {})",
@@ -271,11 +280,31 @@ impl ContinuousEngineState {
                 self.capacity()
             ))
         })?;
-        self.samplers[idx] = Some(config.sampler(prompt));
+        self.samplers[idx] = Some(sampler);
         if let Some(fused) = self.fused_cache.as_mut() {
-            fused.admit(idx)?;
+            fused.release(idx);
         }
         Ok(idx)
+    }
+
+    /// Move a slot whose prefill has ended into the fused cache, where it
+    /// decodes with the others, and free the cache it prefilled on. Does
+    /// nothing when decode is per slot.
+    pub fn promote(&mut self, slot: SlotId) -> Result<(), Exception> {
+        let Some(fused) = self.fused_cache.as_mut() else {
+            return Ok(());
+        };
+        let idx = self
+            .map
+            .get(slot)
+            .ok_or_else(|| Exception::custom(format!("promote: slot {slot:?} not admitted")))?;
+        let own = self
+            .caches
+            .get_mut(idx)
+            .ok_or_else(|| Exception::custom(format!("promote: no cache for slot {slot:?}")))?;
+        fused.load_slot(idx, own)?;
+        self.caches.reset_indices(&[idx]);
+        Ok(())
     }
 
     /// Release a slot's row, resetting the cache entry so the next
@@ -289,6 +318,10 @@ impl ContinuousEngineState {
             }
             if let Some(fused) = self.fused_cache.as_mut() {
                 fused.release(idx);
+                // Nothing in flight: hold no K/V.
+                if self.map.is_empty() {
+                    fused.release_if_idle();
+                }
             }
         }
     }
@@ -316,6 +349,27 @@ impl ContinuousEngineState {
         Some((cache, recurrent))
     }
 
+    /// The slot's recurrent state, for a hybrid model.
+    pub fn recurrent_for(&self, slot: SlotId) -> Option<&MambaCache> {
+        let idx = self.map.get(slot)?;
+        self.recurrent.as_ref()?.get(idx)
+    }
+
+    /// Replace a slot's recurrent state with the state a prefix left.
+    pub fn replace_recurrent(&mut self, slot: SlotId, state: MambaCache) -> Result<(), Exception> {
+        let idx = self.map.get(slot).ok_or_else(|| {
+            Exception::custom(format!(
+                "replace recurrent state: slot {slot:?} not admitted"
+            ))
+        })?;
+        let rows = self
+            .recurrent
+            .as_mut()
+            .ok_or_else(|| Exception::custom("replace recurrent state: the model carries none"))?;
+        rows[idx] = state;
+        Ok(())
+    }
+
     /// Replace a slot's KV cache with a forked prefix cache.
     pub fn replace_cache(&mut self, slot: SlotId, cache: KVCache) -> Result<(), Exception> {
         let idx = self.map.get(slot).ok_or_else(|| {
@@ -337,6 +391,57 @@ impl ContinuousEngineState {
             .and_then(Option::as_mut)
             .ok_or_else(|| Exception::custom(format!("sample: slot {slot:?} has no sampler")))?;
         Ok(sampler.sample(logits))
+    }
+
+    /// Sample one token for each of `slots` from the matching row of
+    /// `logits` (`[N, vocab]`): `[N]` uint32, lazy.
+    ///
+    /// Each slot's token is what its own sampler draws from its own row, so a
+    /// request's tokens do not depend on who shares its step. Slots that
+    /// decode by plain argmax (temperature 0, no penalty, bias or processor)
+    /// take it together in one op over the whole block; the others go
+    /// through their samplers a row at a time.
+    pub fn sample_rows(&mut self, slots: &[SlotId], logits: &Array) -> Result<Array, Exception> {
+        let rows = slots.len();
+        let vocab = logits.dim(-1);
+        let mut indices = Vec::with_capacity(rows);
+        for &slot in slots {
+            indices.push(self.map.get(slot).ok_or_else(|| {
+                Exception::custom(format!("sample: slot {slot:?} has no sampler"))
+            })?);
+        }
+        let plain: Vec<bool> = indices
+            .iter()
+            .map(|&i| {
+                self.samplers[i]
+                    .as_ref()
+                    .is_some_and(DecodeSampler::is_plain_argmax)
+            })
+            .collect();
+        let uint32 = Dtype::Uint32.as_i32();
+        if plain.iter().all(|&p| p) {
+            return Ok(logits.argmax(-1).as_dtype(uint32));
+        }
+        let argmax = plain
+            .iter()
+            .any(|&p| p)
+            .then(|| logits.argmax(-1).as_dtype(uint32));
+        let mut drawn = Vec::with_capacity(rows);
+        for (row, &idx) in indices.iter().enumerate() {
+            let row_i = row as i32;
+            drawn.push(match (&argmax, plain[row]) {
+                (Some(argmax), true) => argmax.slice(&[row_i], &[row_i + 1]),
+                _ => {
+                    let sampler = self.samplers[idx].as_mut().ok_or_else(|| {
+                        Exception::custom(format!("sample: slot {:?} has no sampler", slots[row]))
+                    })?;
+                    let one = logits.slice(&[row_i, 0], &[row_i + 1, vocab]);
+                    sampler.sample(&one).reshape(&[1]).as_dtype(uint32)
+                }
+            });
+        }
+        let refs: Vec<&Array> = drawn.iter().collect();
+        Ok(ops::concatenate_axis(&refs, 0))
     }
 }
 
@@ -375,11 +480,38 @@ pub fn drive_prefill_step<F: SlotForward>(
 pub struct SlotStepOutput {
     pub slot: SlotId,
     pub token: u32,
+    /// The raw last-position logits the token was drawn from, `[1, vocab]`,
+    /// lazy: read only by a slot that asked for log-probabilities.
     pub logits: Array,
 }
 
-/// Run a batched decode step across the given `(slot, current_token)`
-/// pairs.
+/// Sample every slot's token from `logits` (`[N, vocab]`, row `i` for
+/// `slots[i]`), evaluate the tokens in one go and read them back in one.
+fn sample_and_read(
+    state: &mut ContinuousEngineState,
+    slots: &[SlotId],
+    logits: &Array,
+) -> Result<Vec<SlotStepOutput>, Exception> {
+    let vocab = logits.dim(-1);
+    let tokens = state.sample_rows(slots, logits)?;
+    // The step's one eval, and the only values to leave the GPU.
+    tokens
+        .try_eval()
+        .map_err(|e| Exception::custom(e.to_string()))?;
+    let drawn = tokens.as_slice::<u32>();
+    Ok(slots
+        .iter()
+        .enumerate()
+        .map(|(row, &slot)| SlotStepOutput {
+            slot,
+            token: drawn[row],
+            logits: logits.slice(&[row as i32, 0], &[row as i32 + 1, vocab]),
+        })
+        .collect())
+}
+
+/// Run a decode step across the given `(slot, current_token)` pairs, one
+/// forward per slot on the slot's own cache.
 ///
 /// Each slot's repetition / frequency / presence penalties read the
 /// history the slot keeps on the GPU since [admission](ContinuousEngineState::admit),
@@ -390,12 +522,9 @@ pub struct SlotStepOutput {
 /// 1. Schedules `forward` for each slot (one token per slot) without
 ///    evaluating — the returned logits are lazy tensors.
 /// 2. Samples the next token for each slot via its own sampler and
-///    penalties ([`ContinuousEngineState::sample`]), which take the token
-///    into the slot's history lazily.
-/// 3. Calls `async_eval` on the batched sample tensors so the GPU can
-///    fuse the sampling kernels together.
-/// 4. Extracts `u32` tokens from each sampled tensor (one host sync
-///    per slot — unavoidable without a single batched sample path).
+///    penalties ([`ContinuousEngineState::sample_rows`]), which take the
+///    token into the slot's history lazily.
+/// 3. Evaluates the sampled tokens once and reads them back once.
 ///
 /// All forwards run on the caller's current default stream.
 pub fn drive_decode_step<F: SlotForward>(
@@ -403,50 +532,27 @@ pub fn drive_decode_step<F: SlotForward>(
     state: &mut ContinuousEngineState,
     slots: &[(SlotId, u32)],
 ) -> Result<Vec<SlotStepOutput>, Exception> {
-    use pmetal_runtime::compat::ops::async_eval;
-
-    // Phase 1: schedule forwards, collect lazy logits per slot.
-    let mut lazy: Vec<(SlotId, Array)> = Vec::with_capacity(slots.len());
+    if slots.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Schedule the forwards, collecting each slot's lazy last-position
+    // logits as one row.
+    let mut rows: Vec<Array> = Vec::with_capacity(slots.len());
     for &(slot, token) in slots {
         let (cache, recurrent) = state
             .slot_caches(slot)
             .ok_or_else(|| Exception::custom(format!("decode: slot {slot:?} not admitted")))?;
-        let tokens = [token];
-        let logits = forward.forward(&tokens, cache, recurrent)?;
-        lazy.push((slot, logits));
+        let logits = forward.forward(&[token], cache, recurrent)?;
+        rows.push(extract_last_logits(&logits)?);
     }
-
-    // Phase 2: sample per slot (penalty-aware), also lazy. Keep RAW
-    // last-position logits around so the caller can compute per-slot
-    // logprobs later.
-    let mut samples: Vec<(SlotId, Array, Array)> = Vec::with_capacity(slots.len()); // (slot, y, last_logits)
-    for (slot, full_logits) in lazy {
-        let last = extract_last_logits(&full_logits)?;
-        let y = state.sample(slot, &last)?;
-        samples.push((slot, y, last));
-    }
-
-    // Phase 3: async-eval every (y, last_logits) pair so the GPU
-    // schedules them back-to-back.
-    {
-        let arrays: Vec<&Array> = samples
-            .iter()
-            .flat_map(|(_, y, last)| [y, last].into_iter())
-            .collect();
-        async_eval(arrays);
-    }
-
-    // Phase 4: per-slot host sync + token extraction.
-    let mut out = Vec::with_capacity(samples.len());
-    for (slot, y, last) in samples {
-        let token = y.item::<u32>();
-        out.push(SlotStepOutput {
-            slot,
-            token,
-            logits: last,
-        });
-    }
-    Ok(out)
+    let refs: Vec<&Array> = rows.iter().collect();
+    let logits = if refs.len() == 1 {
+        rows.pop().expect("one row")
+    } else {
+        ops::concatenate_axis(&refs, 0)
+    };
+    let ids: Vec<SlotId> = slots.iter().map(|&(slot, _)| slot).collect();
+    sample_and_read(state, &ids, &logits)
 }
 
 /// Fused variant of [`drive_decode_step`].
@@ -457,19 +563,18 @@ pub fn drive_decode_step<F: SlotForward>(
 /// returned alongside each sampled token).
 ///
 /// Prerequisites:
-/// - `state.has_fused_cache()` must be true.
-/// - The model powering `forward` must implement [`FusedBatchForward`]
-///   (usually a thin closure over `DynamicModel::forward_batched`).
+/// - `state.has_fused_cache()` must be true, and each slot must have been
+///   [promoted](ContinuousEngineState::promote) into it.
+/// - The model powering `forward` must implement
+///   [`SlotForward::forward_batched`].
 ///
 /// The `slots` pair format mirrors [`drive_decode_step`] so the pump
 /// can hand the same inputs to either path.
-pub fn drive_fused_decode_step<F: FusedBatchForward>(
+pub fn drive_fused_decode_step<F: SlotForward>(
     forward: &mut F,
     state: &mut ContinuousEngineState,
     slots: &[(SlotId, u32)],
 ) -> Result<Vec<SlotStepOutput>, Exception> {
-    use pmetal_runtime::compat::ops::async_eval;
-
     if slots.is_empty() {
         return Ok(Vec::new());
     }
@@ -492,42 +597,16 @@ pub fn drive_fused_decode_step<F: FusedBatchForward>(
 
     let n = slots.len() as i32;
     let input_ids = Array::from_i32_slice(&input_tokens).reshape(&[n, 1]);
-
     let fused = state.fused_cache.as_mut().ok_or_else(|| {
         Exception::custom("fused decode: ContinuousEngineState has no fused cache")
     })?;
 
-    let logits = forward.forward_batched(&input_ids, &active_indices, fused)?;
-
-    // Extract per-slot last-position logits then sample.
-    let mut samples: Vec<(SlotId, Array, Array)> = Vec::with_capacity(slots.len());
-    for (row, &(slot, _)) in slots.iter().enumerate() {
-        let idx = Array::from_i32_slice(&[row as i32]);
-        // logits: [N, 1, V] → take row → [1, 1, V] → squeeze axis 0 → [1, V]
-        let row_logits = logits.take_axis(&idx, 0);
-        let last = extract_last_logits(&row_logits)?;
-        let y = state.sample(slot, &last)?;
-        samples.push((slot, y, last));
-    }
-
-    {
-        let arrays: Vec<&Array> = samples
-            .iter()
-            .flat_map(|(_, y, last)| [y, last].into_iter())
-            .collect();
-        async_eval(arrays);
-    }
-
-    let mut out = Vec::with_capacity(samples.len());
-    for (slot, y, last) in samples {
-        let token = y.item::<u32>();
-        out.push(SlotStepOutput {
-            slot,
-            token,
-            logits: last,
-        });
-    }
-    Ok(out)
+    // [N, 1, vocab] -> one last-position row per slot, [N, vocab].
+    let logits = forward
+        .forward_batched(&input_ids, &active_indices, fused)?
+        .squeeze_axes(&[1]);
+    let ids: Vec<SlotId> = slots.iter().map(|&(slot, _)| slot).collect();
+    sample_and_read(state, &ids, &logits)
 }
 
 /// Extract the last-position logits from a `[B, S, V]` tensor as a
@@ -885,11 +964,240 @@ mod tests {
     fn fused_decode_refuses_recurrent_state() {
         let mut state =
             ContinuousEngineState::new(1, make_config()).with_recurrent_state(&MambaCache::new(1));
-        let mut never = |_: &Array,
-                         _: &[usize],
-                         _: &mut FusedBatchKVCache|
-         -> Result<Array, Exception> { unreachable!() };
-        let err = drive_fused_decode_step(&mut never, &mut state, &[(SlotId(1), 1)]).unwrap_err();
+        let fused = FusedBatchKVCache::new(make_config(), 1).unwrap();
+        let err = state.enable_fused_cache(fused).expect_err("refused");
         assert!(format!("{err:?}").contains("recurrent"));
+    }
+
+    /// A forward with a fused path: prefill extends the slot's cache and
+    /// decode extends the shared one, with logits whose argmax is
+    /// `next[token]` for each row.
+    struct FusedStub {
+        vocab: i32,
+        next: HashMap<u32, u32>,
+        batched_calls: usize,
+    }
+
+    impl SlotForward for FusedStub {
+        fn forward(
+            &mut self,
+            tokens: &[u32],
+            cache: &mut KVCache,
+            _recurrent: Option<&mut MambaCache>,
+        ) -> Result<Array, Exception> {
+            let (h, d) = {
+                let c = cache.config();
+                (c.num_kv_heads as i32, c.head_dim as i32)
+            };
+            let s = tokens.len() as i32;
+            let kv = Array::zeros_f32(&[1, h, s, d]);
+            cache.update_and_fetch(0, &kv, &kv)?;
+            cache.update_and_fetch(1, &kv, &kv)?;
+            Ok(Array::zeros_f32(&[1, s, self.vocab]))
+        }
+
+        fn forward_batched(
+            &mut self,
+            input_ids: &Array,
+            active_indices: &[usize],
+            cache: &mut FusedBatchKVCache,
+        ) -> Result<Array, Exception> {
+            self.batched_calls += 1;
+            let n = active_indices.len() as i32;
+            let (h, d) = (
+                cache.config().num_kv_heads as i32,
+                cache.config().head_dim as i32,
+            );
+            let kv = Array::zeros_f32(&[n, h, 1, d]);
+            for layer in 0..cache.config().num_layers {
+                cache.update_and_fetch_batched(layer, active_indices, &kv, &kv)?;
+            }
+            let tokens: Vec<i32> = input_ids.as_slice::<i32>().to_vec();
+            let mut data = vec![0.0f32; n as usize * self.vocab as usize];
+            for (row, token) in tokens.iter().enumerate() {
+                let next = self.next.get(&(*token as u32)).copied().unwrap_or(0);
+                data[row * self.vocab as usize + next as usize] = 10.0;
+            }
+            Ok(Array::from_f32_slice(&data, &[n, 1, self.vocab]))
+        }
+    }
+
+    fn fused_state(max_slots: usize) -> ContinuousEngineState {
+        let mut state = ContinuousEngineState::new(max_slots, make_config());
+        state
+            .enable_fused_cache(FusedBatchKVCache::new(make_config(), max_slots).unwrap())
+            .unwrap();
+        state
+    }
+
+    /// A slot that has prefilled moves into the fused cache with its tokens
+    /// and its own cache is freed; one fused step then decodes every slot
+    /// with a single forward and routes each row's logits to its own slot.
+    #[test]
+    fn a_fused_step_is_one_forward_and_each_slot_gets_its_own_row() {
+        let mut state = fused_state(3);
+        let greedy = GenerationConfig::default();
+        let (a, b) = (SlotId(1), SlotId(2));
+        state.admit(a, &greedy, &[1, 2, 3]).unwrap();
+        state.admit(b, &greedy, &[4, 5]).unwrap();
+        let mut stub = FusedStub {
+            vocab: 32,
+            next: HashMap::from([(100, 7), (200, 13)]),
+            batched_calls: 0,
+        };
+        drive_prefill_step(&mut stub, &mut state, a, &[1, 2, 3], true).unwrap();
+        drive_prefill_step(&mut stub, &mut state, b, &[4, 5], true).unwrap();
+        state.promote(a).unwrap();
+        state.promote(b).unwrap();
+        let fused = state.fused_cache().unwrap();
+        assert_eq!(
+            (
+                fused.offset(state.batch_idx(a).unwrap()),
+                fused.offset(state.batch_idx(b).unwrap())
+            ),
+            (3, 2)
+        );
+        assert_eq!(
+            state.cache_for(a).unwrap().seq_len(),
+            0,
+            "the prefill cache is freed"
+        );
+
+        let outs = drive_fused_decode_step(&mut stub, &mut state, &[(a, 100), (b, 200)]).unwrap();
+        assert_eq!(stub.batched_calls, 1, "one forward for both slots");
+        assert_eq!(outs.iter().find(|o| o.slot == a).unwrap().token, 7);
+        assert_eq!(outs.iter().find(|o| o.slot == b).unwrap().token, 13);
+        let fused = state.fused_cache().unwrap();
+        assert_eq!(fused.offset(state.batch_idx(a).unwrap()), 4);
+
+        // The last slot out gives the fused buffers back.
+        state.retire(a);
+        assert!(state.fused_cache().unwrap().memory_usage() > 0);
+        state.retire(b);
+        assert_eq!(state.fused_cache().unwrap().memory_usage(), 0);
+        pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
+    }
+
+    /// A grammar-style logits processor that follows the tokens its slot
+    /// takes: the next must be one more than the last.
+    struct CountUp {
+        next: u32,
+        vocab: usize,
+    }
+
+    impl pmetal_runtime::logits_processor::LogitsProcessor for CountUp {
+        fn process(&mut self, logits: &Array) -> Array {
+            let mut bias = vec![-1e9f32; self.vocab];
+            bias[self.next as usize] = 0.0;
+            logits
+                .as_dtype(Dtype::Float32.as_i32())
+                .add(&Array::from_f32_slice(&bias, &[1, self.vocab as i32]))
+        }
+        fn accept(&mut self, token: u32) {
+            self.next = token + 1;
+        }
+        fn needs_host_tokens(&self) -> bool {
+            true
+        }
+        fn fork(&self) -> Box<dyn pmetal_runtime::logits_processor::LogitsProcessor> {
+            Box::new(CountUp {
+                next: self.next,
+                vocab: self.vocab,
+            })
+        }
+    }
+
+    /// A slot whose sampler carries a processor that follows its tokens is
+    /// sampled in the block like any other: its row is masked by its own
+    /// state, step after step, and the plain-argmax slot beside it takes the
+    /// argmax of its row.
+    #[test]
+    fn a_constrained_slot_is_sampled_in_the_block_beside_a_plain_one() {
+        let vocab = 20usize;
+        let mut state = ContinuousEngineState::new(2, make_config());
+        let (constrained, plain) = (SlotId(1), SlotId(2));
+        let greedy = GenerationConfig::greedy(8);
+        state
+            .admit_sampler(
+                constrained,
+                greedy
+                    .sampler(&[1])
+                    .with_processor(Box::new(CountUp { next: 5, vocab })),
+            )
+            .unwrap();
+        state.admit(plain, &greedy, &[1]).unwrap();
+
+        let mut rng = 9u64;
+        let mut taken = Vec::new();
+        for step in 0..6 {
+            let data: Vec<f32> = (0..2 * vocab)
+                .map(|_| {
+                    rng = rng
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (rng >> 40) as f32 / (1u64 << 24) as f32
+                })
+                .collect();
+            let logits = Array::from_f32_slice(&data, &[2, vocab as i32]);
+            let block = state.sample_rows(&[constrained, plain], &logits).unwrap();
+            let block = block.as_slice::<u32>().to_vec();
+            taken.push(block[0]);
+            let best = (0..vocab)
+                .max_by(|&a, &b| data[vocab + a].total_cmp(&data[vocab + b]))
+                .unwrap() as u32;
+            assert_eq!(block[1], best, "step {step}: the plain slot's argmax");
+        }
+        assert_eq!(taken, vec![5, 6, 7, 8, 9, 10], "the grammar's own sequence");
+        pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
+    }
+
+    /// Sampling a block of rows draws, for each slot, what that slot's own
+    /// sampler draws from its own row alone: plain-argmax slots together, the
+    /// seeded and penalized ones one by one, in any mix.
+    #[test]
+    fn sampling_a_block_of_rows_matches_sampling_each_alone() {
+        let vocab = 50usize;
+        let configs = [
+            GenerationConfig::greedy(8),
+            sampling(Some(11)),
+            {
+                let mut c = GenerationConfig::greedy(8);
+                c.repetition_penalty = 1.5;
+                c
+            },
+            GenerationConfig::greedy(8),
+            sampling(Some(12)),
+        ];
+        let prompts: [&[u32]; 5] = [&[1], &[2, 3], &[4, 4, 5], &[6], &[7, 8]];
+        let mut state = ContinuousEngineState::new(configs.len(), make_config());
+        let ids: Vec<SlotId> = (0..configs.len() as u64).map(SlotId).collect();
+        let mut alone: Vec<DecodeSampler> = Vec::new();
+        for ((&id, config), prompt) in ids.iter().zip(&configs).zip(prompts) {
+            state.admit(id, config, prompt).unwrap();
+            alone.push(config.sampler(prompt));
+        }
+        let mut rng = 5u64;
+        for step in 0..6 {
+            let data: Vec<f32> = (0..configs.len() * vocab)
+                .map(|_| {
+                    rng = rng
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((rng >> 40) as f32 / (1u64 << 24) as f32) * 4.0 - 2.0
+                })
+                .collect();
+            let logits = Array::from_f32_slice(&data, &[configs.len() as i32, vocab as i32]);
+            let block = state.sample_rows(&ids, &logits).unwrap();
+            let block = block.as_slice::<u32>().to_vec();
+            for (row, sampler) in alone.iter_mut().enumerate() {
+                let one = logits.slice(&[row as i32, 0], &[row as i32 + 1, vocab as i32]);
+                assert_eq!(
+                    block[row],
+                    sampler.sample(&one).item::<u32>(),
+                    "step {step}, row {row}"
+                );
+            }
+        }
+        pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
     }
 }

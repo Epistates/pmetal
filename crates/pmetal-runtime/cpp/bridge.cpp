@@ -866,6 +866,21 @@ void mlx_inline_synchronize(void) {
     });
 }
 
+void mlx_inline_release_thread_streams(void) {
+    BRIDGE_GUARD("release_thread_streams", {
+        // Whatever this thread queued has to finish before its streams go.
+        mlx::core::synchronize();
+        // `clear_streams` also empties MLX's compile cache, which every
+        // thread shares; a thread that is calling a compiled function holds
+        // this lock.
+        CompileCacheLock cache_lock;
+        mlx::core::clear_streams();
+        // The generation stream was among them; it is made again on demand.
+        delete generation_stream_;
+        generation_stream_ = nullptr;
+    });
+}
+
 void mlx_inline_set_metallib_path(const char* path) {
     mlx::core::metal::set_metallib_path(path);
 }

@@ -1573,6 +1573,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 cb_max_queue_depth,
                 cb_block_size,
                 cb_max_blocks,
+                cb_exact,
             } = args;
             #[cfg(feature = "ane")]
             let ane_enabled = ane;
@@ -1613,6 +1614,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 cb_max_queue_depth,
                 cb_block_size,
                 cb_max_blocks,
+                cb_exact,
             )
             .await?;
         }

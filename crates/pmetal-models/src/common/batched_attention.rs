@@ -19,18 +19,16 @@
 //! # Contract with [`FusedBatchKVCache`]
 //!
 //! The cache's `update_and_fetch_batched` reads each slot's *pre-update*
-//! offset when writing the new K/V at position `offset[slot]`. This
-//! block reads the same pre-update offset to build per-slot RoPE
-//! positions, so Q and the newly-written K/V rotate with identical
-//! positions — preserving the invariant the serial `forward_with_cache`
-//! path relies on (`apply_rope(Q, ..., offset)` matched by
-//! `apply_rope(K, ..., offset)` before the cache write).
+//! offset for the layer when writing the new K/V at position
+//! `offset[layer][slot]`. This block reads the same per-layer pre-update
+//! offset to build per-slot RoPE positions, so Q and the newly-written K/V
+//! rotate with identical positions — preserving the invariant the serial
+//! `forward_with_cache` path relies on (`apply_rope(Q, ..., offset)` matched
+//! by `apply_rope(K, ..., offset)` before the cache write).
 
 use pmetal_cache::kv_cache::FusedBatchKVCache;
 use pmetal_runtime::compat::{Array, Dtype, Exception, Module, nn, ops};
-use pmetal_runtime::nn::{
-    AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope_with_per_batch_positions,
-};
+use pmetal_runtime::nn::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 
 use crate::decoder_layer::{MlpModule, NormModule};
 
@@ -233,32 +231,30 @@ pub fn batched_gqa_attn(
         keys
     };
 
-    // Build per-slot position ids from the cache's *pre-update* offsets.
-    // position_ids[n, 0] = cache.offset(active_indices[n]).
-    let pre_offsets: Vec<i32> = active_indices
-        .iter()
-        .map(|&idx| cache.offset(idx) as i32)
-        .collect();
-    let position_ids = Array::from_i32_slice_shaped(&pre_offsets, &[n_active, 1]);
-
-    let queries = apply_rope_with_per_batch_positions(
-        &queries,
-        &position_ids,
+    // Rotate each row by the position its own K/V is about to be written at:
+    // this layer's *pre-update* offset, one per row. (Layer 0's offset is not
+    // this layer's: it has moved on by the time any later layer asks, which
+    // would rotate every layer after the first one position too far from what
+    // its own cached keys were rotated by.) One fused kernel takes the whole
+    // batch's offsets.
+    let positions = cache.positions(layer_idx, active_indices);
+    let queries = queries.rope_with_pos_ids(
         cfg.rope_dims,
         cfg.rope_traditional,
         cfg.rope_base,
         cfg.rope_scale,
-    )?;
-    let keys = apply_rope_with_per_batch_positions(
-        &keys,
-        &position_ids,
+        &positions,
+    );
+    let keys = keys.rope_with_pos_ids(
         cfg.rope_dims,
         cfg.rope_traditional,
         cfg.rope_base,
         cfg.rope_scale,
-    )?;
+        &positions,
+    );
 
-    // Write new K/V, fetch T_max-sliced K/V + per-slot padding mask.
+    // Write new K/V, fetch T_max-sliced K/V + per-slot padding mask (none when
+    // no row is padded).
     let (k_all, v_all, mask) =
         cache.update_and_fetch_batched(layer_idx, active_indices, &keys, &values)?;
 
@@ -272,13 +268,7 @@ pub fn batched_gqa_attn(
     // KV buffer), and the fused path must match that to stay parity-clean
     // with the per-layer-offset quirk preserved by the cache.
     let mask = if let Some(window) = cfg.sliding_window {
-        let mask_shape = mask.shape();
-        debug_assert_eq!(
-            mask_shape.len(),
-            4,
-            "cache padding mask must be 4-D, got {mask_shape:?}"
-        );
-        let t_max_i32 = mask_shape[3];
+        let t_max_i32 = k_all.dim(2);
         // After `update_and_fetch_batched`, `offset_for(layer_idx, idx)` is
         // the post-update offset. q_pos = post_offset - 1, so the lower
         // bound (`q_pos - window + 1`) simplifies to `post_offset - window`.
@@ -293,7 +283,10 @@ pub fn batched_gqa_attn(
         let zero = Array::from_f32(0.0);
         let neg_inf = Array::from_f32(f32::NEG_INFINITY);
         let sliding = ops::r#where(&invalid, &neg_inf, &zero);
-        mask.add(&sliding)
+        Some(match mask {
+            Some(padding) => padding.add(&sliding),
+            None => sliding,
+        })
     } else {
         mask
     };
@@ -306,7 +299,7 @@ pub fn batched_gqa_attn(
     if let Some(cap) = cfg.logit_softcap {
         attn_cfg = attn_cfg.with_logit_softcapping(cap);
     }
-    let output = fused_sdpa(&queries, &k_all, &v_all, &attn_cfg, Some(&mask))?;
+    let output = fused_sdpa(&queries, &k_all, &v_all, &attn_cfg, mask.as_ref())?;
 
     // [N_active, heads, 1, head_dim] → [N_active, 1, n_heads*head_dim].
     let output = output
