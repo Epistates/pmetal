@@ -192,6 +192,7 @@ bridge_extern! {
     pub(super) fn mlx_inline_set_default_stream(index: i32);
     pub(super) fn mlx_inline_reset_default_stream();
     pub(super) fn mlx_inline_synchronize();
+    pub(super) fn mlx_inline_release_thread_streams();
     pub(super) fn mlx_inline_clear_cache();
     pub(super) fn mlx_inline_enable_compile();
     pub(super) fn mlx_inline_disable_compile();

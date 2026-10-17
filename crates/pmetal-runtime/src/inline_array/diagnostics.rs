@@ -284,6 +284,47 @@ pub fn synchronize() {
     }
 }
 
+/// Give back the streams MLX made for this thread.
+///
+/// MLX makes streams for every thread that runs an op (the default streams)
+/// and for every thread that makes a generation stream, and a worker thread
+/// for each CPU stream, and keeps them until the thread gives them back. A
+/// thread that comes and goes (one per request, on a pool) leaves about
+/// 100 KiB of resident memory and an idle OS thread behind for the life of the
+/// process unless it calls this before it ends, which [`ThreadStreams`] does.
+/// A long-lived thread, like a model thread, needs it once, at the end.
+///
+/// The thread must be done with its arrays: anything it queued is finished
+/// first, but an array it built and evaluates later, on whatever thread, has
+/// lost the stream it records. Calling it empties MLX's shared compile cache
+/// too, so the next fused op on any thread compiles again; it is not for a
+/// hot path.
+pub fn release_thread_streams() {
+    unsafe { mlx_inline_release_thread_streams() }
+}
+
+/// Calls [`release_thread_streams`] when dropped: the first thing a task
+/// that runs on a short-lived thread creates.
+#[must_use = "the streams go back when this is dropped"]
+pub struct ThreadStreams {
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl ThreadStreams {
+    /// Give back this thread's streams when the value is dropped.
+    pub fn release_on_drop() -> Self {
+        Self {
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for ThreadStreams {
+    fn drop(&mut self) {
+        release_thread_streams();
+    }
+}
+
 thread_local! {
     /// Open [`GenerationStream`]s on this thread.
     static STREAM_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
