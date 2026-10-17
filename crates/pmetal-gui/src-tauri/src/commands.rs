@@ -2656,7 +2656,7 @@ fn try_add_adapter(
     }
 
     let has_config = dir.join("adapter_config.json").exists();
-    let weights_file = pmetal::lora::peft::find_adapter_weights(&dir);
+    let weights_file = pmetal::lora::peft::find_adapter_weights(dir);
 
     if !has_config && weights_file.is_none() {
         return;
@@ -3091,8 +3091,6 @@ async fn run_distillation_in_process(
     metrics_path: &PathBuf,
     cancel_flag: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
-    use pmetal::lora::TrainableModel;
-
     let teacher_path = resolve_model_path(&spec.teacher).await?;
     let student_path = resolve_model_path(&spec.student).await?;
     let dataset_path = resolve_dataset_path(&spec.dataset).await?;
@@ -3263,8 +3261,6 @@ async fn run_grpo_in_process(
     metrics_path: &PathBuf,
     cancel_flag: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
-    use pmetal::lora::TrainableModel;
-
     let model_path = resolve_model_path(&spec.model).await?;
     let dataset_path = resolve_dataset_path(&spec.dataset).await?;
     let tokenizer = pmetal::data::Tokenizer::from_model_dir(&model_path)
