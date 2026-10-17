@@ -258,6 +258,22 @@ pub trait VisitLinears {
         prefix: &str,
         f: &mut dyn FnMut(&str, &mut super::layers::Linear),
     );
+
+    /// Call `f` for each stacked expert projection reachable from here, with
+    /// its path and the number of experts a token is routed to. The routed
+    /// experts of a mixture-of-experts layer are stacked `[experts, out, in]`
+    /// weights read by gather matmuls, not `Linear`s, so
+    /// [`visit_linears_mut`](Self::visit_linears_mut) does not reach them. A
+    /// layer that holds them passes its own `top_k`; everything else passes
+    /// the one it was given on.
+    fn visit_experts_mut(
+        &mut self,
+        prefix: &str,
+        top_k: usize,
+        f: &mut dyn FnMut(&str, usize, &mut crate::nn::moe::Linear),
+    ) {
+        let _ = (prefix, top_k, f);
+    }
 }
 
 /// Join a parent path and a field name, skipping the separator at the root.
@@ -308,6 +324,17 @@ impl<T: VisitLinears> VisitLinears for Option<T> {
             inner.visit_linears_mut(prefix, f);
         }
     }
+
+    fn visit_experts_mut(
+        &mut self,
+        prefix: &str,
+        top_k: usize,
+        f: &mut dyn FnMut(&str, usize, &mut crate::nn::moe::Linear),
+    ) {
+        if let Some(inner) = self {
+            inner.visit_experts_mut(prefix, top_k, f);
+        }
+    }
 }
 
 impl<T: VisitLinears> VisitLinears for Box<T> {
@@ -317,6 +344,15 @@ impl<T: VisitLinears> VisitLinears for Box<T> {
         f: &mut dyn FnMut(&str, &mut super::layers::Linear),
     ) {
         (**self).visit_linears_mut(prefix, f);
+    }
+
+    fn visit_experts_mut(
+        &mut self,
+        prefix: &str,
+        top_k: usize,
+        f: &mut dyn FnMut(&str, usize, &mut crate::nn::moe::Linear),
+    ) {
+        (**self).visit_experts_mut(prefix, top_k, f);
     }
 }
 
@@ -329,6 +365,17 @@ impl<T: VisitLinears> VisitLinears for Vec<T> {
     ) {
         for (i, item) in self.iter_mut().enumerate() {
             item.visit_linears_mut(&child_path(prefix, &i.to_string()), f);
+        }
+    }
+
+    fn visit_experts_mut(
+        &mut self,
+        prefix: &str,
+        top_k: usize,
+        f: &mut dyn FnMut(&str, usize, &mut crate::nn::moe::Linear),
+    ) {
+        for (i, item) in self.iter_mut().enumerate() {
+            item.visit_experts_mut(&child_path(prefix, &i.to_string()), top_k, f);
         }
     }
 }
@@ -392,6 +439,23 @@ macro_rules! impl_module_params {
                     );
                 )*
             }
+
+            fn visit_experts_mut(
+                &mut self,
+                prefix: &str,
+                top_k: usize,
+                f: &mut dyn ::std::ops::FnMut(&str, usize, &mut $crate::nn::moe::Linear),
+            ) {
+                let _ = (&prefix, &top_k, &f);
+                $(
+                    $crate::compat::VisitLinears::visit_experts_mut(
+                        &mut self.$field,
+                        &$crate::compat::child_path(prefix, stringify!($field)),
+                        top_k,
+                        f,
+                    );
+                )*
+            }
         }
     };
 
@@ -436,6 +500,23 @@ macro_rules! impl_module_params {
                     $crate::compat::VisitLinears::visit_linears_mut(
                         &mut self.$field,
                         &$crate::compat::child_path(prefix, stringify!($field)),
+                        f,
+                    );
+                )*
+            }
+
+            fn visit_experts_mut(
+                &mut self,
+                prefix: &str,
+                top_k: usize,
+                f: &mut dyn ::std::ops::FnMut(&str, usize, &mut $crate::nn::moe::Linear),
+            ) {
+                let _ = (&prefix, &top_k, &f);
+                $(
+                    $crate::compat::VisitLinears::visit_experts_mut(
+                        &mut self.$field,
+                        &$crate::compat::child_path(prefix, stringify!($field)),
+                        top_k,
                         f,
                     );
                 )*

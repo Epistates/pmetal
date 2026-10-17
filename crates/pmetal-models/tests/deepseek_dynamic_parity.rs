@@ -171,7 +171,10 @@ fn dynamic_deepseek_parameters_are_the_checkpoints_tensors() {
         !trainable.contains_key(bias),
         "the router bias is not trainable"
     );
-    assert!(trainable.contains_key("model.layers.1.mlp.gate.weight"));
+    // The router picks experts by argmax; a step on it reroutes tokens the
+    // experts were not tuned for, so no optimizer is handed it.
+    assert!(params.contains_key("model.layers.1.mlp.gate.weight"));
+    assert!(!trainable.contains_key("model.layers.1.mlp.gate.weight"));
 }
 
 /// An MLX conversion stores each layer's experts stacked (`mlp.switch_mlp`):

@@ -480,7 +480,7 @@ fn merging_preserves_the_adapted_output() {
     let ids = input_ids(config_int(case, "vocab_size").expect("vocab"));
     let before = adapted.forward(&ids, None).expect("adapted forward");
 
-    adapted.merge();
+    adapted.merge().expect("merge");
     let merged = adapted.forward(&ids, None).expect("merged forward");
     let report = ParityReport::compute("merge", &merged, &before, TOLERANCE);
     assert!(
@@ -503,7 +503,7 @@ fn merging_preserves_the_adapted_output() {
     );
 
     // Fusing is the one-way form `pmetal fuse` produces.
-    adapted.fuse();
+    adapted.fuse().expect("fuse");
     assert!(adapted.adapted_projections().is_empty());
     assert!(
         adapted.lora_parameters().is_empty(),

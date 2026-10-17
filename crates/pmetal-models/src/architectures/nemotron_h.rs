@@ -610,7 +610,12 @@ impl NemotronHMoe {
         };
         Ok(Self {
             gate: NemotronHRouter::new(config.hidden_size, experts, config.routing())?,
-            switch_mlp: PlainSwitchMlp::new(experts, width, intermediate),
+            switch_mlp: PlainSwitchMlp::new(
+                experts,
+                width,
+                intermediate,
+                config.routing().top_k.max(1) as usize,
+            ),
             shared_experts,
             fc1_latent_proj: latent(config.hidden_size, width)?,
             fc2_latent_proj: latent(width, config.hidden_size)?,
@@ -703,6 +708,15 @@ impl ModuleParameters for NemotronHMixer {
 impl VisitLinears for NemotronHMixer {
     fn visit_linears_mut(&mut self, prefix: &str, f: &mut dyn FnMut(&str, &mut nn::Linear)) {
         delegate!(self, m => m.visit_linears_mut(prefix, f))
+    }
+
+    fn visit_experts_mut(
+        &mut self,
+        prefix: &str,
+        top_k: usize,
+        f: &mut dyn FnMut(&str, usize, &mut pmetal_runtime::nn::moe::Linear),
+    ) {
+        delegate!(self, m => m.visit_experts_mut(prefix, top_k, f))
     }
 }
 

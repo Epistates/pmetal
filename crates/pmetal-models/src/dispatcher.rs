@@ -2742,6 +2742,15 @@ impl pmetal_runtime::compat::VisitLinears for DynamicModel {
     ) {
         dispatch_uniform!(self, visit_linears_mut, prefix, f)
     }
+
+    fn visit_experts_mut(
+        &mut self,
+        prefix: &str,
+        top_k: usize,
+        f: &mut dyn FnMut(&str, usize, &mut pmetal_runtime::nn::moe::Linear),
+    ) {
+        dispatch_uniform!(self, visit_experts_mut, prefix, top_k, f)
+    }
 }
 
 /// Remove the router parameters from a parameter tree, in place.

@@ -164,8 +164,7 @@ impl DynamicLoraModel {
 
     /// Fold every adapter into its base weight, reversibly.
     pub fn merge_lora(&mut self) -> Result<(), LoraError> {
-        self.inner.merge();
-        Ok(())
+        self.inner.merge()
     }
 
     /// Undo [`merge_lora`](Self::merge_lora).

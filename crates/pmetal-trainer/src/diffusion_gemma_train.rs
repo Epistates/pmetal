@@ -760,7 +760,7 @@ mod tests {
             "training did not change the forward"
         );
         fresh.load_lora_weights(&path).unwrap();
-        fresh.merge();
+        fresh.merge().unwrap();
         let restored = logits_vec(&mut fresh, &context, &x_t);
         let diff = max_diff(&trained, &restored);
         assert!(

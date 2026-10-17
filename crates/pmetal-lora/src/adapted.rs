@@ -39,8 +39,12 @@ const TRUNK_PREFIX: &str = "model.";
 pub struct AdaptedModel {
     model: DynamicModel,
     config: LoraConfig,
-    /// Parameter paths of the projections carrying an adapter, in walk order.
+    /// Parameter paths of the projections carrying an adapter, in walk order:
+    /// the `Linear`s, then the stacked expert projections.
     adapted: Vec<String>,
+    /// The paths among `adapted` that are stacked expert projections, whose
+    /// adapters hold one factor pair per expert.
+    experts: std::collections::BTreeSet<String>,
 }
 
 impl std::fmt::Debug for AdaptedModel {
@@ -175,6 +179,30 @@ impl AdaptedModel {
             return Err(e);
         }
 
+        // The routed experts, which are stacked weights read by gather
+        // matmuls and not `Linear`s. Each expert gets its own adapter, of the
+        // configured rank divided by the experts a token is routed to, so the
+        // rank a token sees is the configured one. They start from the
+        // standard initialisation whatever `init` says, and are plain LoRA
+        // under DoRA: a magnitude per expert row would need each expert's
+        // dense weight on every forward.
+        let mut experts = Vec::new();
+        model.visit_experts_mut("", 1, &mut |path, top_k, projection| {
+            if failure.is_some() || !is_targeted(path, targets, output.as_deref()) {
+                return;
+            }
+            let expert_rank = (rank / top_k.max(1) as i32).max(1);
+            match projection.attach_lora(expert_rank, alpha, use_rslora) {
+                Ok(_) => experts.push(path.to_string()),
+                Err(e) => failure = Some(LoraError::Mlx(e)),
+            }
+        });
+        if let Some(e) = failure {
+            return Err(e);
+        }
+        adapted.extend(experts.iter().cloned());
+        let experts: std::collections::BTreeSet<String> = experts.into_iter().collect();
+
         if adapted.is_empty() {
             return Err(LoraError::InvalidState(format!(
                 "no projection matched target_modules {targets:?}; the model exposes \
@@ -186,6 +214,7 @@ impl AdaptedModel {
             model,
             config,
             adapted,
+            experts,
         })
     }
 
@@ -229,25 +258,45 @@ impl AdaptedModel {
     /// Reversible with [`unmerge`](Self::unmerge). A merged model runs one
     /// matmul per projection instead of three, which is worth it for an
     /// evaluation pass mid-run.
-    pub fn merge(&mut self) {
+    ///
+    /// Fails if a routed expert's weight is packed or FP8, which an adapter
+    /// cannot be folded into without unpacking the whole stack.
+    pub fn merge(&mut self) -> Result<(), LoraError> {
         self.model
             .visit_linears_mut("", &mut |_, linear| linear.merge_lora());
+        let mut failure = None;
+        self.model.visit_experts_mut("", 1, &mut |path, _, expert| {
+            if failure.is_none()
+                && let Err(e) = expert.merge_lora()
+            {
+                failure = Some(LoraError::InvalidState(format!("merging `{path}`: {e}")));
+            }
+        });
+        failure.map_or(Ok(()), Err)
     }
 
     /// Undo [`merge`](Self::merge) and resume training.
     pub fn unmerge(&mut self) {
         self.model
             .visit_linears_mut("", &mut |_, linear| linear.unmerge_lora());
+        self.model
+            .visit_experts_mut("", 1, &mut |_, _, expert| expert.unmerge_lora());
     }
 
     /// Fold every adapter in and drop it, leaving a plain dense model.
     ///
     /// This is what `pmetal fuse` produces: servable without pmetal-lora in the
-    /// picture, and not reversible.
-    pub fn fuse(&mut self) {
+    /// picture, and not reversible. Fails as [`merge`](Self::merge) does.
+    pub fn fuse(&mut self) -> Result<(), LoraError> {
+        self.merge()?;
         self.model
             .visit_linears_mut("", &mut |_, linear| linear.fuse_lora());
+        self.model.visit_experts_mut("", 1, &mut |_, _, expert| {
+            expert.adapter = None;
+        });
         self.adapted.clear();
+        self.experts.clear();
+        Ok(())
     }
 
     /// Forward pass. Identical to what inference runs, because it *is* what
@@ -316,6 +365,14 @@ impl AdaptedModel {
             let part = |suffix: &str| params.get(format!("{stem}.{suffix}").as_str());
             let missing = || LoraError::InvalidState(format!("`{module}` has no adapter tensors"));
             let (a, b) = (part("lora_a").ok_or_else(missing)?, part("lora_b").ok_or_else(missing)?);
+            if self.experts.contains(module) {
+                // A stacked projection has a factor pair per expert, which
+                // PEFT's `lora_A.weight` (one `[r, in]` matrix) cannot hold;
+                // the names are ours, and `peft` leaves them alone.
+                out.insert(peft_tensor_name(module, "lora_expert_A"), a.clone());
+                out.insert(peft_tensor_name(module, "lora_expert_B"), b.clone());
+                continue;
+            }
             out.insert(peft_tensor_name(module, "lora_A.weight"), a.clone());
             out.insert(peft_tensor_name(module, "lora_B.weight"), b.clone());
             if let Some(magnitude) = part("lora_magnitude") {
@@ -509,9 +566,11 @@ fn native_key(
     ours: &HashMap<Rc<str>, Array>,
 ) -> Option<String> {
     if let Some(rest) = name.strip_prefix(PEFT_PREFIX) {
-        const PARTS: [(&str, &str); 4] = [
+        const PARTS: [(&str, &str); 6] = [
             (".lora_A.weight", ".lora_a"),
             (".lora_B.weight", ".lora_b"),
+            (".lora_expert_A", ".lora_a"),
+            (".lora_expert_B", ".lora_b"),
             (".lora_magnitude_vector.weight", ".lora_magnitude"),
             (".lora_magnitude_vector", ".lora_magnitude"),
         ];

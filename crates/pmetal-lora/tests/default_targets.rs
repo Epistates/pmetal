@@ -41,8 +41,9 @@ fn the_default_reaches_past_attention_on_every_architecture() {
             continue;
         };
         checked += 1;
-        // Models whose every MLP is routed experts, which take no adapter yet.
-        if matches!(case.name, "qwen3_moe" | "gpt_oss") {
+        // gpt-oss's experts are read by its own kernels, which take no adapter
+        // yet; every other routed layer here is stacked experts that do.
+        if case.name == "gpt_oss" {
             continue;
         }
         assert!(

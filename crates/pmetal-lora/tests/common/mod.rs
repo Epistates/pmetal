@@ -579,6 +579,10 @@ pub fn every_projection(model: &mut DynamicModel) -> Vec<String> {
     model.visit_linears_mut("", &mut |path, _| {
         names.insert(path.rsplit('.').next().unwrap_or(path).to_string());
     });
+    // The stacked expert projections are targets too.
+    model.visit_experts_mut("", 1, &mut |path, _, _| {
+        names.insert(path.rsplit('.').next().unwrap_or(path).to_string());
+    });
     names.into_iter().collect()
 }
 
