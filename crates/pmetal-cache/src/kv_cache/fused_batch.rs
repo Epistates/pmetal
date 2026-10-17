@@ -65,13 +65,22 @@ pub const ROW_STEP: usize = 4;
 /// Positions per row are allocated this many at a time.
 pub const CAPACITY_STEP: usize = 256;
 
-/// The padding mask of a step, kept for the layers after the first, which
-/// ask for the same one.
+/// An array built from the rows of a step and their offsets, kept for the
+/// layers after the first, which ask for the same one: every layer of a step
+/// has the same rows at the same offsets.
 #[derive(Debug)]
-struct PaddingMask {
+struct PerStep {
     active: Vec<usize>,
     offsets: Vec<usize>,
-    mask: Array,
+    array: Array,
+}
+
+impl PerStep {
+    fn get(memo: &Option<Self>, active: &[usize], offsets: &[usize]) -> Option<Array> {
+        memo.as_ref()
+            .filter(|m| m.active == active && m.offsets == offsets)
+            .map(|m| m.array.clone())
+    }
 }
 
 /// Fused per-layer batched KV cache.
@@ -97,7 +106,8 @@ pub struct FusedBatchKVCache {
     layer_values: Vec<Option<Array>>,
     /// Per-layer per-slot offsets: `offsets[layer_idx][batch_idx]`.
     offsets: Vec<Vec<usize>>,
-    padding_mask: Option<PaddingMask>,
+    padding_mask: Option<PerStep>,
+    positions: Option<PerStep>,
 }
 
 fn round_up(n: usize, step: usize) -> usize {
@@ -133,6 +143,7 @@ impl FusedBatchKVCache {
             capacity: 0,
             offsets,
             padding_mask: None,
+            positions: None,
         })
     }
 
@@ -244,6 +255,7 @@ impl FusedBatchKVCache {
             }
         }
         self.padding_mask = None;
+        self.positions = None;
     }
 
     /// Free every buffer when no slot holds a token, so a server with no
@@ -257,6 +269,7 @@ impl FusedBatchKVCache {
         self.rows = 0;
         self.capacity = 0;
         self.padding_mask = None;
+        self.positions = None;
         true
     }
 
@@ -354,30 +367,52 @@ impl FusedBatchKVCache {
             self.offsets[layer][batch_idx] = have;
         }
         self.padding_mask = None;
+        self.positions = None;
         Ok(())
+    }
+
+    /// The position each of rows `active` is about to write in layer
+    /// `layer_idx`, `[N]` int32: what the layer's RoPE rotates the new token
+    /// by. Read it before that layer's update.
+    pub fn positions(&mut self, layer_idx: usize, active: &[usize]) -> Array {
+        let offsets: Vec<usize> = active
+            .iter()
+            .map(|&row| self.offset_for(layer_idx, row))
+            .collect();
+        if let Some(array) = PerStep::get(&self.positions, active, &offsets) {
+            return array;
+        }
+        let as_i32: Vec<i32> = offsets.iter().map(|&o| o as i32).collect();
+        let array = Array::from_i32_slice(&as_i32);
+        self.positions = Some(PerStep {
+            active: active.to_vec(),
+            offsets,
+            array: array.clone(),
+        });
+        array
     }
 
     /// The additive padding mask `[N, 1, 1, t_max]` for rows `active` whose
     /// offsets are `offsets` (after the step's write): `0` where a position
     /// is in the row, `-inf` past it.
     fn padding_mask(&mut self, active: &[usize], offsets: &[usize], t_max: i32) -> Array {
-        if let Some(memo) = &self.padding_mask {
-            if memo.active == active && memo.offsets == offsets {
-                return memo.mask.clone();
-            }
+        if let Some(mask) = PerStep::get(&self.padding_mask, active, offsets) {
+            return mask;
         }
         let n_active = active.len() as i32;
         let off_i32: Vec<i32> = offsets.iter().map(|&o| o as i32).collect();
         let offs = Array::from_i32_slice_shaped(&off_i32, &[n_active, 1, 1, 1]);
         let positions = ops::arange_range(0, t_max).reshape(&[1, 1, 1, t_max]);
-        let valid = ops::less(&positions, &offs.as_dtype(Dtype::Float32.as_i32()));
-        let zero = Array::from_f32(0.0);
-        let neg_inf = Array::from_f32(f32::NEG_INFINITY);
+        let valid = ops::less(&positions, &offs);
+        // In the cache's dtype, which is the queries' for a model that keeps
+        // its cache in its own: attention takes it as it is.
+        let zero = Array::from_f32(0.0).as_dtype(self.config.dtype.as_i32());
+        let neg_inf = Array::from_f32(f32::NEG_INFINITY).as_dtype(self.config.dtype.as_i32());
         let mask = ops::r#where(&valid, &zero, &neg_inf);
-        self.padding_mask = Some(PaddingMask {
+        self.padding_mask = Some(PerStep {
             active: active.to_vec(),
             offsets: offsets.to_vec(),
-            mask: mask.clone(),
+            array: mask.clone(),
         });
         mask
     }

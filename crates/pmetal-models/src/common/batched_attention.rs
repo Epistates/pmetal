@@ -28,9 +28,7 @@
 
 use pmetal_cache::kv_cache::FusedBatchKVCache;
 use pmetal_runtime::compat::{Array, Dtype, Exception, Module, nn, ops};
-use pmetal_runtime::nn::{
-    AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope_with_per_batch_positions,
-};
+use pmetal_runtime::nn::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 
 use crate::decoder_layer::{MlpModule, NormModule};
 
@@ -233,33 +231,27 @@ pub fn batched_gqa_attn(
         keys
     };
 
-    // Build per-slot position ids from this layer's *pre-update* offsets.
-    // position_ids[n, 0] = cache.offset_for(layer_idx, active_indices[n]).
-    // Layer 0's offset is not this layer's: it has moved on by the time any
-    // later layer asks, which would rotate every layer after the first one
-    // position too far from what its own cached keys were rotated by.
-    let pre_offsets: Vec<i32> = active_indices
-        .iter()
-        .map(|&idx| cache.offset_for(layer_idx, idx) as i32)
-        .collect();
-    let position_ids = Array::from_i32_slice_shaped(&pre_offsets, &[n_active, 1]);
-
-    let queries = apply_rope_with_per_batch_positions(
-        &queries,
-        &position_ids,
+    // Rotate each row by the position its own K/V is about to be written at:
+    // this layer's *pre-update* offset, one per row. (Layer 0's offset is not
+    // this layer's: it has moved on by the time any later layer asks, which
+    // would rotate every layer after the first one position too far from what
+    // its own cached keys were rotated by.) One fused kernel takes the whole
+    // batch's offsets.
+    let positions = cache.positions(layer_idx, active_indices);
+    let queries = queries.rope_with_pos_ids(
         cfg.rope_dims,
         cfg.rope_traditional,
         cfg.rope_base,
         cfg.rope_scale,
-    )?;
-    let keys = apply_rope_with_per_batch_positions(
-        &keys,
-        &position_ids,
+        &positions,
+    );
+    let keys = keys.rope_with_pos_ids(
         cfg.rope_dims,
         cfg.rope_traditional,
         cfg.rope_base,
         cfg.rope_scale,
-    )?;
+        &positions,
+    );
 
     // Write new K/V, fetch T_max-sliced K/V + per-slot padding mask.
     let (k_all, v_all, mask) =
