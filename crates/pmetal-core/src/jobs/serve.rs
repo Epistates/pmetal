@@ -198,6 +198,16 @@ pub struct ServeSpec {
     )]
     #[serde(default)]
     pub cb_max_blocks: usize,
+
+    #[job(
+        label = "CB Exact",
+        group = "Server",
+        argv = "--cb-exact",
+        flag,
+        default_bool = false
+    )]
+    #[serde(default)]
+    pub cb_exact: bool,
 }
 
 impl Default for ServeSpec {
@@ -222,6 +232,7 @@ impl Default for ServeSpec {
             cb_max_queue_depth: default_cb_queue(),
             cb_block_size: default_cb_block_size(),
             cb_max_blocks: 0,
+            cb_exact: false,
         }
     }
 }

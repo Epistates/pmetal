@@ -655,3 +655,125 @@ async fn prefix_hits_continue_as_a_cold_prefill_does() {
     }
     pmetal_runtime::check_unobserved_error().unwrap();
 }
+
+/// A pump with nothing in flight holds no K/V: the allocator's active memory
+/// after a round of requests (and one whose clients hang up half way) is the
+/// model's alone, round after round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn memory_returns_to_the_models_when_requests_finish_or_hang_up() {
+    use pmetal_runtime::inline_array::get_active_memory;
+
+    let Some(dir) = checkpoint() else { return };
+    for per_slot in [true, false] {
+        let engine = engine(&dir, 4, Some(per_slot));
+        let requests = greedy_requests(&dir);
+        let mut after = Vec::new();
+        for _round in 0..4 {
+            let _ = batched(&engine, &requests, Duration::ZERO).await;
+            // Clients that read a few tokens and leave.
+            for (prompt, p) in requests.iter().take(3) {
+                let mut rx = engine.generate_batched(prompt, p.clone()).unwrap();
+                for _ in 0..3 {
+                    let _ = rx.recv().await;
+                }
+                drop(rx);
+            }
+            // The pump notices the hang-ups on its next steps.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(engine.continuous_batching_depth(), (0, 0));
+            after.push(get_active_memory());
+        }
+        let growth = after[3].saturating_sub(after[1]);
+        println!(
+            "{}: active memory after each round: {:?} MiB",
+            if per_slot { "per-slot" } else { "fused" },
+            after.iter().map(|b| b >> 20).collect::<Vec<_>>()
+        );
+        assert!(
+            growth < (4 << 20),
+            "active memory grew by {} KiB over two rounds",
+            growth >> 10
+        );
+    }
+    pmetal_runtime::check_unobserved_error().unwrap();
+}
+
+fn hybrid_checkpoint() -> Option<PathBuf> {
+    let dir = std::env::var_os("PMETAL_BATCH_HYBRID_CHECKPOINT").map(PathBuf::from);
+    if dir.is_none() {
+        eprintln!("PMETAL_BATCH_HYBRID_CHECKPOINT not set; skipping");
+    }
+    dir
+}
+
+/// A hybrid model (recurrent layers beside attention) in a batch: each
+/// request has state of its own, and gets bit for bit what the single-request
+/// path gives it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hybrid_requests_in_a_batch_match_the_single_request_path() {
+    let Some(dir) = hybrid_checkpoint() else {
+        return;
+    };
+    let engine = engine(&dir, 3, Some(false));
+    let mut requests = greedy_requests(&dir);
+    requests.extend(sampled_requests(&dir).into_iter().take(3));
+    let want = alone(&engine, &requests).await;
+    let got = batched(&engine, &requests, Duration::from_millis(30)).await;
+    for (i, (got, want)) in got.iter().zip(&want).enumerate() {
+        assert_same(&format!("hybrid request {i}"), got, want, 0.0);
+    }
+    pmetal_runtime::check_unobserved_error().unwrap();
+}
+
+/// A hybrid chat's next turn repeats the conversation so far: the pump
+/// restores the recurrent state the earlier prompt left and the KV beside it,
+/// runs only the new turn, and replies as a cold prefill would, within bf16
+/// rounding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hybrid_conversation_reuses_the_state_its_earlier_prompt_left() {
+    let Some(dir) = hybrid_checkpoint() else {
+        return;
+    };
+    let tokenizer = pmetal_data::Tokenizer::from_model_dir(&dir).unwrap();
+    let turn_one = tokenizer
+        .encode(
+            "You are a careful assistant who answers questions about geography, history and \
+             science in short, plain sentences. Question: What is the capital of Australia? \
+             Answer: Canberra is the capital of Australia.",
+        )
+        .unwrap();
+    let mut turn_two = turn_one.clone();
+    turn_two.extend(
+        tokenizer
+            .encode(" Question: Why is the sea salty? Answer:")
+            .unwrap(),
+    );
+
+    let engine = engine(&dir, 4, Some(false));
+    engine.set_prefix_cache_limits(16, 1 << 30);
+    let request = |prompt: &Vec<u32>| -> Request { (prompt.clone(), params(32)) };
+
+    let cold = batched(&engine, &[request(&turn_two)], Duration::ZERO).await;
+    engine.set_prefix_cache_limits(0, 0);
+    engine.set_prefix_cache_limits(16, 1 << 30);
+    let _ = batched(&engine, &[request(&turn_one)], Duration::ZERO).await;
+    let hits_before = engine.prefix_cache_stats().2;
+    let warm = batched(&engine, &[request(&turn_two)], Duration::ZERO).await;
+    assert_eq!(
+        engine.prefix_cache_stats().2 - hits_before,
+        1,
+        "the second turn found the first prompt's state"
+    );
+    let (differ, worst) = compare(&warm[0], &cold[0]);
+    println!(
+        "hybrid warm vs cold: {} ({} shared tokens), worst log-probability difference {worst:.3}",
+        match differ {
+            None => "identical".to_string(),
+            Some(at) => format!("tokens differ from {at}"),
+        },
+        turn_one.len()
+    );
+    assert_eq!(warm[0].tokens[0], cold[0].tokens[0], "first token");
+    assert!(worst <= 0.3, "log-probabilities differ by {worst}");
+    pmetal_runtime::check_unobserved_error().unwrap();
+}

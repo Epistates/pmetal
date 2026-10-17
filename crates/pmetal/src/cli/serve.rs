@@ -82,11 +82,21 @@ pub struct ServeArgs {
     #[arg(long = "cb-max-queue-depth", default_value = "256")]
     pub cb_max_queue_depth: usize,
 
-    /// Token block size for continuous-batch paged-KV admission.
+    /// Token block size the continuous-batching admission counts KV memory in.
     #[arg(long = "cb-block-size", default_value = "32")]
     pub cb_block_size: usize,
 
-    /// Maximum active token blocks for continuous batching (0 = auto).
+    /// Maximum active token blocks for continuous batching (0 = what the
+    /// device can hold beside the model).
     #[arg(long = "cb-max-blocks", default_value = "0")]
     pub cb_max_blocks: usize,
+
+    /// Decode each request on its own cache, one forward per request, so a
+    /// reply is bit for bit what the request gets alone. By default a model
+    /// with a batched forward decodes all requests together, several times
+    /// faster under load, and a request that shares its batch can differ from
+    /// its solo reply in the last bit of a logit (a greedy near-tie may fall
+    /// the other way).
+    #[arg(long = "cb-exact")]
+    pub cb_exact: bool,
 }

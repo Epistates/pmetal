@@ -125,6 +125,43 @@ curl http://localhost:8080/v1/chat/completions \
   -d '{"model": "Qwen/Qwen3-0.6B", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
+### Continuous batching
+
+`--continuous-batch` serves requests together instead of one after another. The
+scheduler re-forms the batch after every step, so a request starts as soon as a
+slot is free and leaves the step it finishes; each step decodes one token for
+every running request and runs one chunk of the prompt that is prefilling, so a
+long prompt delays the others by a chunk and no more.
+
+A model with a batched forward (Llama, Mistral, Qwen 2 and 3, Qwen3-MoE, Gemma 1
+and 2, Phi, Cohere and Granite, with a plain dense KV cache) decodes all running
+requests in one forward, reading the weights once however many there are. Hybrid
+models, quantized, TurboQuant and sliding-window caches, and the other
+architectures decode one forward per request. A request that decodes alone gets
+what the single-request path gives it, bit for bit; with company its logits can
+differ in the last bit of a bf16 value, so a greedy near-tie may fall the other
+way. `--cb-exact` decodes every request on its own cache, so a reply is exactly
+the single-request one however requests join and leave, at the cost of the
+batched speed.
+
+A request that begins with tokens an earlier request already ran reuses their
+K/V. For a hybrid model the cached prefix holds the recurrent state beside the
+K/V, so it serves a request that repeats a whole earlier prompt (a chat's next
+turn) but not one that diverges inside it.
+
+| Flag | Meaning | Default |
+|------|---------|---------|
+| `--cb-max-slots` | Requests running at once | 8 |
+| `--cb-max-queue-depth` | Requests that may wait for a slot | 256 |
+| `--cb-block-size` | Tokens per block that admission counts KV memory in | 32 |
+| `--cb-max-blocks` | KV blocks that may be reserved at once (0 = what the device can hold beside the model) | 0 |
+| `--cb-exact` | One forward per request, bit for bit the single-request reply | off |
+
+A request reserves its worst case (prompt plus `max_tokens`) while it runs, so
+none is ever preempted; one that does not fit waits, and a small request may pass
+it only so many times before it holds the line. A client that hangs up frees its
+slot at once.
+
 ### Context length
 
 Without `--max-seq-len`, each sequence gets the model's context window
