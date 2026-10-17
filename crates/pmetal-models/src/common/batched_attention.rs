@@ -19,12 +19,12 @@
 //! # Contract with [`FusedBatchKVCache`]
 //!
 //! The cache's `update_and_fetch_batched` reads each slot's *pre-update*
-//! offset when writing the new K/V at position `offset[slot]`. This
-//! block reads the same pre-update offset to build per-slot RoPE
-//! positions, so Q and the newly-written K/V rotate with identical
-//! positions — preserving the invariant the serial `forward_with_cache`
-//! path relies on (`apply_rope(Q, ..., offset)` matched by
-//! `apply_rope(K, ..., offset)` before the cache write).
+//! offset for the layer when writing the new K/V at position
+//! `offset[layer][slot]`. This block reads the same per-layer pre-update
+//! offset to build per-slot RoPE positions, so Q and the newly-written K/V
+//! rotate with identical positions — preserving the invariant the serial
+//! `forward_with_cache` path relies on (`apply_rope(Q, ..., offset)` matched
+//! by `apply_rope(K, ..., offset)` before the cache write).
 
 use pmetal_cache::kv_cache::FusedBatchKVCache;
 use pmetal_runtime::compat::{Array, Dtype, Exception, Module, nn, ops};
@@ -233,11 +233,14 @@ pub fn batched_gqa_attn(
         keys
     };
 
-    // Build per-slot position ids from the cache's *pre-update* offsets.
-    // position_ids[n, 0] = cache.offset(active_indices[n]).
+    // Build per-slot position ids from this layer's *pre-update* offsets.
+    // position_ids[n, 0] = cache.offset_for(layer_idx, active_indices[n]).
+    // Layer 0's offset is not this layer's: it has moved on by the time any
+    // later layer asks, which would rotate every layer after the first one
+    // position too far from what its own cached keys were rotated by.
     let pre_offsets: Vec<i32> = active_indices
         .iter()
-        .map(|&idx| cache.offset(idx) as i32)
+        .map(|&idx| cache.offset_for(layer_idx, idx) as i32)
         .collect();
     let position_ids = Array::from_i32_slice_shaped(&pre_offsets, &[n_active, 1]);
 

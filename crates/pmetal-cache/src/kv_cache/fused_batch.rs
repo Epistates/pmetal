@@ -3,24 +3,30 @@
 //! # Why this exists
 //!
 //! The per-slot `BatchKVCache` (`Vec<KVCache>`) runs one forward per slot
-//! per decode step. On Apple Silicon, decode matmuls are small
-//! (`[1, hidden]`) and kernel-dispatch overhead dominates wall time.
-//! `FusedBatchKVCache` owns a single `[max_slots, heads, max_seq, D]` K/V
-//! tensor per layer so the model can run one fused `[N, 1]` forward per
-//! tick, folding N kernel launches into one per op.
+//! per decode step. On Apple Silicon a decode step is bound by reading the
+//! weights, so `N` forwards read them `N` times. `FusedBatchKVCache` keeps
+//! the K/V of every active request in one `[rows, heads, capacity, D]` buffer
+//! per layer so the model can run one `[N, 1]` forward per step: the weights
+//! are read once for all `N` requests (the iteration-level batching of Orca,
+//! Yu et al., OSDI 2022, with the requests' K/V padded to a common length and
+//! masked, as a contiguous batch needs).
 //!
 //! # Layout
 //!
 //! Per layer:
-//! - `layer_keys[i]: [max_slots, num_kv_heads, max_seq_len, head_dim]`
-//! - `layer_values[i]: [max_slots, num_kv_heads, max_seq_len, value_head_dim]`
+//! - `layer_keys[i]: [rows, num_kv_heads, capacity, head_dim]`
+//! - `layer_values[i]: [rows, num_kv_heads, capacity, value_head_dim]`
 //!
-//! Per slot:
-//! - `offsets[slot]: usize` — number of valid tokens written so far.
+//! Per row (one request):
+//! - `offsets[layer][row]: usize` — number of valid tokens written so far.
 //!
-//! All rows are eager-allocated at construction. Total memory matches the
-//! existing per-slot `Vec<KVCache>` sized with `max_seq_len`, so this is a
-//! compute-side optimization only, not a memory regression.
+//! The buffers start empty and grow as requests arrive and lengthen: `rows`
+//! in steps of [`ROW_STEP`] up to `max_slots`, `capacity` in steps of
+//! [`CAPACITY_STEP`] up to the configuration's `max_seq_len`. Memory is
+//! therefore `rows * capacity` positions, set by the longest request and the
+//! most requests that have been in flight together, not by `max_slots *
+//! max_seq_len`. [`release_if_idle`](FusedBatchKVCache::release_if_idle)
+//! gives all of it back once no request is running.
 //!
 //! # Update protocol
 //!
@@ -32,26 +38,41 @@
 //! - `K: [N_active, heads, T_max, D]`
 //! - `V: [N_active, heads, T_max, D_v]`
 //! - `mask: [N_active, 1, 1, T_max]` — additive mask, `-inf` at positions
-//!   `t >= new_offset[slot]` (per-slot left-padding against the shared
-//!   `T_max`).
+//!   `t >= new_offset[slot]` (per-slot padding against the shared `T_max`).
 //!
-//! Internally:
-//! 1. `K_active = K_full.take(active_indices, axis=0)` — gather rows.
-//! 2. `K_active = put_along_axis(K_active, write_idx, new_k, axis=2)` —
-//!    write at each slot's current offset.
-//! 3. `K_full = put_along_axis(K_full, scatter_idx, K_active, axis=0)` —
-//!    scatter rows back into the persistent buffer.
-//! 4. Advance `offsets[slot] += 1` for each active slot.
+//! The new tokens go in with one scatter per buffer, in place (the buffer has
+//! a single owner while it is written), so a step costs the tokens it adds
+//! and not the cache, whatever the number of requests. Rows that are not in
+//! `active_indices` get a zero written at their own next position, which no
+//! attention reads and a later token overwrites.
+//!
+//! A request enters the cache with [`load_slot`](FusedBatchKVCache::load_slot),
+//! which copies what a single-request prefill left in an ordinary
+//! [`KVCache`].
 //!
 //! # Scope
 //!
-//! Standard (non-quantized, non-sliding) caches only, which covers every
-//! arch slated for the fused-batch rollout. TurboQuant/Quantized/Sliding
-//! variants stay on the per-slot fallback.
+//! Standard (non-quantized, non-sliding) caches only. TurboQuant, quantized
+//! and sliding-window requests stay on the per-slot path.
 
 use pmetal_runtime::compat::{Array, Dtype, Exception, ops};
 
-use super::{CacheMode, KVCacheConfig};
+use super::{CacheMode, KVCache, KVCacheConfig};
+
+/// Rows are allocated this many at a time.
+pub const ROW_STEP: usize = 4;
+
+/// Positions per row are allocated this many at a time.
+pub const CAPACITY_STEP: usize = 256;
+
+/// The padding mask of a step, kept for the layers after the first, which
+/// ask for the same one.
+#[derive(Debug)]
+struct PaddingMask {
+    active: Vec<usize>,
+    offsets: Vec<usize>,
+    mask: Array,
+}
 
 /// Fused per-layer batched KV cache.
 ///
@@ -64,16 +85,28 @@ use super::{CacheMode, KVCacheConfig};
 pub struct FusedBatchKVCache {
     config: KVCacheConfig,
     max_slots: usize,
-    /// Per-layer K buffer: `[max_slots, num_kv_heads, max_seq_len, head_dim]`.
-    layer_keys: Vec<Array>,
-    /// Per-layer V buffer: `[max_slots, num_kv_heads, max_seq_len, value_head_dim]`.
-    layer_values: Vec<Array>,
+    /// Rows every layer's buffers have, or will have when next touched.
+    rows: usize,
+    /// Positions per row every layer's buffers have, or will have when next
+    /// touched.
+    capacity: usize,
+    /// Per-layer K buffer: `[rows, num_kv_heads, capacity, head_dim]`, once
+    /// the layer is first written.
+    layer_keys: Vec<Option<Array>>,
+    /// Per-layer V buffer: `[rows, num_kv_heads, capacity, value_head_dim]`.
+    layer_values: Vec<Option<Array>>,
     /// Per-layer per-slot offsets: `offsets[layer_idx][batch_idx]`.
     offsets: Vec<Vec<usize>>,
+    padding_mask: Option<PaddingMask>,
+}
+
+fn round_up(n: usize, step: usize) -> usize {
+    n.div_ceil(step) * step
 }
 
 impl FusedBatchKVCache {
-    /// Create a new fused batched cache with eager per-layer allocations.
+    /// Create an empty fused batched cache for up to `max_slots` requests.
+    /// Nothing is allocated until requests arrive.
     ///
     /// Only `CacheMode::Standard` is supported; other modes return an
     /// `Exception`. Callers that need quantized or sliding caches must
@@ -90,33 +123,16 @@ impl FusedBatchKVCache {
                 "FusedBatchKVCache::new: max_slots must be >= 1",
             ));
         }
-
-        let k_shape = [
-            max_slots as i32,
-            config.num_kv_heads as i32,
-            config.max_seq_len as i32,
-            config.head_dim as i32,
-        ];
-        let v_shape = [
-            max_slots as i32,
-            config.num_kv_heads as i32,
-            config.max_seq_len as i32,
-            config.value_head_dim as i32,
-        ];
-        let layer_keys = (0..config.num_layers)
-            .map(|_| ops::zeros(&k_shape, config.dtype))
-            .collect();
-        let layer_values = (0..config.num_layers)
-            .map(|_| ops::zeros(&v_shape, config.dtype))
-            .collect();
-
         let offsets = (0..config.num_layers).map(|_| vec![0; max_slots]).collect();
         Ok(Self {
+            layer_keys: (0..config.num_layers).map(|_| None).collect(),
+            layer_values: (0..config.num_layers).map(|_| None).collect(),
             config,
             max_slots,
-            layer_keys,
-            layer_values,
+            rows: 0,
+            capacity: 0,
             offsets,
+            padding_mask: None,
         })
     }
 
@@ -125,16 +141,39 @@ impl FusedBatchKVCache {
         &self.config
     }
 
-    /// Number of batch rows pre-allocated.
+    /// Number of batch rows the cache can hold.
     pub fn max_slots(&self) -> usize {
         self.max_slots
     }
 
-    /// Layer-0 token offset for `batch_idx`. This is the "canonical"
-    /// per-slot position used for RoPE position ids — every layer's
-    /// offset advances in lockstep during a single decode forward, so
-    /// layer 0's offset at the *start* of the forward is the authoritative
-    /// position of the token being written.
+    /// Rows currently allocated.
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Positions per row currently allocated.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Bytes of K/V the cache holds now (or will, once every layer has been
+    /// touched at the current size).
+    pub fn memory_usage(&self) -> usize {
+        Self::bytes_for(&self.config, self.rows, self.capacity)
+    }
+
+    /// Bytes `rows` rows of `capacity` positions take for `config`'s model.
+    pub fn bytes_for(config: &KVCacheConfig, rows: usize, capacity: usize) -> usize {
+        let per_position = config.clone().memory_footprint() / config.max_seq_len.max(1);
+        rows * capacity * per_position
+    }
+
+    /// Layer-0 token offset for `batch_idx`.
+    ///
+    /// Every layer's offset advances in lockstep during a forward, so this is
+    /// the position of the token being written only before layer 0's update;
+    /// a layer reads its own with [`offset_for`](Self::offset_for) before its
+    /// update.
     pub fn offset(&self, batch_idx: usize) -> usize {
         self.offset_for(0, batch_idx)
     }
@@ -161,19 +200,39 @@ impl FusedBatchKVCache {
             .unwrap_or(0)
     }
 
-    /// Reset a slot's offset back to 0 across all layers. No buffer
-    /// zeroing — the next `update_and_fetch_batched` overwrites
-    /// position 0 directly.
-    pub fn admit(&mut self, batch_idx: usize) -> Result<(), Exception> {
+    /// Make room for row `batch_idx`.
+    fn reserve_row(&mut self, batch_idx: usize) -> Result<(), Exception> {
         if batch_idx >= self.max_slots {
             return Err(Exception::custom(format!(
-                "FusedBatchKVCache::admit: batch_idx {} out of range (max_slots {})",
+                "FusedBatchKVCache: batch_idx {} out of range (max_slots {})",
                 batch_idx, self.max_slots,
             )));
         }
-        for layer in self.offsets.iter_mut() {
-            layer[batch_idx] = 0;
+        self.rows = self
+            .rows
+            .max(round_up(batch_idx + 1, ROW_STEP).min(self.max_slots));
+        Ok(())
+    }
+
+    /// Make room for `tokens` positions in every row.
+    fn reserve_positions(&mut self, tokens: usize) -> Result<(), Exception> {
+        if tokens > self.config.max_seq_len {
+            return Err(Exception::custom(format!(
+                "FusedBatchKVCache: {tokens} positions exceed max_seq_len {}",
+                self.config.max_seq_len,
+            )));
         }
+        self.capacity = self
+            .capacity
+            .max(round_up(tokens, CAPACITY_STEP).min(self.config.max_seq_len));
+        Ok(())
+    }
+
+    /// Reset a slot's offset back to 0 across all layers and make sure it has
+    /// a row. No buffer zeroing — the next write overwrites position 0.
+    pub fn admit(&mut self, batch_idx: usize) -> Result<(), Exception> {
+        self.reserve_row(batch_idx)?;
+        self.release(batch_idx);
         Ok(())
     }
 
@@ -184,6 +243,143 @@ impl FusedBatchKVCache {
                 *off = 0;
             }
         }
+        self.padding_mask = None;
+    }
+
+    /// Free every buffer when no slot holds a token, so a server with no
+    /// request in flight holds no K/V. Returns whether it did.
+    pub fn release_if_idle(&mut self) -> bool {
+        if self.offsets.iter().flatten().any(|&o| o > 0) {
+            return false;
+        }
+        self.layer_keys.iter_mut().for_each(|b| *b = None);
+        self.layer_values.iter_mut().for_each(|b| *b = None);
+        self.rows = 0;
+        self.capacity = 0;
+        self.padding_mask = None;
+        true
+    }
+
+    /// Bring layer `layer_idx`'s buffers to the cache's current `rows` and
+    /// `capacity`, allocating them on first use and growing them since.
+    fn fit_layer(&mut self, layer_idx: usize) {
+        let heads = self.config.num_kv_heads as i32;
+        let (rows, capacity) = (self.rows as i32, self.capacity as i32);
+        let dtype = self.config.dtype;
+        for (slot, dim) in [
+            (&mut self.layer_keys[layer_idx], self.config.head_dim as i32),
+            (
+                &mut self.layer_values[layer_idx],
+                self.config.value_head_dim as i32,
+            ),
+        ] {
+            let want = [rows, heads, capacity, dim];
+            let fitted = match slot.take() {
+                None => ops::zeros(&want, dtype),
+                Some(buffer) if buffer.shape() == want => buffer,
+                Some(mut buffer) => {
+                    let have = buffer.shape().to_vec();
+                    if have[2] < capacity {
+                        let pad = ops::zeros(&[have[0], heads, capacity - have[2], dim], dtype);
+                        buffer = ops::concatenate_axis(&[&buffer, &pad], 2);
+                    }
+                    if have[0] < rows {
+                        let pad = ops::zeros(&[rows - have[0], heads, capacity, dim], dtype);
+                        buffer = ops::concatenate_axis(&[&buffer, &pad], 0);
+                    }
+                    buffer
+                }
+            };
+            *slot = Some(fitted);
+        }
+    }
+
+    /// Copy what an ordinary single-request [`KVCache`] holds (a prefill, or a
+    /// prefix restored from the prefix cache) into row `batch_idx`, which
+    /// then decodes on from it.
+    ///
+    /// # Errors
+    /// When the cache is not a plain dense one, holds no tokens, or holds no
+    /// room for the next token; or `batch_idx` is out of range.
+    pub fn load_slot(&mut self, batch_idx: usize, source: &KVCache) -> Result<(), Exception> {
+        if !matches!(source.config().mode, CacheMode::Standard) {
+            return Err(Exception::custom(format!(
+                "FusedBatchKVCache::load_slot: a {:?} cache cannot be loaded into the fused one",
+                source.config().mode,
+            )));
+        }
+        self.reserve_row(batch_idx)?;
+        let heads = self.config.num_kv_heads as i32;
+        let mut layers = Vec::with_capacity(self.config.num_layers);
+        for layer in 0..self.config.num_layers {
+            let (k, v) = source.get(layer).ok_or_else(|| {
+                Exception::custom(format!(
+                    "FusedBatchKVCache::load_slot: layer {layer} of the source holds no tokens"
+                ))
+            })?;
+            let have = k.dim(2);
+            if k.shape() != [1, heads, have, self.config.head_dim as i32] || v.dim(2) != have {
+                return Err(Exception::custom(format!(
+                    "FusedBatchKVCache::load_slot: layer {layer} holds {:?} / {:?}, \
+                     not one row of {heads} heads",
+                    k.shape(),
+                    v.shape(),
+                )));
+            }
+            layers.push((k, v, have as usize));
+        }
+        // Room for every layer's tokens and for the next one.
+        let longest = layers.iter().map(|&(.., n)| n).max().unwrap_or(0);
+        self.reserve_positions(longest + 1)?;
+        let slot = batch_idx as i32;
+        for (layer, (k, v, have)) in layers.into_iter().enumerate() {
+            self.fit_layer(layer);
+            let have_i = have as i32;
+            let (dk, dv) = (
+                self.config.head_dim as i32,
+                self.config.value_head_dim as i32,
+            );
+            let dtype_k = self.layer_keys[layer].as_ref().map(Array::dtype_raw);
+            let dtype_v = self.layer_values[layer].as_ref().map(Array::dtype_raw);
+            let (k, v) = (
+                k.as_dtype(dtype_k.expect("fitted")),
+                v.as_dtype(dtype_v.expect("fitted")),
+            );
+            let keys = self.layer_keys[layer].take().expect("fitted");
+            let values = self.layer_values[layer].take().expect("fitted");
+            self.layer_keys[layer] =
+                Some(keys.slice_set(&k, &[slot, 0, 0, 0], &[slot + 1, heads, have_i, dk]));
+            self.layer_values[layer] =
+                Some(values.slice_set(&v, &[slot, 0, 0, 0], &[slot + 1, heads, have_i, dv]));
+            self.offsets[layer][batch_idx] = have;
+        }
+        self.padding_mask = None;
+        Ok(())
+    }
+
+    /// The additive padding mask `[N, 1, 1, t_max]` for rows `active` whose
+    /// offsets are `offsets` (after the step's write): `0` where a position
+    /// is in the row, `-inf` past it.
+    fn padding_mask(&mut self, active: &[usize], offsets: &[usize], t_max: i32) -> Array {
+        if let Some(memo) = &self.padding_mask {
+            if memo.active == active && memo.offsets == offsets {
+                return memo.mask.clone();
+            }
+        }
+        let n_active = active.len() as i32;
+        let off_i32: Vec<i32> = offsets.iter().map(|&o| o as i32).collect();
+        let offs = Array::from_i32_slice_shaped(&off_i32, &[n_active, 1, 1, 1]);
+        let positions = ops::arange_range(0, t_max).reshape(&[1, 1, 1, t_max]);
+        let valid = ops::less(&positions, &offs.as_dtype(Dtype::Float32.as_i32()));
+        let zero = Array::from_f32(0.0);
+        let neg_inf = Array::from_f32(f32::NEG_INFINITY);
+        let mask = ops::r#where(&valid, &zero, &neg_inf);
+        self.padding_mask = Some(PaddingMask {
+            active: active.to_vec(),
+            offsets: offsets.to_vec(),
+            mask: mask.clone(),
+        });
+        mask
     }
 
     /// Write `new_k`/`new_v` at each active slot's current offset,
@@ -235,8 +431,7 @@ impl FusedBatchKVCache {
             )));
         }
 
-        // Validate and collect current offsets; bounds-check against max_seq_len.
-        let mut pre_offsets = Vec::with_capacity(n_active);
+        let mut seen = vec![false; self.max_slots];
         for &idx in active_indices {
             if idx >= self.max_slots {
                 return Err(Exception::custom(format!(
@@ -244,41 +439,63 @@ impl FusedBatchKVCache {
                     idx, self.max_slots,
                 )));
             }
-            let off = self.offsets[layer_idx][idx];
-            if off + 1 > self.config.max_seq_len {
-                return Err(Exception::custom(format!(
-                    "FusedBatchKVCache: slot {} exceeds max_seq_len {}",
-                    idx, self.config.max_seq_len,
-                )));
-            }
-            pre_offsets.push(off);
-        }
-        let mut seen = vec![false; self.max_slots];
-        for &idx in active_indices {
             if std::mem::replace(&mut seen[idx], true) {
                 return Err(Exception::custom(format!(
                     "FusedBatchKVCache: slot {idx} appears twice in active_indices",
                 )));
             }
+            if self.offsets[layer_idx][idx] + 1 > self.config.max_seq_len {
+                return Err(Exception::custom(format!(
+                    "FusedBatchKVCache: slot {} exceeds max_seq_len {}",
+                    idx, self.config.max_seq_len,
+                )));
+            }
         }
+        for &idx in active_indices {
+            self.reserve_row(idx)?;
+        }
+        // Room for the next token of every row, the ones not in this step
+        // too: they get a placeholder written at their own next position.
+        let deepest = self.offsets[layer_idx].iter().copied().max().unwrap_or(0);
+        self.reserve_positions(deepest + 1)?;
+        self.fit_layer(layer_idx);
+        let rows = self.rows;
 
-        // Write each slot's token at its own offset, in place: one small
-        // slice update per slot into the persistent buffers, so a step costs
-        // the tokens it adds and not the cache. The buffers are taken out of
-        // `self` while they are written, which leaves each update the only
-        // holder of its input.
-        let placeholder = || Array::zeros(&[1], Dtype::Float32);
-        let mut k_full = std::mem::replace(&mut self.layer_keys[layer_idx], placeholder());
-        let mut v_full = std::mem::replace(&mut self.layer_values[layer_idx], placeholder());
-        let new_k = new_k.as_dtype(k_full.dtype_raw());
-        let new_v = new_v.as_dtype(v_full.dtype_raw());
-        for (row, (&slot, &off)) in active_indices.iter().zip(&pre_offsets).enumerate() {
-            let (row, slot, off) = (row as i32, slot as i32, off as i32);
-            let k_row = new_k.slice(&[row, 0, 0, 0], &[row + 1, heads, 1, d_k]);
-            let v_row = new_v.slice(&[row, 0, 0, 0], &[row + 1, heads, 1, d_v]);
-            k_full = k_full.slice_set(&k_row, &[slot, 0, off, 0], &[slot + 1, heads, off + 1, d_k]);
-            v_full = v_full.slice_set(&v_row, &[slot, 0, off, 0], &[slot + 1, heads, off + 1, d_v]);
+        // Where each row writes, and which of the step's tokens it writes.
+        // A row that is not in the step takes the zero row appended to the
+        // new tokens.
+        let positions: Vec<i32> = (0..rows)
+            .map(|r| self.offsets[layer_idx][r] as i32)
+            .collect();
+        let mut source = vec![n_active as i32; rows];
+        for (n, &slot) in active_indices.iter().enumerate() {
+            source[slot] = n as i32;
         }
+        let in_order = n_active == rows && active_indices.iter().enumerate().all(|(n, &s)| n == s);
+
+        let mut k_full = self.layer_keys[layer_idx].take().expect("fitted");
+        let mut v_full = self.layer_values[layer_idx].take().expect("fitted");
+        let spread = |new: &Array, dim: i32, dtype: i32| -> Array {
+            let new = new.as_dtype(dtype);
+            if in_order {
+                return new;
+            }
+            let zero_row = ops::zeros(&[1, heads, 1, dim], Dtype::Float32).as_dtype(dtype);
+            let with_zero = ops::concatenate_axis(&[&new, &zero_row], 0);
+            with_zero.take_axis(&Array::from_i32_slice(&source), 0)
+        };
+        let at = Array::from_i32_slice_shaped(&positions, &[rows as i32, 1, 1, 1]).broadcast_to(&[
+            rows as i32,
+            heads,
+            1,
+            1,
+        ]);
+        let k_rows = spread(new_k, d_k, k_full.dtype_raw());
+        let v_rows = spread(new_v, d_v, v_full.dtype_raw());
+        k_full =
+            k_full.put_along_axis_op(&at.broadcast_to(&[rows as i32, heads, 1, d_k]), &k_rows, 2);
+        v_full =
+            v_full.put_along_axis_op(&at.broadcast_to(&[rows as i32, heads, 1, d_v]), &v_rows, 2);
 
         // Advance offsets for this layer only.
         for &idx in active_indices {
@@ -300,7 +517,7 @@ impl FusedBatchKVCache {
             .iter()
             .enumerate()
             .all(|(row, &slot)| slot == first + row);
-        let rows = |buf: &Array, dim: i32| -> Array {
+        let rows_of = |buf: &Array, dim: i32| -> Array {
             if consecutive {
                 buf.slice(
                     &[first as i32, 0, 0, 0],
@@ -311,28 +528,16 @@ impl FusedBatchKVCache {
                     &active_indices.iter().map(|&i| i as i32).collect::<Vec<_>>(),
                     &[n_active as i32],
                 );
-                buf.slice(
-                    &[0, 0, 0, 0],
-                    &[self.max_slots as i32, heads, t_max_i32, dim],
-                )
-                .take_axis(&gather, 0)
+                buf.slice(&[0, 0, 0, 0], &[rows as i32, heads, t_max_i32, dim])
+                    .take_axis(&gather, 0)
             }
         };
-        let k_out = rows(&k_full, d_k);
-        let v_out = rows(&v_full, d_v);
-        self.layer_keys[layer_idx] = k_full;
-        self.layer_values[layer_idx] = v_full;
+        let k_out = rows_of(&k_full, d_k);
+        let v_out = rows_of(&v_full, d_v);
+        self.layer_keys[layer_idx] = Some(k_full);
+        self.layer_values[layer_idx] = Some(v_full);
 
-        // Build additive padding mask: mask[n, 0, 0, t] = 0 if t < new_offset[n] else -inf.
-        let new_off_i32: Vec<i32> = new_offsets.iter().map(|&o| o as i32).collect();
-        let offs_arr = Array::from_i32_slice_shaped(&new_off_i32, &[n_active as i32, 1, 1, 1]);
-        let t_range = ops::arange_range(0, t_max_i32).reshape(&[1, 1, 1, t_max_i32]);
-        let offs_f = offs_arr.as_dtype(Dtype::Float32.as_i32());
-        let valid = ops::less(&t_range, &offs_f);
-        let zero = Array::from_f32(0.0);
-        let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-        let mask = ops::r#where(&valid, &zero, &neg_inf);
-
+        let mask = self.padding_mask(active_indices, &new_offsets, t_max_i32);
         Ok((k_out, v_out, mask))
     }
 }
@@ -419,6 +624,195 @@ mod tests {
         let _ = c.update_and_fetch_batched(1, &[0], &nk, &nv).unwrap();
         assert_eq!(c.offset_for(0, 0), 1);
         assert_eq!(c.offset_for(1, 0), 1);
+    }
+
+    use crate::kv_cache::reference_tests::{Rng, array};
+    use crate::test_utils::to_f32_vec_eval;
+
+    const H: usize = 2;
+    const D: usize = 4;
+    const LAYERS: usize = 3;
+
+    /// `[layer][token][H * D]`.
+    type LayerTokens = Vec<Vec<Vec<f32>>>;
+
+    /// A dense one-row cache holding `tokens` tokens of random keys and
+    /// values in every layer; also returns them as `[layer][token][H * D]`.
+    fn prefilled(rng: &mut Rng, tokens: usize) -> (KVCache, LayerTokens, LayerTokens) {
+        let mut cache = KVCache::new(KVCacheConfig::new(LAYERS, 2048, H, D));
+        let (mut keys, mut values) = (Vec::new(), Vec::new());
+        for layer in 0..LAYERS {
+            let k = rng.normals(tokens * H * D, 1.0);
+            let v = rng.normals(tokens * H * D, 1.0);
+            // The cache's layout is [1, H, T, D]; ours is token-major.
+            let to_cache = |flat: &[f32]| -> Array {
+                let mut laid = vec![0.0f32; flat.len()];
+                for t in 0..tokens {
+                    for h in 0..H {
+                        for d in 0..D {
+                            laid[(h * tokens + t) * D + d] = flat[(t * H + h) * D + d];
+                        }
+                    }
+                }
+                array(&laid, &[1, H, tokens, D])
+            };
+            cache
+                .update_and_fetch(layer, &to_cache(&k), &to_cache(&v))
+                .unwrap();
+            keys.push(k.chunks(H * D).map(<[f32]>::to_vec).collect());
+            values.push(v.chunks(H * D).map(<[f32]>::to_vec).collect());
+        }
+        (cache, keys, values)
+    }
+
+    /// A row's keys as `[token][H * D]` out of a fetched `[N, H, T, D]`.
+    fn row_tokens(fetched: &Array, row: usize, tokens: usize) -> Vec<Vec<f32>> {
+        let t_max = fetched.dim(2) as usize;
+        let flat = to_f32_vec_eval(fetched);
+        (0..tokens)
+            .map(|t| {
+                (0..H)
+                    .flat_map(|h| {
+                        let base = ((row * H + h) * t_max + t) * D;
+                        flat[base..base + D].to_vec()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Requests prefilled elsewhere and loaded into rows keep every token
+    /// through decode steps that run for some rows and not others, and a row
+    /// that was idle for a while picks up where it left off.
+    #[test]
+    fn loaded_rows_keep_their_tokens_through_uneven_decoding() {
+        let mut rng = Rng::new(7);
+        let lengths = [5usize, 1, 9];
+        let rows = [2usize, 0, 5];
+        let mut cache = FusedBatchKVCache::new(KVCacheConfig::new(LAYERS, 2048, H, D), 6).unwrap();
+        let mut keys: Vec<LayerTokens> = Vec::new();
+        let mut values: Vec<LayerTokens> = Vec::new();
+        for (&len, &row) in lengths.iter().zip(&rows) {
+            let (source, k, v) = prefilled(&mut rng, len);
+            cache.admit(row).unwrap();
+            cache.load_slot(row, &source).unwrap();
+            assert_eq!(cache.offset(row), len);
+            keys.push(k);
+            values.push(v);
+        }
+        assert_eq!(cache.rows(), 6, "rows grow in steps, up to max_slots");
+
+        // Steps over different subsets of the three requests.
+        let schedule: [&[usize]; 5] = [&[0, 1, 2], &[2], &[1, 2], &[0], &[0, 1, 2]];
+        for (step, subset) in schedule.iter().enumerate() {
+            let active: Vec<usize> = subset.iter().map(|&i| rows[i]).collect();
+            for layer in 0..LAYERS {
+                let new: Vec<Vec<f32>> = subset.iter().map(|_| rng.normals(H * D, 1.0)).collect();
+                let flat: Vec<f32> = new.iter().flatten().copied().collect();
+                // [N, H, 1, D]: the token-major data is already [H][D] per row.
+                let nk = array(&flat, &[subset.len(), H, 1, D]);
+                let nv = nk.clone();
+                let (k, v, _mask) = cache
+                    .update_and_fetch_batched(layer, &active, &nk, &nv)
+                    .unwrap();
+                for (n, &i) in subset.iter().enumerate() {
+                    keys[i][layer].push(new[n].clone());
+                    values[i][layer].push(new[n].clone());
+                    let have = keys[i][layer].len();
+                    assert_eq!(
+                        row_tokens(&k, n, have),
+                        keys[i][layer],
+                        "step {step}, layer {layer}: keys of request {i}"
+                    );
+                    assert_eq!(
+                        row_tokens(&v, n, have),
+                        values[i][layer],
+                        "step {step}, layer {layer}: values of request {i}"
+                    );
+                }
+            }
+        }
+        pmetal_runtime::check_unobserved_error().unwrap();
+    }
+
+    #[test]
+    fn buffers_grow_with_the_requests_and_are_given_back_when_idle() {
+        let mut cache = FusedBatchKVCache::new(KVCacheConfig::new(LAYERS, 4096, H, D), 16).unwrap();
+        assert_eq!(
+            (cache.rows(), cache.capacity(), cache.memory_usage()),
+            (0, 0, 0)
+        );
+
+        let mut rng = Rng::new(3);
+        let (short, ..) = prefilled(&mut rng, 10);
+        cache.admit(0).unwrap();
+        cache.load_slot(0, &short).unwrap();
+        assert_eq!((cache.rows(), cache.capacity()), (ROW_STEP, CAPACITY_STEP));
+        let small = cache.memory_usage();
+
+        // A longer request, in a later row.
+        let (long, ..) = prefilled(&mut rng, 600);
+        cache.admit(5).unwrap();
+        cache.load_slot(5, &long).unwrap();
+        assert_eq!(
+            (cache.rows(), cache.capacity()),
+            (2 * ROW_STEP, 3 * CAPACITY_STEP)
+        );
+        assert!(cache.memory_usage() > small);
+        assert_eq!(
+            cache.memory_usage(),
+            FusedBatchKVCache::bytes_for(cache.config(), cache.rows(), cache.capacity())
+        );
+
+        assert!(!cache.release_if_idle(), "requests still hold tokens");
+        cache.release(0);
+        assert!(!cache.release_if_idle());
+        cache.release(5);
+        assert!(cache.release_if_idle());
+        assert_eq!((cache.rows(), cache.capacity()), (0, 0));
+    }
+
+    #[test]
+    fn a_cache_that_is_not_plain_dense_cannot_be_loaded() {
+        let mut cache = FusedBatchKVCache::new(KVCacheConfig::new(1, 64, H, D), 2).unwrap();
+        let quantized = KVCache::new(KVCacheConfig::new(1, 64, H, D).with_quantized(8, 64));
+        assert!(cache.load_slot(0, &quantized).is_err());
+        let empty = KVCache::new(KVCacheConfig::new(1, 64, H, D));
+        assert!(cache.load_slot(0, &empty).is_err());
+    }
+
+    /// A decode step writes into the buffer it already has: the K/V of every
+    /// request is not copied per token.
+    #[test]
+    fn a_decode_step_writes_in_place() {
+        let mut rng = Rng::new(11);
+        let mut cache = FusedBatchKVCache::new(KVCacheConfig::new(1, 2048, H, D), 4).unwrap();
+        for row in 0..3 {
+            let (source, ..) = prefilled(&mut rng, 20);
+            cache.admit(row).unwrap();
+            cache.load_slot(row, &source).unwrap();
+        }
+        let active = [0usize, 1, 2];
+        let address = |cache: &FusedBatchKVCache| cache.layer_keys[0].as_ref().unwrap().data_ptr();
+        let mut moves = 0;
+        for _ in 0..24 {
+            let before = address(&cache);
+            let nk = array(&rng.normals(3 * H * D, 1.0), &[3, H, 1, D]);
+            let (k, v, m) = cache
+                .update_and_fetch_batched(0, &active, &nk, &nk)
+                .unwrap();
+            k.eval();
+            v.eval();
+            m.eval();
+            drop((k, v, m));
+            if address(&cache) != before {
+                moves += 1;
+            }
+        }
+        // MLX hands a buffer over once the previous command buffer has let
+        // go of it, which on a loaded machine is sometimes later than the next
+        // write; a cache that copies every step moves at all of them.
+        assert!(moves <= 6, "{moves} of 24 steps moved the buffer");
     }
 
     #[test]
