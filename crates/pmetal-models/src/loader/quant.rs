@@ -396,9 +396,7 @@ pub(crate) fn take_packed_linears(
     ];
     let experts: Vec<String> = weights
         .keys()
-        .filter(|key| {
-            key.contains(".experts.") && EXPERT_SUFFIXES.iter().any(|s| key.ends_with(s))
-        })
+        .filter(|key| key.contains(".experts.") && EXPERT_SUFFIXES.iter().any(|s| key.ends_with(s)))
         .cloned()
         .collect();
     let held: Vec<(String, Array)> = experts

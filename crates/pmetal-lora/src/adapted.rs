@@ -165,9 +165,7 @@ impl AdaptedModel {
             let fitted = initialise(
                 linear,
                 init,
-                round_trip
-                    .as_ref()
-                    .map(|f| f as &Quantizer<'_>),
+                round_trip.as_ref().map(|f| f as &Quantizer<'_>),
             );
             if let Err(e) = fitted {
                 failure = Some(e);

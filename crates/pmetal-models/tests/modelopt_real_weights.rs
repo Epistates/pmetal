@@ -74,9 +74,11 @@ fn a_released_modelopt_checkpoint_stays_packed() {
         let packed_logits = logits.as_dtype(Dtype::Float32.as_i32());
         packed_logits.eval();
         drop(model);
-        let mut dense =
-            Qwen3NextForCausalLM::new_with_routed_expert_mode(config.clone(), Qwen3NextRoutedExpertMode::Resident)
-                .expect("model");
+        let mut dense = Qwen3NextForCausalLM::new_with_routed_expert_mode(
+            config.clone(),
+            Qwen3NextRoutedExpertMode::Resident,
+        )
+        .expect("model");
         load_qwen3_next_weights_with_options(
             &mut dense,
             std::path::Path::new(&dir),
