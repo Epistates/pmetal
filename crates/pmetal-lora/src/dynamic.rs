@@ -338,6 +338,10 @@ impl TrainableModel for DynamicLoraModel {
         TrainableModel::load_lora_weights(&mut self.inner, path)
     }
 
+    fn adapter_target_modules(&self) -> Vec<String> {
+        TrainableModel::adapter_target_modules(&self.inner)
+    }
+
     fn enable_gradient_checkpointing(&mut self, layers_per_block: usize) {
         TrainableModel::enable_gradient_checkpointing(&mut self.inner, layers_per_block)
     }

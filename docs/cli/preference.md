@@ -30,7 +30,7 @@ pmetal dpo --model Qwen/Qwen3-0.6B --dataset pairs.jsonl --label-smoothing 0.1
 pmetal preference --model Qwen/Qwen3-0.6B --dataset feedback.jsonl --loss kto --batch-size 4
 
 # Use the trained adapter
-pmetal infer --model Qwen/Qwen3-0.6B --lora ./output/preference/lora_weights.safetensors
+pmetal infer --model Qwen/Qwen3-0.6B --lora ./output/preference/adapter_model.safetensors
 ```
 
 ## Objectives
@@ -65,7 +65,7 @@ The last shape is KTO's. KTO also reads paired rows, taking the chosen completio
 |-----------|---------|-------------|
 | `--model` | *required* | Model ID or local path |
 | `--dataset` | *required* | JSONL / JSON / Parquet file or Hugging Face dataset ID |
-| `--output` | `./output/preference` | Where `lora_weights.safetensors` and `adapter_config.json` go |
+| `--output` | `./output/preference` | Where `adapter_model.safetensors` and `adapter_config.json` go |
 | `--loss` | `dpo` | `dpo`, `ipo`, `hinge`, `simpo`, `orpo` or `kto` |
 | `--beta` | 2.5 for SimPO, 0.1 otherwise | β |
 | `--simpo-gamma-ratio` | `0.5` | SimPO's target margin over β (γ/β) |

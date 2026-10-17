@@ -48,7 +48,7 @@ Chat with your fine-tuned model:
 ```bash
 pmetal infer \
   --model Qwen/Qwen3-0.6B \
-  --lora ./output/lora_weights.safetensors \
+  --lora ./output/adapter_model.safetensors \
   --prompt "Explain quantum entanglement" \
   --chat --show-thinking
 ```

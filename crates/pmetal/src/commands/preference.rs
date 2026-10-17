@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use pmetal_core::jobs::PreferenceSpec;
 use pmetal_core::{LoraConfig, TrainingCallback, TrainingConfig};
 use pmetal_data::Tokenizer;
-use pmetal_lora::{DynamicLoraModel, TrainableModel};
+use pmetal_lora::DynamicLoraModel;
 use pmetal_trainer::preference::{self, KtoConfig, PreferenceLoss, PreferenceStepMetrics};
 use pmetal_trainer::{KtoTrainer, PreferenceTrainer, TrainOptimizer};
 
@@ -158,14 +158,10 @@ pub(crate) async fn run_preference(
         }
     };
 
-    let weights = output_dir.join("lora_weights.safetensors");
-    model.save_lora_weights(&weights)?;
-    pmetal_trainer::orchestrator::save_adapter_config(
-        &weights,
-        lora_config.r,
-        lora_config.alpha,
-        &lora_config.target_modules,
-        lora_config.use_rslora,
+    let weights = pmetal_trainer::orchestrator::save_adapter(
+        &model,
+        &output_dir,
+        &lora_config,
         Some(&spec.model),
     )?;
 

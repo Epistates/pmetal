@@ -25,7 +25,7 @@ pmetal eval \
 pmetal eval \
   --model Qwen/Qwen3-0.6B \
   --dataset eval.jsonl \
-  --lora ./output/lora_weights.safetensors
+  --lora ./output/adapter_model.safetensors
 ```
 
 ## See Also

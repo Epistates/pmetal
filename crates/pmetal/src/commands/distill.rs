@@ -493,17 +493,14 @@ pub(crate) async fn run_distillation_cli(
         }
     }
 
-    let lora_output = validated_distill_output.join("lora_weights.safetensors");
-    tracing::info!("Saving distilled student adapters to {:?}", lora_output);
-    std::fs::create_dir_all(&validated_distill_output)?;
-    use pmetal_lora::TrainableModel;
-    student_model.save_lora_weights(&lora_output)?;
-    pmetal_trainer::orchestrator::save_adapter_config(
-        &lora_output,
-        student_lora_config.r,
-        student_lora_config.alpha,
-        &student_lora_config.target_modules,
-        student_lora_config.use_rslora,
+    tracing::info!(
+        "Saving distilled student adapters to {:?}",
+        validated_distill_output
+    );
+    let lora_output = pmetal_trainer::orchestrator::save_adapter(
+        &student_model,
+        &validated_distill_output,
+        &student_lora_config,
         Some(student_id),
     )?;
 

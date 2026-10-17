@@ -413,16 +413,10 @@ pub(crate) async fn run_grpo_cli(
             .map_err(|e| anyhow::anyhow!("GRPO training error: {}", e))?;
     }
 
-    let output_dir_path = PathBuf::from(output_dir);
-    std::fs::create_dir_all(&output_dir_path)?;
-    let final_path = output_dir_path.join("lora_weights.safetensors");
-    model.save_lora_weights(&final_path)?;
-    pmetal_trainer::orchestrator::save_adapter_config(
-        &final_path,
-        lora_config.r,
-        lora_config.alpha,
-        &lora_config.target_modules,
-        lora_config.use_rslora,
+    pmetal_trainer::orchestrator::save_adapter(
+        &model,
+        &PathBuf::from(output_dir),
+        &lora_config,
         Some(model_id),
     )?;
 

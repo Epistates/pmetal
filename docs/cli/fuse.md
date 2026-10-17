@@ -19,12 +19,12 @@ pmetal fuse \
 # Fuse LoRA weights
 pmetal fuse \
   --model Qwen/Qwen3-0.6B \
-  --lora ./output/lora_weights.safetensors
+  --lora ./output/adapter_model.safetensors
 
 # Accurate mode (higher precision)
 pmetal fuse \
   --model Qwen/Qwen3-0.6B \
-  --lora ./output/lora_weights.safetensors \
+  --lora ./output/adapter_model.safetensors \
   --accurate
 ```
 

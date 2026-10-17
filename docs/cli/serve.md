@@ -19,7 +19,7 @@ pmetal serve --model Qwen/Qwen3-0.6B --port 8080
 # Serve a pre-fused adapter model
 pmetal fuse \
   --model Qwen/Qwen3-0.6B \
-  --lora ./output/lora_weights.safetensors \
+  --lora ./output/adapter_model.safetensors \
   --output ./output/fused
 pmetal serve --model ./output/fused --port 8080
 ```

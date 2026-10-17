@@ -111,7 +111,7 @@ pmetal train --model ... --dataset data.jsonl \
 
 Training produces:
 
-- `lora_weights.safetensors` — LoRA adapter weights
+- `adapter_model.safetensors` and `adapter_config.json` — the LoRA adapter, in the layout `peft` reads (`PeftModel.from_pretrained(base, "./output")` loads it; adapters from earlier releases, `lora_weights.safetensors`, still load here)
 - `training_metrics.jsonl` — Per-step metrics log
 - `checkpoint/` — Resumable checkpoints (if training is interrupted)
 

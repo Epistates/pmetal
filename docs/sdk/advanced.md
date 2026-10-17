@@ -105,7 +105,7 @@ let mut training_loop = TrainingLoop::new(loop_config);
 training_loop.add_callback(Box::new(ProgressCallback::new(total_steps)));
 
 let model = training_loop.run_packed(model, dataset, None, Some(&checkpoints))?;
-model.save_lora_weights("./output/lora_weights.safetensors")?;
+model.save_lora_weights("./output/adapter_model.safetensors")?;
 
 println!("final loss {:.4} over {} steps",
     training_loop.current_loss(), training_loop.current_step());

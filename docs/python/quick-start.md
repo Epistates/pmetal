@@ -38,7 +38,7 @@ print(text)
 text = pmetal.infer(
     "Qwen/Qwen3-0.6B",
     "Explain quantum entanglement",
-    lora="./output/lora_weights.safetensors",
+    lora="./output/adapter_model.safetensors",
 )
 print(text)
 

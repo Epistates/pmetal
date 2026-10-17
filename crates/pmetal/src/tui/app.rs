@@ -2944,11 +2944,9 @@ impl App {
             .to_string_lossy()
             .to_string();
         let output_dir = format!("./output/{adapter_name}--fused");
-        let lora_file = if model.path.join("lora_weights.safetensors").exists() {
-            model.path.join("lora_weights.safetensors")
-        } else {
-            model.path.clone()
-        };
+        // The adapter directory: fuse finds its weights (`adapter_model.safetensors`,
+        // or `lora_weights.safetensors` in older runs) and its config there.
+        let lora_file = model.path.clone();
 
         let args = vec![
             "fuse".to_string(),
@@ -3008,13 +3006,9 @@ impl App {
         // For LoRA adapters: use base model as --model and adapter dir as --lora
         let (effective_model, lora_path) = if let Some(entry) = model_entry {
             if is_lora_adapter(&entry.path) {
-                // Find the actual lora weights file
-                let lora_file = if entry.path.join("lora_weights.safetensors").exists() {
-                    entry.path.join("lora_weights.safetensors")
-                } else {
-                    // adapter_config.json style — pass the directory
-                    entry.path.clone()
-                };
+                // The adapter directory holds the weights and config; the
+                // runner finds both.
+                let lora_file = entry.path.clone();
 
                 if let Some(ref base) = entry.base_model {
                     // Resolve base model to its actual path
@@ -3276,9 +3270,12 @@ impl App {
     }
 }
 
-/// Check if a model directory is a LoRA adapter (has lora_weights.safetensors or adapter_config.json).
+/// Check if a model directory is a LoRA adapter (has adapter_model.safetensors,
+/// lora_weights.safetensors or adapter_config.json).
 fn is_lora_adapter(path: &std::path::Path) -> bool {
-    path.join("lora_weights.safetensors").exists() || path.join("adapter_config.json").exists()
+    ["adapter_model.safetensors", "lora_weights.safetensors", "adapter_config.json"]
+        .iter()
+        .any(|name| path.join(name).exists())
 }
 
 /// Extract the value following a flag in a CLI args list (e.g., `--model` → the next arg).
