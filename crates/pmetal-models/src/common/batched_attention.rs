@@ -253,7 +253,8 @@ pub fn batched_gqa_attn(
         &positions,
     );
 
-    // Write new K/V, fetch T_max-sliced K/V + per-slot padding mask.
+    // Write new K/V, fetch T_max-sliced K/V + per-slot padding mask (none when
+    // no row is padded).
     let (k_all, v_all, mask) =
         cache.update_and_fetch_batched(layer_idx, active_indices, &keys, &values)?;
 
@@ -267,13 +268,7 @@ pub fn batched_gqa_attn(
     // KV buffer), and the fused path must match that to stay parity-clean
     // with the per-layer-offset quirk preserved by the cache.
     let mask = if let Some(window) = cfg.sliding_window {
-        let mask_shape = mask.shape();
-        debug_assert_eq!(
-            mask_shape.len(),
-            4,
-            "cache padding mask must be 4-D, got {mask_shape:?}"
-        );
-        let t_max_i32 = mask_shape[3];
+        let t_max_i32 = k_all.dim(2);
         // After `update_and_fetch_batched`, `offset_for(layer_idx, idx)` is
         // the post-update offset. q_pos = post_offset - 1, so the lower
         // bound (`q_pos - window + 1`) simplifies to `post_offset - window`.
@@ -288,7 +283,10 @@ pub fn batched_gqa_attn(
         let zero = Array::from_f32(0.0);
         let neg_inf = Array::from_f32(f32::NEG_INFINITY);
         let sliding = ops::r#where(&invalid, &neg_inf, &zero);
-        mask.add(&sliding)
+        Some(match mask {
+            Some(padding) => padding.add(&sliding),
+            None => sliding,
+        })
     } else {
         mask
     };
@@ -301,7 +299,7 @@ pub fn batched_gqa_attn(
     if let Some(cap) = cfg.logit_softcap {
         attn_cfg = attn_cfg.with_logit_softcapping(cap);
     }
-    let output = fused_sdpa(&queries, &k_all, &v_all, &attn_cfg, Some(&mask))?;
+    let output = fused_sdpa(&queries, &k_all, &v_all, &attn_cfg, mask.as_ref())?;
 
     // [N_active, heads, 1, head_dim] → [N_active, 1, n_heads*head_dim].
     let output = output

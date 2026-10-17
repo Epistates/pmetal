@@ -1279,7 +1279,7 @@ fn fused_batch_rows_of_different_lengths_each_attend_to_their_own_tokens() {
         // values and padding mask.
         let q: Vec<f32> = active.iter().flat_map(|&s| queries[s].clone()).collect();
         let q = array(&q, &[n, HQ, 1, DIM]);
-        let out = q.sdpa_with_mask(&k, &v, scale(), Some(&mask));
+        let out = q.sdpa_with_mask(&k, &v, scale(), mask.as_ref());
         let out = to_f32_vec_eval(&out);
         for (row, &slot) in active.iter().enumerate() {
             let have = step + 1;
@@ -1334,7 +1334,9 @@ fn fused_batch_update_cost() {
         let (keys, values, mask) = cache.update_and_fetch_batched(0, &active, &k, &k).unwrap();
         keys.eval();
         values.eval();
-        mask.eval();
+        if let Some(mask) = mask {
+            mask.eval();
+        }
     };
     for _ in 0..8 {
         step(&mut cache, &mut rng);

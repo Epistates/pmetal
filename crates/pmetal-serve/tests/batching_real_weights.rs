@@ -31,6 +31,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use pmetal_cache::kv_cache::{CacheMode, TurboQuantConfig};
 use pmetal_models::DynamicModel;
 use pmetal_serve::InferenceEngine;
 use pmetal_serve::continuous_batch::BatcherConfig;
@@ -48,6 +49,16 @@ fn checkpoint() -> Option<PathBuf> {
 /// An engine over the checkpoint with batching on, decoding fused or, with
 /// `per_slot`, one request at a time.
 fn engine(dir: &PathBuf, max_slots: usize, per_slot: Option<bool>) -> Arc<InferenceEngine> {
+    engine_with_cache(dir, max_slots, per_slot, None)
+}
+
+/// [`engine`] with every request's KV cache in `mode`.
+fn engine_with_cache(
+    dir: &PathBuf,
+    max_slots: usize,
+    per_slot: Option<bool>,
+    mode: Option<CacheMode>,
+) -> Arc<InferenceEngine> {
     let load_dir = dir.clone();
     let engine = InferenceEngine::new_with_backend(
         move || Ok(DynamicModel::load(&load_dir)?),
@@ -59,6 +70,10 @@ fn engine(dir: &PathBuf, max_slots: usize, per_slot: Option<bool>) -> Arc<Infere
         4096,
     )
     .unwrap();
+    let engine = match mode {
+        Some(mode) => engine.with_cache_mode_override(mode),
+        None => engine,
+    };
     // No request shares a prefix with another, so the prefix cache plays no
     // part.
     engine.set_prefix_cache_limits(0, 0);
@@ -273,6 +288,41 @@ async fn per_slot_decode_is_bit_identical_to_the_single_request_path() {
     let got = batched(&engine, &requests, Duration::from_millis(30)).await;
     for (i, (got, want)) in got.iter().zip(&want).enumerate() {
         assert_same(&format!("request {i}"), got, want, 0.0);
+    }
+    pmetal_runtime::check_unobserved_error().unwrap();
+}
+
+/// A quantized or TurboQuant cache cannot share the fused buffer, so its
+/// requests decode one forward each: through joins and leaves they still get,
+/// bit for bit, what the single-request path gives them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compressed_caches_decode_per_slot_exactly() {
+    let Some(dir) = checkpoint() else { return };
+    let modes = [
+        (
+            "8-bit",
+            CacheMode::Quantized {
+                bits: 8,
+                group_size: 64,
+            },
+        ),
+        (
+            "turboquant 4/4",
+            CacheMode::TurboQuant {
+                config: TurboQuantConfig::uniform(4, 4),
+            },
+        ),
+    ];
+    for (label, mode) in modes {
+        // Fused decode is asked for, and refused for these caches.
+        let engine = engine_with_cache(&dir, 3, Some(false), Some(mode));
+        let mut requests = greedy_requests(&dir);
+        requests.extend(sampled_requests(&dir).into_iter().take(3));
+        let want = alone(&engine, &requests).await;
+        let got = batched(&engine, &requests, Duration::from_millis(30)).await;
+        for (i, (got, want)) in got.iter().zip(&want).enumerate() {
+            assert_same(&format!("{label} request {i}"), got, want, 0.0);
+        }
     }
     pmetal_runtime::check_unobserved_error().unwrap();
 }
@@ -541,6 +591,67 @@ fn a_lone_fused_row_matches_the_serial_forward_step_by_step() {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(want == got, "step {step}: logits differ by {worst}");
+    }
+    pmetal_runtime::check_unobserved_error().unwrap();
+}
+
+/// Requests that share a long prefix reuse its K/V, and what they generate
+/// is what a cold prefill gives, within bf16 rounding (the prefix's keys and
+/// values were computed in another chunk shape).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prefix_hits_continue_as_a_cold_prefill_does() {
+    let Some(dir) = checkpoint() else { return };
+    let tokenizer = pmetal_data::Tokenizer::from_model_dir(&dir).unwrap();
+    let system = "You are a careful assistant who answers questions about geography, history and \
+        science in short, plain sentences. You never guess; when you do not know, you say so. \
+        You always give the name of the thing asked about first and a reason second. \
+        Questions come one at a time. ";
+    let ask = |q: &str| {
+        tokenizer
+            .encode(&format!("{system}Question: {q} Answer:"))
+            .unwrap()
+    };
+    let first = ask("What is the capital of Australia?");
+    let second = ask("Why is the sea salty?");
+    let shared = first
+        .iter()
+        .zip(&second)
+        .take_while(|(a, b)| a == b)
+        .count();
+    assert!(shared > 50, "the prompts share {shared} tokens");
+
+    for per_slot in [true, false] {
+        let label = if per_slot { "per-slot" } else { "fused" };
+        let engine = engine(&dir, 4, Some(per_slot));
+        // The default prefix cache, which `engine` turned off.
+        engine.set_prefix_cache_limits(16, 1 << 30);
+        let request = |prompt: &Vec<u32>| -> Request { (prompt.clone(), params(32)) };
+
+        // Cold: the second prompt with nothing cached.
+        let cold = batched(&engine, &[request(&second)], Duration::ZERO).await;
+        engine.set_prefix_cache_limits(0, 0);
+        engine.set_prefix_cache_limits(16, 1 << 30);
+        // Warm: the first prompt first, then the second beside its prefix.
+        let _ = batched(&engine, &[request(&first)], Duration::ZERO).await;
+        let hits_before = engine.prefix_cache_stats().2;
+        let warm = batched(&engine, &[request(&second)], Duration::ZERO).await;
+        let hits = engine.prefix_cache_stats().2 - hits_before;
+        assert_eq!(
+            hits, 1,
+            "{label}: the second prompt found the first's prefix"
+        );
+
+        let (differ, worst) = compare(&warm[0], &cold[0]);
+        println!(
+            "{label}: warm vs cold: {} ({} shared tokens), worst log-probability difference {worst:.3}",
+            match differ {
+                None => "identical".to_string(),
+                Some(at) => format!("tokens differ from {at}"),
+            },
+            shared
+        );
+        assert_eq!(warm[0].tokens[0], cold[0].tokens[0], "{label}: first token");
+        assert!(worst <= 0.3, "{label}: log-probabilities differ by {worst}");
     }
     pmetal_runtime::check_unobserved_error().unwrap();
 }

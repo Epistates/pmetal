@@ -1014,6 +1014,62 @@ mod tests {
         assert_eq!(b.active_reserved_blocks(), 3);
     }
 
+    /// Requests that decode in one padded buffer cost `rows * longest`, not
+    /// the sum of what each needs: beside a long request, every row is as
+    /// long as it is.
+    #[test]
+    fn padded_admission_charges_rows_times_the_longest_request() {
+        let mut b = ContinuousBatcher::new(BatcherConfig {
+            max_slots: 8,
+            ..block_config(16, 16)
+        });
+        b.pad_rows(4);
+        // 4 blocks, then one-block requests.
+        let _long = b.enqueue(vec![1, 2, 3, 4, 5, 6, 7, 8], params(8)).unwrap();
+        for i in 0..5 {
+            b.enqueue(vec![20 + i], params(1)).unwrap();
+        }
+        let _ = b.next_step();
+        // Rows come in fours: four rows of four blocks fill the budget, and a
+        // fifth request would need eight such rows, though the blocks it and
+        // the others reserve add up to far less.
+        assert_eq!(b.slots().len(), 4);
+        assert_eq!(b.pending_depth(), 2);
+        assert!(b.active_reserved_blocks() < 16);
+
+        // The same requests are all admitted when only their sum counts.
+        let mut sum = ContinuousBatcher::new(BatcherConfig {
+            max_slots: 8,
+            ..block_config(16, 16)
+        });
+        sum.enqueue(vec![1, 2, 3, 4, 5, 6, 7, 8], params(8))
+            .unwrap();
+        for i in 0..5 {
+            sum.enqueue(vec![20 + i], params(1)).unwrap();
+        }
+        let _ = sum.next_step();
+        assert_eq!(sum.slots().len(), 6);
+    }
+
+    /// The KV budget is what the device can hold beside the model, in blocks,
+    /// never more than every slot could fill and never none.
+    #[test]
+    fn the_kv_budget_follows_the_device_and_the_model() {
+        const GB: usize = 1 << 30;
+        let block = 4 << 20; // 4 MiB of K/V per block
+        // A 64 GB Mac recommending 48 GB, 8 GB resident: 85% of 48 is 40.8,
+        // 32.8 GB free, in blocks of 4 MiB.
+        assert_eq!(kv_block_budget(48 * GB, 8 * GB, block, usize::MAX), 8396);
+        // The same model on a 16 GB Mac recommending 11.8 GB: 10 GB less 8.
+        let small = kv_block_budget(12 * GB, 8 * GB, block, usize::MAX);
+        assert!((1..1000).contains(&small), "{small}");
+        // Every slot can never use more than its context.
+        assert_eq!(kv_block_budget(48 * GB, 8 * GB, block, 500), 500);
+        // A model that fills the device still gets a block, so a request
+        // can run alone.
+        assert_eq!(kv_block_budget(12 * GB, 20 * GB, block, 500), 1);
+    }
+
     /// Small requests may pass a large one that doesn't fit yet, but only so
     /// many times: after that it holds the line, so a steady stream of small
     /// requests cannot keep it out for good.

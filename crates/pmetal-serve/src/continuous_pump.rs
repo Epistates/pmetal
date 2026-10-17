@@ -1004,6 +1004,52 @@ mod tests {
         assert_eq!(hit.restored_cache.seq_len(), 3);
     }
 
+    /// A request that restored a cached prefix moves into the fused cache
+    /// with the prefix and its own suffix: the shared rows then hold what a
+    /// cold prefill of the whole prompt would have left.
+    #[tokio::test]
+    async fn a_restored_prefix_moves_into_the_fused_cache_whole() {
+        let prefix_cache = Arc::new(Mutex::new(PrefixCache::new(8, 0)));
+        prefix_cache
+            .lock()
+            .unwrap()
+            .insert(&[1, 2], &cache_with_len(2));
+        let mut pump = ContinuousPump::new_with_prefix_cache(
+            BatcherConfig::default(),
+            cache_cfg(),
+            None,
+            Some(Arc::clone(&prefix_cache)),
+        );
+        pump.enable_fused_decode().unwrap();
+        let (_slot, mut rx) = pump
+            .enqueue(
+                vec![1, 2, 3],
+                params(3, vec![]),
+                GenerationConfig::default(),
+                16,
+            )
+            .unwrap();
+        // Two ticks: the prefill of the suffix, then the first decode step.
+        let mut stub = HashedStub;
+        pump.tick(&mut stub).unwrap();
+        pump.tick(&mut stub).unwrap();
+        let rows = pump.state.fused_cache().expect("fused");
+        let row = rows
+            .offsets()
+            .iter()
+            .position(|&n| n > 0)
+            .expect("the request holds a row");
+        // 2 restored + 1 suffix + the token the first decode step fed.
+        assert_eq!(rows.offset(row), 4);
+        while pump.tick(&mut stub).unwrap() == Tick::Ran {}
+        let tokens = drain(&mut rx)
+            .iter()
+            .filter(|ev| matches!(ev, TokenEvent::Token { .. }))
+            .count();
+        assert_eq!(tokens, 3);
+        pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
+    }
+
     #[tokio::test]
     async fn stop_token_short_circuits_generation() {
         let mut pump = ContinuousPump::new(BatcherConfig::default(), cache_cfg(), None);

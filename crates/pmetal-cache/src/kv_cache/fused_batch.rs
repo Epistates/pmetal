@@ -37,8 +37,10 @@
 //! `update_and_fetch_batched` returns:
 //! - `K: [N_active, heads, T_max, D]`
 //! - `V: [N_active, heads, T_max, D_v]`
-//! - `mask: [N_active, 1, 1, T_max]` — additive mask, `-inf` at positions
-//!   `t >= new_offset[slot]` (per-slot padding against the shared `T_max`).
+//! - `mask: Option<[N_active, 1, 1, T_max]>` — additive mask, `-inf` at
+//!   positions `t >= new_offset[slot]` (per-slot padding against the shared
+//!   `T_max`); `None` when no row is padded, which is always the case for a
+//!   lone request.
 //!
 //! The new tokens go in with one scatter per buffer, in place (the buffer has
 //! a single owner while it is written), so a step costs the tokens it adds
@@ -428,14 +430,15 @@ impl FusedBatchKVCache {
     /// Returns `(K, V, mask)` where
     /// - `K: [N_active, num_kv_heads, T_max, head_dim]`
     /// - `V: [N_active, num_kv_heads, T_max, value_head_dim]`
-    /// - `mask: [N_active, 1, 1, T_max]` additive `-inf`/`0.0`.
+    /// - `mask: [N_active, 1, 1, T_max]` additive `-inf`/`0.0`, or `None`
+    ///   when every active row reaches `T_max` and nothing is padded.
     pub fn update_and_fetch_batched(
         &mut self,
         layer_idx: usize,
         active_indices: &[usize],
         new_k: &Array,
         new_v: &Array,
-    ) -> Result<(Array, Array, Array), Exception> {
+    ) -> Result<(Array, Array, Option<Array>), Exception> {
         if layer_idx >= self.config.num_layers {
             return Err(Exception::custom(format!(
                 "FusedBatchKVCache: layer_idx {} out of range ({})",
@@ -519,18 +522,30 @@ impl FusedBatchKVCache {
             let with_zero = ops::concatenate_axis(&[&new, &zero_row], 0);
             with_zero.take_axis(&Array::from_i32_slice(&source), 0)
         };
-        let at = Array::from_i32_slice_shaped(&positions, &[rows as i32, 1, 1, 1]).broadcast_to(&[
-            rows as i32,
-            heads,
-            1,
-            1,
-        ]);
-        let k_rows = spread(new_k, d_k, k_full.dtype_raw());
-        let v_rows = spread(new_v, d_v, v_full.dtype_raw());
-        k_full =
-            k_full.put_along_axis_op(&at.broadcast_to(&[rows as i32, heads, 1, d_k]), &k_rows, 2);
-        v_full =
-            v_full.put_along_axis_op(&at.broadcast_to(&[rows as i32, heads, 1, d_v]), &v_rows, 2);
+        if n_active == 1 {
+            // One row: a slice update in place, as a single request's cache
+            // does, instead of a scatter over every row.
+            let (slot, at) = (active_indices[0] as i32, positions[active_indices[0]]);
+            let k_new = new_k.as_dtype(k_full.dtype_raw());
+            let v_new = new_v.as_dtype(v_full.dtype_raw());
+            k_full = k_full.slice_set(&k_new, &[slot, 0, at, 0], &[slot + 1, heads, at + 1, d_k]);
+            v_full = v_full.slice_set(&v_new, &[slot, 0, at, 0], &[slot + 1, heads, at + 1, d_v]);
+        } else {
+            let at = Array::from_i32_slice_shaped(&positions, &[rows as i32, 1, 1, 1])
+                .broadcast_to(&[rows as i32, heads, 1, 1]);
+            let k_rows = spread(new_k, d_k, k_full.dtype_raw());
+            let v_rows = spread(new_v, d_v, v_full.dtype_raw());
+            k_full = k_full.put_along_axis_op(
+                &at.broadcast_to(&[rows as i32, heads, 1, d_k]),
+                &k_rows,
+                2,
+            );
+            v_full = v_full.put_along_axis_op(
+                &at.broadcast_to(&[rows as i32, heads, 1, d_v]),
+                &v_rows,
+                2,
+            );
+        }
 
         // Advance offsets for this layer only.
         for &idx in active_indices {
@@ -572,7 +587,11 @@ impl FusedBatchKVCache {
         self.layer_keys[layer_idx] = Some(k_full);
         self.layer_values[layer_idx] = Some(v_full);
 
-        let mask = self.padding_mask(active_indices, &new_offsets, t_max_i32);
+        // Nothing is padded when every row reaches as far as the longest.
+        let mask = new_offsets
+            .iter()
+            .any(|&o| o != t_max)
+            .then(|| self.padding_mask(active_indices, &new_offsets, t_max_i32));
         Ok((k_out, v_out, mask))
     }
 }
@@ -614,7 +633,7 @@ mod tests {
             .unwrap();
         assert_eq!(k.shape(), &[2, 2, 1, 3]);
         assert_eq!(v.shape(), &[2, 2, 1, 3]);
-        assert_eq!(mask.shape(), &[2, 1, 1, 1]);
+        assert!(mask.is_none(), "two rows of one token each need no padding");
         assert_eq!(c.offset(0), 1);
         assert_eq!(c.offset(2), 1);
         // Slot 1 stays untouched.
@@ -632,7 +651,7 @@ mod tests {
         let nv1 = Array::zeros_f32(&[2, 1, 1, 2]);
         let (k1, _, m1) = c.update_and_fetch_batched(0, &[0, 1], &nk1, &nv1).unwrap();
         assert_eq!(k1.shape(), &[2, 1, 1, 2]);
-        assert_eq!(m1.shape(), &[2, 1, 1, 1]);
+        assert!(m1.is_none());
 
         // Step 2: only slot 0 active for layer 0. Slot 0 offset becomes 2,
         // slot 1 stays at 1 → T_max on layer 0 = 2.
@@ -640,7 +659,7 @@ mod tests {
         let nv2 = Array::zeros_f32(&[1, 1, 1, 2]);
         let (k2, _, m2) = c.update_and_fetch_batched(0, &[0], &nk2, &nv2).unwrap();
         assert_eq!(k2.shape(), &[1, 1, 2, 2]);
-        assert_eq!(m2.shape(), &[1, 1, 1, 2]);
+        assert!(m2.is_none(), "a lone row has nothing to pad against");
         assert_eq!(c.offset(0), 2);
         assert_eq!(c.offset(1), 1);
     }
@@ -838,7 +857,7 @@ mod tests {
                 .unwrap();
             k.eval();
             v.eval();
-            m.eval();
+            assert!(m.is_none());
             drop((k, v, m));
             if address(&cache) != before {
                 moves += 1;

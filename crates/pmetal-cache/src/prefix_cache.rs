@@ -255,6 +255,11 @@ impl PrefixCache {
         self.current_bytes
     }
 
+    /// The byte budget the cached prefixes may fill; 0 for none.
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
     /// Lookups that found a prefix.
     pub fn hits(&self) -> u64 {
         self.hits

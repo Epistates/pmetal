@@ -1120,9 +1120,14 @@ impl InferenceEngine {
             // never more than every slot could fill.
             let block_size = batcher_config.effective_block_size();
             let per_position = cache_config.memory_footprint() / cache_config.max_seq_len.max(1);
+            // The prefix cache may fill its byte budget beside the model.
+            let prefix_bytes = self
+                .prefix_cache
+                .lock()
+                .map_or(0, |cache| cache.max_bytes());
             batcher_config.max_blocks = crate::continuous_batch::kv_block_budget(
                 pmetal_runtime::inline_array::get_max_recommended_size(),
-                pmetal_runtime::inline_array::get_active_memory(),
+                pmetal_runtime::inline_array::get_active_memory() + prefix_bytes,
                 per_position * block_size,
                 batcher_config.max_slots.max(1) * self.max_seq_len.div_ceil(block_size),
             );
