@@ -188,6 +188,16 @@ pub struct BatcherConfig {
     /// nothing behind it is admitted until it is, so a stream of small
     /// requests cannot starve a large one.
     pub max_overtakes: usize,
+    /// Decode every request on its own cache, one forward per request, even
+    /// for a model that can decode a batch as one forward.
+    ///
+    /// A request then gets, bit for bit, the tokens the single-request path
+    /// gives it. In a fused batch the matmuls run as `[N, hidden]` products
+    /// where a lone request's run as vector products, which add in another
+    /// order, so the last bit of a bf16 logit can differ and a near-tie in
+    /// greedy decoding can fall the other way. The fused batch reads the
+    /// weights once for all its requests, several times faster under load.
+    pub per_slot_decode: bool,
 }
 
 impl Default for BatcherConfig {
@@ -201,6 +211,7 @@ impl Default for BatcherConfig {
             block_size: 32,
             max_blocks: 0,
             max_overtakes: 16,
+            per_slot_decode: false,
         }
     }
 }
@@ -221,6 +232,32 @@ impl BatcherConfig {
             .div_ceil(self.effective_block_size())
             .min(self.max_blocks)
     }
+}
+
+/// Fraction of the device's recommended working set the model, its KV
+/// caches and the scheduler may fill together. The rest is the headroom for
+/// activations, the sampling temporaries and the allocator's cache.
+pub const DEVICE_MEMORY_SHARE: f64 = 0.85;
+
+/// How many token blocks of KV cache fit in the device's working set beside
+/// what is already resident, so admission can stop before memory runs out.
+///
+/// `device_limit_bytes` is what the device recommends a process keep wired
+/// (ask the device: it is a different fraction of the RAM on every Mac),
+/// `resident_bytes` what the process holds now (the weights, above all),
+/// `bytes_per_block` what one block of a request's KV cache takes. The
+/// result is at most `ceiling_blocks` (what every slot could ever use) and at
+/// least one, since a request that does not fit beside the model alone is
+/// no better off refused.
+pub fn kv_block_budget(
+    device_limit_bytes: usize,
+    resident_bytes: usize,
+    bytes_per_block: usize,
+    ceiling_blocks: usize,
+) -> usize {
+    let usable = (device_limit_bytes as f64 * DEVICE_MEMORY_SHARE) as usize;
+    let free = usable.saturating_sub(resident_bytes);
+    (free / bytes_per_block.max(1)).clamp(1, ceiling_blocks.max(1))
 }
 
 /// One chunk of a slot's prompt to feed to the model.
@@ -280,6 +317,9 @@ pub struct ContinuousBatcher {
     config: BatcherConfig,
     slots: Vec<Slot>,
     pending: VecDeque<PendingRequest>,
+    /// Set when the active requests share one padded KV buffer (see
+    /// [`pad_rows`](Self::pad_rows)).
+    padded_row_step: Option<usize>,
 }
 
 impl ContinuousBatcher {
@@ -289,7 +329,19 @@ impl ContinuousBatcher {
             config,
             slots: Vec::new(),
             pending: VecDeque::new(),
+            padded_row_step: None,
         }
+    }
+
+    /// Count the block budget as one padded buffer instead of a sum.
+    ///
+    /// Requests that decode together in a fused batch live in one buffer of
+    /// `rows` rows, each as long as the longest request, with the number of
+    /// rows rounded up to a multiple of `row_step`. The memory the batch
+    /// takes is then `rows * longest`, not the sum of what each request
+    /// needs, and admission has to charge it that way.
+    pub fn pad_rows(&mut self, row_step: usize) {
+        self.padded_row_step = Some(row_step.max(1));
     }
 
     /// Config snapshot.
@@ -382,6 +434,28 @@ impl ContinuousBatcher {
             .sum()
     }
 
+    /// Whether a request reserving `blocks` fits beside the active ones.
+    fn fits(&self, blocks: usize) -> bool {
+        let live = || {
+            self.slots.iter().filter(|s| {
+                matches!(
+                    s.state,
+                    SlotState::Pending | SlotState::Prefilling | SlotState::Decoding
+                )
+            })
+        };
+        let Some(row_step) = self.padded_row_step else {
+            return self.active_reserved_blocks() + blocks <= self.config.max_blocks;
+        };
+        let (rows, longest) = live().fold((1usize, blocks), |(rows, longest), s| {
+            (rows + 1, longest.max(s.reserved_blocks))
+        });
+        // Alone, a request always fits (its reservation is clamped to the
+        // budget); beside others the whole padded buffer must.
+        let padded_rows = (rows.div_ceil(row_step) * row_step).min(self.config.max_slots);
+        rows == 1 || padded_rows.max(rows) * longest <= self.config.max_blocks
+    }
+
     /// The pending request to admit next, if any: the first that fits the
     /// remaining block budget, unless a request ahead of it has been
     /// overtaken [`BatcherConfig::max_overtakes`] times, which holds the line.
@@ -392,12 +466,8 @@ impl ContinuousBatcher {
         if self.config.max_blocks == 0 {
             return Some(0);
         }
-        let remaining = self
-            .config
-            .max_blocks
-            .saturating_sub(self.active_reserved_blocks());
         for (pos, req) in self.pending.iter().enumerate() {
-            if req.reserved_blocks <= remaining {
+            if self.fits(req.reserved_blocks) {
                 return Some(pos);
             }
             if req.overtaken >= self.config.max_overtakes {
@@ -589,6 +659,11 @@ impl ContinuousBatcher {
             }
         }
         drained
+    }
+
+    /// The state of a live slot.
+    pub fn state(&self, slot: SlotId) -> Option<SlotState> {
+        self.slots.iter().find(|s| s.id == slot).map(|s| s.state)
     }
 
     /// Inspect the live slots without taking ownership.
@@ -902,6 +977,7 @@ mod tests {
             block_size: 4,
             max_blocks,
             max_overtakes,
+            per_slot_decode: false,
         }
     }
 

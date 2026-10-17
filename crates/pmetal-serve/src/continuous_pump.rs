@@ -53,12 +53,14 @@
 
 use crate::continuous_batch::{
     BatcherConfig, ContinuousBatcher, EnqueueError, FinishReason, PrefillChunk, SlotId, SlotParams,
+    SlotState,
 };
 use crate::continuous_driver::{
-    ContinuousEngineState, SlotForward, drive_decode_step, drive_prefill_step,
+    ContinuousEngineState, SlotForward, drive_decode_step, drive_fused_decode_step,
+    drive_prefill_step,
 };
 use crate::engine::{TokenEvent, TokenLogprobEntry, detect_stop_sequence_suffix};
-use pmetal_cache::kv_cache::{KVCache, KVCacheConfig, MambaCache};
+use pmetal_cache::kv_cache::{FusedBatchKVCache, KVCache, KVCacheConfig, MambaCache, ROW_STEP};
 use pmetal_cache::prefix_cache::PrefixCache;
 use pmetal_models::generation::{GenerationConfig, token_logprobs};
 use pmetal_runtime::compat::{Array, Exception};
@@ -177,6 +179,29 @@ impl ContinuousPump {
             prefix_cache: None,
             ..self
         }
+    }
+
+    /// Decode the requests together as one fused `[N, 1]` forward over a
+    /// shared KV cache, for a model whose [`SlotForward::forward_batched`] is
+    /// implemented and whose cache is a plain dense one. A request prefills
+    /// on a cache of its own and moves into the shared one when its prefill
+    /// ends.
+    ///
+    /// # Errors
+    /// For a hybrid pump, or a cache configuration the fused cache does not
+    /// take (see [`FusedBatchKVCache::new`]).
+    pub fn enable_fused_decode(&mut self) -> Result<(), Exception> {
+        let fused =
+            FusedBatchKVCache::new(self.cache_config.clone(), self.batcher.config().max_slots)?;
+        self.state.enable_fused_cache(fused)?;
+        // The batch's K/V is one padded buffer; admission has to charge it so.
+        self.batcher.pad_rows(ROW_STEP);
+        Ok(())
+    }
+
+    /// Whether the decoding requests share a fused KV cache.
+    pub fn decodes_fused(&self) -> bool {
+        self.state.has_fused_cache()
     }
 
     /// Enqueue a new request. Returns its `SlotId` plus a receiver that
@@ -446,6 +471,10 @@ impl ContinuousPump {
                 let token = self.state.sample(slot, &last_logits)?.item::<u32>();
                 let logprob = Self::compute_logprob_entry(&last_logits, token, top_n);
                 self.record_first_token(slot, token, logprob)?;
+                // A request that goes on decoding joins the others' batch.
+                if self.batcher.state(slot) == Some(SlotState::Decoding) {
+                    self.state.promote(slot)?;
+                }
             }
             // The chunk's activations are not needed again.
             None => pmetal_runtime::inline_array::clear_cache(),
@@ -474,7 +503,11 @@ impl ContinuousPump {
             inputs.push((*s, tok));
         }
 
-        let outs = drive_decode_step(forward, &mut self.state, &inputs)?;
+        let outs = if self.state.has_fused_cache() {
+            drive_fused_decode_step(forward, &mut self.state, &inputs)?
+        } else {
+            drive_decode_step(forward, &mut self.state, &inputs)?
+        };
 
         // Deliver tokens + update per-slot state + feed the scheduler so it
         // can apply stop-token / length / stop-sequence termination.
@@ -1420,6 +1453,29 @@ mod tests {
             data.extend(hashed_logits(*tokens.last().unwrap()));
             Ok(Array::from_f32_slice(&data, &[1, s, HASHED_VOCAB]))
         }
+
+        fn forward_batched(
+            &mut self,
+            input_ids: &Array,
+            active_indices: &[usize],
+            cache: &mut pmetal_cache::kv_cache::FusedBatchKVCache,
+        ) -> Result<Array, Exception> {
+            let n = active_indices.len() as i32;
+            let (h, d) = (
+                cache.config().num_kv_heads as i32,
+                cache.config().head_dim as i32,
+            );
+            let kv = Array::zeros_f32(&[n, h, 1, d]);
+            for layer in 0..cache.config().num_layers {
+                cache.update_and_fetch_batched(layer, active_indices, &kv, &kv)?;
+            }
+            let data: Vec<f32> = input_ids
+                .as_slice::<i32>()
+                .iter()
+                .flat_map(|&token| hashed_logits(token as u32))
+                .collect();
+            Ok(Array::from_f32_slice(&data, &[n, 1, HASHED_VOCAB]))
+        }
     }
 
     /// The single-request path's greedy tokens: a `DecodeSampler` over the
@@ -1450,6 +1506,17 @@ mod tests {
     /// picks for them alone.
     #[tokio::test]
     async fn batched_penalties_match_the_single_request_path() {
+        penalties_match_the_single_request_path(false);
+    }
+
+    /// The same through the fused path: prefill on a slot's own cache, move
+    /// into the shared one, decode with the others as one forward.
+    #[tokio::test]
+    async fn fused_batched_penalties_match_the_single_request_path() {
+        penalties_match_the_single_request_path(true);
+    }
+
+    fn penalties_match_the_single_request_path(fused: bool) {
         let requests = [
             (vec![1u32, 2, 3, 4], greedy_with(1.3, 0.0, 0.0), 14usize),
             (vec![5, 6, 7], greedy_with(1.1, 0.8, 0.3), 8),
@@ -1464,6 +1531,10 @@ mod tests {
             cache_cfg(),
             None,
         );
+        if fused {
+            pump.enable_fused_decode().unwrap();
+            assert!(pump.decodes_fused());
+        }
         let mut receivers: Vec<_> = requests
             .iter()
             .map(|(prompt, config, max)| {

@@ -667,6 +667,34 @@ fn mllama(
         .ok_or_else(|| pmetal_runtime::compat::Exception::custom("not a Llama 3.2 Vision model"))
 }
 
+/// The model as the continuous-batching pump drives it.
+struct ModelForward<'a> {
+    model: &'a mut DynamicModel,
+}
+
+impl crate::continuous_driver::SlotForward for ModelForward<'_> {
+    fn forward(
+        &mut self,
+        tokens: &[u32],
+        cache: &mut KVCache,
+        recurrent: Option<&mut MambaCache>,
+    ) -> Result<Array, pmetal_runtime::compat::Exception> {
+        let input = Array::from_u32_slice(tokens, &[1, tokens.len() as i32])
+            .as_dtype(Dtype::Int32.as_i32());
+        self.model
+            .forward_with_hybrid_cache_last(&input, None, Some(cache), recurrent)
+    }
+
+    fn forward_batched(
+        &mut self,
+        input_ids: &Array,
+        active_indices: &[usize],
+        cache: &mut pmetal_cache::kv_cache::FusedBatchKVCache,
+    ) -> Result<Array, pmetal_runtime::compat::Exception> {
+        self.model.forward_batched(input_ids, active_indices, cache)
+    }
+}
+
 /// One continuous-batching step, run by the model thread between jobs: a
 /// prefill chunk for one slot or a decode step for every decoding slot.
 /// Reports idle when no request is pending or in flight; the job that
@@ -681,14 +709,8 @@ fn continuous_step(state: &mut EngineState) -> Background {
         tracing::error!(target: "pmetal_serve::continuous_batch", "pump mutex poisoned");
         return Background::Idle;
     };
-    let model = &mut state.model;
-    let mut forward = |tokens: &[u32],
-                       cache: &mut KVCache,
-                       recurrent: Option<&mut MambaCache>|
-     -> Result<Array, pmetal_runtime::compat::Exception> {
-        let input = Array::from_u32_slice(tokens, &[1, tokens.len() as i32])
-            .as_dtype(Dtype::Int32.as_i32());
-        model.forward_with_hybrid_cache_last(&input, None, Some(cache), recurrent)
+    let mut forward = ModelForward {
+        model: &mut state.model,
     };
     match pump.tick(&mut forward) {
         Ok(Tick::Ran) => Background::Busy,
@@ -939,6 +961,7 @@ impl InferenceEngine {
         }
         let tokenizer = Arc::clone(&self.tokenizer);
         let prefix_cache = Arc::clone(&self.prefix_cache);
+        let per_slot_decode = batcher_config.per_slot_decode;
         let pump = self
             .model
             .call(move |state| {
@@ -949,9 +972,15 @@ impl InferenceEngine {
                     Some(prefix_cache),
                 );
                 // A hybrid model's slots each carry their own recurrent
-                // state, and share no prefix cache.
+                // state, and share no prefix cache. Otherwise a model with a
+                // fused decode forward decodes its requests together, when
+                // its cache is a plain dense one.
                 if let Some(template) = state.model.create_mamba_cache() {
                     pump = pump.with_recurrent_state(&template);
+                } else if !per_slot_decode && state.model.supports_fused_batched() {
+                    if let Err(e) = pump.enable_fused_decode() {
+                        tracing::info!("continuous batching decodes one request at a time: {e}");
+                    }
                 }
                 let pump = Arc::new(Mutex::new(pump));
                 state.continuous = Some(Arc::clone(&pump));
@@ -1087,9 +1116,21 @@ impl InferenceEngine {
     ) -> ServeResult<()> {
         let cache_config = self.create_continuous_cache_config()?;
         if batcher_config.max_blocks == 0 {
+            // As many blocks as the device can hold beside the model, though
+            // never more than every slot could fill.
             let block_size = batcher_config.effective_block_size();
-            batcher_config.max_blocks =
-                batcher_config.max_slots.max(1) * self.max_seq_len.div_ceil(block_size);
+            let per_position = cache_config.memory_footprint() / cache_config.max_seq_len.max(1);
+            batcher_config.max_blocks = crate::continuous_batch::kv_block_budget(
+                pmetal_runtime::inline_array::get_max_recommended_size(),
+                pmetal_runtime::inline_array::get_active_memory(),
+                per_position * block_size,
+                batcher_config.max_slots.max(1) * self.max_seq_len.div_ceil(block_size),
+            );
+            tracing::info!(
+                blocks = batcher_config.max_blocks,
+                block_size,
+                "continuous batching KV budget"
+            );
         }
         self.enable_continuous_batching(batcher_config, cache_config)
     }
