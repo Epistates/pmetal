@@ -78,7 +78,22 @@ pub(crate) fn template_message(message: &ChatMessage, parts: Option<Vec<ContentP
         Some(parts) => Message::with_parts(message.role.clone(), parts),
         None => Message::new(message.role.clone(), message.content.clone()),
     };
-    out.tool_calls = message.tool_calls.clone();
+    out.tool_calls = message.tool_calls.clone().map(|calls| {
+        calls
+            .into_iter()
+            .map(|mut call| {
+                // OpenAI sends a call's arguments as a string of JSON; chat
+                // templates iterate them as an object (`arguments|items`).
+                if let Value::String(text) = &call.function.arguments {
+                    if let Ok(object @ Value::Object(_)) = serde_json::from_str::<Value>(text) {
+                        call.function.arguments = object;
+                    }
+                }
+                call
+            })
+            .collect()
+    });
+    out.tool_call_id = message.tool_call_id.clone();
     out.reasoning_content = message.reasoning_content.clone();
     out
 }

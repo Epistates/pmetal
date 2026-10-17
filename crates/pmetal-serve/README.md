@@ -89,6 +89,8 @@ async fn serve(model_dir: &str) -> anyhow::Result<()> {
 | `api_keys` | Keys accepted as `Authorization: Bearer` or `x-api-key`; empty leaves the server open (`/health` is always open) | none |
 | `cors_allowed_origins` | Browser origins allowed to call the server, or `*`; empty sends no CORS headers | none |
 | `max_body_bytes` | Largest request body | 64 MiB |
+| `request_timeout` | Longest one request may run; a request past it ends with a timeout error | 30 minutes |
+| `max_choices` | Largest `n` a request may ask for | 16 |
 
 Errors are the APIs' own: OpenAI's `{"error": {"message", "type", "param", "code"}}` on every
 route but `/v1/messages`, whose errors are Anthropic's `{"type": "error", "error": {"type",

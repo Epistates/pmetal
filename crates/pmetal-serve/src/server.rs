@@ -41,6 +41,11 @@ pub struct ServeConfig {
     pub cors_allowed_origins: Vec<String>,
     /// The largest request body accepted, in bytes.
     pub max_body_bytes: usize,
+    /// How long one request may run, from arrival to its last byte; `None`
+    /// lets a request run until it finishes or the client leaves.
+    pub request_timeout: Option<Duration>,
+    /// The most choices (`n`) a request may ask for.
+    pub max_choices: usize,
 }
 
 impl Default for ServeConfig {
@@ -55,6 +60,8 @@ impl Default for ServeConfig {
             api_keys: Vec::new(),
             cors_allowed_origins: Vec::new(),
             max_body_bytes: MAX_REQUEST_BODY_BYTES,
+            request_timeout: Some(Duration::from_secs(30 * 60)),
+            max_choices: 16,
         }
     }
 }
@@ -81,6 +88,8 @@ pub fn build_router_with(engine: InferenceEngine, config: &ServeConfig) -> Route
         engine,
         metrics: ServingMetrics::default(),
         request_permits: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent.max(1))),
+        request_timeout: config.request_timeout,
+        max_choices: config.max_choices.max(1),
     });
 
     let router = Router::new()

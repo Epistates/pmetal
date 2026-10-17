@@ -80,6 +80,9 @@ pub struct RequestMetrics {
     pub tokens_per_second: f64,
     /// Number of prompt tokens.
     pub prompt_tokens: usize,
+    /// How many of the prompt's tokens the prefix cache supplied: their keys
+    /// and values were restored, not computed (OpenAI's `cached_tokens`).
+    pub cached_prompt_tokens: usize,
     /// Number of completion tokens.
     pub completion_tokens: usize,
 }
@@ -101,6 +104,10 @@ pub enum TokenEvent {
     Done {
         finish_reason: String,
         metrics: RequestMetrics,
+        /// How many of the newest tokens end in a stop sequence. Every token
+        /// is emitted as a `Token` event; where the text is cut is decided
+        /// by [`crate::stop::StopFilter`], which also finds a stop sequence
+        /// that starts inside a token. The single-request path reports 0.
         stripped_tokens: usize,
     },
     /// Generation failed.
@@ -123,14 +130,13 @@ struct DecodeRun {
     generated: Vec<u32>,
     /// Per-token logprobs when the request opted in; `None` otherwise.
     logprobs: Option<Vec<TokenLogprobEntry>>,
+    /// Prompt tokens restored from the prefix cache.
+    cached_prompt_tokens: usize,
     /// Finish reason: `"length"`, `"stop"`, or `"cancelled"`.
     finish_reason: &'static str,
-    /// Number of tokens stripped from the tail due to stop-sequence match
-    /// (used by the streaming path to tell the client how many to discard).
-    stripped_tokens: usize,
     /// Milliseconds to first generated token (TTFT).
     first_token_time_ms: Option<f64>,
-    /// Final token count (after stop-sequence truncation).
+    /// How many tokens were generated.
     completion_tokens: usize,
 }
 
@@ -466,6 +472,8 @@ pub struct InferenceEngine {
     tokenizer: Arc<pmetal_data::Tokenizer>,
     /// Detected chat template.
     chat_template: ChatTemplate,
+    /// What bytes each token stands for, built on first use.
+    vocab: std::sync::OnceLock<Option<Arc<crate::vocab::ByteVocab>>>,
     /// How the model reads images and videos, if it can.
     vision: Vision,
     /// Model name/ID for API responses.
@@ -474,6 +482,9 @@ pub struct InferenceEngine {
     model_path: std::path::PathBuf,
     /// Maximum sequence length for KV cache.
     max_seq_len: usize,
+    /// Prompt plus output a request may take: the model's context window,
+    /// within `max_seq_len`.
+    context_tokens: usize,
     /// Fixed ANE bucket cap for accelerated backends.
     ane_max_seq_len: usize,
     /// DFlash draft model drafting for the ANE engine, if any.
@@ -858,10 +869,13 @@ impl InferenceEngine {
             model,
             tokenizer: Arc::new(tokenizer),
             chat_template,
+            vocab: std::sync::OnceLock::new(),
             vision: Vision::detect(model_path),
             model_id,
             model_path: model_path.to_path_buf(),
             max_seq_len,
+            context_tokens: pmetal_data::inference_config::context_window(model_path)
+                .map_or(max_seq_len, |window| window.min(max_seq_len)),
             ane_max_seq_len,
             ane_draft_path: None,
             backend: Arc::new(Mutex::new(BackendState {
@@ -990,6 +1004,9 @@ impl InferenceEngine {
         params: SamplingParams,
     ) -> ServeResult<tokio::sync::mpsc::Receiver<TokenEvent>> {
         Self::validate_params(&params, self.max_seq_len)?;
+        if input_ids.is_empty() {
+            return Err(ServeError::BadRequest("the prompt is empty".into()));
+        }
         if !self.continuous_batching_enabled() {
             return Err(ServeError::Internal(
                 "continuous batching not enabled; call enable_continuous_batching first".into(),
@@ -1138,6 +1155,22 @@ impl InferenceEngine {
         Arc::clone(&self.tokenizer)
     }
 
+    /// The bytes each token stands for; `None` for a tokenizer that does not
+    /// spell bytes (a word-level vocabulary).
+    pub fn byte_vocab(&self) -> Option<Arc<crate::vocab::ByteVocab>> {
+        self.vocab
+            .get_or_init(|| crate::vocab::ByteVocab::from_tokenizer(&self.tokenizer).map(Arc::new))
+            .clone()
+    }
+
+    /// The tool-call family the model's chat template writes, if it knows
+    /// tools. A model whose template does not still gets Hermes-style
+    /// `<tool_call>` parsing, the convention most tool-trained models share.
+    pub fn tool_format(&self) -> crate::tools::ToolFormat {
+        crate::tools::ToolFormat::detect(&self.chat_template)
+            .unwrap_or(crate::tools::ToolFormat::Hermes)
+    }
+
     /// Format chat messages using the detected template.
     pub fn format_chat(&self, messages: &[ChatMessage]) -> String {
         self.format_chat_with_tools(messages, None)
@@ -1197,10 +1230,25 @@ impl InferenceEngine {
     /// else 256), within the context window and this server's
     /// `--max-seq-len` once the prompt's `prompt_len` tokens are in.
     pub fn default_max_tokens(&self, thinking: bool, prompt_len: usize) -> usize {
-        let context = pmetal_data::inference_config::context_window(&self.model_path)
-            .map_or(self.max_seq_len, |c| c.min(self.max_seq_len));
         pmetal_data::inference_config::default_max_tokens(&self.model_path, thinking)
-            .for_prompt(prompt_len, Some(context))
+            .for_prompt(prompt_len, Some(self.context_tokens))
+    }
+
+    /// How many tokens can be generated after a `prompt_len`-token prompt:
+    /// the context that is left.
+    ///
+    /// # Errors
+    ///
+    /// `context_length_exceeded` when the prompt alone fills the context.
+    pub fn room_after(&self, prompt_len: usize) -> ServeResult<usize> {
+        if prompt_len >= self.context_tokens {
+            return Err(ServeError::ContextLength(format!(
+                "This model's maximum context length is {} tokens. However, your messages \
+                 resulted in {prompt_len} tokens. Please reduce the length of the messages.",
+                self.context_tokens
+            )));
+        }
+        Ok(self.context_tokens - prompt_len)
     }
 
     /// The sampling a request gets for every parameter it leaves out: the
@@ -1379,6 +1427,14 @@ impl InferenceEngine {
             .map_err(|e| ServeError::Tokenizer(e.to_string()))
     }
 
+    /// Tokenize text that may name control tokens (`<|im_end|>`) as the
+    /// tokens they are.
+    pub fn tokenize_with_special_tokens(&self, text: &str) -> ServeResult<Vec<u32>> {
+        self.tokenizer
+            .encode_with_special_tokens(text)
+            .map_err(|e| ServeError::Tokenizer(e.to_string()))
+    }
+
     /// Decode token IDs back to text.
     pub fn decode(&self, tokens: &[u32]) -> ServeResult<String> {
         self.tokenizer
@@ -1507,6 +1563,7 @@ impl InferenceEngine {
             total_latency_ms,
             tokens_per_second,
             prompt_tokens,
+            cached_prompt_tokens: 0,
             completion_tokens,
         }
     }
@@ -1863,7 +1920,6 @@ impl InferenceEngine {
         let mut logprobs_out: Option<Vec<TokenLogprobEntry>> =
             logprobs_top_n.map(|_| Vec::with_capacity(max_tokens));
         let mut first_token_time_ms: Option<f64> = None;
-        let mut stripped_tokens: usize = 0;
         let mut finish_reason: &'static str = "length";
         let mut cancelled = false;
 
@@ -2028,11 +2084,11 @@ impl InferenceEngine {
                 }
 
                 // Stop-sequence detection on decoded text (multi-token
-                // suffix match via tokenizer).
-                if let Some(n_strip) =
-                    detect_stop_sequence_suffix(tokenizer, &generated, stop_sequences)
-                {
-                    stripped_tokens = n_strip;
+                // suffix match via tokenizer). The tokens that complete the
+                // match are kept: where the text is cut is the reply's
+                // business (see `crate::stop`), and a token can hold text
+                // before the stop sequence.
+                if detect_stop_sequence_suffix(tokenizer, &generated, stop_sequences).is_some() {
                     finish_reason = "stop";
                     return std::ops::ControlFlow::Break(());
                 }
@@ -2043,27 +2099,18 @@ impl InferenceEngine {
             return Err(decode_error.take().unwrap_or(ServeError::Model(e)));
         }
 
-        // Truncate tail if a stop-sequence was matched. Non-streaming
-        // callers see the truncated vec; streaming callers use
-        // `stripped_tokens` in the Done event to tell the client how many
-        // tokens to drop from the visible stream.
-        let visible_len = generated.len().saturating_sub(stripped_tokens);
-        if let Some(out) = logprobs_out.as_mut() {
-            out.truncate(visible_len);
-        }
-        generated.truncate(visible_len);
-
         if cancelled {
             finish_reason = "cancelled";
         }
 
+        let completion_tokens = generated.len();
         Ok(DecodeRun {
             generated,
             logprobs: logprobs_out,
+            cached_prompt_tokens: prefix_hit_len,
             finish_reason,
-            stripped_tokens,
             first_token_time_ms,
-            completion_tokens: visible_len,
+            completion_tokens,
         })
     }
     /// What a GPU request needs on the model thread, besides the model.
@@ -2088,6 +2135,9 @@ impl InferenceEngine {
     where
         E: FnMut(u32, Option<TokenLogprobEntry>) -> StepOutcome,
     {
+        if request.input_ids.is_empty() {
+            return Err(ServeError::BadRequest("the prompt is empty".into()));
+        }
         let start = Instant::now();
         let media = match request.media.as_deref() {
             Some(media) => Some(Self::media_forward(
@@ -2160,16 +2210,19 @@ impl InferenceEngine {
         if run.finish_reason == "cancelled" {
             return;
         }
-        let metrics = Self::build_metrics(
-            start,
-            prompt_tokens,
-            run.completion_tokens,
-            run.first_token_time_ms,
-        );
+        let metrics = RequestMetrics {
+            cached_prompt_tokens: run.cached_prompt_tokens,
+            ..Self::build_metrics(
+                start,
+                prompt_tokens,
+                run.completion_tokens,
+                run.first_token_time_ms,
+            )
+        };
         let _ = tx.blocking_send(TokenEvent::Done {
             finish_reason: run.finish_reason.to_string(),
             metrics,
-            stripped_tokens: run.stripped_tokens,
+            stripped_tokens: 0,
         });
     }
 
@@ -2259,12 +2312,15 @@ impl InferenceEngine {
                 let result =
                     Self::generate_on_model(state, &ctx, request, |_, _| StepOutcome::Continue)
                         .map(|(run, start)| {
-                            let metrics = Self::build_metrics(
-                                start,
-                                prompt_tokens,
-                                run.completion_tokens,
-                                run.first_token_time_ms,
-                            );
+                            let metrics = RequestMetrics {
+                                cached_prompt_tokens: run.cached_prompt_tokens,
+                                ..Self::build_metrics(
+                                    start,
+                                    prompt_tokens,
+                                    run.completion_tokens,
+                                    run.first_token_time_ms,
+                                )
+                            };
                             (
                                 run.generated,
                                 run.logprobs,

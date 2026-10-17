@@ -701,7 +701,7 @@ async fn images_over_http() {
     .await;
     assert_eq!(status, 400, "{body}");
     assert!(
-        body.contains("mm_processor_kwargs is not supported"),
+        body.contains("`mm_processor_kwargs` is not supported"),
         "{body}"
     );
 }

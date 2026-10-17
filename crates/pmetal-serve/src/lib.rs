@@ -18,6 +18,7 @@
 //! `POST /v1/systemone`, `GET /v1/models` and `GET /health`; see [`decision`].
 
 pub mod anthropic;
+pub mod assemble;
 pub mod continuous_batch;
 pub mod continuous_driver;
 pub mod continuous_pump;
@@ -25,11 +26,16 @@ pub mod decision;
 pub mod engine;
 pub mod error;
 pub mod extract;
+pub(crate) mod generate;
 pub mod media;
+pub mod request;
 pub mod routes;
 pub mod server;
 pub(crate) mod sse;
+pub mod stop;
+pub mod tools;
 pub mod types;
+pub mod vocab;
 
 pub use continuous_batch::{
     BatcherConfig, ContinuousBatcher, EnqueueError, FinishReason, SlotId, SlotParams, SlotState,
