@@ -161,6 +161,7 @@ pub(crate) async fn run_serve(
             max_queue_depth: cb_max_queue_depth.max(1),
             block_size: cb_block_size.max(1),
             max_blocks: cb_max_blocks,
+            ..BatcherConfig::default()
         })
     } else {
         None

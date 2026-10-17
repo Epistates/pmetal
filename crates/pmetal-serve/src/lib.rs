@@ -31,8 +31,8 @@ pub(crate) mod sse;
 pub mod types;
 
 pub use continuous_batch::{
-    BatcherConfig, ContinuousBatcher, EnqueueError, FinishReason, SlotId, SlotParams, SlotState,
-    StepInstruction,
+    BatcherConfig, ContinuousBatcher, EnqueueError, FinishReason, PrefillChunk, SlotId, SlotParams,
+    SlotState, Step,
 };
 pub use continuous_driver::{
     ContinuousEngineState, SlotForward, SlotIdxMap, SlotStepOutput, drive_decode_step,

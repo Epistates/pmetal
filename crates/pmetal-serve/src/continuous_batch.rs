@@ -1,10 +1,15 @@
-//! Continuous-batching scheduler skeleton.
+//! Continuous-batching scheduler.
 //!
-//! This module provides the *scheduling* half of continuous batching:
-//! a slot pool with FIFO queuing, lifecycle tracking, and a step driver
-//! that tells the caller which slots to prefill / decode on each tick.
-//! It does **not** touch the model or KV cache yet — that plumbing lands
-//! in phase D.2 alongside batched `forward_with_hybrid_cache`.
+//! This module is the *scheduling* half of continuous batching: a slot pool
+//! with a bounded, fair pending queue, lifecycle tracking, and a planner that
+//! tells the caller what to run on each iteration. It does not touch the
+//! model or the KV cache; [`crate::continuous_pump`] and
+//! [`crate::continuous_driver`] do.
+//!
+//! The scheduling is iteration-level: the batch is re-formed after every
+//! model step, so a request joins as soon as a slot is free and leaves the
+//! step it finishes, instead of waiting for the slowest request of a fixed
+//! batch (Orca, Yu et al., OSDI 2022).
 //!
 //! # Lifecycle
 //!
@@ -26,56 +31,53 @@
 //! are retired and their resources released for the next `Pending`
 //! request.
 //!
-//! # Token-block scheduling
+//! # Iterations
 //!
-//! Admission is constrained by both slot count and a paged-KV-style
-//! token-block budget. Each request reserves
-//! `ceil((prompt_tokens + max_new_tokens) / block_size)` blocks while it is
-//! active, clamped to the full block budget so an oversized request can still
-//! run alone. The scheduler scans the pending queue for the first request that
-//! fits the remaining block budget, which avoids head-of-line blocking when a
-//! large request is waiting ahead of a smaller one.
+//! Each iteration ([`Step`]) decodes one token for every `Decoding` slot and,
+//! if a slot is `Prefilling`, runs one chunk of its prompt after it. A long
+//! prompt therefore delays the decoding slots by one chunk per token and no
+//! more, where running a whole prompt before the next decode would stall
+//! every stream for its entire prefill (stall-free chunked prefill, Agrawal
+//! et al., Sarathi-Serve, OSDI 2024).
 //!
-//! # Prefill policy (for D.1)
+//! A request's chunk boundaries are those of the single-request path
+//! ([`prefill_chunk_len`]), whatever else is in flight. The boundaries are
+//! part of the numerics of a prefill (the keys and values of a chunk are
+//! computed with different kernel shapes, and a quantized cache attends the
+//! earlier chunks dequantized), so shrinking a chunk to fit a latency target
+//! would make a reply depend on its neighbours. A deployment that wants a
+//! shorter stall sets a smaller `prefill_step_size`, which every path honors.
 //!
-//! At most one slot is in the `Prefilling` state at any time. This
-//! is the simplest batching pattern: decodes run
-//! batched, prefills run serially. A later phase can relax this to
-//! chunked interleaved prefill once the batched forward pass is in
-//! place.
+//! At most one slot prefills at a time: prefill is compute-bound and fills
+//! the GPU on its own, so running two together finishes neither sooner.
+//!
+//! # Admission
+//!
+//! Admission is constrained by slot count and by a token-block budget for
+//! the KV cache. Each request reserves
+//! `ceil((cached_prefix + prompt_tokens + max_new_tokens) / block_size)`
+//! blocks while it is active, clamped to the full budget so an oversized
+//! request can still run alone. The reservation is the request's worst case,
+//! so an admitted request never runs out of memory part-way and nothing is
+//! ever preempted. The scheduler scans the pending queue for the first
+//! request that fits, which keeps a large request from blocking small ones;
+//! to keep small ones from starving a large one, a request that has been
+//! overtaken [`BatcherConfig::max_overtakes`] times becomes a barrier that
+//! nothing behind it passes until it is admitted.
 //!
 //! # Decode path selection
 //!
-//! Phase 2 introduces a **fused `[N_active, 1]` batched decode** built on
-//! `pmetal_cache::kv_cache::FusedBatchKVCache` and per-arch
-//! `forward_batched_impl` methods. The driver routes a request through the
-//! fused path when
-//! [`pmetal_models::dispatcher::DynamicModel::supports_fused_batched`]
-//! returns `true`; otherwise it falls back to the per-slot serial loop
-//! shipped in Phase 1.
-//!
-//! Currently fused-capable: Llama, Mistral (no sliding window), Qwen2/3
-//! (no sliding window), Qwen3-MoE, GPT-OSS (interleaved sliding-window
-//! supported via per-layer mask overlay), Gemma1, Gemma2 / Gemma3 (4-norm
-//! peri-norm + per-layer sliding + attn logit softcap), Phi/Phi4 (partial
-//! RoPE; SuRoPE and sliding-window configs deferred), Cohere (parallel
-//! decoder block; non-global sliding-window configs deferred), Granite
-//! (plain `granite` with a unit `residual_multiplier`, which no release has).
-//!
-//! Currently on the serial fallback (no `forward_batched_impl` yet, see
-//! `dispatcher::supports_fused_batched`):
-//!
-//! - Granite MoE and hybrid families (`granitemoe`, `granitemoeshared`,
-//!   `granitemoehybrid`): routed experts, the shared MLP and Mamba-2 state
-//!   have no fused path.
-//! - Bespoke attention: Llama4 (MoD per-token skip), DeepSeek (MLA
-//!   compressed latents).
+//! The driver runs a decode step as one fused `[N_active, 1]` forward over a
+//! shared [`pmetal_cache::kv_cache::FusedBatchKVCache`] when the model
+//! supports it ([`pmetal_models::dispatcher::DynamicModel::supports_fused_batched`])
+//! and the cache is a plain dense one, and otherwise as one forward per slot
+//! on that slot's own cache. See [`crate::continuous_driver`].
 //!
 //! # Hybrid models
 //!
 //! Models with recurrent layers (Qwen 3.5 / 3.6 / 3.8 and Qwen4Exp
-//! gated-delta-net, NemotronH and Granite 4.0-H Mamba2) take the serial path, each slot
-//! with its own recurrent state beside its KV cache
+//! gated-delta-net, NemotronH and Granite 4.0-H Mamba2) take the per-slot
+//! path, each slot with its own recurrent state beside its KV cache
 //! ([`crate::continuous_driver::ContinuousEngineState::with_recurrent_state`]),
 //! reset when the slot is freed. They keep no prefix cache, since a KV
 //! snapshot can't restore recurrent state. The fused `[N, 1]` decode
@@ -84,6 +86,8 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+use pmetal_models::generation::prefill_chunk_len;
 
 /// Opaque identifier for a request in flight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -119,12 +123,17 @@ pub struct SlotParams {
 pub struct Slot {
     pub id: SlotId,
     pub state: SlotState,
+    /// The prompt tokens to prefill: the whole prompt, or on a prefix-cache
+    /// hit only the part after the restored prefix.
     pub prompt: Vec<u32>,
     pub generated: Vec<u32>,
     pub params: SlotParams,
     /// Index into `prompt` marking how many prompt tokens have been
     /// prefilled so far. Advances during chunked prefill.
     pub prefilled: usize,
+    /// Tokens of the prompt already in the slot's KV cache before `prompt`
+    /// starts (a restored prefix); chunk sizing counts them as depth.
+    pub cached_prefix: usize,
     /// Epoch-style counter for ordering ticks deterministically.
     pub enqueued_at: Instant,
     /// Final reason, populated only after transition to
@@ -174,6 +183,11 @@ pub struct BatcherConfig {
     pub block_size: usize,
     /// Maximum active token blocks. `0` disables the block-budget gate.
     pub max_blocks: usize,
+    /// How many later requests may be admitted ahead of a pending one that
+    /// does not fit the block budget yet. Past it the request is a barrier:
+    /// nothing behind it is admitted until it is, so a stream of small
+    /// requests cannot starve a large one.
+    pub max_overtakes: usize,
 }
 
 impl Default for BatcherConfig {
@@ -186,6 +200,7 @@ impl Default for BatcherConfig {
             max_queue_depth: 256,
             block_size: 32,
             max_blocks: 0,
+            max_overtakes: 16,
         }
     }
 }
@@ -208,23 +223,26 @@ impl BatcherConfig {
     }
 }
 
-/// What the driver should do in the next step.
+/// One chunk of a slot's prompt to feed to the model.
 #[derive(Debug, Clone)]
-pub enum StepInstruction {
-    /// No work: all slots idle and no pending requests.
-    Idle,
-    /// One slot is in `Prefilling` — run prefill chunk on it.
-    Prefill {
-        slot: SlotId,
-        /// The exact token slice to feed to forward() this tick.
-        chunk: Vec<u32>,
-        /// Whether this is the final chunk (so the scheduler can
-        /// transition the slot to `Decoding` after this step).
-        final_chunk: bool,
-    },
-    /// One or more slots ready for a batched decode step — forward once
-    /// with `[N, 1]` tokens, one per slot.
-    Decode { slots: Vec<SlotId> },
+pub struct PrefillChunk {
+    pub slot: SlotId,
+    /// The exact token slice to feed to forward() this iteration.
+    pub chunk: Vec<u32>,
+    /// Whether this is the final chunk (so the scheduler can
+    /// transition the slot to `Decoding` after this step).
+    pub final_chunk: bool,
+}
+
+/// One scheduler iteration: what to run before the batch is re-formed.
+#[derive(Debug, Clone)]
+pub struct Step {
+    /// Slots to decode one token each, as one batched step. Empty when no
+    /// slot is decoding.
+    pub decode: Vec<SlotId>,
+    /// One chunk of the prompt of the slot that is prefilling, to run after
+    /// the decode.
+    pub prefill: Option<PrefillChunk>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -245,16 +263,19 @@ struct PendingRequest {
     id: SlotId,
     prompt: Vec<u32>,
     params: SlotParams,
+    cached_prefix: usize,
     enqueued_at: Instant,
     reserved_blocks: usize,
+    /// How many later requests were admitted ahead of this one.
+    overtaken: usize,
 }
 
 /// The continuous batching scheduler.
 ///
-/// Tick the scheduler in a loop: `next_instruction()` tells you what to
+/// Tick the scheduler in a loop: `next_step()` tells you what to
 /// do, then you call `advance_prefill` or `advance_decode` back with the
 /// sampled tokens to update slot state. Finished slots are moved to an
-/// outbox the caller drains via `take_finished()`.
+/// outbox the caller drains via `drain_retired()`.
 pub struct ContinuousBatcher {
     config: BatcherConfig,
     slots: Vec<Slot>,
@@ -296,18 +317,18 @@ impl ContinuousBatcher {
         prompt: Vec<u32>,
         params: SlotParams,
     ) -> Result<SlotId, EnqueueError> {
-        let reserved_tokens = prompt.len().saturating_add(params.max_new_tokens);
-        self.enqueue_with_reserved_tokens(prompt, params, reserved_tokens)
+        self.enqueue_after_prefix(prompt, params, 0)
     }
 
-    /// Enqueue with an explicit active-context reservation. Serving uses this
-    /// when prefix reuse shortens the prefill suffix but the active KV cache
-    /// still contains the full prompt prefix.
-    pub fn enqueue_with_reserved_tokens(
+    /// Enqueue a request whose first `cached_prefix` tokens are already in
+    /// its KV cache (a prefix-cache hit): `prompt` is the rest. The active KV
+    /// cache holds the prefix too, so the reservation counts it, and chunk
+    /// sizing starts at its depth.
+    pub fn enqueue_after_prefix(
         &mut self,
         prompt: Vec<u32>,
         params: SlotParams,
-        reserved_context_tokens: usize,
+        cached_prefix: usize,
     ) -> Result<SlotId, EnqueueError> {
         if prompt.is_empty() {
             return Err(EnqueueError::EmptyPrompt);
@@ -316,15 +337,18 @@ impl ContinuousBatcher {
             return Err(EnqueueError::Saturated);
         }
         let id = SlotId::next();
-        let request_tokens =
-            reserved_context_tokens.max(prompt.len().saturating_add(params.max_new_tokens));
+        let request_tokens = cached_prefix
+            .saturating_add(prompt.len())
+            .saturating_add(params.max_new_tokens);
         let reserved_blocks = self.config.reserved_blocks_for(request_tokens);
         self.pending.push_back(PendingRequest {
             id,
             prompt,
             params,
+            cached_prefix,
             enqueued_at: Instant::now(),
             reserved_blocks,
+            overtaken: 0,
         });
         Ok(id)
     }
@@ -358,6 +382,9 @@ impl ContinuousBatcher {
             .sum()
     }
 
+    /// The pending request to admit next, if any: the first that fits the
+    /// remaining block budget, unless a request ahead of it has been
+    /// overtaken [`BatcherConfig::max_overtakes`] times, which holds the line.
     fn next_admissible_pending_position(&self) -> Option<usize> {
         if self.pending.is_empty() {
             return None;
@@ -369,14 +396,20 @@ impl ContinuousBatcher {
             .config
             .max_blocks
             .saturating_sub(self.active_reserved_blocks());
-        self.pending
-            .iter()
-            .position(|req| req.reserved_blocks <= remaining)
+        for (pos, req) in self.pending.iter().enumerate() {
+            if req.reserved_blocks <= remaining {
+                return Some(pos);
+            }
+            if req.overtaken >= self.config.max_overtakes {
+                return None;
+            }
+        }
+        None
     }
 
     /// Pull pending requests into free slots until the batch is full.
     ///
-    /// Called internally at the start of every `next_instruction`.
+    /// Called internally at the start of every `next_step`.
     fn fill_slots(&mut self) {
         while self.pool_size() < self.config.max_slots {
             let req_pos = match self.next_admissible_pending_position() {
@@ -387,6 +420,9 @@ impl ContinuousBatcher {
                 Some(r) => r,
                 None => break,
             };
+            for passed in self.pending.iter_mut().take(req_pos) {
+                passed.overtaken += 1;
+            }
             self.slots.push(Slot {
                 id: req.id,
                 state: SlotState::Pending,
@@ -394,6 +430,7 @@ impl ContinuousBatcher {
                 generated: Vec::new(),
                 params: req.params,
                 prefilled: 0,
+                cached_prefix: req.cached_prefix,
                 enqueued_at: req.enqueued_at,
                 finish_reason: None,
                 reserved_blocks: req.reserved_blocks,
@@ -413,42 +450,42 @@ impl ContinuousBatcher {
         }
     }
 
-    /// Decide what to do next.
+    /// Plan the next iteration, or `None` when there is nothing to do.
     ///
-    /// Preference order:
-    /// 1. Run a prefill chunk if any slot is in `Prefilling`.
-    /// 2. Otherwise, batch all `Decoding` slots and step them together.
-    /// 3. Otherwise, report `Idle`.
-    pub fn next_instruction(&mut self) -> StepInstruction {
+    /// Every `Decoding` slot decodes one token, and the slot that is
+    /// `Prefilling` (there is at most one) gets one chunk of its prompt after
+    /// them, so a long prompt never holds the others up for more than a chunk.
+    pub fn next_step(&mut self) -> Option<Step> {
         self.fill_slots();
 
-        // Serve prefills first. D.1 policy: one slot prefills at a time,
-        // so there's at most one match here.
-        if let Some(slot) = self.slots.iter().find(|s| s.state == SlotState::Prefilling) {
-            let start = slot.prefilled;
-            let step = slot.params.prefill_step_size.max(1);
-            let end = (start + step).min(slot.prompt.len());
-            let chunk: Vec<u32> = slot.prompt[start..end].to_vec();
-            let final_chunk = end == slot.prompt.len();
-            return StepInstruction::Prefill {
-                slot: slot.id,
-                chunk,
-                final_chunk,
-            };
-        }
-
-        // Batched decode over all Decoding slots.
-        let decoding: Vec<SlotId> = self
+        let decode: Vec<SlotId> = self
             .slots
             .iter()
             .filter(|s| s.state == SlotState::Decoding)
             .map(|s| s.id)
             .collect();
-        if !decoding.is_empty() {
-            return StepInstruction::Decode { slots: decoding };
-        }
-
-        StepInstruction::Idle
+        let prefill = self
+            .slots
+            .iter()
+            .find(|s| s.state == SlotState::Prefilling)
+            .map(|slot| {
+                let start = slot.prefilled;
+                let remaining = slot.prompt.len() - start;
+                let step = slot.params.prefill_step_size;
+                // The single-request path's chunking, from the same depth: a
+                // step size of 0 prefills the rest in one forward.
+                let len = if step == 0 {
+                    remaining
+                } else {
+                    prefill_chunk_len(step, slot.cached_prefix + start).min(remaining)
+                };
+                PrefillChunk {
+                    slot: slot.id,
+                    chunk: slot.prompt[start..start + len].to_vec(),
+                    final_chunk: len == remaining,
+                }
+            });
+        (!decode.is_empty() || prefill.is_some()).then_some(Step { decode, prefill })
     }
 
     /// Update slot state after a prefill chunk has been processed.
@@ -480,10 +517,14 @@ impl ContinuousBatcher {
         I: IntoIterator<Item = (SlotId, u32, bool)>,
     {
         for (id, token, stop_seq_match) in sampled {
-            let Some(s) = self.slots.iter_mut().find(|s| s.id == id) else {
+            // A slot cancelled while its step ran has no token to take.
+            let Some(s) = self
+                .slots
+                .iter_mut()
+                .find(|s| s.id == id && s.state == SlotState::Decoding)
+            else {
                 continue;
             };
-            debug_assert_eq!(s.state, SlotState::Decoding);
 
             // Stop token check fires before recording the token — mirrors
             // the single-request decode loop.
@@ -570,6 +611,16 @@ mod tests {
         }
     }
 
+    fn prefill_of(step: Option<Step>) -> PrefillChunk {
+        step.expect("a step")
+            .prefill
+            .expect("a prefill chunk in the step")
+    }
+
+    fn decode_of(step: Option<Step>) -> Vec<SlotId> {
+        step.expect("a step").decode
+    }
+
     #[test]
     fn enqueue_rejects_empty_prompt() {
         let mut b = ContinuousBatcher::new(BatcherConfig::default());
@@ -597,47 +648,98 @@ mod tests {
             .enqueue(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10], params(4))
             .unwrap();
 
-        // First tick: prefill chunk [1..=4].
-        match b.next_instruction() {
-            StepInstruction::Prefill {
-                slot,
-                chunk,
-                final_chunk,
-            } => {
-                assert_eq!(slot, id);
-                assert_eq!(chunk, vec![1, 2, 3, 4]);
-                assert!(!final_chunk);
-                b.advance_prefill(id, 4, false);
-            }
-            other => panic!("expected Prefill, got {other:?}"),
-        }
+        let first = prefill_of(b.next_step());
+        assert_eq!(
+            (first.slot, first.chunk, first.final_chunk),
+            (id, vec![1, 2, 3, 4], false)
+        );
+        b.advance_prefill(id, 4, false);
 
-        // Second tick: [5..=8].
-        match b.next_instruction() {
-            StepInstruction::Prefill { chunk, .. } => {
-                assert_eq!(chunk, vec![5, 6, 7, 8]);
-                b.advance_prefill(id, 4, false);
-            }
-            other => panic!("expected Prefill, got {other:?}"),
-        }
+        let second = prefill_of(b.next_step());
+        assert_eq!(second.chunk, vec![5, 6, 7, 8]);
+        b.advance_prefill(id, 4, false);
 
-        // Third tick: [9..=10] — final chunk.
-        match b.next_instruction() {
-            StepInstruction::Prefill {
-                chunk, final_chunk, ..
-            } => {
-                assert_eq!(chunk, vec![9, 10]);
-                assert!(final_chunk);
-                b.advance_prefill(id, 2, true);
-            }
-            other => panic!("expected Prefill, got {other:?}"),
-        }
+        let third = prefill_of(b.next_step());
+        assert_eq!(third.chunk, vec![9, 10]);
+        assert!(third.final_chunk);
+        b.advance_prefill(id, 2, true);
 
-        // Now the slot should be Decoding.
-        match b.next_instruction() {
-            StepInstruction::Decode { slots } => assert_eq!(slots, vec![id]),
-            other => panic!("expected Decode, got {other:?}"),
+        assert_eq!(decode_of(b.next_step()), vec![id]);
+    }
+
+    /// A step size of zero is the single-request path's "whole prompt in one
+    /// forward".
+    #[test]
+    fn a_zero_step_size_prefills_the_prompt_in_one_chunk() {
+        let mut b = ContinuousBatcher::new(BatcherConfig::default());
+        let prompt: Vec<u32> = (1..=100).collect();
+        let slot_params = SlotParams {
+            prefill_step_size: 0,
+            ..params(4)
+        };
+        b.enqueue(prompt.clone(), slot_params).unwrap();
+        let chunk = prefill_of(b.next_step());
+        assert_eq!(chunk.chunk, prompt);
+        assert!(chunk.final_chunk);
+    }
+
+    /// Chunks shrink with the depth they start at, a restored prefix counted,
+    /// exactly as the single-request path's do.
+    #[test]
+    fn chunks_start_from_the_depth_of_a_restored_prefix() {
+        let mut b = ContinuousBatcher::new(BatcherConfig::default());
+        let step = 2048;
+        let depth = 200_000;
+        let slot_params = SlotParams {
+            prefill_step_size: step,
+            ..params(4)
+        };
+        b.enqueue_after_prefix((0..4096).collect(), slot_params, depth)
+            .unwrap();
+        let chunk = prefill_of(b.next_step());
+        assert_eq!(chunk.chunk.len(), prefill_chunk_len(step, depth));
+        assert!(
+            chunk.chunk.len() < step,
+            "a deep prefill runs shorter chunks"
+        );
+    }
+
+    /// The reply a request gets must not depend on its neighbours, so its
+    /// chunks do not shrink when other slots are decoding: a long prompt is
+    /// interleaved with their decode steps, one chunk per step.
+    #[test]
+    fn a_long_prefill_interleaves_with_decoding_without_changing_its_chunks() {
+        let mut b = ContinuousBatcher::new(BatcherConfig {
+            max_slots: 2,
+            ..BatcherConfig::default()
+        });
+        let a = b.enqueue(vec![1], params(100)).unwrap();
+        let prompt: Vec<u32> = (10..22).collect();
+        let long = b.enqueue(prompt.clone(), params(4)).unwrap();
+
+        let step = b.next_step().unwrap();
+        assert!(step.decode.is_empty());
+        assert_eq!(step.prefill.as_ref().unwrap().slot, a);
+        b.advance_prefill(a, 1, true);
+
+        let mut fed = Vec::new();
+        let mut steps_with_decode = 0;
+        loop {
+            let step = b.next_step().unwrap();
+            if step.decode.contains(&a) {
+                steps_with_decode += 1;
+                b.advance_decode([(a, 7u32, false)]);
+            }
+            let chunk = step.prefill.expect("the long prompt is still prefilling");
+            assert_eq!(chunk.slot, long);
+            fed.extend_from_slice(&chunk.chunk);
+            b.advance_prefill(long, chunk.chunk.len(), chunk.final_chunk);
+            if chunk.final_chunk {
+                break;
+            }
         }
+        assert_eq!(fed, prompt);
+        assert_eq!(steps_with_decode, 3, "a decode step ran before each chunk");
     }
 
     #[test]
@@ -654,10 +756,7 @@ mod tests {
         assert_eq!(b.pending_depth(), 3);
 
         // Only slot 'a' should start prefilling first.
-        match b.next_instruction() {
-            StepInstruction::Prefill { slot, .. } => assert_eq!(slot, a),
-            other => panic!("expected Prefill(a), got {other:?}"),
-        }
+        assert_eq!(prefill_of(b.next_step()).slot, a);
 
         // Finish a: prefill (one chunk covers 2 tokens), decode 1, stop-token.
         b.advance_prefill(a, 2, true);
@@ -672,10 +771,7 @@ mod tests {
         assert_eq!(retired[0].id, a);
 
         // Now c should be up next.
-        match b.next_instruction() {
-            StepInstruction::Prefill { slot, .. } => assert_eq!(slot, c),
-            other => panic!("expected Prefill(c), got {other:?}"),
-        }
+        assert_eq!(prefill_of(b.next_step()).slot, c);
 
         // And d is still pending.
         assert_eq!(b.pending_depth(), 1);
@@ -696,22 +792,13 @@ mod tests {
 
         // Prefill all three serially.
         for id in [a, c, d] {
-            match b.next_instruction() {
-                StepInstruction::Prefill { slot, .. } => assert_eq!(slot, id),
-                other => panic!("expected Prefill, got {other:?}"),
-            }
+            assert_eq!(prefill_of(b.next_step()).slot, id);
             b.advance_prefill(id, 1, true);
         }
 
-        match b.next_instruction() {
-            StepInstruction::Decode { slots } => {
-                assert_eq!(slots.len(), 3);
-                assert!(slots.contains(&a));
-                assert!(slots.contains(&c));
-                assert!(slots.contains(&d));
-            }
-            other => panic!("expected Decode, got {other:?}"),
-        }
+        let slots = decode_of(b.next_step());
+        assert_eq!(slots.len(), 3);
+        assert!(slots.contains(&a) && slots.contains(&c) && slots.contains(&d));
     }
 
     #[test]
@@ -725,9 +812,9 @@ mod tests {
             logprobs_top_n: None,
         };
         let id = b.enqueue(vec![1, 2, 3], params).unwrap();
-        let _ = b.next_instruction(); // Prefill
+        let _ = b.next_step(); // Prefill
         b.advance_prefill(id, 3, true);
-        let _ = b.next_instruction(); // Decode
+        let _ = b.next_step(); // Decode
         b.advance_decode([(id, 7u32, false)]); // stop token
 
         let retired = b.drain_retired();
@@ -748,7 +835,7 @@ mod tests {
         let queued = b.enqueue(vec![2], params(1)).unwrap();
         // Step once so `_active` is pulled into the slot pool; `queued`
         // remains in the pending queue.
-        let _ = b.next_instruction();
+        let _ = b.next_step();
         assert_eq!(b.pending_depth(), 1);
 
         assert!(b.cancel(queued));
@@ -759,7 +846,7 @@ mod tests {
     fn cancel_active_retires_next_drain() {
         let mut b = ContinuousBatcher::new(BatcherConfig::default());
         let id = b.enqueue(vec![1, 2, 3], params(8)).unwrap();
-        let _ = b.next_instruction();
+        let _ = b.next_step();
         b.advance_prefill(id, 3, true);
         assert!(b.cancel(id));
 
@@ -768,10 +855,26 @@ mod tests {
         assert_eq!(retired[0].finish_reason, Some(FinishReason::Cancelled));
     }
 
+    /// A slot cancelled while its decode step ran is not given the token that
+    /// step sampled, and keeps its `Cancelled` outcome.
+    #[test]
+    fn a_cancelled_slot_takes_no_token_from_its_step() {
+        let mut b = ContinuousBatcher::new(BatcherConfig::default());
+        let id = b.enqueue(vec![1], params(1)).unwrap();
+        let _ = b.next_step();
+        b.advance_prefill(id, 1, true);
+        assert!(b.cancel(id));
+        b.advance_decode([(id, 5u32, false)]);
+
+        let retired = b.drain_retired();
+        assert_eq!(retired[0].finish_reason, Some(FinishReason::Cancelled));
+        assert!(retired[0].generated.is_empty());
+    }
+
     #[test]
     fn idle_when_no_work() {
         let mut b = ContinuousBatcher::new(BatcherConfig::default());
-        assert!(matches!(b.next_instruction(), StepInstruction::Idle));
+        assert!(b.next_step().is_none());
     }
 
     #[test]
@@ -783,33 +886,32 @@ mod tests {
         });
         let a = b.enqueue(vec![1], params(1)).unwrap();
         let c = b.enqueue(vec![2], params(1)).unwrap();
-        let _ = b.next_instruction();
+        let _ = b.next_step();
         b.advance_prefill(a, 1, true);
         b.advance_decode([(a, 99u32, false)]);
         assert_eq!(b.drain_retired().len(), 1);
 
         // c should now be eligible.
-        match b.next_instruction() {
-            StepInstruction::Prefill { slot, .. } => assert_eq!(slot, c),
-            other => panic!("expected Prefill(c), got {other:?}"),
+        assert_eq!(prefill_of(b.next_step()).slot, c);
+    }
+
+    fn block_config(max_blocks: usize, max_overtakes: usize) -> BatcherConfig {
+        BatcherConfig {
+            max_slots: 4,
+            max_queue_depth: 64,
+            block_size: 4,
+            max_blocks,
+            max_overtakes,
         }
     }
 
     #[test]
     fn block_budget_holds_request_until_blocks_free() {
-        let mut b = ContinuousBatcher::new(BatcherConfig {
-            max_slots: 4,
-            max_queue_depth: 16,
-            block_size: 4,
-            max_blocks: 3,
-        });
+        let mut b = ContinuousBatcher::new(block_config(3, 16));
         let a = b.enqueue(vec![1, 2, 3, 4], params(1)).unwrap(); // 5 tokens -> 2 blocks
         let c = b.enqueue(vec![5, 6, 7, 8], params(1)).unwrap(); // 5 tokens -> 2 blocks
 
-        match b.next_instruction() {
-            StepInstruction::Prefill { slot, .. } => assert_eq!(slot, a),
-            other => panic!("expected Prefill(a), got {other:?}"),
-        }
+        assert_eq!(prefill_of(b.next_step()).slot, a);
         assert_eq!(b.active_reserved_blocks(), 2);
         assert_eq!(b.pending_depth(), 1);
         assert!(b.pending.iter().any(|r| r.id == c));
@@ -818,32 +920,65 @@ mod tests {
         b.advance_decode([(a, 99u32, false)]);
         assert_eq!(b.drain_retired().len(), 1);
 
-        match b.next_instruction() {
-            StepInstruction::Prefill { slot, .. } => assert_eq!(slot, c),
-            other => panic!("expected Prefill(c), got {other:?}"),
-        }
+        assert_eq!(prefill_of(b.next_step()).slot, c);
     }
 
     #[test]
     fn block_scheduler_skips_head_of_line_when_later_request_fits() {
-        let mut b = ContinuousBatcher::new(BatcherConfig {
-            max_slots: 4,
-            max_queue_depth: 16,
-            block_size: 4,
-            max_blocks: 3,
-        });
+        let mut b = ContinuousBatcher::new(block_config(3, 16));
         let active = b.enqueue(vec![1, 2, 3, 4], params(4)).unwrap(); // 2 blocks
         let big = b.enqueue(vec![5, 6, 7, 8], params(4)).unwrap(); // 2 blocks
         let small = b.enqueue(vec![9], params(1)).unwrap(); // 1 block
 
-        match b.next_instruction() {
-            StepInstruction::Prefill { slot, .. } => assert_eq!(slot, active),
-            other => panic!("expected Prefill(active), got {other:?}"),
-        }
+        assert_eq!(prefill_of(b.next_step()).slot, active);
 
         assert!(b.slots().iter().any(|s| s.id == small));
         assert!(b.pending.iter().any(|r| r.id == big));
         assert_eq!(b.pending_depth(), 1);
         assert_eq!(b.active_reserved_blocks(), 3);
+    }
+
+    /// Small requests may pass a large one that doesn't fit yet, but only so
+    /// many times: after that it holds the line, so a steady stream of small
+    /// requests cannot keep it out for good.
+    #[test]
+    fn a_request_overtaken_too_often_holds_the_line() {
+        let mut b = ContinuousBatcher::new(block_config(4, 2));
+        // One block each; the first two stay active throughout.
+        let first = b.enqueue(vec![1], params(1)).unwrap();
+        let second = b.enqueue(vec![2], params(1)).unwrap();
+        // Three blocks: fits only once at most one other request is active.
+        let big = b
+            .enqueue(vec![3, 4, 5, 6, 7, 8, 9, 10, 11], params(2))
+            .unwrap();
+        let smalls: Vec<SlotId> = (0..6)
+            .map(|i| b.enqueue(vec![20 + i], params(1)).unwrap())
+            .collect();
+
+        let admitted =
+            |b: &ContinuousBatcher| -> Vec<SlotId> { b.slots().iter().map(|s| s.id).collect() };
+        let _ = b.next_step();
+        assert_eq!(admitted(&b), vec![first, second, smalls[0], smalls[1]]);
+
+        // Retire the two smalls: one block each frees, the big one still
+        // needs three and has now been passed twice.
+        for id in [smalls[0], smalls[1]] {
+            b.cancel(id);
+        }
+        b.drain_retired();
+        let _ = b.next_step();
+        assert!(
+            !admitted(&b).contains(&smalls[2]),
+            "a request overtaken max_overtakes times holds the line"
+        );
+        assert_eq!(b.pending.front().map(|r| r.id), Some(big));
+
+        // Once the others leave, the big one goes first.
+        for id in [first, second] {
+            b.cancel(id);
+        }
+        b.drain_retired();
+        let _ = b.next_step();
+        assert!(admitted(&b).contains(&big));
     }
 }

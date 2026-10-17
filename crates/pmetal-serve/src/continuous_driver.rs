@@ -13,7 +13,7 @@
 //!   `DynamicModel` so unit tests can stub the forward pass.
 //! - Drivers [`drive_prefill_step`] and [`drive_decode_step`] that the
 //!   engine's request pump (D.3) calls with the instructions produced
-//!   by [`crate::continuous_batch::ContinuousBatcher::next_instruction`].
+//!   by [`crate::continuous_batch::ContinuousBatcher::next_step`].
 //!
 //! # Today's batched-decode strategy
 //!

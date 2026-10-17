@@ -52,8 +52,7 @@
 //!   penalties are off.
 
 use crate::continuous_batch::{
-    BatcherConfig, ContinuousBatcher, EnqueueError, FinishReason, SlotId, SlotParams,
-    StepInstruction,
+    BatcherConfig, ContinuousBatcher, EnqueueError, FinishReason, PrefillChunk, SlotId, SlotParams,
 };
 use crate::continuous_driver::{
     ContinuousEngineState, SlotForward, drive_decode_step, drive_prefill_step,
@@ -229,7 +228,6 @@ impl ContinuousPump {
         let stop_tokens = params.stop_tokens.clone();
         let stop_sequences = params.stop_sequences.clone();
         let logprobs_top_n = params.logprobs_top_n;
-        let reserved_tokens = prompt_tokens.saturating_add(params.max_new_tokens);
 
         let mut scheduler_prompt = prompt.clone();
         let mut prefix_seed = None;
@@ -269,9 +267,9 @@ impl ContinuousPump {
         // The scheduler consumes the original prompt or, on a prefix hit,
         // only its uncached suffix; the record keeps all of it, so the
         // repetition penalty covers the restored part too.
-        let slot =
-            self.batcher
-                .enqueue_with_reserved_tokens(scheduler_prompt, params, reserved_tokens)?;
+        let slot = self
+            .batcher
+            .enqueue_after_prefix(scheduler_prompt, params, prefix_hit_len)?;
         self.records.insert(
             slot,
             SlotRecord {
@@ -294,18 +292,40 @@ impl ContinuousPump {
         Ok(slot)
     }
 
-    /// Cancel an in-flight slot. Pending slots are simply dropped; a
-    /// slot that's already prefilling/decoding is marked cancelled and
-    /// retired on the next tick.
+    /// Cancel a request. A pending one leaves the queue; one that is
+    /// prefilling or decoding is retired at once, its batch row and KV cache
+    /// freed before this returns.
     pub fn cancel(&mut self, slot: SlotId) -> bool {
         let cancelled = self.batcher.cancel(slot);
         if cancelled {
-            // Drop the per-slot record so any in-flight send on the tx
-            // half errors out — the receiver has already been
-            // abandoned by the caller.
+            // Drop the record so no further event is sent to the receiver,
+            // which the caller has abandoned.
             self.records.remove(&slot);
+            self.drain_retired();
         }
         cancelled
+    }
+
+    /// Cancel every request whose receiver is gone. A client that hangs up
+    /// would otherwise keep its row, its KV cache and its share of every
+    /// decode step until the pump next tried to send it a token, which for a
+    /// request still waiting in the queue or prefilling is not for a long
+    /// time.
+    fn reap_disconnected(&mut self) {
+        let hung_up: Vec<SlotId> = self
+            .records
+            .iter()
+            .filter(|(_, rec)| rec.tx.is_closed())
+            .map(|(&slot, _)| slot)
+            .collect();
+        for slot in hung_up {
+            tracing::debug!(
+                target: "pmetal_serve::continuous_pump",
+                ?slot,
+                "client hung up; freeing its slot"
+            );
+            self.cancel(slot);
+        }
     }
 
     /// Number of currently-active slots (Prefilling + Decoding).
@@ -323,7 +343,9 @@ impl ContinuousPump {
         &self.cache_config
     }
 
-    /// Execute one scheduler step against `forward`.
+    /// Execute one scheduler iteration against `forward`: one decode step
+    /// for every decoding slot, then one chunk of the prompt that is
+    /// prefilling.
     ///
     /// Returns `Tick::Idle` if the scheduler has nothing to do (caller
     /// should park until the next enqueue), else `Tick::Ran`.
@@ -333,12 +355,27 @@ impl ContinuousPump {
     /// `TokenEvent::Error` and its slot is freed. Retrying would fail the
     /// same way on every tick and leave those clients waiting for good.
     pub fn tick<F: SlotForward>(&mut self, forward: &mut F) -> Result<Tick, Exception> {
-        let instruction = self.batcher.next_instruction();
-        let involved = match &instruction {
-            StepInstruction::Idle => return Ok(Tick::Idle),
-            StepInstruction::Prefill { slot, .. } => vec![*slot],
-            StepInstruction::Decode { slots } => slots.clone(),
+        self.reap_disconnected();
+        let Some(step) = self.batcher.next_step() else {
+            return Ok(Tick::Idle);
         };
+        if !step.decode.is_empty() {
+            let slots = step.decode;
+            self.guarded(&slots, |pump| pump.run_decode(forward, &slots));
+        }
+        if let Some(chunk) = step.prefill {
+            self.guarded(&[chunk.slot], |pump| pump.run_prefill(forward, chunk));
+        }
+        Ok(Tick::Ran)
+    }
+
+    /// Run `step`, which is for `involved`, failing those requests if it
+    /// errors.
+    fn guarded(
+        &mut self,
+        involved: &[SlotId],
+        step: impl FnOnce(&mut Self) -> Result<(), Exception>,
+    ) {
         // An error another job left behind on this thread is not this step's.
         // The sticky slot, both here and after the step: the step is many
         // ops, and one that threw early is cleared from the last-op slot by
@@ -349,17 +386,11 @@ impl ContinuousPump {
                 "discarding an earlier bridge error: {stale}"
             );
         }
-        let stepped = self.run_instruction(forward, instruction).and_then(|tick| {
-            pmetal_runtime::check_unobserved_error()
-                .map(|()| tick)
-                .map_err(|e| Exception::custom(e.to_string()))
+        let stepped = step(self).and_then(|()| {
+            pmetal_runtime::check_unobserved_error().map_err(|e| Exception::custom(e.to_string()))
         });
-        match stepped {
-            Ok(tick) => Ok(tick),
-            Err(error) => {
-                self.fail_slots(&involved, &error);
-                Ok(Tick::Ran)
-            }
+        if let Err(error) = stepped {
+            self.fail_slots(involved, &error);
         }
     }
 
@@ -381,84 +412,85 @@ impl ContinuousPump {
         self.drain_retired();
     }
 
-    fn run_instruction<F: SlotForward>(
+    /// One chunk of `chunk.slot`'s prompt. On the final chunk, samples the
+    /// request's first token.
+    fn run_prefill<F: SlotForward>(
         &mut self,
         forward: &mut F,
-        instruction: StepInstruction,
-    ) -> Result<Tick, Exception> {
-        match instruction {
-            StepInstruction::Idle => Ok(Tick::Idle),
+        chunk: PrefillChunk,
+    ) -> Result<(), Exception> {
+        let PrefillChunk {
+            slot,
+            chunk,
+            final_chunk,
+        } = chunk;
+        // Admit the slot the first time we see it — sampler and batch row
+        // are created lazily here so we don't allocate anything for
+        // requests that get cancelled before reaching the prefill stage.
+        self.admit_if_needed(slot)?;
+        let chunk_len = chunk.len();
+        let maybe_last = drive_prefill_step(forward, &mut self.state, slot, &chunk, final_chunk)?;
+        self.batcher.advance_prefill(slot, chunk_len, final_chunk);
 
-            StepInstruction::Prefill {
-                slot,
-                chunk,
-                final_chunk,
-            } => {
-                // Admit the slot the first time we see it — sampler and
-                // batch row are created lazily here so we don't
-                // allocate anything for requests that get cancelled
-                // before reaching the prefill stage.
-                self.admit_if_needed(slot)?;
-                let chunk_len = chunk.len();
-                let maybe_last =
-                    drive_prefill_step(forward, &mut self.state, slot, &chunk, final_chunk)?;
-                self.batcher.advance_prefill(slot, chunk_len, final_chunk);
-
-                // If we just prefilled the final chunk, sample the
-                // first decode token immediately. This avoids a
-                // "dead" tick between prefill-complete and the first
-                // decode step.
-                if let Some(last_logits) = maybe_last {
-                    self.save_prefix_if_possible(slot);
-                    let top_n = self
-                        .records
-                        .get(&slot)
-                        .ok_or_else(|| Exception::custom(format!("no record for {slot:?}")))?
-                        .logprobs_top_n;
-                    let token = self.state.sample(slot, &last_logits)?.item::<u32>();
-                    let logprob = Self::compute_logprob_entry(&last_logits, token, top_n);
-                    self.record_first_token(slot, token, logprob)?;
-                }
-
-                self.drain_retired();
-                Ok(Tick::Ran)
+        match maybe_last {
+            // If we just prefilled the final chunk, sample the first decode
+            // token immediately. This avoids a "dead" tick between
+            // prefill-complete and the first decode step.
+            Some(last_logits) => {
+                self.save_prefix_if_possible(slot);
+                let top_n = self
+                    .records
+                    .get(&slot)
+                    .ok_or_else(|| Exception::custom(format!("no record for {slot:?}")))?
+                    .logprobs_top_n;
+                let token = self.state.sample(slot, &last_logits)?.item::<u32>();
+                let logprob = Self::compute_logprob_entry(&last_logits, token, top_n);
+                self.record_first_token(slot, token, logprob)?;
             }
-
-            StepInstruction::Decode { slots } => {
-                // Build (slot, current_token) inputs. Each slot's penalty
-                // history is already on the GPU with its sampler.
-                let mut inputs: Vec<(SlotId, u32)> = Vec::with_capacity(slots.len());
-                for s in &slots {
-                    let rec = self
-                        .records
-                        .get(s)
-                        .ok_or_else(|| Exception::custom(format!("missing record for {s:?}")))?;
-                    let tok = rec.current_token.ok_or_else(|| {
-                        Exception::custom(format!("slot {s:?} in Decode without a current token"))
-                    })?;
-                    inputs.push((*s, tok));
-                }
-
-                let outs = drive_decode_step(forward, &mut self.state, &inputs)?;
-
-                // Deliver tokens + update per-slot state + feed the
-                // scheduler so it can apply stop-token / length /
-                // stop-sequence termination.
-                let mut sampled: Vec<(SlotId, u32, bool)> = Vec::with_capacity(outs.len());
-                for out in outs {
-                    let logprob = Self::compute_logprob_entry(
-                        &out.logits,
-                        out.token,
-                        self.records.get(&out.slot).and_then(|r| r.logprobs_top_n),
-                    );
-                    let stop_seq_match = self.emit_token(out.slot, out.token, logprob)?;
-                    sampled.push((out.slot, out.token, stop_seq_match));
-                }
-                self.batcher.advance_decode(sampled);
-                self.drain_retired();
-                Ok(Tick::Ran)
-            }
+            // The chunk's activations are not needed again.
+            None => pmetal_runtime::inline_array::clear_cache(),
         }
+        self.drain_retired();
+        Ok(())
+    }
+
+    /// One decode step for `slots`.
+    fn run_decode<F: SlotForward>(
+        &mut self,
+        forward: &mut F,
+        slots: &[SlotId],
+    ) -> Result<(), Exception> {
+        // Build (slot, current_token) inputs. Each slot's penalty history is
+        // already on the GPU with its sampler.
+        let mut inputs: Vec<(SlotId, u32)> = Vec::with_capacity(slots.len());
+        for s in slots {
+            let rec = self
+                .records
+                .get(s)
+                .ok_or_else(|| Exception::custom(format!("missing record for {s:?}")))?;
+            let tok = rec.current_token.ok_or_else(|| {
+                Exception::custom(format!("slot {s:?} in Decode without a current token"))
+            })?;
+            inputs.push((*s, tok));
+        }
+
+        let outs = drive_decode_step(forward, &mut self.state, &inputs)?;
+
+        // Deliver tokens + update per-slot state + feed the scheduler so it
+        // can apply stop-token / length / stop-sequence termination.
+        let mut sampled: Vec<(SlotId, u32, bool)> = Vec::with_capacity(outs.len());
+        for out in outs {
+            let logprob = Self::compute_logprob_entry(
+                &out.logits,
+                out.token,
+                self.records.get(&out.slot).and_then(|r| r.logprobs_top_n),
+            );
+            let stop_seq_match = self.emit_token(out.slot, out.token, logprob)?;
+            sampled.push((out.slot, out.token, stop_seq_match));
+        }
+        self.batcher.advance_decode(sampled);
+        self.drain_retired();
+        Ok(())
     }
 
     /// Allocate a batch row + per-slot sampler for `slot` if not
@@ -569,58 +601,41 @@ impl ContinuousPump {
         token: u32,
         logprob: Option<TokenLogprobEntry>,
     ) -> Result<bool, Exception> {
-        // Phase 1: update record and send the token. We isolate the
-        // `&mut self.records` borrow so we can drop it before taking
-        // `&mut self.batcher` in the close-detection path.
-        let (closed, stop_seq_match) = {
-            let rec = match self.records.get_mut(&slot) {
-                Some(r) => r,
-                None => return Ok(false),
-            };
-            rec.current_token = Some(token);
-            if rec.first_token_ms.is_none() {
-                rec.first_token_ms = Some(rec.start.elapsed().as_secs_f64() * 1000.0);
-            }
-            // A stop token ends the request without being part of the
-            // reply, as on the single-request path; the scheduler sees it
-            // and retires the slot.
-            if rec.stop_tokens.contains(&token) {
-                return Ok(false);
-            }
-            rec.emitted = rec.emitted.saturating_add(1);
-            rec.generated.push(token);
-
-            let send_res = rec.tx.try_send(TokenEvent::Token { id: token, logprob });
-            let closed = matches!(send_res, Err(mpsc::error::TrySendError::Closed(_)));
-
-            // Stop-sequence detection (skipped when the pump has no
-            // tokenizer or the slot has no raw-text stops configured).
-            let stop_seq_match = if closed || rec.stop_sequences.is_empty() {
-                false
-            } else if let Some(tokenizer) = self.tokenizer.as_ref() {
-                match detect_stop_sequence_suffix(
-                    tokenizer.as_ref(),
-                    &rec.generated,
-                    &rec.stop_sequences,
-                ) {
-                    Some(n_strip) => {
-                        rec.stripped_tokens = n_strip;
-                        true
-                    }
-                    None => false,
-                }
-            } else {
-                false
-            };
-
-            (closed, stop_seq_match)
+        let Some(rec) = self.records.get_mut(&slot) else {
+            return Ok(false);
         };
-
-        if closed {
-            self.batcher.cancel(slot);
+        rec.current_token = Some(token);
+        if rec.first_token_ms.is_none() {
+            rec.first_token_ms = Some(rec.start.elapsed().as_secs_f64() * 1000.0);
+        }
+        // A stop token ends the request without being part of the reply, as
+        // on the single-request path; the scheduler sees it and retires the
+        // slot.
+        if rec.stop_tokens.contains(&token) {
             return Ok(false);
         }
-        Ok(stop_seq_match)
+        rec.emitted = rec.emitted.saturating_add(1);
+        rec.generated.push(token);
+
+        // A receiver that has gone is noticed (and its slot freed) at the
+        // start of the next tick.
+        let _ = rec.tx.try_send(TokenEvent::Token { id: token, logprob });
+
+        // Stop-sequence detection (skipped when the pump has no tokenizer or
+        // the slot has no raw-text stops configured).
+        if rec.stop_sequences.is_empty() {
+            return Ok(false);
+        }
+        let Some(tokenizer) = self.tokenizer.as_ref() else {
+            return Ok(false);
+        };
+        match detect_stop_sequence_suffix(tokenizer.as_ref(), &rec.generated, &rec.stop_sequences) {
+            Some(n_strip) => {
+                rec.stripped_tokens = n_strip;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     /// Move every retired slot out of the batcher, free its row, and
@@ -1050,6 +1065,162 @@ mod tests {
         assert_eq!(a_tokens, vec![10, 11]);
         assert_eq!(b_tokens, vec![20, 21]);
         assert!(a_done && b_done);
+    }
+
+    /// A client that hangs up mid-decode is noticed when its next token has
+    /// nowhere to go; its slot is freed in the same tick, and the requests it
+    /// shared the batch with go on unharmed. The retired slot used to be
+    /// marked cancelled and then fed to the scheduler as a decoded token,
+    /// which tripped its state assertion.
+    #[tokio::test]
+    async fn a_client_that_hangs_up_mid_decode_frees_its_slot() {
+        let mut pump = ContinuousPump::new(
+            BatcherConfig {
+                max_slots: 2,
+                ..BatcherConfig::default()
+            },
+            cache_cfg(),
+            None,
+        );
+        let next: HashMap<u32, u32> = (1..40).map(|t| (t, t + 1)).collect();
+        let mut stub = Stub { vocab: 64, next };
+        let (_a, rx_a) = pump
+            .enqueue(vec![1], params(12, vec![]), GenerationConfig::default(), 16)
+            .unwrap();
+        let (_b, mut rx_b) = pump
+            .enqueue(
+                vec![20],
+                params(12, vec![]),
+                GenerationConfig::default(),
+                16,
+            )
+            .unwrap();
+        for _ in 0..4 {
+            pump.tick(&mut stub).unwrap();
+        }
+        assert_eq!(pump.active_slots(), 2);
+        drop(rx_a);
+        pump.tick(&mut stub).unwrap();
+        assert_eq!(
+            pump.active_slots(),
+            1,
+            "the hung-up request still holds a slot"
+        );
+        while pump.tick(&mut stub).unwrap() == Tick::Ran {}
+
+        let tokens: Vec<u32> = drain(&mut rx_b)
+            .iter()
+            .filter_map(|ev| match ev {
+                TokenEvent::Token { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tokens, (21..33).collect::<Vec<u32>>());
+    }
+
+    /// A request that hangs up while it waits in the queue, or while its
+    /// prompt prefills, is dropped without ever taking a row; cancelling a
+    /// running one frees its row before `cancel` returns.
+    #[tokio::test]
+    async fn hung_up_and_cancelled_requests_free_what_they_hold_at_once() {
+        let mut pump = ContinuousPump::new(
+            BatcherConfig {
+                max_slots: 1,
+                ..BatcherConfig::default()
+            },
+            cache_cfg(),
+            None,
+        );
+        let mut stub = Stub {
+            vocab: 64,
+            next: (1..40).map(|t| (t, t + 1)).collect(),
+        };
+        let (running, mut rx_running) = pump
+            .enqueue(vec![1], params(30, vec![]), GenerationConfig::default(), 64)
+            .unwrap();
+        let (_queued, rx_queued) = pump
+            .enqueue(vec![5], params(30, vec![]), GenerationConfig::default(), 64)
+            .unwrap();
+        let (_last, mut rx_last) = pump
+            .enqueue(vec![9], params(3, vec![]), GenerationConfig::default(), 64)
+            .unwrap();
+        pump.tick(&mut stub).unwrap();
+        assert_eq!((pump.active_slots(), pump.pending_depth()), (1, 2));
+
+        drop(rx_queued);
+        pump.tick(&mut stub).unwrap();
+        assert_eq!(
+            pump.pending_depth(),
+            1,
+            "the hung-up request left the queue"
+        );
+
+        assert!(pump.cancel(running));
+        assert_eq!(pump.active_slots(), 0, "cancel frees the row at once");
+        assert!(drain(&mut rx_running).len() < 30);
+
+        while pump.tick(&mut stub).unwrap() == Tick::Ran {}
+        let last: Vec<u32> = drain(&mut rx_last)
+            .iter()
+            .filter_map(|ev| match ev {
+                TokenEvent::Token { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(last, vec![10, 11, 12], "the request behind them still ran");
+    }
+
+    /// A long prompt's chunks are interleaved with the decoding requests'
+    /// steps: no stream waits out the whole prefill.
+    #[tokio::test]
+    async fn a_long_prompt_does_not_stall_decoding_requests() {
+        struct Logging {
+            inner: Stub,
+            calls: Vec<usize>,
+        }
+        impl SlotForward for Logging {
+            fn forward(
+                &mut self,
+                tokens: &[u32],
+                cache: &mut KVCache,
+                recurrent: Option<&mut MambaCache>,
+            ) -> Result<Array, Exception> {
+                self.calls.push(tokens.len());
+                self.inner.forward(tokens, cache, recurrent)
+            }
+        }
+        let mut pump = ContinuousPump::new(BatcherConfig::default(), cache_cfg(), None);
+        let mut stub = Logging {
+            inner: Stub {
+                vocab: 64,
+                next: (1..60).map(|t| (t, t + 1)).collect(),
+            },
+            calls: Vec::new(),
+        };
+        let (_a, mut rx_a) = pump
+            .enqueue(vec![1], params(40, vec![]), GenerationConfig::default(), 64)
+            .unwrap();
+        pump.tick(&mut stub).unwrap(); // a's prefill, and its first token
+        let long_prompt: Vec<u32> = (10..58).collect();
+        let long_params = SlotParams {
+            prefill_step_size: 16,
+            ..params(2, vec![])
+        };
+        let (_b, _rx_b) = pump
+            .enqueue(long_prompt, long_params, GenerationConfig::default(), 64)
+            .unwrap();
+        stub.calls.clear();
+        // 48 tokens in chunks of 16: three ticks, each a decode step of `a`
+        // (one token) and then a chunk.
+        for _ in 0..3 {
+            pump.tick(&mut stub).unwrap();
+        }
+        assert_eq!(stub.calls, vec![1, 16, 1, 16, 1, 16]);
+        let a_tokens = drain(&mut rx_a)
+            .iter()
+            .filter(|ev| matches!(ev, TokenEvent::Token { .. }))
+            .count();
+        assert_eq!(a_tokens, 4, "a decoded through b's whole prefill");
     }
 
     #[tokio::test]
