@@ -653,6 +653,7 @@ impl ContinuousPump {
                             0.0
                         },
                         prompt_tokens: rec.prompt.len(),
+                        cached_prompt_tokens: 0,
                         completion_tokens: visible,
                     };
                     let _ = rec.tx.try_send(TokenEvent::Done {

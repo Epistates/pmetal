@@ -247,7 +247,42 @@ the sample-rate converter follows torchaudio's windowed-sinc kernel (BSD
 2-Clause); the mel filterbank follows librosa (ISC).
 
 
-8. Chat templates of released models (test fixtures)
+8. llguidance and toktrie (Microsoft)
+-------------------------------------
+
+pmetal-serve compiles JSON schemas and grammars to token masks with
+llguidance (its Earley parser and derivative-based lexer, over toktrie's token
+trie) to enforce `response_format` and `tool_choice`. They are linked as
+dependencies, unmodified. pmetal-serve's reading of a tokenizer's vocabulary as
+bytes (`vocab.rs`: GPT-2's byte-to-character table and SentencePiece's
+`<0xNN>` byte tokens) follows the approach of llguidance's
+toktrie_hf_tokenizers crate.
+
+    Copyright (c) Microsoft Corporation.
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+Source: https://github.com/guidance-ai/llguidance
+License: MIT
+
+
+9. Chat templates of released models (test fixtures)
 -----------------------------------------------------
 
 crates/pmetal-data/tests/fixtures/chat_template_suite_reference.json holds the

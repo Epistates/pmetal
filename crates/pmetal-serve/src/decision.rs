@@ -20,9 +20,9 @@ use pmetal_models::decision::{DecisionError, DecisionModel};
 use pmetal_models::model_thread::{ModelThread, ModelThreadStartError};
 use serde_json::Value;
 use tokio::sync::{Semaphore, oneshot};
-use tower_http::trace::TraceLayer;
 
 use crate::error::{ServeError, ServeResult};
+use crate::extract::ApiJson;
 use crate::server::ServeConfig;
 use crate::types::{ModelInfo, ModelListResponse};
 
@@ -90,7 +90,7 @@ struct DecisionAppState {
 /// `POST /v1/systemone`.
 async fn systemone(
     State(state): State<Arc<DecisionAppState>>,
-    Json(request): Json<Value>,
+    ApiJson(request): ApiJson<Value>,
 ) -> ServeResult<Json<Value>> {
     let _permit = Arc::clone(&state.request_permits)
         .try_acquire_owned()
@@ -120,18 +120,28 @@ pub(crate) async fn not_a_decision_model() -> ServeError {
     )
 }
 
-/// The router for a decision model.
+/// The router for a decision model, under the default configuration.
 pub fn build_decision_router(engine: DecisionEngine, max_concurrent: usize) -> Router {
+    build_decision_router_with(
+        engine,
+        &ServeConfig {
+            max_concurrent,
+            ..ServeConfig::default()
+        },
+    )
+}
+
+/// The router for a decision model, under `config`.
+pub fn build_decision_router_with(engine: DecisionEngine, config: &ServeConfig) -> Router {
     let state = Arc::new(DecisionAppState {
         engine,
-        request_permits: Arc::new(Semaphore::new(max_concurrent.max(1))),
+        request_permits: Arc::new(Semaphore::new(config.max_concurrent.max(1))),
     });
     let router = Router::new()
         .route("/health", axum::routing::get(crate::routes::health))
         .route("/v1/models", axum::routing::get(list_models))
-        .route("/v1/systemone", axum::routing::post(systemone))
-        .layer(TraceLayer::new_for_http());
-    crate::server::limit_request_bodies(router).with_state(state)
+        .route("/v1/systemone", axum::routing::post(systemone));
+    crate::server::harden(router, config).with_state(state)
 }
 
 /// Serve a decision model until the process exits.
@@ -139,14 +149,9 @@ pub async fn run_decision_server(
     engine: DecisionEngine,
     config: ServeConfig,
 ) -> anyhow::Result<()> {
-    let router = build_decision_router(engine, config.max_concurrent);
+    let router = build_decision_router_with(engine, &config);
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
-    if !addr.ip().is_loopback() {
-        tracing::warn!(
-            "binding the decision server to a non-loopback address without authentication; \
-             expose this only on trusted networks"
-        );
-    }
+    crate::server::warn_if_exposed(&addr, &config);
     tracing::info!("Decision API available at http://{}/v1/systemone", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, router).await?;
