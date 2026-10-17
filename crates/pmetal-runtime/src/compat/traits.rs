@@ -355,18 +355,21 @@ macro_rules! impl_module_params {
             }
 
             fn parameters(&self) -> $crate::compat::ModuleParamRef<'_> {
+                #[allow(unused_mut)] // a parameter-free layer lists no fields
                 let mut out = ::std::collections::HashMap::new();
                 $( $crate::compat::Parameter::collect_params(&self.$field, stringify!($field), &mut out); )*
                 out
             }
 
             fn trainable_parameters(&self) -> $crate::compat::ModuleParamRef<'_> {
+                #[allow(unused_mut)] // a parameter-free layer lists no fields
                 let mut out = ::std::collections::HashMap::new();
                 $( $crate::compat::Parameter::collect_trainable_params(&self.$field, stringify!($field), &mut out); )*
                 out
             }
 
             fn parameters_mut(&mut self) -> $crate::compat::ModuleParamMut<'_> {
+                #[allow(unused_mut)] // a parameter-free layer lists no fields
                 let mut out = ::std::collections::HashMap::new();
                 $( $crate::compat::Parameter::collect_params_mut(&mut self.$field, stringify!($field), &mut out); )*
                 out
@@ -379,6 +382,8 @@ macro_rules! impl_module_params {
                 prefix: &str,
                 f: &mut dyn ::std::ops::FnMut(&str, &mut $crate::compat::Linear),
             ) {
+                // A module with no fields (a parameter-free layer) uses neither.
+                let _ = (&prefix, &f);
                 $(
                     $crate::compat::VisitLinears::visit_linears_mut(
                         &mut self.$field,
@@ -398,18 +403,21 @@ macro_rules! impl_module_params {
             }
 
             fn parameters(&self) -> $crate::compat::ModuleParamRef<'_> {
+                #[allow(unused_mut)] // a parameter-free layer lists no fields
                 let mut out = ::std::collections::HashMap::new();
                 $( $crate::compat::Parameter::collect_params(&self.$field, stringify!($field), &mut out); )*
                 out
             }
 
             fn trainable_parameters(&self) -> $crate::compat::ModuleParamRef<'_> {
+                #[allow(unused_mut)] // a parameter-free layer lists no fields
                 let mut out = ::std::collections::HashMap::new();
                 $( $crate::compat::Parameter::collect_trainable_params(&self.$field, stringify!($field), &mut out); )*
                 out
             }
 
             fn parameters_mut(&mut self) -> $crate::compat::ModuleParamMut<'_> {
+                #[allow(unused_mut)] // a parameter-free layer lists no fields
                 let mut out = ::std::collections::HashMap::new();
                 $( $crate::compat::Parameter::collect_params_mut(&mut self.$field, stringify!($field), &mut out); )*
                 out
@@ -422,6 +430,8 @@ macro_rules! impl_module_params {
                 prefix: &str,
                 f: &mut dyn ::std::ops::FnMut(&str, &mut $crate::compat::Linear),
             ) {
+                // A module with no fields (a parameter-free layer) uses neither.
+                let _ = (&prefix, &f);
                 $(
                     $crate::compat::VisitLinears::visit_linears_mut(
                         &mut self.$field,

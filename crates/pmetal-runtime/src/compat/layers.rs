@@ -718,6 +718,30 @@ impl RmsNorm {
 
 crate::impl_module_params!(RmsNorm; weight);
 
+/// An RMS norm with no weight: `x / sqrt(mean(x²) + eps)`, the parameter-free
+/// L2 norm some architectures put on queries and keys (Llama 4).
+///
+/// Holding it as an [`RmsNorm`] whose weight sits at one would work in the
+/// forward pass and make the one a trainable parameter, which a full
+/// fine-tune then moves off the identity (weight decay alone does it) and
+/// saves in a checkpoint whose architecture has no such tensor.
+#[derive(Debug, Clone)]
+pub struct WeightlessRmsNorm {
+    pub eps: f32,
+}
+
+impl WeightlessRmsNorm {
+    pub fn new(eps: f32) -> Self {
+        Self { eps }
+    }
+
+    pub fn forward(&self, x: &Array) -> Array {
+        x.rms_norm(None, self.eps)
+    }
+}
+
+crate::impl_module_params!(WeightlessRmsNorm;);
+
 /// Builder for [`RmsNorm`].
 pub struct RmsNormBuilder {
     dims: i32,
@@ -772,6 +796,15 @@ impl LayerNorm {
         }
     }
 
+    /// Drop the bias: a scale-only layer norm, for an architecture whose norm
+    /// has none. The parameter does not exist, so it cannot be trained or
+    /// saved.
+    #[must_use]
+    pub fn without_bias(mut self) -> Self {
+        self.bias = Param::new(None);
+        self
+    }
+
     pub fn forward(&self, x: &Array) -> Array {
         let w = self.weight.value.as_ref().map(fp8_weight_for_compute);
         let b = self.bias.value.as_ref().map(fp8_weight_for_compute);
@@ -786,6 +819,7 @@ pub struct LayerNormBuilder {
     dims: i32,
     eps: f32,
     affine: bool,
+    bias: bool,
 }
 
 impl LayerNormBuilder {
@@ -794,6 +828,7 @@ impl LayerNormBuilder {
             dims,
             eps: LayerNorm::DEFAULT_EPS,
             affine: LayerNorm::DEFAULT_AFFINE,
+            bias: true,
         }
     }
     pub fn eps(mut self, eps: f32) -> Self {
@@ -804,8 +839,14 @@ impl LayerNormBuilder {
         self.affine = a;
         self
     }
+    /// Whether an affine layer norm has a bias (default yes).
+    pub fn bias(mut self, b: bool) -> Self {
+        self.bias = b;
+        self
+    }
     pub fn build(self) -> Result<LayerNorm, Exception> {
-        Ok(LayerNorm::with_affine(self.dims, self.eps, self.affine))
+        let norm = LayerNorm::with_affine(self.dims, self.eps, self.affine);
+        Ok(if self.bias { norm } else { norm.without_bias() })
     }
 }
 

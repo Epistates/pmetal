@@ -602,8 +602,11 @@ impl CohereDecoderLayer {
         let mlp = CohereMLP::new(config.hidden_size, config.intermediate_size)?;
 
         // Cohere uses LayerNorm (not RMSNorm)
+        // Scale only: no Cohere release has a norm bias, so none exists to be
+        // trained or saved.
         let input_layernorm = nn::LayerNormBuilder::new(config.hidden_size)
             .eps(config.layer_norm_eps)
+            .bias(false)
             .build()?;
 
         Ok(Self {
@@ -668,6 +671,7 @@ impl CohereModel {
 
         let norm = nn::LayerNormBuilder::new(config.hidden_size)
             .eps(config.layer_norm_eps)
+            .bias(false)
             .build()?;
 
         Ok(Self {

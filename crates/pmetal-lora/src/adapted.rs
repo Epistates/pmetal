@@ -323,11 +323,7 @@ fn is_targeted(path: &str, targets: &[String], output: Option<&str>) -> bool {
 /// field named `layer`, so its path ends `router.layer`, and Gemma 4's (and
 /// DiffusionGemma's) in one named `proj`, so its path ends `router.proj`.
 pub(crate) fn moe_role(path: &str) -> Option<&'static str> {
-    let name = path.rsplit('.').next().unwrap_or(path);
-    if matches!(name, "gate" | "router" | "shared_expert_gate")
-        || path.ends_with(".router.layer")
-        || path.ends_with(".router.proj")
-    {
+    if pmetal_models::moe_routing::is_router_path(path) {
         return Some("a router picks experts by argmax");
     }
     if path.contains(".experts.") {

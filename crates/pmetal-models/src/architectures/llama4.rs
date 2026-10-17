@@ -465,8 +465,8 @@ pub struct Llama4Attention {
     pub o_proj: nn::Linear,
 
     // QK normalization (optional)
-    pub q_norm: Option<nn::RmsNorm>,
-    pub k_norm: Option<nn::RmsNorm>,
+    pub q_norm: Option<nn::WeightlessRmsNorm>,
+    pub k_norm: Option<nn::WeightlessRmsNorm>,
 }
 impl_module_params!(Llama4Attention; q_proj, k_proj, v_proj, o_proj, q_norm, k_norm);
 
@@ -495,15 +495,14 @@ impl Llama4Attention {
         // QK norm: weightless RMS norm applied AFTER RoPE, and only on RoPE
         // layers, at the model's `rms_norm_eps` (transformers'
         // `Llama4TextL2Norm(config.rms_norm_eps)`, the reference's
-        // `rmsnorm(x, norm_eps)`). The RmsNorm weight stays at its default
-        // ones, so it is the weightless norm.
-        let qk_norm = || {
-            nn::RmsNormBuilder::new(head_dim)
-                .eps(config.rms_norm_eps)
-                .build()
-        };
+        // `rmsnorm(x, norm_eps)`). It has no weight, so it holds none: a
+        // weight at ones would be a trainable parameter that a full
+        // fine-tune moves off the identity.
         let (q_norm, k_norm) = if config.use_qk_norm && uses_rope {
-            (Some(qk_norm()?), Some(qk_norm()?))
+            (
+                Some(nn::WeightlessRmsNorm::new(config.rms_norm_eps)),
+                Some(nn::WeightlessRmsNorm::new(config.rms_norm_eps)),
+            )
         } else {
             (None, None)
         };
@@ -634,9 +633,9 @@ impl Llama4Attention {
 
         // QK normalization: weightless RMS norm applied AFTER RoPE, only on RoPE
         // layers (q_norm/k_norm are None on NoPE layers per construction).
-        if let (Some(qn), Some(kn)) = (&mut self.q_norm, &mut self.k_norm) {
-            q = Module::forward(qn, &q)?;
-            k = Module::forward(kn, &k)?;
+        if let (Some(qn), Some(kn)) = (&self.q_norm, &self.k_norm) {
+            q = qn.forward(&q);
+            k = kn.forward(&k);
         }
 
         // Attention temperature on the NoPE layers (arXiv 2501.19399):
