@@ -108,8 +108,8 @@ File: crates/pmetal-runtime/src/nn/gated_delta.rs
 --------------------
 
 PMetal's GGUF quantization infrastructure (K-quant and IQ-quant block
-structures, quantization routines, and the dequantization Metal kernel)
-is based on the llama.cpp/GGML implementation.
+structures and quantization routines) and its GGUF pre-tokenizer table
+are based on the llama.cpp/GGML implementation.
 
     Copyright (c) 2023-2026 The ggml authors
 
@@ -137,16 +137,14 @@ Files: crates/pmetal-data/src/gguf_tokenizer/pre_table.rs (the pre-tokenizer
        patterns by `tokenizer.ggml.pre` name),
        crates/pmetal-gguf/src/k_quants.rs,
        crates/pmetal-gguf/src/iq_quants.rs,
-       crates/pmetal-gguf/src/quantize.rs,
-       crates/pmetal-metal/src/kernels/metal/dequant.metal
+       crates/pmetal-gguf/src/quantize.rs
 
 
 5. Candle (Hugging Face)
 -------------------------
 
 PMetal's GGUF quantization code is co-derived from Candle's quantized
-module alongside llama.cpp. The Whisper speech-to-text architecture is
-based on Candle's Whisper implementation.
+module alongside llama.cpp.
 
     Copyright (c) Hugging Face, Inc. and contributors.
 
@@ -171,8 +169,7 @@ based on Candle's Whisper implementation.
 Source: https://github.com/huggingface/candle
 License: MIT / Apache 2.0
 Files: crates/pmetal-gguf/src/k_quants.rs,
-       crates/pmetal-gguf/src/quantize.rs,
-       crates/pmetal-models/src/architectures/whisper.rs
+       crates/pmetal-gguf/src/quantize.rs
 
 
 6. Burn (Tracel AI)
