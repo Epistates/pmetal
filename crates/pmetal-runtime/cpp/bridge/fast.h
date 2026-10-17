@@ -68,6 +68,14 @@ void mlx_inline_svd(
     mlx_inline_array* dst_vt,
     const mlx_inline_array* a);
 
+// ── QR ───────────────────────────────────────────────────────────────────
+// Reduced QR: for `a` of [m, n], writes Q [m, k] -> dst_q and R [k, n] -> dst_r
+// with k = min(m, n). Always runs on the CPU stream (no GPU QR in MLX).
+void mlx_inline_qr(
+    mlx_inline_array* dst_q,
+    mlx_inline_array* dst_r,
+    const mlx_inline_array* a);
+
 // ── Clip / log_softmax / cross_entropy / addmm ───────────────────────────
 void mlx_inline_clip(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* lo, const mlx_inline_array* hi);
 void mlx_inline_log_softmax(mlx_inline_array* dst, const mlx_inline_array* a, int axis);

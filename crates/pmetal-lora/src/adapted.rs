@@ -14,13 +14,16 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
-use pmetal_core::LoraConfig;
+use pmetal_core::{LoraConfig, LoraInit};
 use pmetal_models::dispatcher::DynamicModel;
 use pmetal_runtime::compat::{
-    Array, Exception, ModuleParameters, ModuleParametersExt, NestedValue, VisitLinears,
+    Array, ModuleParameters, ModuleParametersExt, NestedValue, VisitLinears,
 };
 
-use crate::{LoraError, load_safetensors_map, save_safetensors_map};
+use crate::init::initialise;
+use crate::{
+    LoraError, PackedBase, QLoraConfig, load_safetensors_map, quantize_base, save_safetensors_map,
+};
 
 /// Prefix the dispatcher's parameter tree puts in front of the decoder stack.
 ///
@@ -53,7 +56,45 @@ impl AdaptedModel {
     /// default) or `all-linear` adapts every projection except the output
     /// layer (the LM head), as PEFT's `all-linear` does; name it (`lm_head`)
     /// to adapt it. MoE routers and routed experts are never adapted.
-    pub fn attach(mut model: DynamicModel, config: LoraConfig) -> Result<Self, LoraError> {
+    ///
+    /// `config.init_lora_weights` says how the adapters start. PiSSA and
+    /// OLoRA move part of each adapted weight into its adapter and need a
+    /// dense base; LoftQ is fitted to a quantizer and goes through
+    /// [`attach_quantized`](Self::attach_quantized).
+    pub fn attach(model: DynamicModel, config: LoraConfig) -> Result<Self, LoraError> {
+        Self::attach_fitted(model, config, None)
+    }
+
+    /// Pack the base for QLoRA and attach adapters: the whole of QLoRA, in the
+    /// order its initialisation needs.
+    ///
+    /// With the standard initialisation the base is packed first, so a DoRA
+    /// magnitude is seeded from the weight each layer computes with. PiSSA and
+    /// OLoRA split the *dense* weight and pack the residual they leave (QPiSSA
+    /// and QOLoRA: the principal part stays out of the quantizer), and LoftQ
+    /// fits the adapter to the quantizer's round trip, so for those the
+    /// adapters come first and the pack second.
+    pub fn attach_quantized(
+        mut model: DynamicModel,
+        config: LoraConfig,
+        qlora: &QLoraConfig,
+    ) -> Result<(Self, PackedBase), LoraError> {
+        qlora.validate()?;
+        if config.init_lora_weights == LoraInit::Standard {
+            let packed = quantize_base(&mut model, qlora)?;
+            return Ok((Self::attach(model, config)?, packed));
+        }
+        let mut adapted = Self::attach_fitted(model, config, Some(qlora))?;
+        let packed = quantize_base(&mut adapted.model, qlora)?;
+        Ok((adapted, packed))
+    }
+
+    /// [`attach`](Self::attach), with the quantizer LoftQ fits its adapter to.
+    fn attach_fitted(
+        mut model: DynamicModel,
+        config: LoraConfig,
+        quantizer: Option<&QLoraConfig>,
+    ) -> Result<Self, LoraError> {
         let rank = config.r as i32;
         if rank <= 0 {
             return Err(LoraError::InvalidState(format!(
@@ -67,18 +108,19 @@ impl AdaptedModel {
         } else {
             &config.target_modules
         };
-        let output = if targets.is_empty() {
+        let output = if targets.is_empty() || quantizer.is_some() {
             model.output_projection_path()
         } else {
             None
         };
         let mut adapted = Vec::new();
-        let mut failure: Option<Exception> = None;
+        let mut failure: Option<LoraError> = None;
 
         let use_dora = config.use_dora;
         let dropout = config.dropout;
         let alpha = config.alpha;
         let use_rslora = config.use_rslora;
+        let init = config.init_lora_weights;
 
         model.visit_linears_mut("", &mut |path, linear| {
             if failure.is_some() || !is_targeted(path, targets, output.as_deref()) {
@@ -96,12 +138,37 @@ impl AdaptedModel {
                     }
                     adapted.push(path.to_string());
                 }
-                Err(e) => failure = Some(e),
+                Err(e) => {
+                    failure = Some(LoraError::Mlx(e));
+                    return;
+                }
+            }
+            // A projection QLoRA leaves unpacked (the head, a narrow one) has
+            // no quantization error for LoftQ to correct.
+            let init = match quantizer {
+                Some(q) if init == LoraInit::Loftq && !q.packs(path, linear, output.as_deref()) => {
+                    LoraInit::Standard
+                }
+                _ => init,
+            };
+            let dtype = linear.weight.value.dtype();
+            let round_trip = quantizer.map(|q| {
+                move |dense: &Array| q.round_trip(&dense.as_dtype(dtype.as_i32()))
+            });
+            let fitted = initialise(
+                linear,
+                init,
+                round_trip
+                    .as_ref()
+                    .map(|f| f as &dyn Fn(&Array) -> Result<Array, LoraError>),
+            );
+            if let Err(e) = fitted {
+                failure = Some(e);
             }
         });
 
         if let Some(e) = failure {
-            return Err(LoraError::Mlx(e));
+            return Err(e);
         }
 
         if adapted.is_empty() {

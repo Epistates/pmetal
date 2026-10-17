@@ -21,6 +21,7 @@
 
 pub mod adapted;
 mod dynamic;
+mod init;
 mod lora;
 mod qlora;
 mod trainable;

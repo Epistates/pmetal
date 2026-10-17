@@ -243,16 +243,6 @@ impl LoraConfig {
                 "training LoRA bias terms is not implemented; use `none`",
             );
         }
-        if !self.init_lora_weights.is_supported() {
-            p.add(
-                &key("init_lora_weights"),
-                format!(
-                    "the '{}' initialisation is not implemented; use `true` (the standard \
-                     initialisation)",
-                    self.init_lora_weights
-                ),
-            );
-        }
         p
     }
 }
@@ -423,7 +413,6 @@ mod tests {
     #[test]
     fn unimplemented_lora_choices_are_refused() {
         let config = LoraConfig {
-            init_lora_weights: crate::LoraInit::Pissa,
             bias: LoraBias::All,
             r: 0,
             dropout: 1.0,
@@ -431,7 +420,7 @@ mod tests {
             ..Default::default()
         };
         let text = message(config.validate());
-        for fragment in ["pissa", "bias", "lora.r", "dropout", "more than once"] {
+        for fragment in ["bias", "lora.r", "dropout", "more than once"] {
             assert!(text.contains(fragment), "{fragment} missing from:\n{text}");
         }
     }

@@ -36,7 +36,7 @@ use pmetal_models::{ModelArchitecture, WeightFormatError};
 use pmetal_runtime::compat::Array;
 use pmetal_runtime::compat::Exception;
 
-use crate::{AdaptedModel, LoraError, PackedBase, QLoraConfig, TrainableModel, quantize_base};
+use crate::{AdaptedModel, LoraError, PackedBase, QLoraConfig, TrainableModel};
 
 /// A model loaded for LoRA training, whatever its architecture.
 pub struct DynamicLoraModel {
@@ -71,28 +71,26 @@ impl DynamicLoraModel {
     /// Load a checkpoint, pack its base as `qlora` says, and attach adapters:
     /// QLoRA. Returns what was packed alongside the model.
     ///
-    /// Packing comes first so that a DoRA magnitude is seeded from the weight
-    /// the layer will actually compute with.
+    /// With the standard initialisation packing comes first, so that a DoRA
+    /// magnitude is seeded from the weight the layer will actually compute
+    /// with; PiSSA, OLoRA and LoftQ fit their adapters to the dense weight
+    /// and pack after (see [`AdaptedModel::attach_quantized`]).
     pub fn from_pretrained_quantized(
         model_dir: impl AsRef<Path>,
         lora_config: LoraConfig,
         qlora: &QLoraConfig,
     ) -> Result<(Self, PackedBase), DynamicLoraError> {
-        let mut model = DynamicModel::load(model_dir.as_ref())?;
-        let packed = quantize_base(&mut model, qlora)?;
+        let model = DynamicModel::load(model_dir.as_ref())?;
+        let architecture = model.architecture();
+        let (inner, packed) = AdaptedModel::attach_quantized(model, lora_config, qlora)?;
         tracing::info!(
             "Loaded {} for QLoRA training: {} projections packed as {}, {} kept",
-            model.architecture(),
+            architecture,
             packed.packed,
             qlora.scheme,
             packed.kept.len()
         );
-        Ok((
-            Self {
-                inner: AdaptedModel::attach(model, lora_config)?,
-            },
-            packed,
-        ))
+        Ok((Self { inner }, packed))
     }
 
     /// Load from a GGUF file or a directory containing one, then attach

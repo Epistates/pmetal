@@ -271,6 +271,27 @@ impl InlineArray {
         }
     }
 
+    /// Reduced QR decomposition — returns `(Q, R)`.
+    ///
+    /// For `self` of `[m, n]`, `Q` is `[m, k]` with orthonormal columns and
+    /// `R` is `[k, n]` upper triangular, `k = min(m, n)`. Always runs on the
+    /// CPU stream, in float32.
+    pub fn qr(&self) -> (Self, Self) {
+        let mut q = MaybeUninit::<RawBuf>::uninit();
+        let mut r = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_qr(q.as_mut_ptr(), r.as_mut_ptr(), &self.raw);
+            (
+                Self {
+                    raw: q.assume_init(),
+                },
+                Self {
+                    raw: r.assume_init(),
+                },
+            )
+        }
+    }
+
     /// Clip values to [lo, hi]. Either bound can be None.
     pub fn clip(&self, lo: Option<&Self>, hi: Option<&Self>) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();

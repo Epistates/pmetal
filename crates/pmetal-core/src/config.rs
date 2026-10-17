@@ -50,11 +50,10 @@ pub enum LoraBias {
 /// How a LoRA adapter's `A` and `B` matrices are initialised.
 ///
 /// In a config file this is the `init_lora_weights` key: `true` (or
-/// `standard`) for the default, or a method's name. Only
-/// [`Standard`](Self::Standard) is implemented; the others parse so that a
-/// config naming one is refused with a clear error
-/// ([`ConfigValidator`](crate::ConfigValidator)) instead of being trained as
-/// something else.
+/// `standard`) for the default, or a method's name. Every method starts the
+/// layer computing what it did before the adapter: the ones other than
+/// [`Standard`](Self::Standard) move part of the base weight into the adapter
+/// to do it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum LoraInit {
     /// `A` Kaiming-uniform, `B` zero: the adapter starts as the identity
@@ -64,14 +63,18 @@ pub enum LoraInit {
     /// `A` and `B` from the principal singular components of the base weight,
     /// whose residual becomes the frozen base (Meng et al., 2024).
     Pissa,
+    /// `A` and `B` from the first `r` columns of `Q` and rows of `R` in the
+    /// QR decomposition of the base weight, whose residual becomes the frozen
+    /// base (Büyükakyüz, 2024).
+    Olora,
     /// `A` and `B` from an SVD of the quantization residual, with the base
-    /// quantized alternately (Li et al., 2023). For QLoRA.
+    /// quantized alternately (Li et al., 2023). Needs a QLoRA scheme.
     Loftq,
 }
 
 impl LoraInit {
-    /// Every method, implemented or not.
-    pub const ALL: [Self; 3] = [Self::Standard, Self::Pissa, Self::Loftq];
+    /// Every method.
+    pub const ALL: [Self; 4] = [Self::Standard, Self::Pissa, Self::Olora, Self::Loftq];
 
     /// The name a config file uses.
     #[must_use]
@@ -79,14 +82,9 @@ impl LoraInit {
         match self {
             Self::Standard => "standard",
             Self::Pissa => "pissa",
+            Self::Olora => "olora",
             Self::Loftq => "loftq",
         }
-    }
-
-    /// Whether the trainers can initialise an adapter this way.
-    #[must_use]
-    pub fn is_supported(self) -> bool {
-        matches!(self, Self::Standard)
     }
 }
 
@@ -135,7 +133,7 @@ impl<'de> Deserialize<'de> for LoraInit {
             type Value = LoraInit;
 
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("`true` or the name of a LoRA initialisation (standard, pissa, loftq)")
+                f.write_str("`true` or the name of a LoRA initialisation (standard, pissa, olora, loftq)")
             }
 
             fn visit_bool<E: de::Error>(self, v: bool) -> Result<LoraInit, E> {
@@ -895,6 +893,7 @@ mod tests {
         };
         assert_eq!(init("true").unwrap().init_lora_weights, LoraInit::Standard);
         assert_eq!(init("pissa").unwrap().init_lora_weights, LoraInit::Pissa);
+        assert_eq!(init("olora").unwrap().init_lora_weights, LoraInit::Olora);
         assert_eq!(init("loftq").unwrap().init_lora_weights, LoraInit::Loftq);
         assert!(init("false").is_err(), "random B is not a PMetal mode");
         assert!(init("gaussian").is_err());

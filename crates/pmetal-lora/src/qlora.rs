@@ -32,7 +32,7 @@
 
 use pmetal_models::DynamicModel;
 use pmetal_runtime::QuantizedMode;
-use pmetal_runtime::compat::{Linear, ModuleParameters, VisitLinears};
+use pmetal_runtime::compat::{Array, Linear, ModuleParameters, Param, VisitLinears};
 use pmetal_runtime::native_weight::QuantParams;
 
 use super::LoraError;
@@ -130,6 +130,32 @@ impl QLoraConfig {
         }
     }
 
+    /// What a dense weight becomes once the base is packed this way: pack,
+    /// then unpack, in the weight's own dtype. LoftQ fits its adapter to this.
+    pub(crate) fn round_trip(&self, dense: &Array) -> Result<Array, LoraError> {
+        let mut layer = Linear {
+            weight: Param::new(dense.clone()),
+            bias: Param::new(None),
+            adapter: None,
+            quant: None,
+        };
+        self.pack(&mut layer)?;
+        let unpacked = layer.dense_weight();
+        unpacked.clone().eval();
+        pmetal_runtime::check_unobserved_error().map_err(|e| {
+            LoraError::Mlx(pmetal_runtime::compat::Exception::custom(format!(
+                "packing a weight to fit LoftQ: {e}"
+            )))
+        })?;
+        Ok(unpacked)
+    }
+
+    /// Whether the projection at `path` is one `quantize_base` packs under
+    /// this scheme, rather than keeps as loaded.
+    pub(crate) fn packs(&self, path: &str, linear: &Linear, output: Option<&str>) -> bool {
+        keep_reason(path, linear, output, self.group()).is_none()
+    }
+
     fn pack(&self, linear: &mut Linear) -> Result<(), pmetal_runtime::compat::Exception> {
         match self.scheme {
             QLoraScheme::Nf4 => {
@@ -180,6 +206,32 @@ fn kept_because(path: &str, output: Option<&str>) -> Option<&'static str> {
     crate::adapted::moe_role(path)
 }
 
+/// Why `quantize_base` leaves `linear` (at `path`) as it is, if it does:
+/// already packed, an FP8 weight, one of [`kept_because`]'s, or an input width
+/// that doesn't divide into `group`.
+fn keep_reason(
+    path: &str,
+    linear: &Linear,
+    output: Option<&str>,
+    group: i32,
+) -> Option<&'static str> {
+    if linear.quant.is_some() {
+        return Some("already packed");
+    }
+    // An FP8 checkpoint's scale can sit outside the layer (Nemotron-H's
+    // `weight_scale`), where packing would never see it.
+    if linear.weight.value.dtype() == pmetal_runtime::compat::Dtype::Uint8 {
+        return Some("FP8 weights stay as loaded");
+    }
+    if let Some(reason) = kept_because(path, output) {
+        return Some(reason);
+    }
+    if linear.shape().1 % group != 0 {
+        return Some("its input width doesn't divide into the scheme's groups");
+    }
+    None
+}
+
 /// Pack every projection of `model` that QLoRA packs, as `config` says.
 ///
 /// Projections already packed (a checkpoint saved quantized) are left as
@@ -209,27 +261,8 @@ fn pack_projections(
         if failure.is_some() {
             return;
         }
-        if linear.quant.is_some() {
-            report.kept.push((path.to_string(), "already packed"));
-            return;
-        }
-        // An FP8 checkpoint's scale can sit outside the layer (Nemotron-H's
-        // `weight_scale`), where packing would never see it.
-        if linear.weight.value.dtype() == pmetal_runtime::compat::Dtype::Uint8 {
-            report
-                .kept
-                .push((path.to_string(), "FP8 weights stay as loaded"));
-            return;
-        }
-        if let Some(reason) = kept_because(path, output) {
+        if let Some(reason) = keep_reason(path, linear, output, group) {
             report.kept.push((path.to_string(), reason));
-            return;
-        }
-        if linear.shape().1 % group != 0 {
-            report.kept.push((
-                path.to_string(),
-                "its input width doesn't divide into the scheme's groups",
-            ));
             return;
         }
         let dense = linear.weight.value.nbytes();

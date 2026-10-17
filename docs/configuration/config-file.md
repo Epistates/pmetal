@@ -81,7 +81,7 @@ leaves it out.
 | `use_rslora` | bool | `false` | Scale by `alpha / sqrt(r)` |
 | `use_dora` | bool | `false` | Weight-decomposed LoRA |
 | `loraplus_lr_ratio` | float | unset | LoRA+ learning-rate ratio for the `B` matrices (the paper uses 16) |
-| `init_lora_weights` | `true` | `true` | Initialisation of `A` and `B` (`true` is the standard one) |
+| `init_lora_weights` | `true` or name | `true` | Initialisation of `A` and `B`: `true` (the standard one: `A` random, `B` zero), `pissa` (principal singular components), `olora` (QR factors), `loftq` (quantization-aware; needs `quantization`) |
 
 ### training
 
