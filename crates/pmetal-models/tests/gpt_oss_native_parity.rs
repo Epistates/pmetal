@@ -342,6 +342,7 @@ fn packed_experts_pass_the_gradient_to_their_input() {
     let moe = &mut model.model.layers[0].mlp;
     let packed = moe.fused_experts().expect("fused experts").clone();
     assert!(packed.is_packed());
+    pmetal_runtime::compat::random::seed(29);
     let x =
         pmetal_runtime::compat::random::normal(&[5, 64], pmetal_runtime::compat::Dtype::Float32);
 
@@ -366,10 +367,15 @@ fn packed_experts_pass_the_gradient_to_their_input() {
     let dx = through_packed.as_slice::<f32>();
     assert!(dx.iter().all(|g| g.is_finite()), "finite input gradient");
     assert!(dx.iter().any(|g| *g != 0.0), "non-zero input gradient");
+    // The packed kernel dequantizes inside its matmul and the dense path
+    // before it, so the two sum in different orders: f32 rounding, relative
+    // to the gradient's size (an absolute 1e-5 failed by 1.1e-5 on some
+    // inputs). A wrong packed path is off by the gradient's own scale.
+    let scale = dx.iter().fold(0.0f32, |m, g| m.max(g.abs())).max(1.0);
     let diff = max_abs_diff(&through_packed, &through_dense);
     assert!(
-        diff <= 1e-5,
-        "packed and dense experts' gradients differ by {diff:e}"
+        diff <= 1e-5 * scale,
+        "packed and dense experts' gradients differ by {diff:e} (scale {scale})"
     );
 }
 
