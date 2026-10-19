@@ -29,8 +29,9 @@ pub struct GrpoArgs {
     #[arg(long = "learning-rate", default_value = "5e-6")]
     pub learning_rate: f64,
 
-    /// Optimizer: adamw, sgd, lion or adafactor. Lion wants a 3-10x smaller
-    /// learning rate and 3-10x larger weight decay than AdamW.
+    /// Optimizer: adamw, sgd, lion, adafactor, muon, adamw_schedule_free or
+    /// adamw_8bit. Lion wants a 3-10x smaller learning rate and 3-10x larger
+    /// weight decay than AdamW; schedule-free AdamW wants a constant rate.
     #[arg(long = "optimizer", default_value = "adamw")]
     pub optimizer: pmetal_core::OptimizerType,
 
@@ -88,10 +89,6 @@ pub struct GrpoArgs {
     #[arg(long = "reasoning-rewards")]
     pub reasoning_rewards: bool,
 
-    /// Disable Metal FlashAttention
-    #[arg(long = "no-flash-attention")]
-    pub no_flash_attention: bool,
-
     /// Enable VLM (Vision-Language Model) mode for GRPO with image inputs.
     #[arg(long = "vlm")]
     pub vlm: bool,
@@ -119,18 +116,6 @@ pub struct GrpoArgs {
     /// Enable pipelined (asynchronous) reward scoring.
     #[arg(long = "async-rewards")]
     pub async_rewards: bool,
-
-    /// Custom text column name in the dataset JSONL.
-    #[arg(long = "text-column")]
-    pub text_column: Option<String>,
-
-    /// Comma-separated list of columns to concatenate as the text field.
-    #[arg(long = "text-columns", value_delimiter = ',')]
-    pub text_columns: Option<Vec<String>>,
-
-    /// Separator used when joining multiple text columns.
-    #[arg(long = "column-separator", default_value = "\n\n")]
-    pub column_separator: String,
 
     /// Column name for the prompt portion (enables SFT label masking).
     #[arg(long = "prompt-column")]

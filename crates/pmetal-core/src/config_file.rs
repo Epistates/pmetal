@@ -88,6 +88,12 @@ const RETIRED: &[Retired] = &[
     },
     Retired {
         section: "model",
+        key: "use_flash_attention",
+        accepted: Accepted::Anything,
+        why: "attention always runs the fused kernel where one applies; there is no switch",
+    },
+    Retired {
+        section: "model",
         key: "trust_remote_code",
         accepted: Accepted::Default(&["false"]),
         why: "PMetal never runs a checkpoint's own code",
@@ -356,10 +362,22 @@ dataset:
         assert_eq!(c.training.save_steps, Some(500));
         assert_eq!(c.training.max_seq_len, 2048);
         assert_eq!(c.dataset.dataset_id, "./data/train.jsonl");
-        // Only `gradient_checkpointing` had a value worth a note; the rest
-        // were left at their defaults.
-        assert_eq!(loaded.notes.len(), 1, "{:?}", loaded.notes);
-        assert!(loaded.notes[0].contains("gradient_checkpointing"));
+        // Only `gradient_checkpointing` and `use_flash_attention` (a switch
+        // that is gone) had a value worth a note; the rest were left at their
+        // defaults.
+        assert_eq!(loaded.notes.len(), 2, "{:?}", loaded.notes);
+        assert!(
+            loaded
+                .notes
+                .iter()
+                .any(|n| n.contains("gradient_checkpointing"))
+        );
+        assert!(
+            loaded
+                .notes
+                .iter()
+                .any(|n| n.contains("use_flash_attention"))
+        );
     }
 
     #[test]
@@ -447,9 +465,9 @@ dataset:
 
     #[test]
     fn values_the_trainers_cannot_run_are_refused_at_load() {
-        let text = error("training:\n  learning_rate: -1\n  optimizer: muon\n");
+        let text = error("training:\n  learning_rate: -1\n  warmup_ratio: 1.0\n");
         assert!(text.contains("training.learning_rate"), "{text}");
-        assert!(text.contains("training.optimizer"), "{text}");
+        assert!(text.contains("training.warmup_ratio"), "{text}");
         let text = error("lora:\n  bias: all\n");
         assert!(text.contains("lora.bias"), "{text}");
     }

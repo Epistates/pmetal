@@ -68,7 +68,6 @@ leaves it out.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `model_id` | string | *required* | HuggingFace ID or local path |
-| `use_flash_attention` | bool | `true` | Use fused attention when available |
 
 ### lora
 
@@ -101,7 +100,7 @@ leaves it out.
 | `wsd_decay_style` | string | `linear` | `wsd`: `linear`, `cosine` or `one_minus_sqrt` |
 | `cosine_num_restarts` | integer | `1` | `cosine_with_restarts`: cosine cycles |
 | `polynomial_power` | float | `1.0` | `polynomial`: exponent |
-| `optimizer` | string | `adamw` | `adamw`, `sgd`, `lion`, `adafactor` |
+| `optimizer` | string | `adamw` | `adamw`, `sgd`, `lion`, `adafactor`, `muon`, `adamw_schedule_free`, `adamw_8bit` |
 | `weight_decay` | float | `0.01` | Decoupled weight decay |
 | `max_grad_norm` | float | `1.0` | Gradient clipping norm; 0 turns clipping off |
 | `seed` | integer | `42` | Random seed |

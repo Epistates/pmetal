@@ -77,22 +77,6 @@ pub struct RlkdArgs {
     #[arg(long = "reasoning-rewards")]
     pub reasoning_rewards: bool,
 
-    /// Disable Metal FlashAttention.
-    #[arg(long = "no-flash-attention")]
-    pub no_flash_attention: bool,
-
-    /// Custom text column name in the dataset JSONL.
-    #[arg(long = "text-column")]
-    pub text_column: Option<String>,
-
-    /// Comma-separated list of columns to concatenate as the text field.
-    #[arg(long = "text-columns", value_delimiter = ',')]
-    pub text_columns: Option<Vec<String>>,
-
-    /// Separator used when joining multiple text columns.
-    #[arg(long = "column-separator", default_value = "\n\n")]
-    pub column_separator: String,
-
     /// Column name for the prompt portion (enables SFT label masking).
     #[arg(long = "prompt-column")]
     pub prompt_column: Option<String>,

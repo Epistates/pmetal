@@ -78,6 +78,38 @@ pub struct TrainSpec {
     pub embedding_lr: Option<f64>,
 
     #[job(
+        label = "Label Smoothing",
+        group = "Loss",
+        argv = "--label-smoothing",
+        min = 0.0,
+        max = 0.99,
+        default_float = 0.0
+    )]
+    #[serde(default)]
+    pub label_smoothing: f64,
+
+    #[job(
+        label = "Z-Loss",
+        group = "Loss",
+        argv = "--z-loss",
+        min = 0.0,
+        max = 1.0,
+        default_float = 0.0
+    )]
+    #[serde(default)]
+    pub z_loss: f64,
+
+    #[job(
+        label = "NEFTune Alpha",
+        group = "Loss",
+        argv = "--neftune-alpha",
+        min = 0.1,
+        max = 100.0
+    )]
+    #[serde(default)]
+    pub neftune_alpha: Option<f64>,
+
+    #[job(
         label = "Batch Size",
         group = "Training",
         argv = "--batch-size",
@@ -183,7 +215,7 @@ pub struct TrainSpec {
         group = "Optimization",
         argv = "--optimizer",
         kind = "enum",
-        enum_options = ["adamw", "sgd", "lion", "adafactor"],
+        enum_options = ["adamw", "sgd", "lion", "adafactor", "muon", "adamw_schedule_free", "adamw_8bit"],
         help = "Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW",
         default = "adamw"
     )]
@@ -328,16 +360,6 @@ pub struct TrainSpec {
 
     // -- Compute / dispatch flags --------------------------------------------
     #[job(
-        label = "Disable Flash Attention",
-        group = "Compute",
-        argv = "--no-flash-attention",
-        flag,
-        default_bool = false
-    )]
-    #[serde(default)]
-    pub no_flash_attention: bool,
-
-    #[job(
         label = "Disable Sequence Packing",
         group = "Compute",
         argv = "--no-sequence-packing",
@@ -346,36 +368,6 @@ pub struct TrainSpec {
     )]
     #[serde(default)]
     pub no_sequence_packing: bool,
-
-    #[job(
-        label = "Disable JIT",
-        group = "Compute",
-        argv = "--no-jit-compilation",
-        flag,
-        default_bool = false
-    )]
-    #[serde(default)]
-    pub no_jit_compilation: bool,
-
-    #[job(
-        label = "Disable Fused Step",
-        group = "Compute",
-        argv = "--no-fused",
-        flag,
-        default_bool = false
-    )]
-    #[serde(default)]
-    pub no_fused: bool,
-
-    #[job(
-        label = "Disable Fused Optimizer",
-        group = "Compute",
-        argv = "--no-metal-fused-optimizer",
-        flag,
-        default_bool = false
-    )]
-    #[serde(default)]
-    pub no_metal_fused_optimizer: bool,
 
     #[job(
         label = "Cut Cross-Entropy",
@@ -460,6 +452,9 @@ impl Default for TrainSpec {
             output_dir: default_train_output_dir(),
             learning_rate: default_lr(),
             embedding_lr: None,
+            label_smoothing: 0.0,
+            z_loss: 0.0,
+            neftune_alpha: None,
             batch_size: default_batch_size(),
             epochs: default_epochs(),
             max_seq_len: 0,
@@ -486,11 +481,7 @@ impl Default for TrainSpec {
             column_separator: None,
             prompt_column: None,
             response_column: None,
-            no_flash_attention: false,
             no_sequence_packing: false,
-            no_jit_compilation: false,
-            no_fused: false,
-            no_metal_fused_optimizer: false,
             cut_cross_entropy: false,
             no_adaptive_lr: false,
             ane: false,
@@ -531,6 +522,9 @@ impl TrainSpec {
         Ok(TrainingConfig {
             learning_rate: self.learning_rate,
             embedding_learning_rate: self.embedding_lr,
+            label_smoothing: self.label_smoothing,
+            z_loss: self.z_loss,
+            neftune_noise_alpha: self.neftune_alpha,
             batch_size: self.batch_size,
             gradient_accumulation_steps: self.gradient_accumulation_steps,
             num_epochs: self.epochs,
@@ -739,7 +733,7 @@ mod tests {
         };
         assert_eq!(
             names(enum_options("optimizer")),
-            names(crate::OptimizerType::SUPPORTED.map(|k| k.as_str()).to_vec())
+            names(crate::OptimizerType::ALL.map(|k| k.as_str()).to_vec())
         );
         assert_eq!(
             names(enum_options("lr_schedule")),
@@ -785,6 +779,33 @@ mod tests {
         assert_eq!(distributed.peers, ["a:1", "b:2"]);
         assert_eq!(distributed.compression, DistributedCompression::TopK);
         assert!(TrainSpec::default().distributed_config().unwrap().is_none());
+    }
+
+    /// The loss options reach the training config and the command line the
+    /// spec spells, and a value the trainer would refuse is caught by the
+    /// config's own validation.
+    #[test]
+    fn the_loss_options_reach_the_config_and_the_command_line() {
+        let spec = TrainSpec {
+            label_smoothing: 0.1,
+            z_loss: 1e-4,
+            neftune_alpha: Some(5.0),
+            ..Default::default()
+        };
+        let training = spec.training_config().unwrap();
+        assert_eq!(training.label_smoothing, 0.1);
+        assert_eq!(training.z_loss, 1e-4);
+        assert_eq!(training.neftune_noise_alpha, Some(5.0));
+        let argv = spec.to_argv().join(" ");
+        assert!(argv.contains("--label-smoothing 0.1"), "{argv}");
+        assert!(argv.contains("--z-loss 0.0001"), "{argv}");
+        assert!(argv.contains("--neftune-alpha 5"), "{argv}");
+
+        let too_smooth = TrainSpec {
+            label_smoothing: 1.5,
+            ..Default::default()
+        };
+        assert!(crate::ConfigValidator::validate(&too_smooth.training_config().unwrap()).is_err());
     }
 
     #[test]

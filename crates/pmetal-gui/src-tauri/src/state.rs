@@ -93,8 +93,6 @@ pub struct TrainingConfigSummary {
     pub lora_rank: Option<usize>,
     pub lora_alpha: Option<f32>,
     pub sequence_packing: bool,
-    pub flash_attention: bool,
-    pub jit_compilation: bool,
     pub gradient_checkpointing: bool,
 }
 

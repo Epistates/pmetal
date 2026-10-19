@@ -85,17 +85,13 @@ impl Default for QLoraOrchConfig {
 /// Dispatch / optimization flags.
 #[derive(Debug, Clone)]
 pub struct DispatchConfig {
-    pub flash_attention: bool,
     pub sequence_packing: bool,
     /// Explicit override for the packing sequence length.
     ///
-    /// When `None` (default), `run_packed` auto-computes the packing length from
-    /// the p99 of sample lengths, rounded up to the next power of two.
+    /// When `None` (default), packing auto-computes the length from the p99 of
+    /// sample lengths, rounded up to the next power of two.
     /// When `Some(n)`, `n` is used directly, bypassing the adaptive heuristic.
     pub pack_max_seq_len: Option<usize>,
-    pub jit_compilation: bool,
-    pub fused: bool,
-    pub metal_fused_optimizer: bool,
     pub gradient_checkpointing: bool,
     pub gradient_checkpointing_layers: usize,
     pub cut_cross_entropy: bool,
@@ -113,12 +109,8 @@ pub struct DispatchConfig {
 impl Default for DispatchConfig {
     fn default() -> Self {
         Self {
-            flash_attention: true,
             sequence_packing: true,
             pack_max_seq_len: None,
-            jit_compilation: false,
-            fused: true,
-            metal_fused_optimizer: true,
             gradient_checkpointing: true,
             gradient_checkpointing_layers: 4,
             cut_cross_entropy: false,
@@ -194,108 +186,39 @@ fn cli_training_defaults() -> TrainingConfig {
     }
 }
 
+/// Copy into `target` every field of `overrides` that differs from `defaults`.
+///
+/// A field `overrides` leaves at its default is the caller saying nothing
+/// about it, so the file's value stands; a field it sets, even to the value
+/// the file has, wins. The fields are found by serializing, so a field added
+/// to the config is merged without anyone remembering to add a line here (the
+/// hand-copied version of this silently dropped every field added after it
+/// was written).
+fn merge_overrides<T>(target: &mut T, overrides: &T, defaults: &T)
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let to_object = |value: &T| match serde_json::to_value(value) {
+        Ok(serde_json::Value::Object(map)) => map,
+        other => panic!("a config section serializes to an object, got {other:?}"),
+    };
+    let (mut merged, overrides, defaults) =
+        (to_object(target), to_object(overrides), to_object(defaults));
+    for (key, value) in overrides {
+        if defaults.get(&key) != Some(&value) {
+            merged.insert(key, value);
+        }
+    }
+    *target = serde_json::from_value(serde_json::Value::Object(merged))
+        .expect("a merge of two valid config sections is a valid config section");
+}
+
 fn merge_lora_overrides(target: &mut LoraConfig, overrides: &LoraConfig) {
-    let defaults = LoraConfig::default();
-    if overrides.r != defaults.r {
-        target.r = overrides.r;
-    }
-    if overrides.alpha != defaults.alpha {
-        target.alpha = overrides.alpha;
-    }
-    if overrides.dropout != defaults.dropout {
-        target.dropout = overrides.dropout;
-    }
-    if overrides.target_modules != defaults.target_modules {
-        target.target_modules = overrides.target_modules.clone();
-    }
-    if overrides.use_rslora != defaults.use_rslora {
-        target.use_rslora = overrides.use_rslora;
-    }
-    if overrides.use_dora != defaults.use_dora {
-        target.use_dora = overrides.use_dora;
-    }
-    if overrides.bias != defaults.bias {
-        target.bias = overrides.bias;
-    }
-    if overrides.init_lora_weights != defaults.init_lora_weights {
-        target.init_lora_weights = overrides.init_lora_weights;
-    }
-    if overrides.loraplus_lr_ratio != defaults.loraplus_lr_ratio {
-        target.loraplus_lr_ratio = overrides.loraplus_lr_ratio;
-    }
+    merge_overrides(target, overrides, &LoraConfig::default());
 }
 
 fn merge_training_overrides(target: &mut TrainingConfig, overrides: &TrainingConfig) {
-    let defaults = cli_training_defaults();
-    if overrides.learning_rate != defaults.learning_rate {
-        target.learning_rate = overrides.learning_rate;
-    }
-    if overrides.embedding_learning_rate != defaults.embedding_learning_rate {
-        target.embedding_learning_rate = overrides.embedding_learning_rate;
-    }
-    if overrides.batch_size != defaults.batch_size {
-        target.batch_size = overrides.batch_size;
-    }
-    if overrides.gradient_accumulation_steps != defaults.gradient_accumulation_steps {
-        target.gradient_accumulation_steps = overrides.gradient_accumulation_steps;
-    }
-    if overrides.num_epochs != defaults.num_epochs {
-        target.num_epochs = overrides.num_epochs;
-    }
-    if overrides.max_steps != defaults.max_steps {
-        target.max_steps = overrides.max_steps;
-    }
-    if overrides.warmup_steps != defaults.warmup_steps {
-        target.warmup_steps = overrides.warmup_steps;
-    }
-    if overrides.warmup_ratio != defaults.warmup_ratio {
-        target.warmup_ratio = overrides.warmup_ratio;
-    }
-    if overrides.weight_decay != defaults.weight_decay {
-        target.weight_decay = overrides.weight_decay;
-    }
-    if overrides.max_grad_norm != defaults.max_grad_norm {
-        target.max_grad_norm = overrides.max_grad_norm;
-    }
-    if overrides.lr_scheduler != defaults.lr_scheduler {
-        target.lr_scheduler = overrides.lr_scheduler;
-    }
-    if overrides.min_lr != defaults.min_lr {
-        target.min_lr = overrides.min_lr;
-    }
-    if overrides.wsd_stable_ratio != defaults.wsd_stable_ratio {
-        target.wsd_stable_ratio = overrides.wsd_stable_ratio;
-    }
-    if overrides.wsd_decay_style != defaults.wsd_decay_style {
-        target.wsd_decay_style = overrides.wsd_decay_style;
-    }
-    if overrides.cosine_num_restarts != defaults.cosine_num_restarts {
-        target.cosine_num_restarts = overrides.cosine_num_restarts;
-    }
-    if overrides.polynomial_power != defaults.polynomial_power {
-        target.polynomial_power = overrides.polynomial_power;
-    }
-    if overrides.optimizer != defaults.optimizer {
-        target.optimizer = overrides.optimizer;
-    }
-    if overrides.logging_steps != defaults.logging_steps {
-        target.logging_steps = overrides.logging_steps;
-    }
-    if overrides.eval_steps != defaults.eval_steps {
-        target.eval_steps = overrides.eval_steps;
-    }
-    if overrides.save_steps != defaults.save_steps {
-        target.save_steps = overrides.save_steps;
-    }
-    if overrides.output_dir != defaults.output_dir {
-        target.output_dir = overrides.output_dir.clone();
-    }
-    if overrides.use_packing != defaults.use_packing {
-        target.use_packing = overrides.use_packing;
-    }
-    if overrides.max_seq_len != defaults.max_seq_len {
-        target.max_seq_len = overrides.max_seq_len;
-    }
+    merge_overrides(target, overrides, &cli_training_defaults());
 }
 
 /// The training loop's settings for a run: the config's training and LoRA
@@ -309,7 +232,6 @@ fn build_training_loop_config(
     TrainingLoopConfig {
         training: full_config.training.clone(),
         dataloader: dataloader.clone(),
-        use_metal_flash_attention: dispatch.flash_attention,
         log_every: full_config.training.logging_steps.max(1),
         checkpoint_every: full_config.training.save_steps.unwrap_or(500),
         eval_every: if has_eval_dataset {
@@ -317,7 +239,6 @@ fn build_training_loop_config(
         } else {
             0
         },
-        use_jit_compilation: dispatch.jit_compilation,
         use_sequence_packing: dispatch.sequence_packing,
         pack_max_seq_len: dispatch.pack_max_seq_len,
         gradient_checkpointing: dispatch.gradient_checkpointing,
@@ -326,10 +247,7 @@ fn build_training_loop_config(
             .training
             .embedding_learning_rate
             .map(|v| v as f32),
-        eager_evaluation: true,
-        use_metal_fused_optimizer: dispatch.metal_fused_optimizer,
         loraplus_lr_ratio: full_config.lora.loraplus_lr_ratio,
-        neftune_noise_alpha: None,
         use_cut_cross_entropy: dispatch.cut_cross_entropy,
         #[cfg(feature = "distributed")]
         distributed: dispatch.distributed.clone(),
@@ -505,9 +423,6 @@ pub async fn run_training(
         let dispatch_defaults = DispatchConfig::default();
         if config.dispatch.sequence_packing == dispatch_defaults.sequence_packing {
             config.dispatch.sequence_packing = full_config.training.use_packing;
-        }
-        if config.dispatch.flash_attention == dispatch_defaults.flash_attention {
-            config.dispatch.flash_attention = full_config.model.use_flash_attention;
         }
     }
 
@@ -799,21 +714,22 @@ pub async fn run_training(
             ctx.world_size()
         );
         let sync = crate::distributed_bridge::DistributedGradientSync::new(ctx, distributed_config);
-        if config.dispatch.sequence_packing {
-            tracing::warn!(
-                "Sequence packing is disabled for distributed training; using sharded dataloaders instead"
-            );
-            config.dispatch.sequence_packing = false;
-        }
-        if config.dispatch.jit_compilation {
-            tracing::warn!(
-                "Compiled/fused-owned dispatch is disabled for distributed training; using distributed-aware loops"
-            );
-            config.dispatch.jit_compilation = false;
-        }
         Some(sync)
     } else {
-        None
+        // A process MLX launched into a distributed group trains data-parallel
+        // over MLX's collectives, with no peers to name.
+        let sync = crate::distributed_bridge::DistributedGradientSync::from_mlx_group(
+            &pmetal_core::DistributedTrainingConfig::default(),
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to join the MLX distributed group: {e}"))?;
+        if let Some(sync) = &sync {
+            tracing::info!(
+                "Distributed training over MLX collectives: rank={}/{}",
+                sync.rank(),
+                sync.world_size()
+            );
+        }
+        sync
     };
 
     #[cfg(not(feature = "distributed"))]
@@ -1064,7 +980,7 @@ fn run_lora_path(
         training_loop_config.gradient_checkpointing = false;
     }
 
-    let mut training_loop = TrainingLoop::new(training_loop_config);
+    let mut training_loop = TrainingLoop::new(training_loop_config)?;
     attach_distributed_sync(&mut training_loop, distributed_sync);
 
     if let Some(cb) = metrics_callback.take() {
@@ -1086,26 +1002,8 @@ fn run_lora_path(
         training_loop.set_snapshot_persist_dir(checkpoint_manager.checkpoint_dir().to_path_buf());
     }
 
-    if config.resume {
-        if let Some((lora_params, metadata)) = checkpoint_manager.load_latest()? {
-            tracing::info!("Resuming from checkpoint at step {}", metadata.step);
-            model.set_lora_parameters(&lora_params);
-            training_loop.set_step(metadata.step);
-            training_loop.set_epoch(metadata.epoch);
-            // Restore persisted best-loss snapshot so rollback works after resume.
-            if let Some(snapshot) =
-                crate::checkpoint::load_best_snapshot(checkpoint_manager.checkpoint_dir())
-            {
-                training_loop.best_lora_snapshot = Some(snapshot);
-                // Notify adaptive LR controller that a snapshot is available for rollback.
-                if let Some(ref mut ctrl) = training_loop.adaptive_lr {
-                    ctrl.set_has_snapshot(metadata.running_loss, metadata.step);
-                }
-                tracing::info!("Restored best snapshot from disk for rollback-on-resume");
-            }
-        } else {
-            tracing::info!("No checkpoint found, starting fresh");
-        }
+    if config.resume && !training_loop.resume_from(&mut model, checkpoint_manager)? {
+        tracing::info!("No checkpoint found, starting fresh");
     }
 
     tracing::info!("Starting LoRA training...");
@@ -1116,74 +1014,19 @@ fn run_lora_path(
         cb.on_train_start();
     }
 
-    // Dispatch: packed > compiled > metal-fused > standard
-    if config.dispatch.sequence_packing {
-        let model = training_loop.run_packed(
-            model,
-            train_dataset.clone(),
-            eval_dataset.clone(),
-            Some(checkpoint_manager),
-        )?;
+    training_loop.run(
+        &mut model,
+        train_dataset,
+        eval_dataset,
+        Some(checkpoint_manager),
+    )?;
 
-        save_adapter(
-            &model,
-            Path::new(output_dir),
-            &config.lora,
-            Some(&full_config.model.model_id),
-        )?;
-    } else if (config.dispatch.fused || config.dispatch.jit_compilation)
-        && full_config.training.gradient_accumulation_steps == 1
-    {
-        let model = training_loop.run_compiled(
-            model,
-            train_dataset,
-            eval_dataset,
-            Some(checkpoint_manager),
-        )?;
-
-        save_adapter(
-            &model,
-            Path::new(output_dir),
-            &config.lora,
-            Some(&full_config.model.model_id),
-        )?;
-    } else if config.dispatch.metal_fused_optimizer {
-        tracing::info!("Using Metal fused optimizer for training");
-        training_loop.run_metal_fused(
-            &mut model,
-            train_dataset,
-            eval_dataset,
-            Some(checkpoint_manager),
-        )?;
-
-        save_adapter(
-            &model,
-            Path::new(output_dir),
-            &config.lora,
-            Some(&full_config.model.model_id),
-        )?;
-    } else {
-        if (config.dispatch.fused || config.dispatch.jit_compilation)
-            && full_config.training.gradient_accumulation_steps != 1
-        {
-            tracing::warn!(
-                "Fused/JIT training requires gradient_accumulation_steps=1, falling back to standard training"
-            );
-        }
-        training_loop.run(
-            &mut model,
-            train_dataset,
-            eval_dataset,
-            Some(checkpoint_manager),
-        )?;
-
-        save_adapter(
-            &model,
-            Path::new(output_dir),
-            &config.lora,
-            Some(&full_config.model.model_id),
-        )?;
-    }
+    save_adapter(
+        &model,
+        Path::new(output_dir),
+        &config.lora,
+        Some(&full_config.model.model_id),
+    )?;
 
     // Recover the metrics callback (always inserted first) for finalization.
     // Only recover if we actually created one — don't grab a user callback by mistake.
@@ -1382,7 +1225,7 @@ async fn attempt_ane_training(
     let trainer_config = DynamicAneTrainerConfig {
         seq_len: max_seq_len,
         // Full-parameter training wants about a tenth of LoRA's learning
-        // rate: TRL's reference is 2e-5 for full fine-tuning against 2e-4
+        // rate: the usual recipe is 2e-5 for full fine-tuning against 2e-4
         // for LoRA, and published full SFT of models this size runs at 1e-5
         // to 2e-5. A LoRA rate here would diverge, so the rate is capped at
         // 2e-5 (the GUI's ANE default); a lower one is kept as given.
@@ -1878,5 +1721,34 @@ mod tests {
         assert_eq!(full.lora.r, 8);
         assert_eq!(full.training.num_epochs, 2);
         assert_eq!(full.training.max_steps, Some(5));
+    }
+
+    /// Every field a job sets reaches the merged config, the ones added since
+    /// the merge was written included, and the ones it leaves alone keep the
+    /// file's value.
+    #[test]
+    fn the_override_merge_carries_every_field_a_job_sets() {
+        let mut full = FullTrainingConfig::default();
+        full.training.weight_decay = 0.3;
+        let overrides = TrainingConfig {
+            label_smoothing: 0.1,
+            z_loss: 1e-4,
+            neftune_noise_alpha: Some(5.0),
+            optimizer: pmetal_core::OptimizerType::Muon,
+            ..cli_training_defaults()
+        };
+        let job = TrainingJobConfig {
+            training: overrides,
+            ..TrainingJobConfig::default()
+        };
+        merge_job_overrides_into_full_config(&mut full, &job);
+        assert_eq!(full.training.label_smoothing, 0.1);
+        assert_eq!(full.training.z_loss, 1e-4);
+        assert_eq!(full.training.neftune_noise_alpha, Some(5.0));
+        assert_eq!(full.training.optimizer, pmetal_core::OptimizerType::Muon);
+        assert_eq!(
+            full.training.weight_decay, 0.3,
+            "untouched fields keep the file's value"
+        );
     }
 }

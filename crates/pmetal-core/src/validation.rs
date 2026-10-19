@@ -8,8 +8,8 @@
 
 use crate::{
     ConfigValidator, DatasetConfig, DistributedCompression, DistributedTrainingConfig,
-    FullTrainingConfig, LoraBias, LoraConfig, LrSchedulerType, ModelConfig, OptimizerType,
-    PMetalError, Result, TrainingConfig,
+    FullTrainingConfig, LoraBias, LoraConfig, LrSchedulerType, ModelConfig, PMetalError, Result,
+    TrainingConfig,
 };
 
 /// Collects the problems found in one config, so a user fixes them in one pass.
@@ -170,19 +170,15 @@ impl TrainingConfig {
             p.finite_at_least(&key("polynomial_power"), power, 0.0, false);
         }
 
-        if !self.optimizer.is_supported() {
-            let supported: Vec<_> = OptimizerType::SUPPORTED
-                .iter()
-                .map(|k| k.as_str())
-                .collect();
+        if !(self.label_smoothing.is_finite() && (0.0..1.0).contains(&self.label_smoothing)) {
             p.add(
-                &key("optimizer"),
-                format!(
-                    "'{}' is not available in this release; use one of: {}",
-                    self.optimizer,
-                    supported.join(", ")
-                ),
+                &key("label_smoothing"),
+                format!("must be in [0, 1), got {}", self.label_smoothing),
             );
+        }
+        p.finite_at_least(&key("z_loss"), self.z_loss, 0.0, true);
+        if let Some(alpha) = self.neftune_noise_alpha {
+            p.finite_at_least(&key("neftune_noise_alpha"), alpha, 0.0, false);
         }
         if self.output_dir.trim().is_empty() {
             p.add(&key("output_dir"), "must not be empty");
@@ -297,6 +293,7 @@ impl ConfigValidator for FullTrainingConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::OptimizerType;
 
     fn message(result: Result<()>) -> String {
         match result {
@@ -392,21 +389,13 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_optimizers_are_refused_by_name() {
-        for kind in [
-            OptimizerType::Muon,
-            OptimizerType::AdamWScheduleFree,
-            OptimizerType::AdamW8bit,
-        ] {
+    fn every_optimizer_kind_passes_validation() {
+        for kind in OptimizerType::ALL {
             let config = TrainingConfig {
                 optimizer: kind,
                 ..Default::default()
             };
-            let text = message(config.validate());
-            assert!(
-                text.contains(kind.as_str()) && text.contains("adamw, sgd"),
-                "{text}"
-            );
+            assert!(config.validate().is_ok(), "{kind}");
         }
     }
 

@@ -98,6 +98,10 @@ impl PyTrainingConfig {
         max_grad_norm=1.0,
         use_packing=true,
         output_dir="./output",
+        optimizer="adamw",
+        label_smoothing=0.0,
+        z_loss=0.0,
+        neftune_noise_alpha=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -110,8 +114,15 @@ impl PyTrainingConfig {
         max_grad_norm: f64,
         use_packing: bool,
         output_dir: &str,
-    ) -> Self {
-        Self(pmetal_core::TrainingConfig {
+        optimizer: &str,
+        label_smoothing: f64,
+        z_loss: f64,
+        neftune_noise_alpha: Option<f64>,
+    ) -> PyResult<Self> {
+        let optimizer = optimizer
+            .parse::<pmetal_core::OptimizerType>()
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        let config = pmetal_core::TrainingConfig {
             learning_rate,
             batch_size,
             num_epochs,
@@ -121,8 +132,15 @@ impl PyTrainingConfig {
             max_grad_norm,
             use_packing,
             output_dir: output_dir.to_string(),
+            optimizer,
+            label_smoothing,
+            z_loss,
+            neftune_noise_alpha,
             ..Default::default()
-        })
+        };
+        pmetal_core::ConfigValidator::validate(&config)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(Self(config))
     }
 
     #[getter]
@@ -426,6 +444,7 @@ pub enum PyLrSchedulerType {
     Wsd,
 }
 
+/// The optimizers a `TrainingConfig` can name (by string, as the CLI does).
 #[pyclass(from_py_object, name = "OptimizerType", eq)]
 #[derive(Clone, PartialEq)]
 pub enum PyOptimizerType {
@@ -433,6 +452,9 @@ pub enum PyOptimizerType {
     Sgd,
     Adafactor,
     Lion,
+    Muon,
+    AdamWScheduleFree,
+    AdamW8bit,
 }
 
 #[pyclass(from_py_object, name = "DatasetFormat", eq)]

@@ -26,13 +26,9 @@ pub(crate) async fn run_rlkd_cli(
     max_completion_length: usize,
     seed: u64,
     reasoning_rewards: bool,
-    use_metal_flash_attention: bool,
     _log_metrics: Option<String>,
     emit_console_output: bool,
     extra_callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>>,
-    text_column: Option<String>,
-    text_columns: Option<Vec<String>>,
-    column_separator: String,
     prompt_column: Option<String>,
     response_column: Option<String>,
 ) -> anyhow::Result<()> {
@@ -42,10 +38,6 @@ pub(crate) async fn run_rlkd_cli(
 
     pmetal_runtime::compat::random::seed(seed);
 
-    // RLKD reads a prompt and, optionally, a reference answer from a row: the
-    // prompt and response columns name them; the text-column options describe
-    // supervised text, which RLKD does not train on.
-    let _ = (text_column, text_columns, column_separator);
     let prompt_columns = pmetal_trainer::grpo::PromptColumns {
         prompt: prompt_column,
         reference: response_column,
@@ -217,8 +209,6 @@ pub(crate) async fn run_rlkd_cli(
     if emit_console_output {
         println!("Starting RLKD training loop...");
     }
-
-    let _ = use_metal_flash_attention; // passed through GRPO config; honored by model load
 
     trainer
         .run(

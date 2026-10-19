@@ -45,10 +45,12 @@ Every training command takes `--optimizer` (and YAML configs take `training.opti
 | `sgd` | Heavy-ball momentum 0.9, L2 weight decay |
 | `lion` | Sign of an interpolated momentum, betas (0.9, 0.99). Use a learning rate 3-10x smaller and a weight decay 3-10x larger than for AdamW (Chen et al., arXiv 2302.06675) |
 | `adafactor` | Factored second moments, update clipping at RMS 1, decay 1 - t^-0.8, no first moment, learning rate from the schedule (Shazeer and Stern, arXiv 1804.04235). Usually run around 1e-3 |
-| Metal Fused AdamW | The same AdamW update, over the same parameter groups, in one Metal dispatch, used for `adamw` unless `--no-metal-fused-optimizer` |
+| `muon` | Momentum orthogonalized by five Newton-Schulz steps on the hidden weight matrices (Jordan et al., 2024), with the update scaled to AdamW's RMS (`0.2·sqrt(max(rows, cols))`, Liu et al., arXiv 2502.16982) so an AdamW learning rate and weight decay carry over. Embeddings, the output head, norms and biases train with AdamW |
+| `adamw_schedule_free` | Schedule-free AdamW (Defazio et al., arXiv 2405.15682): iterate averaging in place of a decaying schedule. Run at a constant learning rate; the saved and evaluated weights are the average, which the loop swaps to for validation and checkpoints. Takes the learning rate AdamW would, without the decay |
+| `adamw_8bit` | AdamW with both moments held in 8 bits, quantized blockwise (blocks of 256) against a dynamic code (Dettmers et al., arXiv 2110.02861); a quarter of AdamW's optimizer memory. Tensors under 4096 elements keep f32 moments |
 | LoRA+ | Differentiated LR for A and B matrices, with any optimizer |
 
-Every optimizer, fused or not, trains the same parameter groups. Biases and
+Every optimizer trains the same parameter groups. Biases and
 normalization weights train without weight decay (the split
 `transformers`' `Trainer` makes), `--embedding-lr` sets the rate of the
 token embedding and the output head (and of an adapter on the head), and

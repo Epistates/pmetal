@@ -29,12 +29,40 @@ fn map_compression(
     }
 }
 
+/// Wait for `future` from synchronous training code, whether that code runs on
+/// a plain thread inside a runtime's context or on one of the runtime's own
+/// workers (the orchestrator is an `async fn` that trains without yielding).
+/// `Handle::block_on` alone panics on a worker ("cannot start a runtime from
+/// within a runtime"), which is where `pmetal train` calls it from.
+pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    let handle = tokio::runtime::Handle::current();
+    match handle.runtime_flavor() {
+        tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(future))
+        }
+        _ => handle.block_on(future),
+    }
+}
+
+/// How the ranks exchange gradients.
+enum Transport {
+    /// The TCP ring of `pmetal-distributed`, over host `f32` buffers: what
+    /// peers and mDNS discovery set up, and the only one that compresses.
+    Ring(Arc<DistributedContext>),
+    /// MLX's own collectives (ring over TCP, or JACCL over Thunderbolt RDMA),
+    /// for a process launched into an MLX distributed group. The gradients
+    /// stay on the device and the collective is part of the step's graph.
+    Mlx(pmetal_runtime::distributed::Group),
+}
+
 /// Gradient synchronization bridge for distributed training.
 ///
-/// Handles the conversion between `FlattenedModuleParam` (MLX gradient format) and
-/// the flat `f32` buffers expected by `DistributedContext::all_reduce`.
+/// The ring transport converts between `FlattenedModuleParam` (MLX gradient
+/// format) and the flat `f32` buffers `DistributedContext::all_reduce` takes;
+/// the MLX transport averages the gradients on the device
+/// ([`pmetal_runtime::distributed::average_gradients`]).
 pub struct DistributedGradientSync {
-    ctx: Arc<DistributedContext>,
+    transport: Transport,
     compressor: Option<GradientCompressor>,
     /// Reusable scratch buffer for flatten/scatter operations.
     buffer: Vec<f32>,
@@ -64,7 +92,7 @@ impl DistributedGradientSync {
         };
 
         Self {
-            ctx,
+            transport: Transport::Ring(ctx),
             compressor,
             buffer: Vec::new(),
             param_layout: Vec::new(),
@@ -72,19 +100,63 @@ impl DistributedGradientSync {
         }
     }
 
+    /// The bridge for a process MLX launched into a distributed group of more
+    /// than one rank (`mlx.launch`, or `MLX_RANK` and `MLX_HOSTFILE` set by
+    /// hand), or `None` when there is no such group.
+    ///
+    /// Gradients are averaged on the device. Compression needs the ring
+    /// transport's host buffers, so a `config` that asks for it is told it is
+    /// not applied.
+    pub fn from_mlx_group(config: &pmetal_core::DistributedTrainingConfig) -> Result<Option<Self>> {
+        if !pmetal_runtime::distributed::is_available() {
+            return Ok(None);
+        }
+        let group = pmetal_runtime::distributed::Group::init(false)
+            .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
+        if group.size() <= 1 {
+            return Ok(None);
+        }
+        if config.compression != pmetal_core::DistributedCompression::None {
+            tracing::warn!(
+                "Gradient compression is not applied on MLX's collectives; gradients are \
+                 averaged uncompressed"
+            );
+        }
+        Ok(Some(Self {
+            transport: Transport::Mlx(group),
+            compressor: None,
+            buffer: Vec::new(),
+            param_layout: Vec::new(),
+            layout_initialized: false,
+        }))
+    }
+
     /// Get the rank of this node.
     pub fn rank(&self) -> usize {
-        self.ctx.rank()
+        match &self.transport {
+            Transport::Ring(ctx) => ctx.rank(),
+            Transport::Mlx(group) => group.rank() as usize,
+        }
     }
 
     /// Get the total number of nodes.
     pub fn world_size(&self) -> usize {
-        self.ctx.world_size()
+        match &self.transport {
+            Transport::Ring(ctx) => ctx.world_size(),
+            Transport::Mlx(group) => group.size() as usize,
+        }
     }
 
     /// Whether this is the master node (rank 0).
     pub fn is_master(&self) -> bool {
-        self.ctx.is_master()
+        self.rank() == 0
+    }
+
+    fn ring(&self) -> &Arc<DistributedContext> {
+        match &self.transport {
+            Transport::Ring(ctx) => ctx,
+            Transport::Mlx(_) => unreachable!("the ring path is only taken on the ring transport"),
+        }
     }
 
     /// Initialize the parameter layout from a gradient set.
@@ -114,7 +186,7 @@ impl DistributedGradientSync {
             self.param_layout.len(),
             total_elements,
             (total_elements * 4) as f64 / 1_048_576.0,
-            self.ctx.world_size(),
+            self.world_size(),
         );
     }
 
@@ -168,6 +240,18 @@ impl DistributedGradientSync {
     ///
     /// Flow: eval grads → flatten to f32 → all_reduce(Mean) → scatter back
     pub async fn sync_gradients(&mut self, grads: &mut FlattenedModuleParam) -> Result<()> {
+        if let Transport::Mlx(group) = &self.transport {
+            // On the device, lazily: the collective runs when the step is
+            // evaluated, with the gradients still where they were computed.
+            return pmetal_runtime::distributed::average_gradients(
+                grads,
+                Some(group),
+                pmetal_runtime::distributed::DEFAULT_BUCKET_BYTES,
+            )
+            .map_err(|e| {
+                SftError::Mlx(Exception::custom(format!("gradient average failed: {e}")))
+            });
+        }
         if !self.layout_initialized {
             self.init_layout(grads);
         }
@@ -177,17 +261,13 @@ impl DistributedGradientSync {
 
         // All-reduce (mean), compressed when a strategy is configured. The
         // compressor's error feedback is for exactly this buffer.
+        let ctx = Arc::clone(self.ring());
         let reduced = match self.compressor {
             Some(ref mut compressor) => {
-                self.ctx
-                    .all_reduce_compressed(compressor, &mut self.buffer, ReduceOp::Mean)
+                ctx.all_reduce_compressed(compressor, &mut self.buffer, ReduceOp::Mean)
                     .await
             }
-            None => {
-                self.ctx
-                    .all_reduce_f32(&mut self.buffer, ReduceOp::Mean)
-                    .await
-            }
+            None => ctx.all_reduce_f32(&mut self.buffer, ReduceOp::Mean).await,
         };
         reduced.map_err(|e| {
             SftError::Mlx(Exception::custom(format!(
@@ -203,8 +283,18 @@ impl DistributedGradientSync {
 
     /// Reduce a scalar loss across all nodes (mean).
     pub async fn sync_loss(&self, loss: f32) -> Result<f32> {
+        if let Transport::Mlx(group) = &self.transport {
+            let total = pmetal_runtime::distributed::all_sum(&Array::from_f32(loss), Some(group))
+                .map_err(|e| {
+                SftError::Mlx(Exception::custom(format!("loss sync failed: {e}")))
+            })?;
+            let mean = total.mul_scalar(1.0 / group.size() as f32);
+            mean.try_eval()
+                .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
+            return Ok(mean.item_f32());
+        }
         let mut value = [loss];
-        self.ctx
+        self.ring()
             .all_reduce_f32(&mut value, ReduceOp::Mean)
             .await
             .map_err(|e| {
@@ -217,7 +307,14 @@ impl DistributedGradientSync {
 
     /// Barrier synchronization — all nodes must reach this point before any proceed.
     pub async fn barrier(&self) -> Result<()> {
-        self.ctx.barrier().await.map_err(|e| {
+        if let Transport::Mlx(group) = &self.transport {
+            let token = pmetal_runtime::distributed::all_sum(&Array::from_f32(0.0), Some(group))
+                .map_err(|e| SftError::Mlx(Exception::custom(format!("barrier failed: {e}"))))?;
+            return token
+                .try_eval()
+                .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())));
+        }
+        self.ring().barrier().await.map_err(|e| {
             SftError::Mlx(Exception::custom(format!(
                 "distributed barrier failed: {e}"
             )))
@@ -297,5 +394,37 @@ pub async fn create_distributed_context(
         Err(SftError::Mlx(Exception::custom(
             "distributed config has no peers and auto_discover is false",
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::block_on;
+
+    /// Training code that runs on a runtime's own worker (as the orchestrator's
+    /// does, being an `async fn` that never yields) can still wait on a future.
+    #[test]
+    fn a_runtime_worker_can_wait_on_a_future() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let answer = runtime.block_on(async { block_on(async { 6 * 7 }) });
+        assert_eq!(answer, 42);
+        // What the loop called before: `Handle::block_on` on a worker panics.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                tokio::spawn(async { tokio::runtime::Handle::current().block_on(async { 1 }) })
+                    .await
+            })
+        }));
+        assert!(
+            matches!(panicked, Ok(Err(_))),
+            "Handle::block_on on a worker should panic the task"
+        );
+        // And so can a plain thread inside the runtime's context.
+        let _inside = runtime.enter();
+        assert_eq!(block_on(async { 1 + 1 }), 2);
     }
 }

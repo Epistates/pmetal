@@ -115,7 +115,7 @@ print(model.generate("Hello world", temperature=0.7))
 | `Quantization` | None, NF4, FP4, Int8, FP8 |
 | `LoraBias` | None, All, LoraOnly |
 | `LrSchedulerType` | Constant, Linear, Cosine, CosineWithRestarts, Polynomial, Wsd |
-| `OptimizerType` | AdamW, Sgd, Adafactor, Lion |
+| `OptimizerType` | AdamW, Sgd, Adafactor, Lion, Muon, AdamWScheduleFree, AdamW8bit; a `TrainingConfig` takes the optimizer by name (`optimizer="muon"`) |
 | `DatasetFormat` | Simple, Alpaca, ShareGpt, OpenAi, Auto |
 | `ModelArchitecture` | Llama, Llama4, Qwen2, Qwen3, Qwen3MoE, Gemma, Mistral, Phi, Phi4, DeepSeek, Cohere, Granite, NemotronH, Qwen3Next, GptOss, Gemma4, Bert, Flux |
 

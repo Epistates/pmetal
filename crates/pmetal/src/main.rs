@@ -1352,21 +1352,20 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 epochs,
                 max_seq_len,
                 gradient_accumulation_steps,
-                no_flash_attention,
                 max_grad_norm,
                 resume,
                 quantization,
                 quant_block_size,
                 double_quant,
-                no_fused,
-                no_metal_fused_optimizer,
                 no_sequence_packing,
                 pack_max_seq_len,
-                no_jit_compilation,
                 no_gradient_checkpointing,
                 gradient_checkpointing_layers,
                 log_metrics,
                 embedding_lr,
+                label_smoothing,
+                z_loss,
+                neftune_alpha,
                 loss_scale,
                 warmup_steps,
                 lr_schedule,
@@ -1469,16 +1468,15 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                     lr_scheduler,
                     optimizer,
                     embedding_learning_rate: embedding_lr.map(|v| v as f64),
+                    label_smoothing,
+                    z_loss,
+                    neftune_noise_alpha: neftune_alpha,
                     ..Default::default()
                 },
                 columns,
                 dispatch: orchestrator::DispatchConfig {
-                    flash_attention: !no_flash_attention,
                     sequence_packing: !no_sequence_packing,
                     pack_max_seq_len,
-                    jit_compilation: !no_jit_compilation,
-                    fused: !no_fused,
-                    metal_fused_optimizer: !no_metal_fused_optimizer,
                     gradient_checkpointing: !no_gradient_checkpointing,
                     gradient_checkpointing_layers,
                     cut_cross_entropy,
@@ -2242,7 +2240,6 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 loss_type,
                 num_iterations,
                 reasoning_rewards,
-                no_flash_attention,
                 vlm,
                 max_image_size,
                 reward_model,
@@ -2251,9 +2248,6 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 reward_model_template,
                 async_rewards,
                 grpo_kv_bits,
-                text_column,
-                text_columns,
-                column_separator,
                 prompt_column,
                 response_column,
                 log_metrics,
@@ -2278,7 +2272,6 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 &loss_type,
                 num_iterations,
                 reasoning_rewards,
-                !no_flash_attention,
                 vlm,
                 max_image_size,
                 reward_model,
@@ -2290,9 +2283,6 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 log_metrics,
                 true,
                 Vec::new(),
-                text_column,
-                text_columns,
-                column_separator,
                 prompt_column,
                 response_column,
             )
@@ -2320,10 +2310,6 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 max_completion_length,
                 seed,
                 reasoning_rewards,
-                no_flash_attention,
-                text_column,
-                text_columns,
-                column_separator,
                 prompt_column,
                 response_column,
                 log_metrics,
@@ -2347,13 +2333,9 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 max_completion_length,
                 seed,
                 reasoning_rewards,
-                !no_flash_attention,
                 log_metrics,
                 true,
                 Vec::new(),
-                text_column,
-                text_columns,
-                column_separator,
                 prompt_column,
                 response_column,
             )
@@ -2526,6 +2508,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 resume,
                 model_config: _model_config,
                 z_loss,
+                document_mask,
                 gradient_accumulation_steps,
                 log_every,
                 eval_every,
@@ -2627,23 +2610,34 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             if resume.is_some() && resume_position.is_none() && start_step > 0 {
                 let batches_to_skip = start_step.saturating_mul(gradient_accumulation_steps.max(1));
                 for _ in 0..batches_to_skip {
-                    reader.next().ok_or_else(|| {
+                    reader.try_next_batch()?.ok_or_else(|| {
                         anyhow::anyhow!("stream exhausted while seeking resume step")
                     })?;
                 }
             }
 
-            // Convert streaming batches to MLX arrays
-            let batch_iter = reader.map(move |(batch, pos)| {
-                let flat: Vec<i32> = batch
+            // Convert streaming batches to MLX arrays. A shard that cannot be
+            // read is an error that stops the run, not the end of the data.
+            let batch_iter = std::iter::from_fn(move || {
+                let (rows, pos) = match reader.try_next_rows() {
+                    Ok(Some(batch)) => batch,
+                    Ok(None) => return None,
+                    Err(e) => return Some(Err(pretrain::PretrainError::Data(e.to_string()))),
+                };
+                let flat: Vec<i32> = rows
                     .iter()
-                    .flat_map(|seq| seq.iter().map(|&t| t as i32))
+                    .flat_map(|row| row.tokens.iter().map(|&t| t as i32))
                     .collect();
-                let array = pmetal_runtime::InlineArray::from_i32_slice_shaped(
+                let tokens = pmetal_runtime::InlineArray::from_i32_slice_shaped(
                     &flat,
-                    &[batch.len() as i32, seq_len as i32],
+                    &[rows.len() as i32, seq_len as i32],
                 );
-                (array, Some(pos))
+                Some(Ok(pretrain::PretrainBatch {
+                    tokens,
+                    position: Some(pos),
+                    doc_lengths: document_mask
+                        .then(|| rows.into_iter().map(|row| row.doc_lengths).collect()),
+                }))
             });
 
             let eval_iter = if !eval_shards.is_empty() && eval_every > 0 {
@@ -3302,10 +3296,7 @@ mod argv_roundtrip {
         let spec = TrainSpec {
             model: "m".into(),
             dataset: "d".into(),
-            no_flash_attention: true,
             no_sequence_packing: true,
-            no_jit_compilation: true,
-            no_metal_fused_optimizer: true,
             cut_cross_entropy: true,
             no_adaptive_lr: true,
             ane: true,

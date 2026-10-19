@@ -34,7 +34,7 @@ use crate::{
 };
 
 fn config_error(message: impl Into<String>) -> SftError {
-    SftError::Mlx(Exception::custom(message.into()))
+    SftError::Config(message.into())
 }
 
 /// On-policy distillation (GKD): with probability `probability` a batch's
@@ -279,7 +279,7 @@ impl DistillationTrainer {
         }
         Ok(Self {
             distiller,
-            loop_state: TrainingLoop::new(config),
+            loop_state: TrainingLoop::new(config)?,
             on_policy: None,
             batches_seen: 0,
         })
@@ -534,7 +534,6 @@ impl DistillationTrainer {
         let (next_labels, weights) = shifted_targets(&batch.labels, ignore);
         let labels = hard_labels.then_some(&next_labels);
         let current_step = self.loop_state.optimizer_steps_taken();
-        let metal_fa = self.loop_state.metal_fa_available;
         let (loss, grads) = {
             let this = &*self;
             let loss_fn =
@@ -555,11 +554,7 @@ impl DistillationTrainer {
                     Ok(output.total)
                 };
             let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
-            if metal_fa {
-                with_training_mode(|| loss_and_grad_fn(student, &batch.input_ids))?
-            } else {
-                loss_and_grad_fn(student, &batch.input_ids)?
-            }
+            with_training_mode(|| loss_and_grad_fn(student, &batch.input_ids))?
         };
 
         let loss_val = crate::step_check::check_step(self.loop_state.step + 1, loss.item_f32())?;

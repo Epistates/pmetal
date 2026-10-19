@@ -102,17 +102,23 @@ export interface TrainingConfigSummary {
   lora_rank: number | null;
   lora_alpha: number | null;
   sequence_packing: boolean;
-  flash_attention: boolean;
-  jit_compilation: boolean;
   gradient_checkpointing: boolean;
 }
 
 /** Optimizers every training job accepts; `adamw` is the default. */
-export const OPTIMIZERS = ['adamw', 'sgd', 'lion', 'adafactor'] as const;
+export const OPTIMIZERS = [
+  'adamw',
+  'sgd',
+  'lion',
+  'adafactor',
+  'muon',
+  'adamw_schedule_free',
+  'adamw_8bit',
+] as const;
 export type OptimizerName = (typeof OPTIMIZERS)[number];
 /** Shown beside every optimizer picker. */
 export const OPTIMIZER_HINT =
-  'Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW.';
+  'Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW. Schedule-free AdamW wants a constant learning rate.';
 
 export interface TrainSpec {
   model: string;
@@ -121,6 +127,9 @@ export interface TrainSpec {
   output_dir?: string;
   learning_rate?: number;
   embedding_lr?: number | null;
+  label_smoothing?: number;
+  z_loss?: number;
+  neftune_alpha?: number | null;
   batch_size?: number;
   epochs?: number;
   max_seq_len?: number;
@@ -147,11 +156,7 @@ export interface TrainSpec {
   column_separator?: string | null;
   prompt_column?: string | null;
   response_column?: string | null;
-  no_flash_attention?: boolean;
   no_sequence_packing?: boolean;
-  no_jit_compilation?: boolean;
-  no_fused?: boolean;
-  no_metal_fused_optimizer?: boolean;
   cut_cross_entropy?: boolean;
   no_adaptive_lr?: boolean;
   ane?: boolean;
@@ -205,7 +210,6 @@ export interface GrpoSpec {
   loss_type?: GrpoLossType;
   num_iterations?: number;
   reasoning_rewards?: boolean;
-  no_flash_attention?: boolean;
   vlm?: boolean;
   max_image_size?: number;
   reward_model?: string | null;
@@ -1061,6 +1065,7 @@ export interface PretrainSpec {
   resume?: string | null;
   model_config?: string | null;
   z_loss?: number;
+  document_mask?: boolean;
   gradient_accumulation_steps?: number;
   log_every?: number;
   eval_every?: number;
@@ -1157,8 +1162,6 @@ export interface RlkdConfig {
   max_completion_length?: number | null;
   seed?: number | null;
   reasoning_rewards?: boolean | null;
-  no_flash_attention?: boolean | null;
-  text_column?: string | null;
   prompt_column?: string | null;
   response_column?: string | null;
 }

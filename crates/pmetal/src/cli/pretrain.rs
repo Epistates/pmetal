@@ -77,6 +77,12 @@ pub struct PretrainArgs {
     #[arg(long = "z-loss", default_value = "0.0")]
     pub z_loss: f32,
 
+    /// Mask attention to each document of a packed row, so a document never
+    /// attends to the one before it in the row (the architecture must take an
+    /// attention mask; the dense mask costs more than the causal fast path)
+    #[arg(long = "document-mask")]
+    pub document_mask: bool,
+
     /// Gradient accumulation steps (effective batch = batch_size * this)
     #[arg(long = "gradient-accumulation-steps", default_value = "1")]
     pub gradient_accumulation_steps: usize,

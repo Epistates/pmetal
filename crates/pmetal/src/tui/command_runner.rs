@@ -662,6 +662,10 @@ async fn run_training_direct(
             seed: parse_arg(&spec.args, "--seed", 42u64)?,
             embedding_learning_rate: optional_arg(&spec.args, "--embedding-lr")
                 .and_then(|s| s.parse::<f64>().ok()),
+            label_smoothing: parse_arg(&spec.args, "--label-smoothing", 0.0f64)?,
+            z_loss: parse_arg(&spec.args, "--z-loss", 0.0f64)?,
+            neftune_noise_alpha: optional_arg(&spec.args, "--neftune-alpha")
+                .and_then(|s| s.parse::<f64>().ok()),
             lr_scheduler: parse_arg(
                 &spec.args,
                 "--lr-schedule",
@@ -671,12 +675,8 @@ async fn run_training_direct(
         },
         columns,
         dispatch: orchestrator::DispatchConfig {
-            flash_attention: !has_flag(&spec.args, "--no-flash-attention"),
             sequence_packing: !has_flag(&spec.args, "--no-sequence-packing"),
             pack_max_seq_len: parse_opt_arg(&spec.args, "--pack-max-seq-len"),
-            jit_compilation: !has_flag(&spec.args, "--no-jit-compilation"),
-            fused: !has_flag(&spec.args, "--no-fused"),
-            metal_fused_optimizer: !has_flag(&spec.args, "--no-metal-fused-optimizer"),
             gradient_checkpointing: !has_flag(&spec.args, "--no-gradient-checkpointing"),
             gradient_checkpointing_layers: parse_arg(
                 &spec.args,
@@ -795,7 +795,6 @@ async fn run_grpo_direct(
         &loss_type,
         parse_arg(&spec.args, "--num-iterations", 1usize)?,
         has_flag(&spec.args, "--reasoning-rewards"),
-        !has_flag(&spec.args, "--no-flash-attention"),
         has_flag(&spec.args, "--vlm"),
         parse_arg(&spec.args, "--max-image-size", 336usize)?,
         optional_arg(&spec.args, "--reward-model"),
@@ -807,10 +806,6 @@ async fn run_grpo_direct(
         spec.metrics_file.as_ref().map(|p| p.display().to_string()),
         false,
         callbacks,
-        optional_arg(&spec.args, "--text-column"),
-        optional_arg(&spec.args, "--text-columns")
-            .map(|s| s.split(',').map(str::to_string).collect()),
-        optional_arg(&spec.args, "--column-separator").unwrap_or_else(|| "\n\n".to_string()),
         optional_arg(&spec.args, "--prompt-column"),
         optional_arg(&spec.args, "--response-column"),
     )

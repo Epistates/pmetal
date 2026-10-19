@@ -296,6 +296,19 @@ pub trait TrainableModel: ModuleParameters {
         self.forward(input_ids, mask)
     }
 
+    /// Turn NEFTune embedding noise on (`Some(alpha)`) or off (`None`) for the
+    /// forward passes that follow, whichever forward they are (logits, hidden
+    /// states, packed positions, images), and report whether this model has an
+    /// embedding to put it on. A model that does not ignores the request.
+    ///
+    /// Set it around the forward being differentiated and clear it after, so
+    /// nothing else that shares the model (an eval pass, a generation)
+    /// inherits the noise.
+    fn set_neftune_alpha(&mut self, alpha: Option<f32>) -> bool {
+        let _ = alpha;
+        false
+    }
+
     /// Forward pass returning hidden states BEFORE the lm_head projection.
     ///
     /// Used by Cut Cross-Entropy (CCE) to avoid materializing the full [batch, seq,

@@ -18,7 +18,10 @@
 //! | AdamW | Loshchilov & Hutter, *Decoupled Weight Decay Regularization* (arXiv 1711.05101), bias-corrected | β = (0.9, 0.999), ε = 1e-8 | `torch.optim.AdamW` |
 //! | SGD | heavy-ball momentum, Sutskever et al., *On the importance of initialization and momentum in deep learning* (ICML 2013); L2 weight decay added to the gradient | momentum 0.9 | `torch.optim.SGD` |
 //! | Lion | Chen et al., *Symbolic Discovery of Optimization Algorithms* (arXiv 2302.06675) | β = (0.9, 0.99), decoupled weight decay | the authors' PyTorch implementation |
-//! | Adafactor | Shazeer & Stern, *Adafactor: Adaptive Learning Rates with Sublinear Memory Cost* (arXiv 1804.04235) | ε₁ = 1e-30, update clip d = 1, β̂₂ₜ = 1 − t^-0.8, no first moment, external learning rate | `transformers` `Adafactor(relative_step=False, scale_parameter=False)` |
+//! | Adafactor | Shazeer & Stern, *Adafactor: Adaptive Learning Rates with Sublinear Memory Cost* (arXiv 1804.04235) | ε₁ = 1e-30, update clip d = 1, β̂₂ₜ = 1 − t^-0.8, no first moment, external learning rate | the reference Adafactor with `relative_step=False, scale_parameter=False` |
+//! | Muon | Jordan et al., *Muon: An optimizer for hidden layers in neural networks* (2024): momentum 0.95 with Nesterov, five quintic Newton-Schulz steps; update scaled by `0.2·sqrt(max(rows, cols))` to AdamW's RMS (Liu et al., arXiv 2502.16982), decoupled weight decay; embeddings, the head, norms and biases train with AdamW | momentum 0.95, ns steps 5 | `torch.optim.Muon` with `adjust_lr_fn="match_rms_adamw"` |
+//! | Schedule-free AdamW | Defazio et al., *The Road Less Scheduled* (arXiv 2405.15682): iterate averaging, weight decay at `y`, `r = 0`, `weight_lr_power = 2`; a constant rate after warmup | β = (0.9, 0.999), ε = 1e-8 | the authors' `AdamWScheduleFree` |
+//! | 8-bit AdamW | Dettmers et al., *8-bit Optimizers via Block-wise Quantization* (arXiv 2110.02861): both moments one byte per element, blocks of 256, dynamic code; tensors under 4096 elements keep f32 moments | as AdamW | the authors' blockwise 8-bit AdamW |
 //!
 //! The learning rate and weight decay are the caller's. They are not
 //! interchangeable between kinds: the Lion paper recommends a learning rate
@@ -31,7 +34,10 @@ use std::rc::Rc;
 use pmetal_runtime::compat::{
     Array, Exception, FlattenedModuleParam,
     module::ModuleParameters,
-    optimizers::{AdamW, AdamWBuilder, Optimizer, Updatable, apply_updates},
+    optimizers::{
+        AdamW, AdamW8bit, AdamWBuilder, LrAdjust, Muon, MuonAdamW, Optimizer, OptimizerState,
+        ScheduleFreeAdamW, StatefulOptimizer, Updatable, apply_updates,
+    },
 };
 // The update rules live beside AdamW in the runtime; they are re-exported here
 // where the trainer's callers have always found them.
@@ -53,11 +59,21 @@ pub enum TrainOptimizer {
     Lion(Lion),
     /// Adafactor.
     Adafactor(Adafactor),
+    /// Muon on the hidden matrices, AdamW on the rest.
+    Muon(Box<MuonAdamW>),
+    /// Schedule-free AdamW.
+    ScheduleFree(ScheduleFreeAdamW),
+    /// AdamW with 8-bit moments.
+    AdamW8bit(Box<AdamW8bit>),
 }
 
 impl TrainOptimizer {
     /// An optimizer of `kind` at learning rate `lr` and weight decay
     /// `weight_decay`, with the kind's paper defaults for everything else.
+    ///
+    /// Muon runs Moonshot's recipe: its update is scaled to AdamW's RMS
+    /// ([`LrAdjust::MatchRmsAdamw`]), so `lr` and `weight_decay` are the
+    /// AdamW values for both halves.
     pub fn new(kind: OptimizerType, lr: f32, weight_decay: f32) -> Self {
         match kind {
             OptimizerType::AdamW => Self::AdamW(
@@ -69,12 +85,28 @@ impl TrainOptimizer {
             OptimizerType::Sgd => Self::Sgd(MomentumSgd::new(lr, weight_decay)),
             OptimizerType::Lion => Self::Lion(Lion::new(lr, weight_decay)),
             OptimizerType::Adafactor => Self::Adafactor(Adafactor::new(lr, weight_decay)),
-            OptimizerType::Muon | OptimizerType::AdamWScheduleFree | OptimizerType::AdamW8bit => {
-                panic!(
-                    "the {kind} optimizer is not built by this trainer yet; \
-                     TrainingConfig::validate refuses it, so a validated config never gets here"
-                )
+            OptimizerType::Muon => Self::Muon(Box::new(
+                MuonAdamW::new(lr, lr, weight_decay)
+                    .with_muon(Muon::new(lr, weight_decay).with_lr_adjust(LrAdjust::MatchRmsAdamw)),
+            )),
+            OptimizerType::AdamWScheduleFree => {
+                Self::ScheduleFree(ScheduleFreeAdamW::new(lr, weight_decay))
             }
+            OptimizerType::AdamW8bit => Self::AdamW8bit(Box::new(AdamW8bit::new(lr, weight_decay))),
+        }
+    }
+
+    /// The optimizer of `kind` for the parameters of `class`.
+    ///
+    /// Muon is for the hidden matrices only: the embedding and no-decay
+    /// groups (the token embedding, the output head, norms and biases) train
+    /// with AdamW at their rates.
+    pub fn for_class(kind: OptimizerType, class: ParamClass, lr: f32, weight_decay: f32) -> Self {
+        match (kind, class) {
+            (OptimizerType::Muon, ParamClass::Embedding | ParamClass::NoDecay) => {
+                Self::new(OptimizerType::AdamW, lr, weight_decay)
+            }
+            _ => Self::new(kind, lr, weight_decay),
         }
     }
 
@@ -94,6 +126,9 @@ impl TrainOptimizer {
             Self::Sgd(_) => OptimizerType::Sgd,
             Self::Lion(_) => OptimizerType::Lion,
             Self::Adafactor(_) => OptimizerType::Adafactor,
+            Self::Muon(_) => OptimizerType::Muon,
+            Self::ScheduleFree(_) => OptimizerType::AdamWScheduleFree,
+            Self::AdamW8bit(_) => OptimizerType::AdamW8bit,
         }
     }
 
@@ -104,6 +139,9 @@ impl TrainOptimizer {
             Self::Sgd(o) => o.lr,
             Self::Lion(o) => o.lr,
             Self::Adafactor(o) => o.lr,
+            Self::Muon(o) => o.lr(),
+            Self::ScheduleFree(o) => o.lr,
+            Self::AdamW8bit(o) => o.lr(),
         }
     }
 
@@ -114,6 +152,9 @@ impl TrainOptimizer {
             Self::Sgd(o) => o.lr = lr,
             Self::Lion(o) => o.lr = lr,
             Self::Adafactor(o) => o.lr = lr,
+            Self::Muon(o) => o.set_lr(lr),
+            Self::ScheduleFree(o) => o.lr = lr,
+            Self::AdamW8bit(o) => o.set_lr(lr),
         }
     }
 
@@ -123,6 +164,9 @@ impl TrainOptimizer {
         match self {
             Self::AdamW(o) => o.advance_step(),
             Self::Adafactor(o) => o.advance_step(),
+            Self::Muon(o) => o.advance_step(),
+            Self::ScheduleFree(o) => o.advance_step(),
+            Self::AdamW8bit(o) => o.advance_step(),
             Self::Sgd(_) | Self::Lion(_) => {}
         }
     }
@@ -134,6 +178,57 @@ impl TrainOptimizer {
             Self::Sgd(o) => o.state.len(),
             Self::Lion(o) => o.state.len(),
             Self::Adafactor(o) => o.state.len(),
+            Self::Muon(o) => o.muon().state.len() + o.adamw().state.len(),
+            Self::ScheduleFree(o) => o.num_params(),
+            Self::AdamW8bit(o) => o.num_params(),
+        }
+    }
+
+    /// Swap `model` to the weights to evaluate and save. Only schedule-free
+    /// AdamW has any: it trains on `y` and evaluates the average `x`. Every
+    /// other optimizer trains the weights it evaluates, and this does
+    /// nothing.
+    pub fn eval_weights<M: ModuleParameters>(&mut self, model: &mut M) {
+        if let Self::ScheduleFree(o) = self {
+            o.eval_weights(model);
+        }
+    }
+
+    /// Swap `model` back to the weights to train on after
+    /// [`eval_weights`](Self::eval_weights).
+    pub fn train_weights<M: ModuleParameters>(&mut self, model: &mut M) {
+        if let Self::ScheduleFree(o) = self {
+            o.train_weights(model);
+        }
+    }
+
+    fn inner_state(&self) -> OptimizerState {
+        match self {
+            Self::AdamW(o) => o.export_state(),
+            Self::Sgd(o) => o.export_state(),
+            Self::Lion(o) => o.export_state(),
+            Self::Adafactor(o) => o.export_state(),
+            Self::Muon(o) => o.export_state(),
+            Self::ScheduleFree(o) => o.export_state(),
+            Self::AdamW8bit(o) => o.export_state(),
+        }
+    }
+}
+
+impl StatefulOptimizer for TrainOptimizer {
+    fn export_state(&self) -> OptimizerState {
+        self.inner_state()
+    }
+
+    fn import_state(&mut self, state: &OptimizerState) -> Result<()> {
+        match self {
+            Self::AdamW(o) => o.import_state(state),
+            Self::Sgd(o) => o.import_state(state),
+            Self::Lion(o) => o.import_state(state),
+            Self::Adafactor(o) => o.import_state(state),
+            Self::Muon(o) => o.import_state(state),
+            Self::ScheduleFree(o) => o.import_state(state),
+            Self::AdamW8bit(o) => o.import_state(state),
         }
     }
 }
@@ -158,6 +253,9 @@ impl Optimizer for TrainOptimizer {
             Self::Sgd(o) => o.update_single(key, gradient, parameter),
             Self::Lion(o) => o.update_single(key, gradient, parameter),
             Self::Adafactor(o) => o.update_single(key, gradient, parameter),
+            Self::Muon(o) => o.update_single(key, gradient, parameter),
+            Self::ScheduleFree(o) => o.update_single(key, gradient, parameter),
+            Self::AdamW8bit(o) => o.update_single(key, gradient, parameter),
         }
     }
     fn update<M: ModuleParameters>(
@@ -177,31 +275,23 @@ impl Updatable for TrainOptimizer {
     fn updatable_states(&self) -> Vec<&Array> {
         match self {
             Self::AdamW(o) => o.updatable_states(),
-            Self::Sgd(o) => o.state.values().collect(),
-            Self::Lion(o) => o.state.values().collect(),
-            Self::Adafactor(o) => o
-                .state
-                .values()
-                .flat_map(|m| match m {
-                    SecondMoment::Factored { row, col } => vec![row, col],
-                    SecondMoment::Full(v) => vec![v],
-                })
-                .collect(),
+            Self::Sgd(o) => o.updatable_states(),
+            Self::Lion(o) => o.updatable_states(),
+            Self::Adafactor(o) => o.updatable_states(),
+            Self::Muon(o) => o.updatable_states(),
+            Self::ScheduleFree(o) => o.updatable_states(),
+            Self::AdamW8bit(o) => o.updatable_states(),
         }
     }
     fn updatable_states_mut(&mut self) -> Vec<&mut Array> {
         match self {
             Self::AdamW(o) => o.updatable_states_mut(),
-            Self::Sgd(o) => o.state.values_mut().collect(),
-            Self::Lion(o) => o.state.values_mut().collect(),
-            Self::Adafactor(o) => o
-                .state
-                .values_mut()
-                .flat_map(|m| match m {
-                    SecondMoment::Factored { row, col } => vec![row, col],
-                    SecondMoment::Full(v) => vec![v],
-                })
-                .collect(),
+            Self::Sgd(o) => o.updatable_states_mut(),
+            Self::Lion(o) => o.updatable_states_mut(),
+            Self::Adafactor(o) => o.updatable_states_mut(),
+            Self::Muon(o) => o.updatable_states_mut(),
+            Self::ScheduleFree(o) => o.updatable_states_mut(),
+            Self::AdamW8bit(o) => o.updatable_states_mut(),
         }
     }
 }
@@ -215,6 +305,7 @@ impl Updatable for TrainOptimizer {
 /// keeping the ratios.
 #[derive(Debug)]
 pub struct ParamGroupOptimizer {
+    kind: OptimizerType,
     regular: TrainOptimizer,
     lora_b: Option<TrainOptimizer>,
     embedding: TrainOptimizer,
@@ -227,8 +318,9 @@ impl ParamGroupOptimizer {
     /// `kind` optimizers over `groups`, at base learning rate `base_lr`.
     pub fn new(kind: OptimizerType, base_lr: f32, groups: ParameterGroupConfig) -> Self {
         let make = |class| {
-            TrainOptimizer::new(
+            TrainOptimizer::for_class(
                 kind,
+                class,
                 groups.learning_rate(class, base_lr),
                 groups.weight_decay(class),
             )
@@ -242,6 +334,7 @@ impl ParamGroupOptimizer {
             make(ParamClass::LoraB)
         });
         Self {
+            kind,
             regular: make(ParamClass::Regular),
             lora_b,
             embedding: make(ParamClass::Embedding),
@@ -251,9 +344,32 @@ impl ParamGroupOptimizer {
         }
     }
 
-    /// Which kind of optimizer every group runs.
+    /// Which kind of optimizer the groups run (Muon's embedding and no-decay
+    /// groups run AdamW, as Muon is for the hidden matrices only).
     pub fn kind(&self) -> OptimizerType {
-        self.regular.kind()
+        self.kind
+    }
+
+    /// Whether training and evaluating use different weights
+    /// ([`eval_weights`](Self::eval_weights)): schedule-free AdamW's.
+    pub fn has_eval_weights(&self) -> bool {
+        self.kind == OptimizerType::AdamWScheduleFree
+    }
+
+    /// Swap `model` to the weights to evaluate and save; see
+    /// [`TrainOptimizer::eval_weights`]. Pair with
+    /// [`train_weights`](Self::train_weights).
+    pub fn eval_weights<M: ModuleParameters>(&mut self, model: &mut M) {
+        for group in self.optimizers_mut() {
+            group.eval_weights(model);
+        }
+    }
+
+    /// Swap `model` back to the weights to train on.
+    pub fn train_weights<M: ModuleParameters>(&mut self, model: &mut M) {
+        for group in self.optimizers_mut() {
+            group.train_weights(model);
+        }
     }
 
     /// The groups the parameters train in.
@@ -360,6 +476,54 @@ impl Optimizer for ParamGroupOptimizer {
             group.advance_step();
         }
         apply_updates(self, model, gradients)
+    }
+}
+
+/// The names a group's state is nested under in a [`ParamGroupOptimizer`]'s.
+const GROUP_NAMES: [(&str, ParamClass); 4] = [
+    ("regular", ParamClass::Regular),
+    ("embedding", ParamClass::Embedding),
+    ("no_decay", ParamClass::NoDecay),
+    ("lora_b", ParamClass::LoraB),
+];
+
+impl ParamGroupOptimizer {
+    fn group(&self, class: ParamClass) -> Option<&TrainOptimizer> {
+        match class {
+            ParamClass::Regular => Some(&self.regular),
+            ParamClass::Embedding => Some(&self.embedding),
+            ParamClass::NoDecay => Some(&self.no_decay),
+            ParamClass::LoraB => self.lora_b.as_ref(),
+        }
+    }
+}
+
+impl StatefulOptimizer for ParamGroupOptimizer {
+    fn export_state(&self) -> OptimizerState {
+        let mut out = OptimizerState::new("param_groups");
+        for (name, class) in GROUP_NAMES {
+            if let Some(group) = self.group(class) {
+                group.export_state().nest(name, &mut out);
+            }
+        }
+        out
+    }
+
+    fn import_state(&mut self, state: &OptimizerState) -> Result<()> {
+        state.expect_kind("param_groups")?;
+        for (name, class) in GROUP_NAMES {
+            let Some(group) = (match class {
+                ParamClass::Regular => Some(&mut self.regular),
+                ParamClass::Embedding => Some(&mut self.embedding),
+                ParamClass::NoDecay => Some(&mut self.no_decay),
+                ParamClass::LoraB => self.lora_b.as_mut(),
+            }) else {
+                continue;
+            };
+            let kind = group.export_state().kind;
+            group.import_state(&state.unnest(name, &kind))?;
+        }
+        Ok(())
     }
 }
 

@@ -1,88 +1,56 @@
-//! Complete training loop with DataLoader integration.
+//! The training loop: data, model and optimizer connected, with gradient
+//! accumulation, learning-rate scheduling, adaptive control, evaluation,
+//! checkpointing and resume.
 //!
-//! This module provides a unified training loop that:
-//! - Connects DataLoader → Model → Optimizer
-//! - Supports gradient accumulation
-//! - Uses the bridge's `value_and_grad` for gradient computation
-//! - Optionally uses Metal FlashAttention for efficient forward pass
-//! - Provides progress tracking and callbacks
+//! There is one loop, [`TrainingLoop::run`]. It reads micro-batches from a
+//! source (padded batches, or rows of packed sequences), turns
+//! each into a loss and gradients, adds them up until an optimizer
+//! step's worth has been seen, and takes the step. Packing, cut cross-entropy,
+//! NEFTune, vision inputs and data-parallel training are properties of the
+//! source, the loss and the gradient exchange, not separate loops.
 //!
-//! # Optimized Training Path
+//! # One evaluation per micro-batch
 //!
-//! The training loop uses a fused step function (`jit_training_step_inner`) that combines
-//! forward pass, backward pass, and optimizer update. MLX's lazy evaluation
-//! automatically optimizes the computation graph.
+//! MLX is lazy: a step is a graph until something evaluates it. The loop
+//! evaluates once per micro-batch, and everything the micro-batch needs goes
+//! into that one call: the loss, and the accumulated gradients when more
+//! micro-batches follow; the loss, the gradient norm, every trainable
+//! parameter and the optimizer's state when the optimizer has stepped. The
+//! loss and norm are read back after it, so reading them waits for nothing.
+//! Evaluating each step also frees its forward and backward graph, which
+//! otherwise stays alive and grows to many times the model.
 //!
-//! ## State Warmup Requirement
+//! # Gradient accumulation
 //!
-//! Optimizers like AdamW lazily initialize their internal state (momentum, velocity
-//! buffers) on the first `update()` call. We use a warmup step to ensure all
-//! optimizer states are properly initialized before the main training loop.
+//! Each micro-batch contributes the sum of its tokens' losses and the number
+//! of tokens that count; an optimizer step's gradient is the gradient of the
+//! mean over all the tokens of its micro-batches. A step is
+//! `gradient_accumulation_steps` micro-batches, however they are padded. The
+//! learning-rate schedule, `max_steps`, logging, evaluation and checkpoints
+//! count optimizer steps; [`TrainingLoop::current_step`] counts micro-batches.
 //!
-//! ## Note on JIT Compilation
+//! # Resume
 //!
-//! The training step is not wrapped in `mx.compile`. Python's
-//! `mx.compile(fn, inputs=state, outputs=state)` tracks the model and optimizer
-//! state explicitly; the bridge has no equivalent stateful compile for a whole
-//! training step, so the loop relies on lazy evaluation instead.
-//!
-//! ## Performance Comparison (Qwen3-0.6B, batch=4, seq=512)
-//!
-//! | Approach | Throughput | Notes |
-//! |----------|------------|-------|
-//! | pmetal (fused) | ~1700-1800 tok/s | Deferred eval + warmup |
-//! | pmetal (basic) | ~500-600 tok/s | Per-step evaluation |
-//!
-//! The fused training path (`--fused` flag) uses deferred evaluation; the step
-//! itself is not compiled (see above).
-//!
-//! ## Using the Optimized Training Path
-//!
-//! Enable fused training for best performance:
-//! ```bash
-//! pmetal train --model <model> --dataset <data> --fused --use-metal-flash-attention
-//! ```
-//!
-//! Note: Fused training requires `gradient_accumulation_steps=1`.
+//! A checkpoint holds the weights, the optimizer's state (moments, step
+//! counters and the f32 master copies of half-precision weights) and the data
+//! loader's position. [`TrainingLoop::resume_from`] loads the latest one, and
+//! the run continues with the batch the interrupted one would have drawn next.
 
-use pmetal_runtime::compat::{
-    Array, Exception,
-    indexing::argmax_axis,
-    module::FlattenedModuleParam,
-    nn,
-    optimizers::{Optimizer, Updatable},
-    transforms,
-};
-// The Rust bridge does not currently expose a working compile-with-state path
-// for training. Callers that request JIT dispatch are routed back to the fused
-// eager path with an explicit warning instead of silently pretending that
-// compilation happened.
 use pmetal_core::{EvalMetrics, TrainingConfig};
-use pmetal_data::{
-    DataLoader, DataLoaderConfig, PackedDataLoader, PackerConfig, TrainingBatch, TrainingDataset,
-    compute_pack_seq_len,
-};
+use pmetal_data::{DataLoader, DataLoaderConfig, TrainingDataset};
 use pmetal_lora::TrainableModel;
-use pmetal_runtime::nn::with_training_mode;
+use pmetal_runtime::compat::{Array, Exception, indexing::argmax_axis};
 
-use crate::mlx_metal_optimizer::{MlxMetalOptimizerBuilder, is_mlx_metal_optimizer_available};
-use crate::step_check::{check_grad_norm, check_step};
+use crate::checkpoint::TrainState;
 use crate::{CheckpointManager, CheckpointMetadata, Result, SftError};
 
-mod run_compiled;
-mod run_metal_fused;
-mod run_packed;
-mod run_standard;
-mod step_functions;
+mod run;
+mod source;
+pub(crate) mod step;
 #[cfg(test)]
 mod tests;
 
-// Re-export step functions so run_*.rs submodules can access them via `use super::*`
-pub(crate) use step_functions::{
-    compute_cce_loss, eval_training_state, jit_training_step_cce, jit_training_step_cce_clipped,
-    jit_training_step_inner, jit_training_step_inner_clipped, jit_training_step_packed,
-    jit_training_step_packed_cce,
-};
+pub(crate) use step::LossSpec;
 
 /// Training loop configuration.
 #[derive(Debug, Clone)]
@@ -91,22 +59,15 @@ pub struct TrainingLoopConfig {
     pub training: TrainingConfig,
     /// DataLoader configuration.
     pub dataloader: DataLoaderConfig,
-    /// Whether to use Metal FlashAttention for training.
-    /// When true, attention layers use O(n) memory FlashAttention.
-    pub use_metal_flash_attention: bool,
-    /// Log every N steps.
+    /// Log every N optimizer steps.
     pub log_every: usize,
-    /// Checkpoint every N steps (0 to disable).
+    /// Checkpoint every N optimizer steps (0 to disable).
     pub checkpoint_every: usize,
-    /// Evaluate every N steps (0 to disable).
+    /// Evaluate every N optimizer steps (0 to disable).
     pub eval_every: usize,
-    /// Whether to request compiled training for the step function.
-    /// The current Rust bridge falls back to fused eager execution when a
-    /// working compile-with-state path is unavailable.
-    pub use_jit_compilation: bool,
-    /// Enable sequence packing for 2-5x throughput on variable-length data.
-    /// Packs multiple shorter sequences into single batches with block-diagonal
-    /// attention masks to prevent cross-sequence attention.
+    /// Pack short sequences into shared rows, with block-diagonal attention
+    /// masks keeping them apart. A model whose recurrent layers cannot reset at
+    /// a packed boundary, or data that does not pack, trains unpacked.
     pub use_sequence_packing: bool,
     /// Enable gradient checkpointing to reduce memory usage.
     /// Trades compute for memory by recomputing activations during backward pass.
@@ -119,39 +80,6 @@ pub struct TrainingLoopConfig {
     /// Recommended default is 5e-5 for embeddings vs 2e-4 for LoRA params.
     /// None means use the same learning rate as other parameters.
     pub embedding_lr: Option<f32>,
-    /// Enable eager evaluation after each training step.
-    ///
-    /// When true, forces immediate evaluation of model parameters and optimizer
-    /// state after each step, clearing intermediate activations from memory.
-    ///
-    /// Trade-off:
-    /// - **Enabled**: Lower memory usage, enables larger batch sizes/sequences
-    /// - **Disabled**: Better throughput via deferred evaluation batching
-    ///
-    /// Recommended: Enable for memory-constrained scenarios (large models/sequences),
-    /// disable for maximum throughput on smaller models.
-    pub eager_evaluation: bool,
-    /// Enable Metal fused optimizer for maximum throughput.
-    ///
-    /// Uses custom Metal kernels that process all parameters in a single dispatch,
-    /// eliminating per-parameter GPU-CPU synchronization overhead.
-    ///
-    /// Expected performance gain: ~40% (from ~1740 to ~2400 tok/s)
-    ///
-    /// Requires Apple Silicon with Metal support.
-    pub use_metal_fused_optimizer: bool,
-
-    /// NEFTune noise alpha for embedding fine-tuning (Jain et al., 2023).
-    ///
-    /// When set, uniform noise U(-mag, mag) is added to token embeddings during
-    /// each training forward pass, where `mag = alpha / sqrt(seq_len * embed_dim)`.
-    /// This regularisation improves instruction-following by 15-20% with no extra
-    /// compute cost and no change to inference.
-    ///
-    /// Recommended values: 5.0 for small models, 15.0 for larger models.
-    /// `None` disables NEFTune (default).
-    pub neftune_noise_alpha: Option<f32>,
-
     /// LoRA+ B/A learning rate ratio (Hayou et al., ICML 2024).
     ///
     /// When set, LoRA B matrices receive `base_lr * ratio` while A matrices use `base_lr`.
@@ -167,17 +95,17 @@ pub struct TrainingLoopConfig {
     /// hidden states without materializing the full logits tensor.  This reduces memory
     /// by up to 37x for large vocabularies (e.g., 150K tokens in Qwen3.5).
     ///
-    /// Covers packed and unpacked text batches. When it can't apply (NEFTune
-    /// on an unpacked path, image batches, a model with no usable LM head) the
-    /// run warns once and computes the loss from the full logits; see
+    /// Covers packed and unpacked text batches. When it can't apply (image
+    /// batches, a model with no usable LM head) the run warns once and
+    /// computes the loss from the full logits; see
     /// `TrainingLoop::cut_cross_entropy_applies`.
     pub use_cut_cross_entropy: bool,
 
     /// Override the maximum sequence length used for sequence packing.
     ///
-    /// When `None` (default), `run_packed` auto-computes the packing length from
-    /// the p99 of sample lengths in the training dataset, rounded up to the next
-    /// power of two and capped at `dataloader.max_seq_len`.
+    /// When `None` (default), packing auto-computes the length from the p99 of
+    /// sample lengths in the training dataset, rounded up to the next power of
+    /// two and capped at `dataloader.max_seq_len`.
     ///
     /// When `Some(n)`, the explicit value `n` is used directly, bypassing the
     /// adaptive computation.  Useful for reproducibility or when the dataset p99
@@ -196,23 +124,64 @@ impl Default for TrainingLoopConfig {
         Self {
             training: TrainingConfig::default(),
             dataloader: DataLoaderConfig::default(),
-            use_metal_flash_attention: true,
             log_every: 10,
             checkpoint_every: 500,
             eval_every: 100,
-            use_jit_compilation: false,
             use_sequence_packing: false,
             gradient_checkpointing: false,
             gradient_checkpointing_layers: 4,
             embedding_lr: None,
-            eager_evaluation: false,
-            use_metal_fused_optimizer: false,
-            neftune_noise_alpha: None,
             loraplus_lr_ratio: None,
             use_cut_cross_entropy: false,
             pack_max_seq_len: None,
             #[cfg(feature = "distributed")]
             distributed: None,
+        }
+    }
+}
+
+impl TrainingLoopConfig {
+    /// Check the settings the loop acts on, before it does.
+    ///
+    /// # Errors
+    /// [`SftError::Config`] naming every setting that cannot work: the
+    /// training section's own checks ([`pmetal_core::ConfigValidator`]), a
+    /// zero batch size, a rank outside its world, and the rates.
+    pub fn validate(&self) -> Result<()> {
+        use pmetal_core::ConfigValidator;
+        let mut problems = Vec::new();
+        if let Err(e) = self.training.validate() {
+            problems.push(e.to_string());
+        }
+        if self.dataloader.batch_size == 0 {
+            problems.push("dataloader.batch_size must be at least 1".to_string());
+        }
+        if self.dataloader.world_size == 0
+            || self.dataloader.rank >= self.dataloader.world_size.max(1)
+        {
+            problems.push(format!(
+                "rank {} is not in a world of {}",
+                self.dataloader.rank, self.dataloader.world_size
+            ));
+        }
+        if let Some(lr) = self.embedding_lr
+            && !(lr.is_finite() && lr >= 0.0)
+        {
+            problems.push(format!(
+                "embedding_lr must be finite and non-negative, got {lr}"
+            ));
+        }
+        if let Some(ratio) = self.loraplus_lr_ratio
+            && !(ratio.is_finite() && ratio > 0.0)
+        {
+            problems.push(format!(
+                "loraplus_lr_ratio must be finite and positive, got {ratio}"
+            ));
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(SftError::Config(problems.join("; ")))
         }
     }
 }
@@ -254,7 +223,7 @@ pub enum AdaptiveAction {
 pub struct TrainingLoop {
     /// Configuration.
     pub(crate) config: TrainingLoopConfig,
-    /// Current step.
+    /// Current step: micro-batches taken so far.
     pub(crate) step: usize,
     /// Current epoch.
     pub(crate) epoch: usize,
@@ -262,22 +231,14 @@ pub struct TrainingLoop {
     pub(crate) running_loss: f64,
     /// Total tokens processed.
     pub(crate) total_tokens: usize,
-    /// Accumulated gradients for gradient accumulation.
-    pub(crate) accumulated_grads: Option<FlattenedModuleParam>,
-    /// Accumulation step counter.
-    pub(crate) accumulation_step: usize,
-    /// Whether Metal FlashAttention is available.
-    pub(crate) metal_fa_available: bool,
+    /// The micro-batches of the optimizer step in progress.
+    pub(crate) accumulator: step::GradAccumulator,
     /// Tokens accumulated since last log (for throughput calculation).
     pub(crate) tokens_since_log: usize,
     /// Time of last log (for throughput calculation).
     pub(crate) last_log_time: Option<std::time::Instant>,
     /// Step number at the last log boundary.
     pub(crate) last_log_step: Option<usize>,
-    /// Accumulated loss across micro-batches for gradient accumulation.
-    pub(crate) accumulated_loss: f64,
-    /// Number of micro-batches accumulated (for averaging).
-    pub(crate) loss_accumulation_count: usize,
     /// Background thread handle for the most recent async checkpoint write.
     ///
     /// Checkpoint I/O (safetensors serialization + JSON metadata) is offloaded to a
@@ -309,31 +270,31 @@ pub struct TrainingLoop {
     /// Set once the run has said why cut cross-entropy is not in effect, so
     /// the reason is given once rather than every step.
     pub(crate) cce_unavailable_reported: std::cell::Cell<bool>,
+    /// What [`Self::resume_from`] loaded, for [`Self::run`] to continue from.
+    pub(crate) pending_resume: Option<TrainState>,
 }
 
 impl TrainingLoop {
-    /// Create a new training loop.
-    pub fn new(mut config: TrainingLoopConfig) -> Self {
+    /// Create a training loop.
+    ///
+    /// # Errors
+    /// [`SftError::Config`] if the configuration cannot work
+    /// ([`TrainingLoopConfig::validate`]): a loop is never built on settings
+    /// that would fail or silently do nothing partway through a run.
+    pub fn new(mut config: TrainingLoopConfig) -> Result<Self> {
+        config.validate()?;
         config.log_every = config.log_every.max(1);
 
-        // Whether gradient steps run in `with_training_mode`, which the model
-        // forwards read to skip generation-only paths.
-        let metal_fa_available = config.use_metal_flash_attention;
-
-        Self {
+        Ok(Self {
             config,
             step: 0,
             epoch: 0,
             running_loss: 0.0,
             total_tokens: 0,
-            accumulated_grads: None,
-            accumulation_step: 0,
-            metal_fa_available,
+            accumulator: step::GradAccumulator::default(),
             tokens_since_log: 0,
             last_log_time: None,
             last_log_step: None,
-            accumulated_loss: 0.0,
-            loss_accumulation_count: 0,
             pending_checkpoint: None,
             callbacks: Vec::new(),
             adaptive_lr: None,
@@ -345,7 +306,8 @@ impl TrainingLoop {
             schedule_total_steps: None,
             micro_steps_per_update: 1,
             cce_unavailable_reported: std::cell::Cell::new(false),
-        }
+            pending_resume: None,
+        })
     }
 
     /// Add a training callback for metrics logging or dashboard integration.
@@ -404,8 +366,8 @@ impl TrainingLoop {
         }
     }
 
-    /// The parameter groups every loop variant trains: the configured weight
-    /// decay, and the embedding and LoRA+ rates when they are set.
+    /// The parameter groups every run trains: the configured weight decay,
+    /// and the embedding and LoRA+ rates when they are set.
     ///
     /// `output_projection` is where the model's output head sits
     /// ([`pmetal_lora::TrainableModel::output_projection_path`]), so the head trains at
@@ -428,9 +390,8 @@ impl TrainingLoop {
         groups
     }
 
-    /// The optimizer the standard, packed and compiled loops train with: the
-    /// kind `training.optimizer` names, at the configured learning rate, over
-    /// [`Self::parameter_groups`].
+    /// The optimizer the loop trains with: the kind `training.optimizer`
+    /// names, at the configured learning rate, over [`Self::parameter_groups`].
     pub fn build_optimizer(&self, output_projection: Option<String>) -> crate::ParamGroupOptimizer {
         let training = &self.config.training;
         let base_lr = training.learning_rate as f32;
@@ -444,38 +405,6 @@ impl TrainingLoop {
             base_lr,
             self.parameter_groups(output_projection),
         )
-    }
-
-    /// The Metal fused AdamW [`Self::run_metal_fused`] trains with: the same
-    /// learning rate and [`Self::parameter_groups`] as
-    /// [`Self::build_optimizer`]'s AdamW, so it updates every parameter as
-    /// the standard loop does.
-    pub fn build_metal_fused_optimizer(
-        &self,
-        output_projection: Option<String>,
-    ) -> std::result::Result<
-        crate::mlx_metal_optimizer::MlxMetalOptimizer,
-        crate::mlx_metal_optimizer::MlxMetalOptimizerError,
-    > {
-        let base_lr = self.config.training.learning_rate as f32;
-        MlxMetalOptimizerBuilder::new(base_lr)
-            .param_groups(self.parameter_groups(output_projection))
-            .build()
-    }
-
-    /// Run the standard loop while retaining ownership of the model.
-    pub(crate) fn run_standard_owned<M>(
-        &mut self,
-        mut model: M,
-        train_dataset: TrainingDataset,
-        eval_dataset: Option<TrainingDataset>,
-        checkpoint_manager: Option<&CheckpointManager>,
-    ) -> Result<M>
-    where
-        M: TrainableModel,
-    {
-        self.run(&mut model, train_dataset, eval_dataset, checkpoint_manager)?;
-        Ok(model)
     }
 
     /// Start a new logging interval from the current training step.
@@ -526,7 +455,7 @@ impl TrainingLoop {
     /// Set the distributed gradient sync bridge for multi-node training.
     #[cfg(feature = "distributed")]
     pub fn set_distributed(&mut self, sync: crate::distributed_bridge::DistributedGradientSync) {
-        // Also update the DataLoader config for data sharding
+        // Each rank trains its own share of the data.
         self.config.dataloader.rank = sync.rank();
         self.config.dataloader.world_size = sync.world_size();
         self.distributed = Some(sync);
@@ -540,8 +469,7 @@ impl TrainingLoop {
         let Some(dist) = &self.distributed else {
             return Ok(stats);
         };
-        let loss = tokio::runtime::Handle::current()
-            .block_on(async { dist.sync_loss(stats.loss).await })?;
+        let loss = crate::distributed_bridge::block_on(dist.sync_loss(stats.loss))?;
         Ok(StepStats { loss, ..stats })
     }
 
@@ -577,7 +505,7 @@ impl TrainingLoop {
     }
 
     /// Returns true if any callback has requested training to stop.
-    fn check_cancelled(&self) -> bool {
+    pub(crate) fn check_cancelled(&self) -> bool {
         self.callbacks.iter().any(|cb| cb.should_stop())
     }
 
@@ -758,56 +686,6 @@ impl TrainingLoop {
         }
     }
 
-    /// Unified post-step logic: adaptive LR + snapshot + rollback handling.
-    ///
-    /// Consolidates the pattern duplicated across all training loop variants:
-    ///   1. Feed loss to adaptive LR controller
-    ///   2. Snapshot best weights if loss improved
-    ///   3. Restore from snapshot on rollback
-    ///   4. Signal early stop when max rollbacks exhausted
-    ///
-    /// Returns `AdaptiveAction` indicating what the caller should do next.
-    pub fn post_step_adaptive<M: TrainableModel>(
-        &mut self,
-        loss: f64,
-        model: &mut M,
-    ) -> AdaptiveAction {
-        let action = self.apply_adaptive_lr(loss);
-        match action {
-            AdaptiveAction::Continue => {
-                if self.should_snapshot_best() {
-                    self.snapshot_best_weights(model);
-                }
-                AdaptiveAction::Continue
-            }
-            AdaptiveAction::Rollback => {
-                tracing::warn!(
-                    step = self.step,
-                    "Divergence detected — rolling back to best snapshot"
-                );
-                if self.restore_best_weights(model) {
-                    AdaptiveAction::Rollback
-                } else {
-                    // No snapshot available — treat as continue
-                    AdaptiveAction::Continue
-                }
-            }
-            AdaptiveAction::EarlyStop => {
-                tracing::warn!(step = self.step, "Max rollbacks exhausted — early stopping");
-                AdaptiveAction::EarlyStop
-            }
-            AdaptiveAction::SaveCheckpoint => {
-                tracing::info!(step = self.step, "External checkpoint save requested");
-                AdaptiveAction::SaveCheckpoint
-            }
-            AdaptiveAction::GracefulStop => {
-                tracing::info!(step = self.step, "External graceful stop requested");
-                self.restore_best_weights(model);
-                AdaptiveAction::GracefulStop
-            }
-        }
-    }
-
     /// Whether this rank should perform checkpoint writes.
     ///
     /// Non-distributed builds always write; distributed builds only write
@@ -825,375 +703,25 @@ impl TrainingLoop {
         }
     }
 
-    /// Composes [`post_step_adaptive`] with the checkpoint-on-stop behavior
-    /// that every training loop variant previously duplicated.
-    ///
-    /// Returns `Ok(true)` when the caller should `return Ok(())` from the
-    /// training loop — i.e. the adaptive LR controller signaled `EarlyStop`
-    /// or `GracefulStop`, and a final "best" checkpoint (if a manager was
-    /// provided) has been written. Returns `Ok(false)` for Continue,
-    /// Rollback, or SaveCheckpoint — Continue and Rollback do nothing
-    /// extra; SaveCheckpoint writes a regular checkpoint first.
-    ///
-    /// [`post_step_adaptive`]: Self::post_step_adaptive
-    pub fn post_step_adaptive_with_checkpoint<M: TrainableModel>(
-        &mut self,
-        loss: f64,
-        model: &mut M,
-        checkpoint_manager: Option<&CheckpointManager>,
-    ) -> Result<bool> {
-        match self.post_step_adaptive(loss, model) {
-            AdaptiveAction::EarlyStop | AdaptiveAction::GracefulStop => {
-                if self.is_checkpoint_master() {
-                    if let Some(manager) = checkpoint_manager {
-                        self.save_checkpoint(model, manager, true, Some(self.running_loss))?;
-                    }
-                }
-                Ok(true)
-            }
-            AdaptiveAction::SaveCheckpoint => {
-                if self.is_checkpoint_master() {
-                    if let Some(manager) = checkpoint_manager {
-                        self.save_checkpoint(model, manager, false, Some(self.running_loss))?;
-                    }
-                }
-                Ok(false)
-            }
-            AdaptiveAction::Continue | AdaptiveAction::Rollback => Ok(false),
-        }
-    }
-
-    /// Run evaluation at the current step if the schedule calls for it and
-    /// write a "best" checkpoint on improvement. Returns the (possibly
-    /// updated) best-eval-loss bookkeeping value.
-    ///
-    /// Used by every training loop variant that supports mid-training
-    /// evaluation. No-op when `eval_every == 0`, the step isn't on the
-    /// schedule, or no eval dataset was provided.
-    pub fn maybe_evaluate<M: TrainableModel>(
-        &mut self,
-        model: &mut M,
-        eval_dataset: Option<&TrainingDataset>,
-        checkpoint_manager: Option<&CheckpointManager>,
-        best_eval_loss: f64,
-    ) -> Result<f64> {
-        if self.config.eval_every == 0 || self.step % self.config.eval_every != 0 {
-            return Ok(best_eval_loss);
-        }
-        let Some(eval_ds) = eval_dataset else {
-            return Ok(best_eval_loss);
-        };
-        let metrics = self.evaluate(model, eval_ds)?;
-        let acc_str = metrics
-            .accuracy
-            .map(|a| format!(", acc={a:.2}%"))
-            .unwrap_or_default();
-        tracing::info!(
-            "Step {}: eval_loss={:.4}, ppl={:.2}{}",
-            self.step,
-            metrics.loss,
-            metrics.perplexity,
-            acc_str
-        );
-        if metrics.loss < best_eval_loss {
-            if self.is_checkpoint_master() {
-                if let Some(manager) = checkpoint_manager {
-                    self.save_checkpoint(model, manager, true, Some(metrics.loss))?;
-                }
-            }
-            Ok(metrics.loss)
-        } else {
-            Ok(best_eval_loss)
-        }
-    }
-
-    /// Save a regular (non-best) checkpoint if the schedule calls for it
-    /// and this rank is the checkpoint master.
-    pub fn maybe_save_regular_checkpoint<M: TrainableModel>(
-        &mut self,
-        model: &mut M,
-        checkpoint_manager: Option<&CheckpointManager>,
-    ) -> Result<()> {
-        if self.config.checkpoint_every > 0
-            && self.step % self.config.checkpoint_every == 0
-            && self.is_checkpoint_master()
-        {
-            if let Some(manager) = checkpoint_manager {
-                self.save_checkpoint(model, manager, false, None)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Compute loss for a batch.
-    fn compute_loss(logits: &Array, labels: &Array) -> Result<Array> {
-        Ok(pmetal_runtime::training::causal_lm_loss(
-            logits, labels, -100,
-        ))
-    }
-
-    /// Clip gradients by global norm (GPU-based, no sync required).
-    ///
-    /// OPTIMIZED: All operations stay on GPU using lazy evaluation.
-    /// - Computes scale = min(1.0, max_norm / norm) entirely on GPU
-    /// - Always applies scale (even if 1.0) to avoid CPU branch
-    /// - Returns lazy norm Array that can be optionally eval'd for logging
-    ///
-    /// This eliminates the GPU-CPU synchronization overhead that was previously
-    /// required to determine if clipping was needed.
-    pub(crate) fn clip_gradients_gpu(
-        &self,
-        grads: &mut FlattenedModuleParam,
-    ) -> Result<Option<Array>> {
-        let max_norm = self.config.training.max_grad_norm as f32;
-        if max_norm <= 0.0 {
-            return Ok(None);
-        }
-
-        let norm = pmetal_runtime::training::clip_grad_norm_map(grads, max_norm);
-
-        // Return lazy norm - caller can eval() for logging if needed
-        Ok(Some(norm))
-    }
-
-    /// Accumulate gradients.
-    pub(crate) fn accumulate_gradients(&mut self, new_grads: FlattenedModuleParam) -> Result<()> {
-        let accum_steps = self.config.training.gradient_accumulation_steps;
-
-        match &mut self.accumulated_grads {
-            None => {
-                // First accumulation step - scale gradients
-                let scale = 1.0 / accum_steps as f32;
-                let scale_arr = Array::from_f32(scale);
-                let mut scaled: FlattenedModuleParam = FlattenedModuleParam::new();
-                for (k, v) in new_grads {
-                    let scaled_grad = v.multiply(&scale_arr);
-                    scaled.insert(k, scaled_grad);
-                }
-                self.accumulated_grads = Some(scaled);
-            }
-            Some(acc) => {
-                // Accumulate: acc += new_grads / accum_steps
-                let scale = 1.0 / accum_steps as f32;
-                let scale_arr = Array::from_f32(scale);
-                for (key, new_grad) in new_grads {
-                    if let Some(existing) = acc.get_mut(&key) {
-                        let scaled = new_grad.multiply(&scale_arr);
-                        *existing = existing.add(&scaled);
-                    } else {
-                        let scaled = new_grad.multiply(&scale_arr);
-                        acc.insert(key, scaled);
-                    }
-                }
-            }
-        }
-
-        self.accumulation_step += 1;
-
-        // Evaluate accumulated gradients to free the backward computation graph.
-        // Without this, each micro-batch's gradient arrays keep the entire
-        // forward+backward graph alive (~14 GB per step for a 0.6B model).
-        // With grad_accum=4, that's 56 GB before any evaluation happens.
-        if let Some(ref acc) = self.accumulated_grads {
-            let grad_arrays: Vec<&Array> = acc.values().collect();
-            if !grad_arrays.is_empty() {
-                transforms::eval(grad_arrays)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Check if we should apply accumulated gradients.
-    pub(crate) fn should_apply_gradients(&self) -> bool {
-        self.accumulation_step >= self.config.training.gradient_accumulation_steps
-    }
-
-    /// Take accumulated gradients and reset counter.
-    pub(crate) fn take_accumulated_gradients(&mut self) -> Option<FlattenedModuleParam> {
-        self.accumulation_step = 0;
-        self.accumulated_grads.take()
-    }
-
-    /// Perform a single training step.
-    ///
-    /// This computes gradients with the bridge's autodiff and handles gradient accumulation.
-    /// Supports both text-only and multimodal (VLM) batches with pixel_values.
-    pub fn train_step<M, O>(
-        &mut self,
-        model: &mut M,
-        batch: &TrainingBatch,
-        optimizer: &mut O,
-    ) -> Result<StepStats>
-    where
-        M: TrainableModel,
-        O: Optimizer + Updatable,
-    {
-        let start_time = std::time::Instant::now();
-
-        // Track tokens - use checked arithmetic to prevent overflow
-        let batch_tokens = batch.batch_size.saturating_mul(batch.seq_len);
-
-        if self.step <= 1 {
-            tracing::debug!(
-                step = self.step,
-                batch_size = batch.batch_size,
-                seq_len = batch.seq_len,
-                "train_step: computing loss and gradients"
-            );
-        }
-
-        // Compute loss and gradients based on whether we have pixel values (VLM)
-        let (loss, grads) = if let Some(ref pixel_values) = batch.pixel_values {
-            // VLM training with image inputs
-            self.compute_vlm_loss_and_grads(model, batch, pixel_values)?
-        } else {
-            // Text-only training (standard path)
-            self.compute_text_loss_and_grads(model, batch)?
-        };
-
-        // Evaluate loss for this micro-batch
-        // NOTE: The step is not compiled (see the module note), so deferring
-        // evaluation just builds up a massive computation graph.
-        if self.step <= 1 {
-            tracing::debug!(step = self.step, "train_step: evaluating loss...");
-        }
-        loss.eval();
-        let micro_batch_loss = check_step(self.step + 1, loss.item::<f32>())?;
-        if self.step <= 3 {
-            let active = pmetal_runtime::inline_array::get_active_memory();
-            let cache = pmetal_runtime::inline_array::get_cache_memory();
-            tracing::info!(
-                step = self.step,
-                loss = micro_batch_loss,
-                active_mb = active / (1024 * 1024),
-                cache_mb = cache / (1024 * 1024),
-                "train_step: loss evaluated"
-            );
-        }
-
-        // Accumulate loss across micro-batches for accurate reporting
-        self.accumulated_loss += micro_batch_loss as f64;
-        self.loss_accumulation_count += 1;
-
-        // Accumulate gradients
-        self.accumulate_gradients(grads)?;
-
-        // Apply gradients if accumulation is complete
-        // Use GPU-based clipping to avoid GPU-CPU sync overhead
-        let grad_norm = if self.should_apply_gradients() {
-            if let Some(mut accumulated) = self.take_accumulated_gradients() {
-                // Clip gradients using GPU-based method (no sync required)
-                // Returns lazy norm Array that we only eval when logging
-                let lazy_norm = self.clip_gradients_gpu(&mut accumulated)?;
-
-                // Distributed gradient sync: all-reduce gradients across nodes
-                #[cfg(feature = "distributed")]
-                if let Some(ref mut dist) = self.distributed {
-                    tokio::runtime::Handle::current()
-                        .block_on(async { dist.sync_gradients(&mut accumulated).await })?;
-                }
-
-                // Apply with optimizer (lazy - no eval by default)
-                optimizer.update(model, accumulated)?;
-
-                // Eager evaluation mode
-                // Forces immediate evaluation to clear intermediate activations.
-                // Trade-off: Lower memory usage vs lower throughput.
-                if self.config.eager_evaluation {
-                    // Eval only trainable (LoRA) parameters — NOT the frozen base
-                    // model. Evaluating all 600M+ params of a frozen model every step
-                    // is wasteful and can spike memory via unnecessary GPU->CPU sync.
-                    // Equivalent to mx.eval(state, losses, ...).
-                    let _ = pmetal_runtime::compat::eval_params(model.trainable_parameters());
-                    // Optimizer state (momentum/variance for Adam)
-                    let opt_states: Vec<&Array> =
-                        optimizer.updatable_states().into_iter().collect();
-                    if !opt_states.is_empty() {
-                        let _ = transforms::eval(opt_states);
-                    }
-                }
-                // NOTE: Do NOT clear the buffer cache here. MLX's cache holds
-                // freed buffers for reuse — clearing it forces fresh allocations
-                // that inflate RSS. The step is not compiled, so
-                // every step allocates new buffers; the cache is what prevents
-                // unbounded RSS growth by recycling them. MLX's built-in
-                // backpressure (memory_limit) handles OOM prevention.
-
-                // NOTE: When eager_evaluation is false, we use deferred evaluation.
-                // MLX builds a lazy computation graph - forcing evaluation after
-                // every optimizer step is a massive bottleneck (20-50s per step!).
-                // Parameters will be evaluated lazily when needed (at logging or
-                // checkpoint time).
-
-                // Always compute grad_norm when clipping is enabled (tests expect this).
-                // The lazy Array is evaluated here — syncs GPU->CPU.
-                if let Some(norm_arr) = lazy_norm {
-                    norm_arr.eval();
-                    Some(check_grad_norm(self.step + 1, norm_arr.item::<f32>())?)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Compute the reported loss: average across micro-batches when gradient
-        // accumulation completes, otherwise report the current micro-batch loss.
-        let loss_val = if grad_norm.is_some() {
-            // Gradients were applied — report averaged loss across all micro-batches
-            let avg = self.accumulated_loss / self.loss_accumulation_count.max(1) as f64;
-            self.accumulated_loss = 0.0;
-            self.loss_accumulation_count = 0;
-            avg as f32
-        } else {
-            micro_batch_loss
-        };
-
-        // Update stats
-        self.step += 1;
-        self.total_tokens += batch_tokens;
-        self.tokens_since_log += batch_tokens;
-
-        // Update running loss EMA
-        self.running_loss = if self.step == 1 {
-            loss_val as f64
-        } else {
-            0.99 * self.running_loss + 0.01 * loss_val as f64
-        };
-
-        let step_time_ms = start_time.elapsed().as_millis() as u64;
-
-        Ok(StepStats {
-            step: self.step,
-            loss: loss_val,
-            learning_rate: self.get_learning_rate(),
-            tokens: batch_tokens,
-            grad_norm,
-            step_time_ms,
-        })
-    }
-
     /// Whether a step's loss goes through cut cross-entropy: asked for, and
     /// possible for this model and configuration.
     ///
     /// When it was asked for and is not possible, the run says why, once, and
     /// computes the loss from the full logits; the run is not refused, since
-    /// CCE changes memory and not the loss. Every training path decides here,
-    /// so none of them falls back without saying so. `packed` is for the
-    /// packed path, which applies no NEFTune noise either way.
+    /// CCE changes memory and not the loss. Every path decides here, so none
+    /// of them falls back without saying so. `images` is for a batch with a
+    /// vision input, which goes through the vision forward, which returns
+    /// logits.
     pub(crate) fn cut_cross_entropy_applies<M: TrainableModel>(
         &self,
         model: &M,
-        packed: bool,
+        images: bool,
     ) -> bool {
         if !self.config.use_cut_cross_entropy {
             return false;
         }
-        let reason = if self.config.neftune_noise_alpha.is_some() && !packed {
-            "NEFTune adds its noise in the full-logits forward"
+        let reason = if images {
+            "image batches go through the vision forward, which returns logits"
         } else if model.lm_head().is_none() {
             "the model has no LM head in the form it computes from (or an adapter on the \
              head applies dropout, which no single weight reproduces)"
@@ -1214,98 +742,16 @@ impl TrainingLoop {
         }
     }
 
-    /// Compute loss and gradients for text-only training.
-    ///
-    /// When [`cut_cross_entropy_applies`](Self::cut_cross_entropy_applies),
-    /// computes the loss directly from hidden states without materialising
-    /// the full `[batch, seq, vocab]` logits.
-    pub(crate) fn compute_text_loss_and_grads<M: TrainableModel>(
-        &self,
-        model: &mut M,
-        batch: &TrainingBatch,
-    ) -> Result<(Array, FlattenedModuleParam)> {
-        let neftune_alpha = self.config.neftune_noise_alpha;
-
-        if self.cut_cross_entropy_applies(model, false) {
-            // CCE path: forward hidden states, then compute loss without logits.
-            let loss_fn = |model: &mut M,
-                           (input_ids, labels): (&Array, &Array)|
-             -> std::result::Result<Array, Exception> {
-                let hidden = model.forward_hidden(input_ids, None);
-                compute_cce_loss(model, hidden, labels)
-            };
-
-            let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
-            let (loss, grads) = if self.metal_fa_available {
-                with_training_mode(|| loss_and_grad_fn(model, (&batch.input_ids, &batch.labels)))?
-            } else {
-                loss_and_grad_fn(model, (&batch.input_ids, &batch.labels))?
-            };
-            Ok((loss, grads))
-        } else {
-            // Standard path: forward through lm_head, compute cross-entropy.
-            let loss_fn = |model: &mut M,
-                           (input_ids, labels): (&Array, &Array)|
-             -> std::result::Result<Array, Exception> {
-                let logits = if let Some(alpha) = neftune_alpha {
-                    model
-                        .forward_noised(input_ids, None, alpha)
-                        .map_err(|e| Exception::custom(e.to_string()))?
-                } else {
-                    model
-                        .forward(input_ids, None)
-                        .map_err(|e| Exception::custom(e.to_string()))?
-                };
-                Self::compute_loss(&logits, labels).map_err(|e| Exception::custom(e.to_string()))
-            };
-
-            let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
-            let (loss, grads) = if self.metal_fa_available {
-                with_training_mode(|| loss_and_grad_fn(model, (&batch.input_ids, &batch.labels)))?
-            } else {
-                loss_and_grad_fn(model, (&batch.input_ids, &batch.labels))?
-            };
-            Ok((loss, grads))
+    /// The loss's shape for a step on `model`: the config's smoothing, z-loss
+    /// and NEFTune noise, and whether cut cross-entropy applies.
+    pub(crate) fn loss_spec<M: TrainableModel>(&self, model: &M, images: bool) -> LossSpec {
+        let training = &self.config.training;
+        LossSpec {
+            label_smoothing: training.label_smoothing as f32,
+            z_loss: training.z_loss as f32,
+            neftune_alpha: training.neftune_noise_alpha.map(|a| a as f32),
+            cut_cross_entropy: self.cut_cross_entropy_applies(model, images),
         }
-    }
-
-    /// Compute loss and gradients for VLM (Vision-Language Model) training.
-    fn compute_vlm_loss_and_grads<M: TrainableModel>(
-        &self,
-        model: &mut M,
-        batch: &TrainingBatch,
-        pixel_values: &Array,
-    ) -> Result<(Array, FlattenedModuleParam)> {
-        if self.config.use_cut_cross_entropy {
-            self.cut_cross_entropy_unavailable(
-                "image batches go through the vision forward, which returns logits",
-            );
-        }
-        // Clone pixel_values to move into closure
-        let pixels = pixel_values.clone();
-
-        // Define loss function for VLM autodiff
-        let loss_fn = |model: &mut M,
-                       (input_ids, labels): (&Array, &Array)|
-         -> std::result::Result<Array, Exception> {
-            // Use forward_with_images for VLM models
-            let logits = model
-                .forward_with_images(input_ids, None, Some(&pixels))
-                .map_err(|e| Exception::custom(e.to_string()))?;
-            Self::compute_loss(&logits, labels).map_err(|e| Exception::custom(e.to_string()))
-        };
-
-        // Create value_and_grad function
-        let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
-
-        // Optionally enable Metal FlashAttention for forward pass
-        let (loss, grads) = if self.metal_fa_available {
-            with_training_mode(|| loss_and_grad_fn(model, (&batch.input_ids, &batch.labels)))?
-        } else {
-            loss_and_grad_fn(model, (&batch.input_ids, &batch.labels))?
-        };
-
-        Ok((loss, grads))
     }
 
     /// Evaluate the model on a dataset.
@@ -1314,28 +760,48 @@ impl TrainingLoop {
     /// - Average loss across all batches
     /// - Perplexity (exp(loss))
     /// - Token-level accuracy (correct next-token predictions)
+    ///
+    /// The loss is the plain next-token cross-entropy, whatever smoothing or
+    /// z-loss the training loss adds: evaluation measures the model, not the
+    /// regularizer.
     pub fn evaluate<M>(&self, model: &mut M, dataset: &TrainingDataset) -> Result<EvalMetrics>
     where
         M: TrainableModel,
     {
-        let mut eval_config = self.config.dataloader.clone();
-        eval_config.shuffle = false;
-        eval_config.drop_last = false;
+        let mut dataloader = self.eval_loader(std::sync::Arc::new(dataset.clone()));
+        self.evaluate_with(model, &mut dataloader)
+    }
 
-        let dataloader = DataLoader::new(dataset.clone(), eval_config, None);
+    /// [`evaluate`](Self::evaluate) over a loader built once and reused, so a
+    /// run that evaluates every few steps does not copy the dataset each time.
+    pub(crate) fn evaluate_with<M>(
+        &self,
+        model: &mut M,
+        dataloader: &mut DataLoader,
+    ) -> Result<EvalMetrics>
+    where
+        M: TrainableModel,
+    {
+        dataloader.reset(None);
 
         let mut total_loss = 0.0;
         let mut total_correct = 0_u64;
         let mut total_tokens = 0_u64;
         let mut num_batches = 0;
 
-        for batch in dataloader {
+        while let Some(batch) = dataloader
+            .try_next_batch()
+            .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?
+        {
             let logits = model
                 .forward(&batch.input_ids, None)
                 .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
 
-            // Compute loss
-            let loss = Self::compute_loss(&logits, &batch.labels)?;
+            let loss = pmetal_runtime::training::causal_lm_loss(
+                &logits,
+                &batch.labels,
+                step::IGNORE_INDEX,
+            );
             loss.eval();
             total_loss += loss.item::<f32>() as f64;
 
@@ -1393,38 +859,54 @@ impl TrainingLoop {
         // Get predictions (argmax over vocab dimension)
         let flat_logits = shift_logits.reshape(&[-1, vocab_size]);
         let predictions = argmax_axis(&flat_logits, -1, false);
-        predictions.eval();
 
         let flat_labels = shift_labels.reshape(&[-1]);
-        flat_labels.eval();
 
-        // Create mask for valid tokens (label != -100)
-        let ignore_index = Array::from_int(-100);
-        let valid_mask = flat_labels.ne(&ignore_index);
-        valid_mask.eval();
-
-        // Count valid tokens (cast bool→f32 before sum — bridge item_f32
-        // doesn't handle bool dtype correctly)
+        // Valid tokens: label != -100.
+        let valid_mask = flat_labels.ne(&Array::from_int(step::IGNORE_INDEX));
         let valid_mask_f32 = valid_mask.as_type::<f32>();
-        let total_valid = valid_mask_f32.sum(None);
-        total_valid.eval();
-        let total_tokens = total_valid.item_f32() as u64;
-
-        if total_tokens == 0 {
-            return Ok((0, 0));
-        }
-
-        // Compare predictions with labels (both i32 from the bridge dataloader)
         let correct = predictions.eq(&flat_labels).as_type::<f32>();
-        let valid_correct = correct.multiply(&valid_mask_f32);
-        let correct_sum = valid_correct.sum(None);
-        correct_sum.eval();
-        let correct_count = correct_sum.item_f32() as u64;
+        let correct_sum = correct.multiply(&valid_mask_f32).sum(None);
+        let total_valid = valid_mask_f32.sum(None);
+        // One evaluation for both counts.
+        pmetal_runtime::compat::transforms::eval([&total_valid, &correct_sum])?;
 
-        Ok((correct_count, total_tokens))
+        Ok((correct_sum.item_f32() as u64, total_valid.item_f32() as u64))
     }
 
-    /// Save a checkpoint, offloading the I/O to a background thread.
+    /// Get current training step: micro-batches taken.
+    pub fn current_step(&self) -> usize {
+        self.step
+    }
+
+    /// Get current epoch.
+    pub fn current_epoch(&self) -> usize {
+        self.epoch
+    }
+
+    /// Get running loss.
+    pub fn current_loss(&self) -> f64 {
+        self.running_loss
+    }
+
+    /// Get total tokens processed.
+    pub fn total_tokens(&self) -> usize {
+        self.total_tokens
+    }
+
+    /// Set step (for testing and checkpoint restore).
+    pub fn set_step(&mut self, step: usize) {
+        self.step = step;
+    }
+
+    /// Set epoch (for testing and checkpoint restore).
+    pub fn set_epoch(&mut self, epoch: usize) {
+        self.epoch = epoch;
+    }
+
+    /// Save a checkpoint of the model's weights, offloading the I/O to a
+    /// background thread. A run's own checkpoints also hold the optimizer's
+    /// state and the data position; this is the weights alone.
     ///
     /// The LoRA parameter arrays are evaluated (materialized) on the calling thread
     /// before the background thread is spawned. This ensures the GPU computation
@@ -1439,6 +921,22 @@ impl TrainingLoop {
         manager: &CheckpointManager,
         is_best: bool,
         eval_loss: Option<f64>,
+    ) -> Result<std::path::PathBuf>
+    where
+        M: TrainableModel,
+    {
+        self.save_checkpoint_with_state(model, manager, is_best, eval_loss, None)
+    }
+
+    /// [`save_checkpoint`](Self::save_checkpoint) with the state a resume
+    /// continues from.
+    pub(crate) fn save_checkpoint_with_state<M>(
+        &mut self,
+        model: &M,
+        manager: &CheckpointManager,
+        is_best: bool,
+        eval_loss: Option<f64>,
+        state: Option<TrainState>,
     ) -> Result<std::path::PathBuf>
     where
         M: TrainableModel,
@@ -1468,39 +966,9 @@ impl TrainingLoop {
         );
 
         // Offload the blocking I/O to a background thread.
-        self.spawn_async_checkpoint(lora_params, metadata, manager, is_best)?;
+        self.spawn_async_checkpoint(lora_params, metadata, manager, is_best, state)?;
 
         Ok(step_dir)
-    }
-
-    /// Get current training step.
-    pub fn current_step(&self) -> usize {
-        self.step
-    }
-
-    /// Get current epoch.
-    pub fn current_epoch(&self) -> usize {
-        self.epoch
-    }
-
-    /// Get running loss.
-    pub fn current_loss(&self) -> f64 {
-        self.running_loss
-    }
-
-    /// Get total tokens processed.
-    pub fn total_tokens(&self) -> usize {
-        self.total_tokens
-    }
-
-    /// Set step (for testing and checkpoint restore).
-    pub fn set_step(&mut self, step: usize) {
-        self.step = step;
-    }
-
-    /// Set epoch (for testing and checkpoint restore).
-    pub fn set_epoch(&mut self, epoch: usize) {
-        self.epoch = epoch;
     }
 
     /// Poll the pending checkpoint background thread.
@@ -1531,7 +999,8 @@ impl TrainingLoop {
     /// by safetensors serialization or metadata JSON writes.
     ///
     /// The method:
-    /// 1. Forces evaluation of all LoRA parameter arrays (materializes GPU tensors on CPU).
+    /// 1. Forces evaluation of every array the checkpoint holds (weights and
+    ///    optimizer state) so the background thread only performs I/O.
     /// 2. Converts the `Rc<str>`-keyed map to a `String`-keyed map that is `Send`.
     /// 3. Clones the metadata and extracts the manager state needed on the background thread.
     /// 4. Polls the previous handle for completion/errors before spawning the new one.
@@ -1544,17 +1013,18 @@ impl TrainingLoop {
         metadata: CheckpointMetadata,
         manager: &CheckpointManager,
         is_best: bool,
+        state: Option<TrainState>,
     ) -> Result<()> {
         // Poll the previous handle so we surface any errors and free the handle.
         self.poll_pending_checkpoint();
 
-        // Force evaluation of all arrays before crossing the thread boundary.
-        // This materializes the MLX lazy computation graph so the background thread
-        // only performs the I/O work (no GPU/CPU work happens on the other side).
         {
-            let arrays: Vec<&Array> = lora_params.values().collect();
+            let mut arrays: Vec<&Array> = lora_params.values().collect();
+            if let Some(opt) = state.as_ref().and_then(|s| s.optimizer.as_ref()) {
+                arrays.extend(opt.arrays());
+            }
             if !arrays.is_empty() {
-                transforms::eval(arrays)?;
+                pmetal_runtime::compat::transforms::eval(arrays)?;
             }
         }
 
@@ -1578,7 +1048,7 @@ impl TrainingLoop {
                 CheckpointManager::from_parts(checkpoint_dir, max_checkpoints, save_best_flag);
 
             bg_manager
-                .save_checkpoint_owned(params_send, &metadata, is_best)
+                .save_checkpoint_owned(params_send, &metadata, is_best, state.as_ref())
                 .map_err(|e| e.to_string())?;
 
             tracing::info!("Async checkpoint write complete (step {})", step_for_log);
@@ -1587,6 +1057,17 @@ impl TrainingLoop {
 
         self.pending_checkpoint = Some(handle);
         Ok(())
+    }
+
+    /// Wait for the checkpoint being written, if one is, and report how it went.
+    pub(crate) fn finish_pending_checkpoint(&mut self) {
+        if let Some(handle) = self.pending_checkpoint.take() {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!("Checkpoint write failed: {e}"),
+                Err(_) => tracing::warn!("Checkpoint thread panicked"),
+            }
+        }
     }
 }
 

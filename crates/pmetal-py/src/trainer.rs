@@ -73,10 +73,8 @@ pub struct PyTrainer {
     training_config: pmetal_core::TrainingConfig,
     dataset_path: String,
     eval_dataset_path: Option<String>,
-    flash_attention: bool,
     sequence_packing: bool,
     gradient_checkpointing: bool,
-    metal_fused_optimizer: bool,
     embedding_lr: Option<f32>,
     py_callbacks: Vec<Py<PyAny>>,
 }
@@ -106,10 +104,8 @@ impl PyTrainer {
             training_config: training_config.0.clone(),
             dataset_path: dataset_path.to_string(),
             eval_dataset_path: eval_dataset_path.map(String::from),
-            flash_attention: true,
             sequence_packing: true,
             gradient_checkpointing: false,
-            metal_fused_optimizer: false,
             embedding_lr: None,
             py_callbacks: Vec::new(),
         }
@@ -134,11 +130,6 @@ impl PyTrainer {
         self.gradient_checkpointing = enabled;
     }
 
-    /// Enable or disable Metal fused optimizer.
-    fn set_metal_fused_optimizer(&mut self, enabled: bool) {
-        self.metal_fused_optimizer = enabled;
-    }
-
     /// Set separate embedding learning rate.
     fn set_embedding_lr(&mut self, lr: f32) {
         self.embedding_lr = Some(lr);
@@ -157,10 +148,8 @@ impl PyTrainer {
         let training_config = self.training_config.clone();
         let dataset_path = self.dataset_path.clone();
         let eval_dataset_path = self.eval_dataset_path.clone();
-        let flash_attention = self.flash_attention;
         let sequence_packing = self.sequence_packing;
         let gradient_checkpointing = self.gradient_checkpointing;
-        let metal_fused_optimizer = self.metal_fused_optimizer;
         let embedding_lr = self.embedding_lr;
         let mut rust_callbacks = rust_callbacks;
 
@@ -269,59 +258,42 @@ impl PyTrainer {
                     let loop_config = pmetal_trainer::TrainingLoopConfig {
                         training: training_config.clone(),
                         dataloader: dataloader_config,
-                        use_metal_flash_attention: flash_attention,
                         log_every: 10,
                         checkpoint_every: training_config.save_steps.unwrap_or(500),
                         eval_every: if eval_dataset.is_some() { 100 } else { 0 },
-                        use_jit_compilation: false,
                         use_sequence_packing: sequence_packing,
                         gradient_checkpointing,
                         gradient_checkpointing_layers: 4,
                         embedding_lr,
-                        eager_evaluation: false,
-                        use_metal_fused_optimizer: metal_fused_optimizer,
                         loraplus_lr_ratio: None,
-                        neftune_noise_alpha: None,
                         use_cut_cross_entropy: false,
                         ..Default::default()
                     };
 
-                    let mut training_loop = pmetal_trainer::TrainingLoop::new(loop_config);
+                    let mut training_loop =
+                        pmetal_trainer::TrainingLoop::new(loop_config).map_err(training_err)?;
                     for callback in rust_callbacks.drain(..) {
                         training_loop.add_callback(callback);
                     }
 
                     // Run training
-                    let model = {
+                    let mut model = model;
+                    {
                         let _span = info_span!(
                             "training_loop",
                             model = %model_path.display(),
                             sequence_packing,
                         )
                         .entered();
-
-                        if sequence_packing {
-                            training_loop
-                                .run_packed(
-                                    model,
-                                    train_dataset,
-                                    eval_dataset,
-                                    Some(&checkpoint_manager),
-                                )
-                                .map_err(training_err)?
-                        } else {
-                            let mut model = model;
-                            training_loop
-                                .run(
-                                    &mut model,
-                                    train_dataset,
-                                    eval_dataset,
-                                    Some(&checkpoint_manager),
-                                )
-                                .map_err(training_err)?;
-                            model
-                        }
-                    };
+                        training_loop
+                            .run(
+                                &mut model,
+                                train_dataset,
+                                eval_dataset,
+                                Some(&checkpoint_manager),
+                            )
+                            .map_err(training_err)?;
+                    }
 
                     // Save weights
                     let weights_path = {

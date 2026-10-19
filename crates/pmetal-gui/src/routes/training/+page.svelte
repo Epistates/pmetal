@@ -60,14 +60,13 @@
   let loadIn4bit = $state(true);
 
   // PMetal optimizations
-  let jitCompilation = $state(true);
   let gradientCheckpointing = $state(true);
   let gradientCheckpointingLayers = $state(4);
   let sequencePacking = $state(true);
-  let flashAttention = $state(true);
-  let fusedStep = $state(true);
-  let fusedOptimizer = $state(true);
   let embeddingLr = $state(0.0);
+  let labelSmoothing = $state(0.0);
+  let zLoss = $state(0.0);
+  let neftuneAlpha = $state(0.0);
   let cutCrossEntropy = $state(false);
   let noAdaptiveLr = $state(false);
   let packMaxSeqLen = $state('');
@@ -272,12 +271,11 @@
           ? selectedTextColumns[0]
           : selectedTextColumns.length === 0 ? textColumn || undefined : undefined,
         embedding_lr: embeddingLr > 0 ? embeddingLr : undefined,
-        no_jit_compilation: !jitCompilation,
+        label_smoothing: labelSmoothing,
+        z_loss: zLoss,
+        neftune_alpha: neftuneAlpha > 0 ? neftuneAlpha : undefined,
         no_gradient_checkpointing: !gradientCheckpointing,
         gradient_checkpointing_layers: gradientCheckpointingLayers,
-        no_flash_attention: !flashAttention,
-        no_fused: !fusedStep,
-        no_metal_fused_optimizer: !fusedOptimizer,
         cut_cross_entropy: cutCrossEntropy,
         no_adaptive_lr: noAdaptiveLr,
         warmup_steps: warmupSteps,
@@ -521,9 +519,7 @@
                 {/if}
                 <div class="flex flex-wrap gap-1 mt-1">
                   {#if run.config_summary.sequence_packing}<span class="badge badge-xs">Packing</span>{/if}
-                  {#if run.config_summary.flash_attention}<span class="badge badge-xs">FlashAttn</span>{/if}
                   {#if run.config_summary.gradient_checkpointing}<span class="badge badge-xs">GradCkpt</span>{/if}
-                  {#if run.config_summary.jit_compilation}<span class="badge badge-xs">JIT</span>{/if}
                 </div>
               {/if}
             </div>
@@ -975,13 +971,6 @@
             <div class="card-body space-y-4">
               <div class="grid grid-cols-2 md:grid-cols-3 gap-4">
                 <label class="flex items-start gap-3 cursor-pointer">
-                  <input type="checkbox" class="mt-0.5 rounded border-surface-300" bind:checked={jitCompilation} />
-                  <div>
-                    <span class="text-sm font-medium text-surface-700 dark:text-surface-300">JIT Compilation</span>
-                    <p class="text-xs text-surface-500 mt-0.5">Compile the training graph</p>
-                  </div>
-                </label>
-                <label class="flex items-start gap-3 cursor-pointer">
                   <input type="checkbox" class="mt-0.5 rounded border-surface-300" bind:checked={gradientCheckpointing} />
                   <div>
                     <span class="text-sm font-medium text-surface-700 dark:text-surface-300">Gradient Checkpointing</span>
@@ -989,31 +978,10 @@
                   </div>
                 </label>
                 <label class="flex items-start gap-3 cursor-pointer">
-                  <input type="checkbox" class="mt-0.5 rounded border-surface-300" bind:checked={fusedStep} />
-                  <div>
-                    <span class="text-sm font-medium text-surface-700 dark:text-surface-300">Fused Step</span>
-                    <p class="text-xs text-surface-500 mt-0.5">Use fused train dispatch</p>
-                  </div>
-                </label>
-                <label class="flex items-start gap-3 cursor-pointer">
                   <input type="checkbox" class="mt-0.5 rounded border-surface-300" bind:checked={sequencePacking} />
                   <div>
                     <span class="text-sm font-medium text-surface-700 dark:text-surface-300">Sequence Packing</span>
                     <p class="text-xs text-surface-500 mt-0.5">Pack short sequences</p>
-                  </div>
-                </label>
-                <label class="flex items-start gap-3 cursor-pointer">
-                  <input type="checkbox" class="mt-0.5 rounded border-surface-300" bind:checked={flashAttention} />
-                  <div>
-                    <span class="text-sm font-medium text-surface-700 dark:text-surface-300">Flash Attention</span>
-                    <p class="text-xs text-surface-500 mt-0.5">Fused SDPA kernel</p>
-                  </div>
-                </label>
-                <label class="flex items-start gap-3 cursor-pointer">
-                  <input type="checkbox" class="mt-0.5 rounded border-surface-300" bind:checked={fusedOptimizer} />
-                  <div>
-                    <span class="text-sm font-medium text-surface-700 dark:text-surface-300">Fused Optimizer</span>
-                    <p class="text-xs text-surface-500 mt-0.5">Metal-fused Adam step</p>
                   </div>
                 </label>
                 <label class="flex items-start gap-3 cursor-pointer">
@@ -1035,6 +1003,21 @@
                 <div>
                   <label class="label" for="embedding-lr">Embedding LR (0 = same as base)</label>
                   <input id="embedding-lr" type="number" class="input" step="0.00001" min="0" bind:value={embeddingLr} />
+                </div>
+                <div>
+                  <label class="label" for="label-smoothing">Label Smoothing</label>
+                  <input id="label-smoothing" type="number" class="input" step="0.01" min="0" max="0.99" bind:value={labelSmoothing} />
+                  <p class="text-xs text-surface-400 mt-0.5">0 = plain cross-entropy. Evaluation reports the plain loss.</p>
+                </div>
+                <div>
+                  <label class="label" for="z-loss">Z-Loss</label>
+                  <input id="z-loss" type="number" class="input" step="0.00001" min="0" max="1" bind:value={zLoss} />
+                  <p class="text-xs text-surface-400 mt-0.5">Keeps the softmax normalizer near 1. 1e-4 is PaLM's value.</p>
+                </div>
+                <div>
+                  <label class="label" for="neftune-alpha">NEFTune Alpha (0 = off)</label>
+                  <input id="neftune-alpha" type="number" class="input" step="0.5" min="0" max="100" bind:value={neftuneAlpha} />
+                  <p class="text-xs text-surface-400 mt-0.5">Embedding noise: 5 for small models, 15 for larger.</p>
                 </div>
                 <div>
                   <label class="label" for="ckpt-layers">Checkpoint Layers</label>
@@ -1209,12 +1192,8 @@
                       <div>LoRA: <span class="font-mono">r={selectedRun.config_summary.lora_rank} a={selectedRun.config_summary.lora_alpha}</span></div>
                     {/if}
                     <div>Packing: <span class="font-mono">{selectedRun.config_summary.sequence_packing ? 'on' : 'off'}</span></div>
-                    <div>FlashAttn: <span class="font-mono">{selectedRun.config_summary.flash_attention ? 'on' : 'off'}</span></div>
                     {#if selectedRun.config_summary.gradient_checkpointing}
                       <div>GradCkpt: <span class="font-mono">on</span></div>
-                    {/if}
-                    {#if selectedRun.config_summary.jit_compilation}
-                      <div>JIT: <span class="font-mono">on</span></div>
                     {/if}
                   </div>
                 </div>
@@ -1250,8 +1229,6 @@
                     maxSeqLen = c.max_seq_len;
                     if (c.lora_rank) { loraRank = c.lora_rank; loraAlpha = c.lora_alpha ?? 32; }
                     sequencePacking = c.sequence_packing;
-                    flashAttention = c.flash_attention;
-                    jitCompilation = c.jit_compilation;
                     gradientCheckpointing = c.gradient_checkpointing;
                     // Clear selection to show the form
                     selectedRunId = null;

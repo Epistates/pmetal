@@ -79,10 +79,7 @@ impl TrainingTab {
     /// | `loss_scale` (new Number field)      | not present in old TUI | new field from spec |
     /// | `lora_r` label="LoRA r"             | label="LoRA Rank"         | label rename |
     /// | `lora_alpha` label="LoRA α"         | label="LoRA Alpha"        | label rename |
-    /// | `no_flash_attention` Toggle         | "Flash Attention" Toggle (inverted) | logic inversion |
     /// | `no_sequence_packing` Toggle        | "Sequence Packing" Toggle (inverted) | logic inversion |
-    /// | `no_jit_compilation` Toggle         | "JIT Compilation" Toggle (inverted) | logic inversion |
-    /// | `no_metal_fused_optimizer` Toggle   | "Fused Optimizer" Toggle (inverted) | logic inversion |
     /// | `cut_cross_entropy` Toggle          | "Cut Cross-Entropy" Toggle (same) | unchanged |
     /// | `ane` Toggle (flag)                 | "ANE" Enum(Disabled/Enabled)  | kind change |
     /// | `embedding_lr`, `text_column`, etc. | not in old TUI             | new fields from spec |
@@ -324,17 +321,10 @@ impl TrainingTab {
         let dataset = self.form.value("Dataset");
 
         // Inverted-flag fields: the spec stores `no_x: bool` but the old TUI
-        // showed them as positive toggles ("Flash Attention: Enabled").
+        // showed them as positive toggles ("Sequence Packing: Enabled").
         // The spec field names were changed to `no_*` — so "Disabled" → true.
-        let no_flash = self.form.value("Disable Flash Attention") == "Enabled"
-            || self.form.value("Flash Attention") == "Disabled";
         let no_seq_pack = self.form.value("Disable Sequence Packing") == "Enabled"
             || self.form.value("Sequence Packing") == "Disabled";
-        let no_jit = self.form.value("Disable JIT") == "Enabled"
-            || self.form.value("JIT Compilation") == "Disabled";
-        let no_fused_step = self.form.value("Disable Fused Step") == "Enabled";
-        let no_fused_optimizer = self.form.value("Disable Fused Optimizer") == "Enabled"
-            || self.form.value("Fused Optimizer") == "Disabled";
         let no_gradient_checkpointing =
             self.form.value("Disable Gradient Checkpointing") == "Enabled";
 
@@ -377,6 +367,17 @@ impl TrainingTab {
                 .parse()
                 .unwrap_or(TrainSpec::default().learning_rate),
             embedding_lr: self.form.value("Embedding LR").parse().ok(),
+            label_smoothing: self
+                .form
+                .value("Label Smoothing")
+                .parse()
+                .unwrap_or(TrainSpec::default().label_smoothing),
+            z_loss: self
+                .form
+                .value("Z-Loss")
+                .parse()
+                .unwrap_or(TrainSpec::default().z_loss),
+            neftune_alpha: self.form.value("NEFTune Alpha").parse().ok(),
             batch_size: self
                 .form
                 .value("Batch Size")
@@ -483,11 +484,7 @@ impl TrainingTab {
             column_separator: optional_form_value(&self.form.value("Column Separator")),
             prompt_column: optional_form_value(&self.form.value("Prompt Column")),
             response_column: optional_form_value(&self.form.value("Response Column")),
-            no_flash_attention: no_flash,
             no_sequence_packing: no_seq_pack,
-            no_jit_compilation: no_jit,
-            no_fused: no_fused_step,
-            no_metal_fused_optimizer: no_fused_optimizer,
             cut_cross_entropy,
             no_adaptive_lr: self.form.value("Disable Adaptive LR") == "Enabled",
             ane,

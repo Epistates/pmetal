@@ -1,65 +1,67 @@
 //! Full-parameter pretraining loop with gradient accumulation, LR scheduling,
 //! gradient clipping, periodic eval, and step logging.
+//!
+//! A step takes the shared machinery of the fine-tuning loop: micro-batches
+//! add up in a `GradAccumulator` (the step's gradient is the mean over all
+//! its tokens, and the one multiplication that divides by the count also
+//! clips), and the loss, gradient norm, every parameter and the optimizer's
+//! state are evaluated in one call.
 
 use super::init::{apply_depth_scaled_init, zero_biases};
 use super::loss::causal_lm_loss;
-use super::{CausalLm, PretrainConfig, PretrainError};
+use super::{CausalLm, PretrainBatch, PretrainConfig, PretrainError, document_mask};
 
 use pmetal_core::LearningRateScheduler;
 use pmetal_data::streaming::StreamPosition;
 use pmetal_runtime::compat::{
-    Array, Exception,
-    module::FlattenedModuleParam,
+    Array, Exception, ModuleParametersExt,
     nn::value_and_grad,
-    optimizers::{AdamW, AdamWBuilder, Optimizer},
+    optimizers::{AdamW, AdamWBuilder, Optimizer, Updatable},
+    transforms,
 };
 
-fn clip_grad_norm(
-    mut grads: FlattenedModuleParam,
-    max_norm: f32,
-) -> Result<FlattenedModuleParam, Exception> {
-    pmetal_runtime::training::clip_grad_norm_map(&mut grads, max_norm);
-    Ok(grads)
-}
+use crate::training_loop::step::{GradAccumulator, MicroOutput};
 
-/// Accumulate `rhs` into `acc`, creating entries on first use.
-fn accumulate_grads(acc: &mut FlattenedModuleParam, rhs: &FlattenedModuleParam) {
-    for (key, grad) in rhs {
-        acc.entry(key.clone())
-            .and_modify(|existing| *existing = existing.add(grad))
-            .or_insert_with(|| grad.clone());
-    }
-}
-
-/// Scale every gradient by `1 / n`.
-fn scale_grads(grads: &mut FlattenedModuleParam, n: f32) {
-    let inv = Array::from_f32(1.0 / n);
-    for grad in grads.values_mut() {
-        *grad = grad.multiply(&inv);
-    }
-}
-
-/// Compute forward + loss + grad for one micro-batch. Does NOT step the
-/// optimizer — the caller accumulates and steps after K micro-batches.
+/// Compute forward + loss + grad for one micro-batch, as the sum of its
+/// counted tokens' losses with the count. Does NOT step the optimizer.
 fn forward_backward<M: CausalLm>(
     model: &mut M,
     input_ids: &Array,
+    mask: Option<&Array>,
     ignore_index: Option<i32>,
     z_loss_coef: Option<f32>,
-) -> Result<(f32, FlattenedModuleParam), PretrainError> {
-    let mut vag = value_and_grad(|model: &mut M, batch: &Array| -> Result<Array, Exception> {
-        let logits = model.forward_logits(batch)?;
-        causal_lm_loss(&logits, batch, ignore_index, z_loss_coef)
-    });
-    let (loss, grads) =
+) -> Result<MicroOutput, PretrainError> {
+    // The tokens a next-token loss scores: every position but the first,
+    // less the ignored ones.
+    let count = match ignore_index {
+        Some(ignore) => input_ids
+            .index((.., 1..))
+            .ne(&Array::from_int(ignore))
+            .as_type::<f32>()
+            .sum(None)
+            .stop_gradient(),
+        None => Array::from_f32((input_ids.dim(0) * (input_ids.dim(1) - 1)) as f32),
+    };
+    let loss_count = count.clone();
+    let mut vag = value_and_grad(
+        move |model: &mut M, batch: &Array| -> Result<Array, Exception> {
+            let logits = model.forward_logits_masked(batch, mask)?;
+            // The loss is a mean over the counted tokens; times the count it is the sum.
+            Ok(causal_lm_loss(&logits, batch, ignore_index, z_loss_coef)?.multiply(&loss_count))
+        },
+    );
+    let (loss_sum, grads) =
         vag(model, input_ids).map_err(|e| PretrainError::Autograd(e.to_string()))?;
-    loss.eval();
-    Ok((loss.item::<f32>(), grads))
+    Ok(MicroOutput {
+        loss_sum,
+        count,
+        grads,
+    })
 }
 
 /// One optimizer step with gradient accumulation over `micro_batches`.
 ///
-/// Returns the mean loss across the accumulated micro-batches.
+/// Returns the mean loss across the accumulated micro-batches' tokens.
 pub fn pretrain_step<M: CausalLm>(
     model: &mut M,
     optimizer: &mut AdamW,
@@ -68,33 +70,70 @@ pub fn pretrain_step<M: CausalLm>(
     z_loss_coef: Option<f32>,
     max_grad_norm: Option<f32>,
 ) -> Result<f32, PretrainError> {
-    let k = micro_batches.len();
-    assert!(k > 0, "pretrain_step: empty micro_batches");
+    let batches: Vec<PretrainBatch> = micro_batches
+        .iter()
+        .map(|tokens| PretrainBatch::new(tokens.clone()))
+        .collect();
+    pretrain_step_batches(
+        model,
+        optimizer,
+        &batches,
+        ignore_index,
+        z_loss_coef,
+        max_grad_norm,
+    )
+}
 
-    let mut acc_grads = FlattenedModuleParam::new();
-    let mut total_loss = 0.0f32;
+/// [`pretrain_step`] over batches that may carry the documents each row is
+/// made of, in which case attention is masked to each document.
+pub fn pretrain_step_batches<M: CausalLm>(
+    model: &mut M,
+    optimizer: &mut AdamW,
+    batches: &[PretrainBatch],
+    ignore_index: Option<i32>,
+    z_loss_coef: Option<f32>,
+    max_grad_norm: Option<f32>,
+) -> Result<f32, PretrainError> {
+    assert!(!batches.is_empty(), "pretrain_step: empty micro_batches");
 
-    for batch in micro_batches {
-        let (loss, grads) = forward_backward(model, batch, ignore_index, z_loss_coef)?;
-        total_loss += loss;
-        accumulate_grads(&mut acc_grads, &grads);
+    let mut accumulator = GradAccumulator::default();
+    for batch in batches {
+        let mask = match &batch.doc_lengths {
+            Some(docs) => Some(document_mask(docs, batch.tokens.dim(1) as usize)?),
+            None => None,
+        };
+        let out = forward_backward(
+            model,
+            &batch.tokens,
+            mask.as_ref(),
+            ignore_index,
+            z_loss_coef,
+        )?;
+        accumulator.add(out);
+        // Evaluating what is held frees each micro-batch's graph; the last
+        // one is evaluated with the step.
+        if accumulator.micro_batches() < batches.len() {
+            accumulator
+                .eval_held(&[])
+                .map_err(|e| PretrainError::Autograd(e.to_string()))?;
+        }
     }
-
-    if k > 1 {
-        scale_grads(&mut acc_grads, k as f32);
-    }
-
-    let acc_grads = if let Some(max_norm) = max_grad_norm {
-        clip_grad_norm(acc_grads, max_norm).map_err(|e| PretrainError::Autograd(e.to_string()))?
-    } else {
-        acc_grads
-    };
+    let finished = accumulator
+        .finish(max_grad_norm.unwrap_or(0.0))
+        .expect("at least one micro-batch was added");
 
     optimizer
-        .update(model, acc_grads)
+        .update(model, finished.grads)
         .map_err(|e| PretrainError::Optimizer(e.to_string()))?;
 
-    Ok(total_loss / k as f32)
+    // One evaluation: the loss, the norm, every parameter, the optimizer's state.
+    let params = model.flatten_trainable_params();
+    let mut arrays: Vec<&Array> = vec![&finished.loss];
+    arrays.extend(finished.grad_norm.iter());
+    arrays.extend(params.values());
+    arrays.extend(optimizer.updatable_states());
+    transforms::eval(arrays).map_err(|e| PretrainError::Autograd(e.to_string()))?;
+    Ok(finished.loss.item_f32())
 }
 
 /// Compute eval loss over `n_batches` from the eval iterator (forward only,
@@ -142,7 +181,7 @@ where
     run_pretrain_with_state(
         model,
         config,
-        batches.map(|batch| (batch, None)),
+        batches.map(|tokens| Ok(PretrainBatch::new(tokens))),
         optimizer,
         0,
         Option::<std::iter::Empty<Array>>::None,
@@ -160,9 +199,11 @@ fn build_optimizer(config: &PretrainConfig) -> Result<AdamW, PretrainError> {
 
 /// Run pretraining from an explicit optimizer and global step.
 ///
-/// `batches` may carry a streaming position for each yielded batch; when present,
-/// that position is written into checkpoints so resume can restart at the exact
-/// corpus boundary.
+/// `batches` yields `Result`s: a corrupt shard is an error that stops the
+/// run, not the end of the data. A batch may carry a streaming position,
+/// which is written into checkpoints so resume can restart at the exact
+/// corpus boundary, and the documents its rows are made of, which attention
+/// is then masked to.
 pub fn run_pretrain_with_state<M, I, E>(
     model: &mut M,
     config: &PretrainConfig,
@@ -173,9 +214,10 @@ pub fn run_pretrain_with_state<M, I, E>(
 ) -> Result<Vec<f32>, PretrainError>
 where
     M: CausalLm,
-    I: Iterator<Item = (Array, Option<StreamPosition>)>,
+    I: Iterator<Item = Result<PretrainBatch, PretrainError>>,
     E: Iterator<Item = Array>,
 {
+    config.validate()?;
     if config.apply_init && config.n_layers > 0 {
         apply_depth_scaled_init(model, config.n_layers)
             .map_err(|e| PretrainError::Autograd(e.to_string()))?;
@@ -201,18 +243,18 @@ where
         optimizer.set_lr(lr);
 
         // Collect micro-batches for gradient accumulation
-        let mut micro: Vec<Array> = Vec::with_capacity(gas);
+        let mut micro: Vec<PretrainBatch> = Vec::with_capacity(gas);
         for _ in 0..gas {
-            let (batch, position) = batches
+            let batch = batches
                 .next()
-                .ok_or(PretrainError::BatchIteratorExhausted { step })?;
-            if position.is_some() {
-                last_stream_position = position;
+                .ok_or(PretrainError::BatchIteratorExhausted { step })??;
+            if batch.position.is_some() {
+                last_stream_position = batch.position;
             }
             micro.push(batch);
         }
 
-        let loss = pretrain_step(
+        let loss = pretrain_step_batches(
             model,
             &mut optimizer,
             &micro,
@@ -227,8 +269,12 @@ where
         // Logging
         if config.log_every > 0 && (step + 1) % config.log_every == 0 {
             let elapsed = start.elapsed().as_secs_f64();
-            let tokens_per_batch = micro.first().map(|b| b.dim(0) * b.dim(1)).unwrap_or(0);
-            let total_tokens = (step + 1) as f64 * gas as f64 * tokens_per_batch as f64;
+            let tokens_per_batch = micro
+                .first()
+                .map(|b| b.tokens.dim(0) * b.tokens.dim(1))
+                .unwrap_or(0);
+            let total_tokens =
+                (step + 1 - start_step) as f64 * gas as f64 * tokens_per_batch as f64;
             let tok_per_sec = total_tokens / elapsed;
             eprintln!(
                 "step {:>6} | loss {:.4} | lr {:.2e} | {:.0} tok/s",

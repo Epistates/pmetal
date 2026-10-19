@@ -185,6 +185,11 @@ pub struct MasterWeight {
     /// master copy is stale. Held, not just identified, so that no new array
     /// can take its identity while it is the one compared against.
     produced: Option<InlineArray>,
+    /// Set by [`restore`](Self::restore): the master copy came from a
+    /// checkpoint, and the parameter it is read against was loaded from the
+    /// same checkpoint, so it is the one to continue from although no commit
+    /// of this process produced it.
+    restored: bool,
 }
 
 impl MasterWeight {
@@ -196,10 +201,11 @@ impl MasterWeight {
     /// The f32 weight an update of `parameter` starts from: the master copy,
     /// unless the parameter was replaced since the commit that produced it.
     pub fn weight(&self, parameter: &InlineArray) -> InlineArray {
-        let current = self
-            .produced
-            .as_ref()
-            .is_some_and(|produced| produced.id() == parameter.id());
+        let current = self.restored
+            || self
+                .produced
+                .as_ref()
+                .is_some_and(|produced| produced.id() == parameter.id());
         match &self.value {
             Some(master) if current && Self::is_half(parameter.dtype_raw()) => master.clone(),
             _ => parameter.as_dtype(Dtype::Float32.as_i32()),
@@ -219,6 +225,19 @@ impl MasterWeight {
             *parameter = weight.as_dtype(dtype);
             self.value = None;
             self.produced = None;
+        }
+        self.restored = false;
+    }
+
+    /// A master copy read back from a checkpoint. The parameter it belongs to
+    /// must be the checkpoint's own weight (the master rounded to its dtype),
+    /// which is what a resumed run loads; the next update continues from the
+    /// master rather than from that rounded weight.
+    pub fn restore(value: InlineArray) -> Self {
+        Self {
+            value: Some(value),
+            produced: None,
+            restored: true,
         }
     }
 
@@ -255,6 +274,16 @@ impl AdamState {
             m,
             v,
             master: MasterWeight::default(),
+        }
+    }
+
+    /// A state from a checkpoint: the moments and, for a half-precision
+    /// parameter, its f32 master copy, from which the next step continues.
+    pub fn restored(m: InlineArray, v: InlineArray, master: Option<InlineArray>) -> Self {
+        Self {
+            m,
+            v,
+            master: master.map_or_else(MasterWeight::default, MasterWeight::restore),
         }
     }
 

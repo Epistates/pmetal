@@ -198,12 +198,7 @@ fn adafactor_keeps_the_full_moment_for_a_vector_and_clips_the_update() {
 
 #[test]
 fn a_zero_learning_rate_leaves_every_kind_where_it_was() {
-    for kind in [
-        OptimizerType::AdamW,
-        OptimizerType::Sgd,
-        OptimizerType::Lion,
-        OptimizerType::Adafactor,
-    ] {
+    for kind in OptimizerType::ALL {
         let mut opt = TrainOptimizer::new(kind, 0.5, 0.1);
         opt.set_lr(0.0);
         assert_eq!(opt.lr(), 0.0);
@@ -292,13 +287,7 @@ fn misfit_gradient() -> FlattenedModuleParam {
 fn an_update_that_fails_on_the_gpu_stops_the_step_and_names_the_parameter() {
     // The failed op hands back a zero placeholder, so the update used to
     // finish, leave the weight where it was, and return Ok.
-    let kinds = [
-        OptimizerType::AdamW,
-        OptimizerType::Sgd,
-        OptimizerType::Lion,
-        OptimizerType::Adafactor,
-    ];
-    for kind in kinds {
+    for kind in OptimizerType::ALL {
         let mut opt = TrainOptimizer::new(kind, 0.1, 0.0);
         let err = expect_runtime_errors(|| opt.update(&mut one_weight(), misfit_gradient()))
             .expect_err("a gradient that doesn't fit its weight must fail the update");
@@ -322,4 +311,198 @@ fn the_plain_adamw_update_reports_a_failed_parameter_too() {
     opt.update(&mut model, grads).unwrap();
     assert_close(&values(&model.w), &[0.9, 1.1], 1e-5);
     pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
+}
+
+/// A small regression whose parameters land in every group: a hidden matrix,
+/// an embedding, a norm weight and a LoRA B matrix.
+struct Net {
+    q_proj: pmetal_runtime::compat::Param<Array>,
+    lora_b: pmetal_runtime::compat::Param<Array>,
+    embed_tokens: pmetal_runtime::compat::Param<Array>,
+    norm: pmetal_runtime::compat::Param<Array>,
+}
+pmetal_runtime::impl_module_params!(Net; q_proj, lora_b, embed_tokens, norm);
+
+fn net() -> Net {
+    use pmetal_runtime::compat::{Dtype, Param, random};
+    random::seed(401);
+    let f32_ = Dtype::Float32;
+    Net {
+        // 8192 elements: above the 8-bit optimizer's quantization threshold.
+        q_proj: Param::new(random::normal(&[64, 128], f32_).mul_scalar(0.1)),
+        lora_b: Param::new(random::normal(&[16, 8], f32_).mul_scalar(0.1)),
+        embed_tokens: Param::new(random::normal(&[8, 16], f32_).mul_scalar(0.1)),
+        norm: Param::new(Array::ones(&[128], f32_.as_i32())),
+    }
+}
+
+/// The loss, and the gradients of every parameter: fit `x @ q^T` to a fixed
+/// target through the norm weight, with the other two pulled toward zero.
+fn loss_and_grads(net: &mut Net) -> (Array, FlattenedModuleParam) {
+    use pmetal_runtime::compat::{Dtype, nn, random};
+    random::seed(402);
+    let x = random::normal(&[16, 128], Dtype::Float32);
+    let target = random::normal(&[16, 64], Dtype::Float32);
+    let loss_fn = |net: &mut Net, (x, t): (&Array, &Array)| {
+        let pred = x.multiply(&net.norm).matmul(&net.q_proj.t());
+        let fit = pred.subtract(t).square().mean_all();
+        let pull = net
+            .embed_tokens
+            .square()
+            .mean_all()
+            .add(&net.lora_b.square().mean_all());
+        Ok::<_, pmetal_runtime::compat::Exception>(fit.add(&pull))
+    };
+    nn::value_and_grad(loss_fn)(net, (&x, &target)).unwrap()
+}
+
+fn loss_value(net: &mut Net) -> f32 {
+    let (loss, _) = loss_and_grads(net);
+    values(&loss)[0]
+}
+
+/// Every optimizer a config can name trains a model: the loss falls, each
+/// group's parameters move, and nothing is NaN. (A silent zero gradient or an
+/// update that never reaches the weights fails here.)
+#[test]
+fn every_optimizer_kind_trains_every_group() {
+    use pmetal_runtime::compat::ModuleParametersExt;
+    let rates = |kind| match kind {
+        OptimizerType::Sgd => 0.05,
+        OptimizerType::Lion => 2e-3,
+        OptimizerType::Adafactor => 5e-3,
+        OptimizerType::Muon => 2e-2,
+        OptimizerType::AdamWScheduleFree => 2e-2,
+        _ => 5e-3,
+    };
+    for kind in OptimizerType::ALL {
+        let mut model = net();
+        let before = loss_value(&mut model);
+        let start = model.flatten_params();
+        let start: Vec<(String, Vec<f32>)> = start
+            .iter()
+            .map(|(k, v)| (k.to_string(), values(v)))
+            .collect();
+        let mut opt = ParamGroupOptimizerBuilder::new(kind, rates(kind))
+            .with_weight_decay(0.0)
+            .with_loraplus_lr_ratio(2.0)
+            .build();
+        for _ in 0..40 {
+            let (loss, grads) = loss_and_grads(&mut model);
+            loss.eval();
+            opt.update(&mut model, grads).unwrap();
+            let params = model.flatten_params();
+            let arrays: Vec<&Array> = params.values().collect();
+            pmetal_runtime::compat::transforms::eval(arrays).unwrap();
+        }
+        // Evaluate at the weights a run would save.
+        opt.eval_weights(&mut model);
+        let after = loss_value(&mut model);
+        assert!(after.is_finite(), "{kind}: loss {after}");
+        assert!(after < 0.8 * before, "{kind}: loss {before} -> {after}");
+        let end = model.flatten_params();
+        for (name, was) in &start {
+            let now = values(&end[name.as_str()]);
+            assert!(
+                now.iter().all(|v| v.is_finite()),
+                "{kind}: {name} is finite"
+            );
+            assert!(
+                now.iter().zip(was).any(|(a, b)| (a - b).abs() > 1e-6),
+                "{kind}: {name} did not move"
+            );
+        }
+    }
+}
+
+/// Muon trains the hidden matrices only: the embedding and the norm weight
+/// (and the output head, wherever the model puts it) train with AdamW.
+#[test]
+fn muon_trains_hidden_matrices_and_adamw_the_rest() {
+    let mut model = net();
+    let mut opt = ParamGroupOptimizerBuilder::new(OptimizerType::Muon, 1e-2)
+        .with_loraplus_lr_ratio(2.0)
+        .build();
+    let (_, grads) = loss_and_grads(&mut model);
+    opt.update(&mut model, grads).unwrap();
+    let state = opt.export_state();
+    let held = |prefix: &str, name: &str| {
+        state
+            .tensors
+            .keys()
+            .any(|k| k.starts_with(prefix) && k.ends_with(&format!("/{name}")))
+    };
+    // Hidden matrices (the regular group's and LoRA+'s) hold a Muon buffer.
+    assert!(held("regular:muon:buf", "q_proj"));
+    assert!(held("lora_b:muon:buf", "lora_b"));
+    // The embedding group and the norm weight run plain AdamW.
+    assert!(held("embedding:m", "embed_tokens"));
+    assert!(held("no_decay:m", "norm"));
+    assert_eq!(opt.kind(), OptimizerType::Muon);
+}
+
+/// A checkpoint of the whole grouped optimizer: stopping at step 4, saving
+/// its state, rebuilding it and loading the state continues bit for bit what
+/// six uninterrupted steps do, for every kind and with every group.
+#[test]
+fn every_kind_resumes_bit_exactly_through_its_groups() {
+    use pmetal_runtime::compat::{ModuleParametersExt, transforms};
+    let make = |kind| {
+        ParamGroupOptimizerBuilder::new(kind, 5e-3)
+            .with_weight_decay(0.01)
+            .with_embedding_lr(1e-3)
+            .with_loraplus_lr_ratio(2.0)
+            .build()
+    };
+    let snapshot = |model: &Net| -> Vec<(String, Vec<f32>)> {
+        let mut v: Vec<_> = model
+            .flatten_params()
+            .iter()
+            .map(|(k, a)| (k.to_string(), values(a)))
+            .collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    };
+    let steps = |opt: &mut ParamGroupOptimizer, model: &mut Net, n: usize| {
+        for _ in 0..n {
+            let (_, grads) = loss_and_grads(model);
+            opt.update(model, grads).unwrap();
+            let params = model.flatten_params();
+            transforms::eval(params.values().collect::<Vec<_>>()).unwrap();
+        }
+    };
+    for kind in OptimizerType::ALL {
+        let mut whole_model = net();
+        let mut whole = make(kind);
+        steps(&mut whole, &mut whole_model, 6);
+
+        let mut first_model = net();
+        let mut first = make(kind);
+        steps(&mut first, &mut first_model, 4);
+        // What a checkpoint holds: the evaluation weights and the state.
+        first.eval_weights(&mut first_model);
+        let state = first.export_state();
+        let saved = snapshot(&first_model);
+
+        let mut resumed_model = net();
+        {
+            let mut flat = resumed_model.flatten_params_mut();
+            for (name, values) in &saved {
+                let shape = flat[name.as_str()].shape().to_vec();
+                **flat.get_mut(name.as_str()).unwrap() = Array::from_slice(values, &shape);
+            }
+        }
+        let mut resumed = make(kind);
+        resumed.import_state(&state).unwrap();
+        resumed.train_weights(&mut resumed_model);
+        steps(&mut resumed, &mut resumed_model, 2);
+
+        // Whole's weights are the training weights; so are resumed's.
+        assert_eq!(
+            snapshot(&resumed_model),
+            snapshot(&whole_model),
+            "{kind}: the resumed run diverged"
+        );
+        pmetal_runtime::check_unobserved_error().unwrap();
+    }
 }

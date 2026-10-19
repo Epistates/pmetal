@@ -69,70 +69,6 @@ pub enum MlxMetalOptimizerError {
 /// Result type for MLX-Metal optimizer operations.
 pub type MlxMetalOptimizerResult<T> = std::result::Result<T, MlxMetalOptimizerError>;
 
-/// Learning rate schedule type.
-///
-/// Supported schedules:
-/// - `Constant`: Fixed learning rate
-/// - `CosineDecay`: Cosine annealing from init_lr to 0
-/// - `CosineDecayWithWarmup`: Linear warmup followed by cosine decay
-#[derive(Debug, Clone, Default)]
-pub enum LrSchedule {
-    /// Constant learning rate.
-    #[default]
-    Constant,
-    /// Cosine decay: lr * 0.5 * (1 + cos(π * step / total_steps))
-    CosineDecay {
-        /// Total number of training steps.
-        total_steps: u32,
-    },
-    /// Linear warmup followed by cosine decay.
-    CosineDecayWithWarmup {
-        /// Number of warmup steps (typically 5-10% of total).
-        warmup_steps: u32,
-        /// Total number of training steps.
-        total_steps: u32,
-        /// Initial learning rate during warmup start (default: 0.0).
-        warmup_init: f32,
-    },
-}
-
-impl LrSchedule {
-    /// Compute the learning rate multiplier for the given step.
-    pub fn get_lr_multiplier(&self, step: u32, base_lr: f32) -> f32 {
-        match self {
-            Self::Constant => base_lr,
-            Self::CosineDecay { total_steps } => {
-                if *total_steps == 0 {
-                    return base_lr;
-                }
-                let progress = (step as f32) / (*total_steps as f32);
-                let progress = progress.min(1.0);
-                base_lr * 0.5 * (1.0 + (std::f32::consts::PI * progress).cos())
-            }
-            Self::CosineDecayWithWarmup {
-                warmup_steps,
-                total_steps,
-                warmup_init,
-            } => {
-                if step < *warmup_steps {
-                    // Linear warmup: warmup_init -> base_lr
-                    let warmup_progress = (step as f32) / (*warmup_steps as f32).max(1.0);
-                    warmup_init + (base_lr - warmup_init) * warmup_progress
-                } else {
-                    // Cosine decay after warmup
-                    let decay_steps = total_steps.saturating_sub(*warmup_steps);
-                    if decay_steps == 0 {
-                        return base_lr;
-                    }
-                    let progress = ((step - warmup_steps) as f32) / (decay_steps as f32);
-                    let progress = progress.min(1.0);
-                    base_lr * 0.5 * (1.0 + (std::f32::consts::PI * progress).cos())
-                }
-            }
-        }
-    }
-}
-
 /// Configuration for the MLX-Metal fused optimizer.
 #[derive(Debug, Clone)]
 pub struct MlxMetalOptimizerConfig {
@@ -147,8 +83,6 @@ pub struct MlxMetalOptimizerConfig {
     /// The parameter groups: each group's learning rate (a multiple of
     /// `learning_rate`) and decoupled weight decay.
     pub param_groups: ParameterGroupConfig,
-    /// Learning rate schedule.
-    pub lr_schedule: LrSchedule,
     /// Enable gradient/parameter validation (NaN/Inf detection).
     /// This adds a small overhead (~1-2%) but catches numerical issues early.
     /// Recommended for debugging but can be disabled in production.
@@ -163,7 +97,6 @@ impl Default for MlxMetalOptimizerConfig {
             beta2: 0.999,
             epsilon: 1e-8,
             param_groups: ParameterGroupConfig::new(0.01),
-            lr_schedule: LrSchedule::Constant,
             validate_numerics: false, // Disabled by default for production perf
         }
     }
@@ -308,23 +241,11 @@ impl MlxMetalOptimizer {
         })
     }
 
-    /// Set total steps for learning rate scheduling.
-    /// Call this before training starts if using a decay schedule.
-    pub fn set_total_steps(&mut self, total_steps: u32) {
-        match &mut self.config.lr_schedule {
-            LrSchedule::CosineDecay { total_steps: ts } => *ts = total_steps,
-            LrSchedule::CosineDecayWithWarmup {
-                total_steps: ts, ..
-            } => *ts = total_steps,
-            LrSchedule::Constant => {}
-        }
-    }
-
-    /// Get the current learning rate (after applying schedule).
+    /// The learning rate the next step uses: the base rate the caller last
+    /// set with [`Self::set_learning_rate`]. The schedule is the training
+    /// loop's (`pmetal_core::LearningRateScheduler`), not this optimizer's.
     pub fn current_lr(&self) -> f32 {
-        self.config
-            .lr_schedule
-            .get_lr_multiplier(self.step, self.config.learning_rate)
+        self.config.learning_rate
     }
 
     /// Initialize the optimizer with the model's trainable parameters.
@@ -708,29 +629,6 @@ impl MlxMetalOptimizerBuilder {
         self
     }
 
-    /// Set learning rate schedule to cosine decay.
-    pub fn cosine_decay(mut self, total_steps: u32) -> Self {
-        self.config.lr_schedule = LrSchedule::CosineDecay { total_steps };
-        self
-    }
-
-    /// Set learning rate schedule to cosine decay with warmup.
-    /// SOTA: This is the recommended schedule; typical warmup is 5-10% of total steps.
-    /// Typical warmup is 5-10% of total steps.
-    pub fn cosine_decay_with_warmup(
-        mut self,
-        warmup_steps: u32,
-        total_steps: u32,
-        warmup_init: Option<f32>,
-    ) -> Self {
-        self.config.lr_schedule = LrSchedule::CosineDecayWithWarmup {
-            warmup_steps,
-            total_steps,
-            warmup_init: warmup_init.unwrap_or(0.0),
-        };
-        self
-    }
-
     /// Enable gradient/parameter validation (NaN/Inf detection).
     ///
     /// When enabled, the optimizer checks gradients for NaN/Inf values each step.
@@ -922,87 +820,5 @@ mod tests {
 
         let values: Vec<f32> = updated.as_slice().to_vec();
         assert!(values[0] < 1.0, "Weight should decrease, got {}", values[0]);
-    }
-
-    #[test]
-    fn test_lr_schedule_constant() {
-        let schedule = LrSchedule::Constant;
-        let base_lr = 1e-4;
-
-        // Constant schedule should always return base_lr
-        assert!((schedule.get_lr_multiplier(0, base_lr) - base_lr).abs() < 1e-8);
-        assert!((schedule.get_lr_multiplier(100, base_lr) - base_lr).abs() < 1e-8);
-        assert!((schedule.get_lr_multiplier(1000, base_lr) - base_lr).abs() < 1e-8);
-    }
-
-    #[test]
-    fn test_lr_schedule_cosine_decay() {
-        let schedule = LrSchedule::CosineDecay { total_steps: 100 };
-        let base_lr = 1e-4;
-
-        // At step 0, should be full LR
-        let lr_0 = schedule.get_lr_multiplier(0, base_lr);
-        assert!((lr_0 - base_lr).abs() < 1e-8, "Step 0 should be base_lr");
-
-        // At step 50 (halfway), should be ~0.5 * base_lr
-        let lr_50 = schedule.get_lr_multiplier(50, base_lr);
-        assert!(
-            (lr_50 - 0.5 * base_lr).abs() < 1e-6,
-            "Step 50 should be ~0.5 * base_lr"
-        );
-
-        // At step 100, should be ~0
-        let lr_100 = schedule.get_lr_multiplier(100, base_lr);
-        assert!(lr_100 < 1e-8, "Step 100 should be ~0");
-    }
-
-    #[test]
-    fn test_lr_schedule_warmup() {
-        let schedule = LrSchedule::CosineDecayWithWarmup {
-            warmup_steps: 10,
-            total_steps: 100,
-            warmup_init: 0.0,
-        };
-        let base_lr = 1e-4;
-
-        // At step 0, should be warmup_init (0.0)
-        let lr_0 = schedule.get_lr_multiplier(0, base_lr);
-        assert!(lr_0.abs() < 1e-8, "Step 0 should be warmup_init");
-
-        // At step 5 (halfway through warmup), should be ~0.5 * base_lr
-        let lr_5 = schedule.get_lr_multiplier(5, base_lr);
-        assert!(
-            (lr_5 - 0.5 * base_lr).abs() < 1e-6,
-            "Step 5 should be ~0.5 * base_lr"
-        );
-
-        // At step 10 (end of warmup), should be full base_lr
-        let lr_10 = schedule.get_lr_multiplier(10, base_lr);
-        assert!((lr_10 - base_lr).abs() < 1e-6, "Step 10 should be base_lr");
-
-        // After warmup, should decay
-        let lr_55 = schedule.get_lr_multiplier(55, base_lr);
-        assert!(lr_55 < base_lr, "Step 55 should be less than base_lr");
-    }
-
-    #[test]
-    fn test_builder_with_schedule() {
-        let opt = MlxMetalOptimizerBuilder::new(2e-4)
-            .cosine_decay_with_warmup(10, 100, None)
-            .build()
-            .unwrap();
-
-        // Verify schedule was set
-        match &opt.config.lr_schedule {
-            LrSchedule::CosineDecayWithWarmup {
-                warmup_steps,
-                total_steps,
-                ..
-            } => {
-                assert_eq!(*warmup_steps, 10);
-                assert_eq!(*total_steps, 100);
-            }
-            _ => panic!("Expected CosineDecayWithWarmup schedule"),
-        }
     }
 }

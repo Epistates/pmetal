@@ -76,7 +76,7 @@ pub struct GrpoSpec {
         group = "Optimization",
         argv = "--optimizer",
         kind = "enum",
-        enum_options = ["adamw", "sgd", "lion", "adafactor"],
+        enum_options = ["adamw", "sgd", "lion", "adafactor", "muon", "adamw_schedule_free", "adamw_8bit"],
         help = "Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW",
         default = "adamw"
     )]
@@ -184,16 +184,6 @@ pub struct GrpoSpec {
     pub reasoning_rewards: bool,
 
     #[job(
-        label = "Disable Flash Attention",
-        group = "Compute",
-        argv = "--no-flash-attention",
-        flag,
-        default_bool = false
-    )]
-    #[serde(default)]
-    pub no_flash_attention: bool,
-
-    #[job(
         label = "VLM Mode",
         group = "GRPO",
         argv = "--vlm",
@@ -259,22 +249,6 @@ pub struct GrpoSpec {
     #[serde(default)]
     pub async_rewards: bool,
 
-    #[job(label = "Text Column", group = "Data", argv = "--text-column")]
-    #[serde(default)]
-    pub text_column: Option<String>,
-
-    #[job(label = "Text Columns (csv)", group = "Data", argv = "--text-columns")]
-    #[serde(default)]
-    pub text_columns: Option<String>,
-
-    #[job(
-        label = "Column Separator",
-        group = "Data",
-        argv = "--column-separator"
-    )]
-    #[serde(default)]
-    pub column_separator: Option<String>,
-
     #[job(label = "Prompt Column", group = "Data", argv = "--prompt-column")]
     #[serde(default)]
     pub prompt_column: Option<String>,
@@ -321,7 +295,6 @@ impl Default for GrpoSpec {
             loss_type: default_loss_type(),
             num_iterations: default_num_iterations(),
             reasoning_rewards: false,
-            no_flash_attention: false,
             vlm: false,
             max_image_size: default_max_image_size(),
             reward_model: None,
@@ -329,9 +302,6 @@ impl Default for GrpoSpec {
             reward_model_weight: default_reward_model_weight(),
             reward_model_template: None,
             async_rewards: false,
-            text_column: None,
-            text_columns: None,
-            column_separator: None,
             prompt_column: None,
             response_column: None,
             grpo_kv_bits: None,

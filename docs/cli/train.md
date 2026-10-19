@@ -60,13 +60,15 @@ pmetal train --config training.yaml
 | `--double-quant` | `false` | Pack `nf4`'s absmax values to 8 bits as well |
 | `--gradient-accumulation-steps` | `4` | Gradient accumulation steps |
 | `--embedding-lr` | None | Separate LR for embeddings |
-| `--no-metal-fused-optimizer` | `false` | Disable Metal fused optimizer |
+| `--label-smoothing` | `0.0` | Label smoothing of the training loss, in [0, 1); evaluation reports the plain loss |
+| `--z-loss` | `0.0` | Weight of the z-loss `weight * lse^2` added to each token's loss (PaLM; 1e-4 is the paper's value) |
+| `--neftune-alpha` | None | NEFTune noise alpha on the token embeddings of every training forward pass (5 for small models, 15 for larger) |
 | `--lr-schedule` | `cosine` | `constant`, `linear`, `cosine`, `cosine_with_restarts`, `polynomial`, `wsd` |
 | `--no-gradient-checkpointing` | `false` | Disable gradient checkpointing |
 | `--gradient-checkpointing-layers` | `4` | Layers per checkpoint block |
 | `--warmup-steps` | `0` | Learning rate warmup steps |
 | `--weight-decay` | `0.01` | Weight decay |
-| `--optimizer` | `adamw` | `adamw`, `sgd` (momentum 0.9), `lion`, `adafactor`. Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW |
+| `--optimizer` | `adamw` | `adamw`, `sgd` (momentum 0.9), `lion`, `adafactor`, `muon`, `adamw_schedule_free`, `adamw_8bit`. Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW; schedule-free AdamW wants a constant rate |
 | `--no-sequence-packing` | `false` | Disable sequence packing |
 | `--cut-cross-entropy` | `false` | Loss from fused Metal kernels that never hold the logits; gradient as precise as the full logits' |
 | `--text-column` | — | Custom JSONL column name for training text |

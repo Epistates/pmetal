@@ -21,8 +21,6 @@
   let maxCompletionLength = $state(512);
   let seed = $state(42);
   let reasoningRewards = $state(false);
-  let noFlashAttention = $state(false);
-  let textColumn = $state('');
   let promptColumn = $state('');
   let responseColumn = $state('');
 
@@ -71,8 +69,6 @@
       max_completion_length: maxCompletionLength,
       seed,
       reasoning_rewards: reasoningRewards,
-      no_flash_attention: noFlashAttention,
-      text_column: textColumn.trim() || null,
       prompt_column: promptColumn.trim() || null,
       response_column: responseColumn.trim() || null,
     };
@@ -147,11 +143,7 @@
           <label class="label" for="rlkd-output">Output Directory</label>
           <input id="rlkd-output" type="text" class="input" bind:value={outputDir} />
         </div>
-        <div class="grid grid-cols-3 gap-3">
-          <div>
-            <label class="label" for="rlkd-textcol">Text Column</label>
-            <input id="rlkd-textcol" type="text" class="input" placeholder="optional" bind:value={textColumn} />
-          </div>
+        <div class="grid grid-cols-2 gap-3">
           <div>
             <label class="label" for="rlkd-promptcol">Prompt Column</label>
             <input id="rlkd-promptcol" type="text" class="input" placeholder="optional" bind:value={promptColumn} />
@@ -247,12 +239,6 @@
         <div>
           <label class="label" for="rlkd-seed">Seed</label>
           <input id="rlkd-seed" type="number" class="input" min="0" bind:value={seed} />
-        </div>
-        <div class="col-span-2">
-          <label class="flex items-center gap-2 cursor-pointer">
-            <input type="checkbox" class="rounded border-surface-300" bind:checked={noFlashAttention} />
-            <span class="text-sm font-medium text-surface-700 dark:text-surface-300">Disable flash attention</span>
-          </label>
         </div>
       </div>
     </div>

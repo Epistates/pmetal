@@ -29,8 +29,9 @@ This crate provides the training infrastructure for PMetal, including various tr
 
 ### Basic Training Loop
 
-`TrainingLoop::new` takes a single `TrainingLoopConfig`. The model and dataset go to `run_packed`,
-which returns the trained model.
+`TrainingLoop::new` takes a single `TrainingLoopConfig` and checks it: a configuration that cannot
+work (a zero batch size, a label smoothing outside `[0, 1)`) is an error here, not a failure
+partway through a run. The model and dataset go to `run`, which trains the model in place.
 
 ```rust,no_run
 use pmetal_core::TrainingConfig;
@@ -39,7 +40,7 @@ use pmetal_lora::DynamicLoraModel;
 use pmetal_trainer::{ProgressCallback, TrainingLoop, TrainingLoopConfig};
 
 fn train(
-    model: DynamicLoraModel,
+    mut model: DynamicLoraModel,
     train_dataset: TrainingDataset,
 ) -> anyhow::Result<DynamicLoraModel> {
     let loop_config = TrainingLoopConfig {
@@ -56,21 +57,25 @@ fn train(
         ..Default::default()
     };
 
-    let mut training_loop = TrainingLoop::new(loop_config);
+    let mut training_loop = TrainingLoop::new(loop_config)?;
     training_loop.add_callback(Box::new(ProgressCallback::new(1_000)));
 
-    Ok(training_loop.run_packed(model, train_dataset, None, None)?)
+    training_loop.run(&mut model, train_dataset, None, None)?;
+    Ok(model)
 }
 ```
 
-Drive the iteration yourself with `train_step(&mut model, &batch, &mut optimizer)` if you need
-control over batching.
+`run` packs short sequences when `use_sequence_packing` is set and the model allows it, trains on
+this rank's share of the data under data parallelism, takes an optimizer step every
+`gradient_accumulation_steps` micro-batches (the mean gradient over all their tokens), and
+evaluates once per micro-batch. Drive the iteration yourself with
+`train_step(&mut model, &batch, &mut optimizer)` if you need control over batching.
 
 ### With Checkpointing
 
 ```rust,no_run
 use pmetal_data::TrainingDataset;
-use pmetal_lora::{DynamicLoraModel, TrainableModel};
+use pmetal_lora::DynamicLoraModel;
 use pmetal_trainer::{CheckpointManager, TrainingLoop};
 
 fn train_with_checkpoints(
@@ -82,16 +87,16 @@ fn train_with_checkpoints(
         .with_max_checkpoints(3)
         .with_save_best(true);
 
-    // Resume from the newest checkpoint if there is one.
-    if let Some((lora_params, metadata)) = checkpoints.load_latest()? {
-        model.set_lora_parameters(&lora_params);
-        training_loop.set_step(metadata.step);
-        training_loop.set_epoch(metadata.epoch);
-        println!("resumed at step {}", metadata.step);
+    // Resume from the newest checkpoint if there is one: its weights, the optimizer's
+    // state and the data loader's position, so the run takes the steps the interrupted
+    // one would have.
+    if training_loop.resume_from(&mut model, &checkpoints)? {
+        println!("resumed at step {}", training_loop.current_step());
     }
 
-    // Hand the manager to run_packed and it saves on the configured cadence.
-    Ok(training_loop.run_packed(model, train_dataset, None, Some(&checkpoints))?)
+    // Hand the manager to `run` and it saves on the configured cadence.
+    training_loop.run(&mut model, train_dataset, None, Some(&checkpoints))?;
+    Ok(model)
 }
 ```
 
@@ -100,7 +105,10 @@ fn train_with_checkpoints(
 | Optimizer | Description |
 |-----------|-------------|
 | **AdamW Groups** | AdamW with per-parameter-group learning rates |
-| **Metal Fused** | GPU-accelerated AdamW parameter updates |
+| **SGD, Lion, Adafactor** | Momentum SGD, sign-momentum Lion, factored-moment Adafactor |
+| **Muon** | Newton-Schulz-orthogonalized momentum on hidden matrices, AdamW on the rest |
+| **Schedule-free AdamW** | Iterate averaging instead of a decaying schedule |
+| **8-bit AdamW** | Blockwise-quantized moments, a quarter of the optimizer memory |
 
 ## Learning Rate Schedulers
 
@@ -127,7 +135,7 @@ fn train_with_checkpoints(
 | `embedding_trainer` | Sentence-transformer fine-tuning |
 | `contrastive_loss` | InfoNCE, Triplet, CoSENT loss functions |
 | `orchestrator` | Unified training pipeline (shared across CLI/GUI/TUI/easy) |
-| `optimizer` | AdamW, SGD with momentum, Lion and Adafactor, in parameter groups |
+| `optimizer` | AdamW, SGD with momentum, Lion, Adafactor, Muon, schedule-free AdamW and 8-bit AdamW, in parameter groups |
 | `mlx_metal_optimizer` | Metal-accelerated AdamW updates |
 | `adaptive_lr` | EMA-based adaptive learning rate control |
 | `checkpoint` | Checkpoint save/load |

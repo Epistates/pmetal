@@ -25,7 +25,6 @@ pub(crate) async fn run_grpo_cli(
     loss_type: &str,
     num_iterations: usize,
     reasoning_rewards: bool,
-    _use_metal_flash_attention: bool,
     vlm_mode: bool,
     max_image_size: usize,
     reward_model_path: Option<String>,
@@ -37,9 +36,6 @@ pub(crate) async fn run_grpo_cli(
     _log_metrics: Option<String>,
     emit_console_output: bool,
     extra_callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>>,
-    text_column: Option<String>,
-    text_columns: Option<Vec<String>>,
-    column_separator: String,
     prompt_column: Option<String>,
     response_column: Option<String>,
 ) -> anyhow::Result<()> {
@@ -49,10 +45,6 @@ pub(crate) async fn run_grpo_cli(
 
     pmetal_runtime::compat::random::seed(seed);
 
-    // GRPO reads a prompt and, optionally, a reference answer from a row: the
-    // prompt and response columns name them; the text-column options describe
-    // supervised text, which GRPO does not train on.
-    let _ = (text_column, text_columns, column_separator);
     let prompt_columns = pmetal_trainer::grpo::PromptColumns {
         prompt: prompt_column,
         reference: response_column,
