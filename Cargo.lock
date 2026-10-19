@@ -5213,8 +5213,7 @@ name = "pmetal"
 version = "0.6.0"
 dependencies = [
  "anyhow",
- "arrow-array",
- "arrow-json",
+ "arrow",
  "base64 0.23.1",
  "chrono",
  "clap",

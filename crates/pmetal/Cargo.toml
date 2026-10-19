@@ -58,7 +58,6 @@ cli = [
     "dep:clap", "dep:clap_complete", "dep:tokio", "dep:tracing-subscriber",
     "dep:serde", "dep:serde-saphyr", "dep:indicatif", "dep:anyhow",
     "dep:safetensors", "dep:dirs", "dep:chrono",
-    "dep:parquet", "dep:arrow-array", "dep:arrow-json",
     "dep:rand", "dep:regex", "dep:tempfile", "dep:tokenizers",
     "dep:walkdir", "dep:flate2", "dep:libc", "dep:sha2",
 ]
@@ -109,9 +108,6 @@ anyhow = { workspace = true, optional = true }
 safetensors = { workspace = true, optional = true }
 dirs = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
-parquet = { workspace = true, features = ["arrow"], optional = true }
-arrow-array = { workspace = true, optional = true }
-arrow-json = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 regex = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
@@ -132,6 +128,9 @@ flate2 = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+# Parquet fixtures for the dataset commands
+arrow = { workspace = true }
+parquet = { workspace = true }
 # Fail every test at the bridge op that throws (pmetal-runtime `strict-errors`).
 pmetal-runtime = { workspace = true, features = ["strict-errors"] }
 tracing-subscriber = { workspace = true }

@@ -3,15 +3,21 @@
 use clap::{Subcommand, ValueEnum};
 
 /// Dataset subcommands for data preparation.
+///
+/// Every command that reads a dataset reads JSONL, JSON, Parquet, Arrow, CSV
+/// or TSV, a file or a directory (its train split), and a row of any layout
+/// `pmetal dataset formats` lists.
 #[derive(Subcommand, Debug)]
 pub enum DatasetAction {
     /// Analyze a dataset and show statistics
     Analyze {
-        /// Path to dataset file (JSONL)
+        /// Dataset file or directory
         #[arg(short, long)]
         path: String,
 
-        /// Model ID for tokenization (required for accurate token counts)
+        /// Model ID or path whose tokenizer counts tokens and whose chat
+        /// template renders conversations, so the lengths are what training
+        /// sees
         #[arg(short, long)]
         model: Option<String>,
 
@@ -38,9 +44,9 @@ pub enum DatasetAction {
         revision: Option<String>,
     },
 
-    /// Convert a dataset to pmetal-compatible JSONL format
+    /// Convert a dataset to JSONL
     Convert {
-        /// Input file path (Parquet, JSON, JSONL, CSV)
+        /// Input file or directory (Parquet, JSON, JSONL, Arrow, CSV, TSV)
         #[arg(short, long)]
         input: String,
 
@@ -48,11 +54,8 @@ pub enum DatasetAction {
         #[arg(short, long)]
         output: String,
 
-        /// Input format (auto-detected if not specified)
-        #[arg(long, value_enum)]
-        format: Option<InputFormat>,
-
-        /// Column mapping for non-standard formats (e.g., "text=content,prompt=instruction")
+        /// Rename columns: "target=source,target=source" (e.g., "text=content,prompt=instruction"
+        /// takes `text` from the column `content`)
         #[arg(long)]
         columns: Option<String>,
 
@@ -67,11 +70,12 @@ pub enum DatasetAction {
 
     /// Validate a dataset for training
     Validate {
-        /// Path to dataset file (JSONL)
+        /// Dataset file or directory
         #[arg(short, long)]
         path: String,
 
-        /// Model ID for tokenization validation
+        /// Model ID or path whose tokenizer (and chat template) measures the
+        /// samples
         #[arg(short, long)]
         model: Option<String>,
 
@@ -80,12 +84,12 @@ pub enum DatasetAction {
         max_seq_len: usize,
     },
 
-    /// Preview first N samples from a HuggingFace dataset
+    /// Preview the first N samples of a dataset
     Preview {
-        /// Dataset ID (e.g., "tatsu-lab/alpaca")
+        /// HuggingFace dataset ID (e.g., "tatsu-lab/alpaca") or a local path
         dataset_id: String,
 
-        /// Dataset split (e.g., "train", "test")
+        /// Dataset split (e.g., "train", "test"); for a HuggingFace dataset
         #[arg(long, default_value = "train")]
         split: String,
 
@@ -96,7 +100,7 @@ pub enum DatasetAction {
 
     /// Filter a dataset by various criteria
     Filter {
-        /// Input dataset path (JSONL)
+        /// Input dataset (file or directory)
         #[arg(short, long)]
         input: String,
 
@@ -104,7 +108,7 @@ pub enum DatasetAction {
         #[arg(short, long)]
         output: String,
 
-        /// Model ID for token-based filtering
+        /// Model ID or path for token-based filtering
         #[arg(short, long)]
         model: Option<String>,
 
@@ -116,11 +120,12 @@ pub enum DatasetAction {
         #[arg(long)]
         max_tokens: Option<usize>,
 
-        /// Remove duplicate samples (exact match)
+        /// Remove duplicate samples (exact match of their text)
         #[arg(long)]
         dedup: bool,
 
-        /// Regex pattern to match (keeps matching samples)
+        /// Regex pattern to match against the sample's text (keeps matching
+        /// samples; a conversation reads as `Role: content` blocks)
         #[arg(long)]
         pattern: Option<String>,
 
@@ -128,14 +133,14 @@ pub enum DatasetAction {
         #[arg(long)]
         invert: bool,
 
-        /// Require all conversation turns (filters incomplete conversations)
+        /// Keep only conversations that have both a user and an assistant turn
         #[arg(long)]
         complete_only: bool,
     },
 
     /// Split a dataset into train/validation/test sets
     Split {
-        /// Input dataset path (JSONL)
+        /// Input dataset (file or directory)
         #[arg(short, long)]
         input: String,
 
@@ -155,14 +160,15 @@ pub enum DatasetAction {
         #[arg(long, default_value = "42")]
         seed: u64,
 
-        /// Stratify by a field (e.g., "category", "difficulty")
+        /// Keep the proportions of a column's values in every split (e.g.,
+        /// "category", "difficulty")
         #[arg(long)]
         stratify: Option<String>,
     },
 
     /// Merge multiple datasets into one
     Merge {
-        /// Input dataset paths (JSONL)
+        /// Input datasets (files or directories)
         #[arg(short, long, num_args = 1..)]
         inputs: Vec<String>,
 
@@ -174,7 +180,7 @@ pub enum DatasetAction {
         #[arg(long)]
         shuffle: bool,
 
-        /// Random seed for shuffling
+        /// Random seed for shuffling and weighted sampling
         #[arg(long, default_value = "42")]
         seed: u64,
 
@@ -182,14 +188,15 @@ pub enum DatasetAction {
         #[arg(long)]
         interleave: bool,
 
-        /// Weights for each input dataset (comma-separated, e.g., "1.0,2.0,0.5")
+        /// Weights for each input dataset (comma-separated, one per input,
+        /// e.g., "1.0,2.0,0.5"): 2.0 repeats a dataset, 0.5 keeps half of it
         #[arg(long)]
         weights: Option<String>,
     },
 
     /// Take a random sample from a dataset
     Sample {
-        /// Input dataset path (JSONL)
+        /// Input dataset (file or directory)
         #[arg(short, long)]
         input: String,
 
@@ -208,7 +215,7 @@ pub enum DatasetAction {
 
     /// Apply a chat template to format conversations
     Template {
-        /// Input dataset path (JSONL with conversations)
+        /// Input dataset (file or directory)
         #[arg(short, long)]
         input: String,
 
@@ -216,23 +223,27 @@ pub enum DatasetAction {
         #[arg(short, long)]
         output: String,
 
-        /// Chat template to use
-        #[arg(long, value_enum, default_value = "chatml")]
-        template: ChatTemplate,
+        /// A built-in chat template, in place of the model's own. Without it
+        /// the template of --model is used, and chatml without a model
+        #[arg(long, value_enum)]
+        template: Option<TemplateName>,
 
-        /// Custom system message (overrides default)
+        /// System message that replaces the template's default
         #[arg(long)]
         system: Option<String>,
 
-        /// Model ID for tokenizer-based template (uses tokenizer's chat_template)
+        /// Model ID or path whose chat template formats the conversations
         #[arg(short, long)]
         model: Option<String>,
 
-        /// Add generation prompt marker at end
+        /// Write each conversation only up to the generation prompt of its
+        /// last assistant turn, as a model is prompted to answer it
         #[arg(long)]
         add_generation_prompt: bool,
 
-        /// Only mask prompt tokens in labels (for SFT)
+        /// Write each sample as a prompt and a completion (the last assistant
+        /// turn), so a trainer that reads such rows trains on the completion
+        /// only
         #[arg(long)]
         mask_prompt: bool,
     },
@@ -246,13 +257,14 @@ pub enum DatasetAction {
         #[arg(short, long)]
         output_dir: String,
 
-        /// Model ID for tokenization
+        /// Model ID or path whose tokenizer measures the samples and whose
+        /// chat template formats them
         #[arg(short, long)]
         model: String,
 
-        /// Chat template to apply
-        #[arg(long, value_enum, default_value = "chatml")]
-        template: ChatTemplate,
+        /// A built-in chat template, in place of the model's own
+        #[arg(long, value_enum)]
+        template: Option<TemplateName>,
 
         /// Maximum sequence length (filters longer samples)
         #[arg(long, default_value = "2048")]
@@ -280,9 +292,9 @@ pub enum DatasetAction {
     Formats,
 }
 
-/// Chat template formats for conversation formatting.
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum ChatTemplate {
+/// A built-in chat template, for conversation formatting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TemplateName {
     /// ChatML format: <|im_start|>role\ncontent<|im_end|>
     Chatml,
     /// Llama 3 format: <|start_header_id|>role<|end_header_id|>\n\ncontent<|eot_id|>
@@ -297,25 +309,8 @@ pub enum ChatTemplate {
     Phi,
     /// Gemma format: <start_of_turn>role\ncontent<end_of_turn>
     Gemma,
-    /// Raw text (no template, just concatenate)
+    /// No chat template: `Role: content` blocks
     Raw,
-    /// Use tokenizer's built-in chat template
+    /// The model's own chat template (needs --model)
     Auto,
-}
-
-/// Input format for dataset conversion.
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum InputFormat {
-    /// Parquet format
-    Parquet,
-    /// JSON array format
-    Json,
-    /// JSONL (JSON Lines) format
-    Jsonl,
-    /// CSV format
-    Csv,
-    /// ShareGPT conversation format
-    ShareGpt,
-    /// Alpaca instruction format
-    Alpaca,
 }

@@ -123,8 +123,6 @@ clap_complete = "4"
 safetensors = "0.8"
 arrow = "60"
 parquet = "60"
-arrow-array = "60"
-arrow-json = "60"
 
 # HuggingFace integration
 hf-hub = "1.0"
