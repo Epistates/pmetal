@@ -3270,40 +3270,17 @@ async fn run_grpo_in_process(
 
     let max_seq_len = spec.max_seq_len;
 
-    // Build column config from spec fields.
-    let col_cfg = {
-        let text_column = spec.text_column.clone();
-        let text_columns = spec
-            .text_columns
-            .as_ref()
-            .map(|s| s.split(',').map(str::to_string).collect::<Vec<_>>());
-        let prompt_column = spec.prompt_column.clone();
-        let response_column = spec.response_column.clone();
-        let column_separator = spec.column_separator.clone();
-        if text_column.is_some()
-            || text_columns.is_some()
-            || prompt_column.is_some()
-            || response_column.is_some()
-        {
-            Some(pmetal::data::DatasetColumnConfig {
-                text_column,
-                text_columns,
-                column_separator,
-                prompt_column,
-                response_column,
-            })
-        } else {
-            None
-        }
-    };
-
-    let dataset = pmetal::data::TrainingDataset::from_jsonl_tokenized(
+    // Each row's conversation up to where the model writes, with its answer
+    // kept aside as the accuracy reward's reference.
+    let prompts = pmetal::trainer::grpo::load_prompts_with(
         &dataset_path,
         &tokenizer,
-        pmetal::data::DatasetFormat::Auto,
+        &chat_template,
         max_seq_len,
-        Some(&chat_template),
-        col_cfg.as_ref(),
+        &pmetal::trainer::grpo::PromptColumns {
+            prompt: spec.prompt_column.clone(),
+            reference: spec.response_column.clone(),
+        },
     )
     .map_err(|e| AppError(e.to_string()))?;
 
@@ -3328,20 +3305,28 @@ async fn run_grpo_in_process(
     grpo_config.max_prompt_length = max_seq_len;
     grpo_config.max_completion_length = spec.max_completion_length;
     grpo_config.kv_cache_bits = spec.grpo_kv_bits;
+    // A completion ends where the model would stop, not only at the tokenizer's EOS.
+    grpo_config.stop_tokens = pmetal::data::inference_config::collect_all_stop_tokens(
+        std::path::Path::new(&model_path),
+        &tokenizer,
+        Some(chat_template.template_type),
+    );
 
-    let mut rewards = pmetal::trainer::CombinedReward::new();
-    if spec.reasoning_rewards {
-        rewards = rewards.add(
-            Box::new(pmetal::trainer::XmlFormatReward::default_reasoning()),
-            1.0,
-        );
+    // The reasoning rewards, which add the accuracy of the final answer when
+    // every prompt has a reference answer; or the accuracy alone.
+    let with_references = prompts.iter().all(|p| p.reference.is_some());
+    let rewards = if spec.reasoning_rewards {
+        pmetal::trainer::CombinedReward::reasoning(max_seq_len * 2, with_references)
+    } else if with_references {
+        pmetal::trainer::CombinedReward::new()
+            .add(Box::new(pmetal::trainer::AccuracyReward::new()), 1.0)
     } else {
         return Err(AppError(
-            "GRPO requires a reward function. Enable 'Reasoning Rewards' or use the CLI \
-             with a custom reward configuration."
+            "GRPO requires a reward function. Enable 'Reasoning Rewards', give every dataset \
+             row an `answer`, or use the CLI with a reward model."
                 .to_string(),
         ));
-    }
+    };
 
     let output_dir = spec.output_dir.clone();
     let training_config = pmetal::core::TrainingConfig {
@@ -3369,15 +3354,22 @@ async fn run_grpo_in_process(
     trainer.enable_adaptive_lr_with_control(adaptive_config, control_file);
 
     let mut optimizer = pmetal::trainer::TrainOptimizer::from_config(&trainer.training_config);
-    let mut ref_model =
-        pmetal::models::DynamicModel::load(&model_path).map_err(|e| AppError(e.to_string()))?;
+    // The reference model is only the KL penalty's.
+    let mut ref_model = if spec.beta > 0.0 {
+        Some(
+            pmetal::models::DynamicModel::load(&model_path)
+                .map_err(|e| AppError(e.to_string()))?,
+        )
+    } else {
+        None
+    };
 
     trainer
         .run(
             &mut model,
-            Some(&mut ref_model),
+            ref_model.as_mut(),
             &tokenizer,
-            &dataset,
+            &prompts,
             &rewards,
             &mut optimizer,
             |opt, lr| opt.set_lr(lr),
@@ -4032,7 +4024,7 @@ pub async fn start_rlkd(
         "--num-generations".into(),
         config.num_generations.unwrap_or(8).to_string(),
     ]);
-    args.extend(["--beta".into(), config.beta.unwrap_or(0.001).to_string()]);
+    args.extend(["--beta".into(), config.beta.unwrap_or(0.0).to_string()]);
     args.extend([
         "--learning-rate".into(),
         config.learning_rate.unwrap_or(5e-6).to_string(),

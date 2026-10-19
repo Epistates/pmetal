@@ -66,7 +66,7 @@ pub fn triplet_loss(
 }
 
 /// CoSENT loss (Su Jianlin, *CoSENT: A more efficient sentence vector scheme
-/// than Sentence-BERT*, 2022), as sentence-transformers' `CoSENTLoss` computes it.
+/// than Sentence-BERT*, 2022).
 ///
 /// Each row is a pair `(a_i, b_i)` with a similarity label `y_i` (binary or
 /// graded). With `s_i = cos(a_i, b_i) / temperature`, every pair labelled

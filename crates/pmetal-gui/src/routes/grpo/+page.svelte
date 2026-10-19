@@ -12,7 +12,7 @@
   let optimizer = $state<OptimizerName>('adamw');
   let batchSize = $state(1);
   let groupSize = $state(8);
-  let beta = $state(0.04);
+  let beta = $state(0);
   let lossType = $state<GrpoLossType>('dapo');
   let numIterations = $state(1);
   let dapo = $state(false);

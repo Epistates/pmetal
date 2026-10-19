@@ -55,18 +55,18 @@ pub fn read_rows(path: impl AsRef<Path>) -> anyhow::Result<Vec<Value>> {
 }
 
 /// A field's value: plain text, or a list of chat messages.
-enum Turns {
+pub(crate) enum Turns {
     Text(String),
     Messages(Vec<Message>),
 }
 
-fn field<'a>(row: &'a Value, names: &[&str]) -> Option<&'a Value> {
+pub(crate) fn field<'a>(row: &'a Value, names: &[&str]) -> Option<&'a Value> {
     names
         .iter()
         .find_map(|n| row.get(*n).filter(|v| !v.is_null()))
 }
 
-fn turns(value: &Value) -> Option<Turns> {
+pub(crate) fn turns(value: &Value) -> Option<Turns> {
     match value {
         Value::String(s) => Some(Turns::Text(s.clone())),
         Value::Array(items) => items
@@ -101,7 +101,10 @@ fn completion(value: &Value) -> Option<(Vec<Message>, String)> {
 /// The prompt messages for a row whose completion is `completion_prefix` +
 /// assistant turn: the `prompt` field if there is one, otherwise the
 /// completion's own preceding turns. A `system` field is prepended.
-fn prompt_messages(row: &Value, completion_prefix: Vec<Message>) -> Option<Vec<Message>> {
+pub(crate) fn prompt_messages(
+    row: &Value,
+    completion_prefix: Vec<Message>,
+) -> Option<Vec<Message>> {
     let mut messages = match field(row, PROMPT_FIELDS).map(turns) {
         Some(Some(Turns::Text(text))) => {
             let mut m = vec![Message::user(text)];

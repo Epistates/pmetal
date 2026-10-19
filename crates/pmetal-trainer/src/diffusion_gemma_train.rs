@@ -2,8 +2,8 @@
 //!
 //! DiffusionGemma is a *block-autoregressive discrete-diffusion* model: a causal
 //! encoder commits a prompt to a read-only KV cache, and a bidirectional decoder
-//! denoises a fixed-length canvas conditioned on that cache. transformers ships
-//! the modeling + generation code but **no training loop** (the top-level
+//! denoises a fixed-length canvas conditioned on that cache. The released
+//! modeling and generation code has **no training loop** (the top-level
 //! `forward` returns logits, never a loss), so the objective here is derived
 //! from the architecture, mirroring how the generation sampler was.
 //!
@@ -20,7 +20,7 @@
 //! The objective is the decoder **denoising cross-entropy** (predict the clean
 //! canvas from its corrupted version), optionally restricted to corrupted
 //! positions, plus an optional **encoder autoregressive** next-token loss (the
-//! encoder is causal; transformers exposes its hidden states "to compute an
+//! encoder is causal, and its hidden states are exposed "to compute an
 //! autoregressive loss on the encoder during training"). The full training step
 //! (t-schedule sampling, self-conditioning dropout, optimiser) lives in the
 //! training loop that consumes these primitives.

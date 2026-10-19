@@ -12,7 +12,7 @@
   let annealAlpha = $state(false);
   let distillTemperature = $state(2.0);
   let numGenerations = $state(8);
-  let beta = $state(0.001);
+  let beta = $state(0);
   let learningRate = $state(5e-6);
   let epochs = $state(1);
   let loraR = $state(16);

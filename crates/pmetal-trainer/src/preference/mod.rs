@@ -15,7 +15,7 @@
 //! before training, and keep those log-probs: one forward pass per sequence,
 //! a few bytes per example, and no second copy of the model.
 
-mod data;
+pub(crate) mod data;
 mod kto;
 mod loss;
 
