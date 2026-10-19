@@ -2478,6 +2478,9 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 max_seq_len,
                 weight_decay,
                 no_normalize,
+                lora,
+                lora_r,
+                lora_alpha,
                 log_every,
                 seed,
             } = args;
@@ -2497,6 +2500,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 !no_normalize,
                 log_every,
                 seed,
+                lora.then_some((lora_r, lora_alpha)),
             )
             .await?;
         }

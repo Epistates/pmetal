@@ -31,7 +31,12 @@ pub fn info_nce_loss(
     let batch_size = anchors.dim(0);
 
     // Similarity matrix [batch, batch]
-    let sim = anchors.matmul(&positives.transpose_axes(&[1, 0]));
+    // In f32 whatever the embeddings' dtype: the matrix is divided by a
+    // small temperature, which magnifies a half-precision matmul's rounding.
+    let f32_dtype = Dtype::Float32.as_i32();
+    let sim = anchors
+        .as_dtype(f32_dtype)
+        .matmul(&positives.as_dtype(f32_dtype).transpose_axes(&[1, 0]));
     let sim_scaled = sim.divide(&Array::from_f32(temperature));
 
     // Diagonal labels: [0, 1, 2, ..., batch-1]
@@ -149,6 +154,8 @@ pub fn cosine_similarity_loss(
 ///
 /// Returns `[batch]` of similarity values in `[-1, 1]`.
 pub(crate) fn pairwise_cosine_similarity(a: &Array, b: &Array) -> Result<Array, Exception> {
+    let f32_dtype = Dtype::Float32.as_i32();
+    let (a, b) = (&a.as_dtype(f32_dtype), &b.as_dtype(f32_dtype));
     let dot = a.multiply(b).sum_axes(&[-1], false); // [batch]
     let norm_a = a.square().sum_axes(&[-1], false).sqrt(); // [batch]
     let norm_b = b.square().sum_axes(&[-1], false).sqrt(); // [batch]
@@ -169,6 +176,85 @@ mod tests {
             data[b * dim as usize] = 1.0;
         }
         Array::from_slice(&data, &[batch, dim])
+    }
+
+    /// bf16 embeddings: the similarity matrix is divided by a temperature of
+    /// 0.05, so a bf16 matmul's rounding (a few thousandths of each cosine)
+    /// becomes tenths of a nat in every logit. The losses are those of the
+    /// values the embeddings hold, evaluated in f32.
+    #[test]
+    fn half_precision_embeddings_lose_nothing_in_the_losses() {
+        use pmetal_runtime::compat::random;
+        random::seed(3);
+        let (n, d) = (16usize, 96usize);
+        // Rows of about unit length, as normalized embeddings are.
+        let make = || {
+            random::normal(&[n as i32, d as i32], Dtype::Float32)
+                .multiply(&Array::from_f32((d as f32).sqrt().recip()))
+                .as_dtype(Dtype::Bfloat16.as_i32())
+        };
+        let (a16, p16, n16) = (make(), make(), make());
+        let host = |x: &Array| -> Vec<Vec<f64>> {
+            let x = x.as_dtype(Dtype::Float32.as_i32());
+            x.eval();
+            x.as_slice::<f32>()
+                .chunks(d)
+                .map(|r| r.iter().map(|&v| v as f64).collect())
+                .collect()
+        };
+        let (a, p, ng) = (host(&a16), host(&p16), host(&n16));
+        let dot = |x: &[f64], y: &[f64]| x.iter().zip(y).map(|(u, v)| u * v).sum::<f64>();
+        let cos = |x: &[f64], y: &[f64]| dot(x, y) / (dot(x, x) * dot(y, y)).sqrt();
+
+        // InfoNCE over the raw dot products, at temperature 0.05.
+        let t = 0.05f64;
+        let mut want = 0.0;
+        for i in 0..n {
+            let s: Vec<f64> = (0..n).map(|j| dot(&a[i], &p[j]) / t).collect();
+            let max = s.iter().cloned().fold(f64::MIN, f64::max);
+            let lse = max + s.iter().map(|x| (x - max).exp()).sum::<f64>().ln();
+            want += (lse - s[i]) / n as f64;
+        }
+        let got = info_nce_loss(&a16, &p16, t as f32).unwrap();
+        got.eval();
+        pmetal_runtime::check_unobserved_error().unwrap();
+        assert_eq!(got.dtype_raw(), Dtype::Float32.as_i32());
+        assert!(
+            (got.item_f32() as f64 - want).abs() < 1e-3,
+            "{} vs {want}",
+            got.item_f32()
+        );
+
+        // Triplet margin loss on cosine distances.
+        let margin = 0.3f64;
+        let want = (0..n)
+            .map(|i| (margin - cos(&a[i], &p[i]) + cos(&a[i], &ng[i])).max(0.0))
+            .sum::<f64>()
+            / n as f64;
+        let got = triplet_loss(&a16, &p16, &n16, margin as f32).unwrap();
+        got.eval();
+        assert_eq!(got.dtype_raw(), Dtype::Float32.as_i32());
+        assert!(
+            (got.item_f32() as f64 - want).abs() < 1e-4,
+            "{} vs {want}",
+            got.item_f32()
+        );
+
+        // Cosine-similarity regression.
+        let labels: Vec<f32> = (0..n).map(|i| (i % 2) as f32).collect();
+        let want = (0..n)
+            .map(|i| (cos(&a[i], &p[i]) - labels[i] as f64).powi(2))
+            .sum::<f64>()
+            / n as f64;
+        let got =
+            cosine_similarity_loss(&a16, &p16, &Array::from_slice(&labels, &[n as i32])).unwrap();
+        got.eval();
+        assert_eq!(got.dtype_raw(), Dtype::Float32.as_i32());
+        assert!(
+            (got.item_f32() as f64 - want).abs() < 1e-4,
+            "{} vs {want}",
+            got.item_f32()
+        );
     }
 
     /// Orthonormal anchors and positives at temperature 1 score each anchor

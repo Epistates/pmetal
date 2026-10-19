@@ -44,7 +44,8 @@ pub struct EmbedTrainSpec {
     pub loss: String,
 
     #[job(label = "Pooling", group = "Model", argv = "--pooling", kind = "enum",
-          enum_options = ["mean", "cls", "max", "last_token", "weighted_mean"], default = "mean")]
+          enum_options = ["auto", "mean", "cls", "max", "last_token", "weighted_mean"], default = "auto",
+          help = "auto reads the pooling the model was trained with (its sentence-transformers configuration), mean without one")]
     #[serde(default = "default_pooling")]
     pub pooling: String,
 
@@ -147,6 +148,39 @@ pub struct EmbedTrainSpec {
     #[job(label = "Seed", group = "Training", argv = "--seed", default_int = 42)]
     #[serde(default = "default_seed")]
     pub seed: u64,
+
+    #[job(
+        label = "LoRA",
+        group = "LoRA",
+        argv = "--lora",
+        flag,
+        default_bool = false,
+        help = "Train LoRA adapters on every linear layer and save them as an adapter, instead of fine-tuning the whole encoder"
+    )]
+    #[serde(default)]
+    pub lora: bool,
+
+    #[job(
+        label = "LoRA r",
+        group = "LoRA",
+        argv = "--lora-r",
+        min = 1,
+        max = 1024,
+        default_int = 16
+    )]
+    #[serde(default = "default_lora_r")]
+    pub lora_r: usize,
+
+    #[job(
+        label = "LoRA α",
+        group = "LoRA",
+        argv = "--lora-alpha",
+        min = 1.0,
+        max = 1024.0,
+        default_float = 32.0
+    )]
+    #[serde(default = "default_lora_alpha")]
+    pub lora_alpha: f32,
 }
 
 impl Default for EmbedTrainSpec {
@@ -167,6 +201,9 @@ impl Default for EmbedTrainSpec {
             no_normalize: false,
             log_every: default_log_every(),
             seed: default_seed(),
+            lora: false,
+            lora_r: default_lora_r(),
+            lora_alpha: default_lora_alpha(),
         }
     }
 }
@@ -185,7 +222,7 @@ fn default_loss() -> String {
     "info_nce".to_string()
 }
 fn default_pooling() -> String {
-    "mean".to_string()
+    "auto".to_string()
 }
 fn default_temperature() -> f32 {
     0.05
@@ -210,6 +247,12 @@ fn default_weight_decay() -> f64 {
 }
 fn default_log_every() -> usize {
     10
+}
+fn default_lora_r() -> usize {
+    16
+}
+fn default_lora_alpha() -> f32 {
+    32.0
 }
 fn default_seed() -> u64 {
     42

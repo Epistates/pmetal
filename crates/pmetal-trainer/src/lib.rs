@@ -82,7 +82,7 @@ pub use diffusion_gemma_train::{
 };
 pub use distillation::*;
 pub use embedding_trainer::{
-    EmbeddingLossType, EmbeddingResult, EmbeddingTrainer, EmbeddingTrainerConfig,
+    EmbeddingLossType, EmbeddingModel, EmbeddingResult, EmbeddingTrainer, EmbeddingTrainerConfig,
     EmbeddingTrainerError,
 };
 pub use grpo::*;
