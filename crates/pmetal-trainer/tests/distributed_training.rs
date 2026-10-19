@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use pmetal_core::{DistributedTrainingConfig, LoraConfig, TrainingConfig};
 use pmetal_data::{DataLoaderConfig, Sample, TrainingDataset};
 use pmetal_distributed::{ClusterSecret, DistributedConfig, DistributedContext, RingBackend};
-use pmetal_lora::{AdaptedModel, TrainableModel};
+use pmetal_lora::AdaptedModel;
 use pmetal_models::architectures::llama::LlamaConfig;
 use pmetal_models::dispatcher::DynamicModel;
 use pmetal_runtime::compat::random;
@@ -60,7 +60,7 @@ fn run_rank(
     rank: usize,
     secret: ClusterSecret,
     packed: bool,
-) -> (Vec<(String, Vec<f32>)>, usize) {
+) -> RankOutcome {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -126,7 +126,10 @@ fn run_rank(
     (weights, training_loop.current_step())
 }
 
-fn two_ranks(packed: bool) -> [(Vec<(String, Vec<f32>)>, usize); 2] {
+/// A rank's adapter weights by name, and the steps it took.
+type RankOutcome = (Vec<(String, Vec<f32>)>, usize);
+
+fn two_ranks(packed: bool) -> [RankOutcome; 2] {
     let nodes: Vec<SocketAddr> = (0..2)
         .map(|_| format!("127.0.0.1:{}", free_port()).parse().unwrap())
         .collect();
