@@ -7,7 +7,8 @@
 //! [`MasterWeight`], so a bf16 model trains rather than rounding its updates
 //! away.
 
-use super::{Optimizer, State, Updatable, apply_updates};
+use super::state::{export_masters, import_masters, import_slot};
+use super::{Optimizer, OptimizerState, State, StatefulOptimizer, Updatable, apply_updates};
 use crate::compat::{Array, Dtype, Exception, FlattenedModuleParam, ModuleParameters};
 use crate::optimizer::MasterWeight;
 use std::collections::HashMap;
@@ -381,6 +382,164 @@ impl Optimizer for Adafactor {
     ) -> Result<(), Exception> {
         self.advance_step();
         apply_updates(self, model, gradients)
+    }
+}
+
+/// The buffers an optimizer keeps for evaluating between steps: its state
+/// and the master copies of its half-precision parameters.
+fn masters_of(masters: &State<MasterWeight>) -> impl Iterator<Item = &Array> {
+    masters.values().filter_map(|m| m.value())
+}
+
+fn masters_of_mut(masters: &mut State<MasterWeight>) -> impl Iterator<Item = &mut Array> {
+    masters.values_mut().filter_map(|m| m.value_mut())
+}
+
+impl Updatable for MomentumSgd {
+    fn updatable_states_len(&self) -> usize {
+        self.updatable_states().len()
+    }
+    fn updatable_states(&self) -> Vec<&Array> {
+        self.state.values().chain(masters_of(&self.masters)).collect()
+    }
+    fn updatable_states_mut(&mut self) -> Vec<&mut Array> {
+        self.state
+            .values_mut()
+            .chain(masters_of_mut(&mut self.masters))
+            .collect()
+    }
+}
+
+impl Updatable for Lion {
+    fn updatable_states_len(&self) -> usize {
+        self.updatable_states().len()
+    }
+    fn updatable_states(&self) -> Vec<&Array> {
+        self.state.values().chain(masters_of(&self.masters)).collect()
+    }
+    fn updatable_states_mut(&mut self) -> Vec<&mut Array> {
+        self.state
+            .values_mut()
+            .chain(masters_of_mut(&mut self.masters))
+            .collect()
+    }
+}
+
+impl Updatable for Adafactor {
+    fn updatable_states_len(&self) -> usize {
+        self.updatable_states().len()
+    }
+    fn updatable_states(&self) -> Vec<&Array> {
+        self.state
+            .values()
+            .flat_map(|m| match m {
+                SecondMoment::Factored { row, col } => vec![row, col],
+                SecondMoment::Full(v) => vec![v],
+            })
+            .chain(masters_of(&self.masters))
+            .collect()
+    }
+    fn updatable_states_mut(&mut self) -> Vec<&mut Array> {
+        self.state
+            .values_mut()
+            .flat_map(|m| match m {
+                SecondMoment::Factored { row, col } => vec![row, col],
+                SecondMoment::Full(v) => vec![v],
+            })
+            .chain(masters_of_mut(&mut self.masters))
+            .collect()
+    }
+}
+
+impl StatefulOptimizer for Sgd {
+    fn export_state(&self) -> OptimizerState {
+        let mut out = OptimizerState::new("sgd");
+        export_masters(&self.masters, &mut out);
+        out
+    }
+
+    fn import_state(&mut self, state: &OptimizerState) -> Result<(), Exception> {
+        state.expect_kind("sgd")?;
+        self.masters = import_masters(state);
+        Ok(())
+    }
+}
+
+impl StatefulOptimizer for MomentumSgd {
+    fn export_state(&self) -> OptimizerState {
+        let mut out = OptimizerState::new("momentum_sgd");
+        for (key, buf) in &self.state {
+            out.set_tensor("buf", key, buf);
+        }
+        export_masters(&self.masters, &mut out);
+        out
+    }
+
+    fn import_state(&mut self, state: &OptimizerState) -> Result<(), Exception> {
+        state.expect_kind("momentum_sgd")?;
+        self.state = import_slot(state, "buf");
+        self.masters = import_masters(state);
+        Ok(())
+    }
+}
+
+impl StatefulOptimizer for Lion {
+    fn export_state(&self) -> OptimizerState {
+        let mut out = OptimizerState::new("lion");
+        for (key, m) in &self.state {
+            out.set_tensor("m", key, m);
+        }
+        export_masters(&self.masters, &mut out);
+        out
+    }
+
+    fn import_state(&mut self, state: &OptimizerState) -> Result<(), Exception> {
+        state.expect_kind("lion")?;
+        self.state = import_slot(state, "m");
+        self.masters = import_masters(state);
+        Ok(())
+    }
+}
+
+impl StatefulOptimizer for Adafactor {
+    fn export_state(&self) -> OptimizerState {
+        let mut out = OptimizerState::new("adafactor");
+        out.set_scalar("step", self.step as f64);
+        for (key, moment) in &self.state {
+            match moment {
+                SecondMoment::Factored { row, col } => {
+                    out.set_tensor("row", key, row);
+                    out.set_tensor("col", key, col);
+                }
+                SecondMoment::Full(v) => out.set_tensor("full", key, v),
+            }
+        }
+        export_masters(&self.masters, &mut out);
+        out
+    }
+
+    fn import_state(&mut self, state: &OptimizerState) -> Result<(), Exception> {
+        state.expect_kind("adafactor")?;
+        self.step = state.scalar("step")? as u64;
+        let mut moments = HashMap::new();
+        for (key, row) in state.slot("row") {
+            let col = state.tensor("col", key).ok_or_else(|| {
+                Exception::custom(format!("Adafactor state has a row factor for `{key}` but no column factor"))
+            })?;
+            moments.insert(
+                Rc::from(key),
+                SecondMoment::Factored {
+                    row: row.clone(),
+                    col: col.clone(),
+                },
+            );
+        }
+        for (key, v) in state.slot("full") {
+            moments.insert(Rc::from(key), SecondMoment::Full(v.clone()));
+        }
+        self.state = moments;
+        self.masters = import_masters(state);
+        Ok(())
     }
 }
 

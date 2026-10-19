@@ -5,11 +5,17 @@ use super::{Array, Exception, FlattenedModuleParam, ModuleParameters, ModulePara
 use std::collections::HashMap;
 use std::rc::Rc;
 
+mod adamw_8bit;
 mod first_order;
 mod muon;
+mod schedule_free;
+mod state;
 
+pub use adamw_8bit::{AdamW8bit, BLOCK as ADAMW_8BIT_BLOCK, MIN_8BIT_SIZE, dynamic_map, nearest_code};
 pub use first_order::{Adafactor, Lion, MomentumSgd, SecondMoment, Sgd};
 pub use muon::{LrAdjust, Muon, MuonAdamW, NS_COEFFICIENTS, newton_schulz_orthogonalize};
+pub use schedule_free::ScheduleFreeAdamW;
+pub use state::{OptimizerState, StatefulOptimizer};
 
 /// Optimizer state: stores (momentum, velocity) tensors per parameter.
 pub type State<V> = HashMap<Rc<str>, V>;
@@ -175,6 +181,47 @@ impl Optimizer for AdamW {
         // Advance the step counter ONCE per training step, not per parameter.
         self.inner.advance_step();
         apply_updates(self, model, gradients)
+    }
+}
+
+impl StatefulOptimizer for AdamW {
+    fn export_state(&self) -> OptimizerState {
+        let mut out = OptimizerState::new("adamw");
+        out.set_scalar("step", self.inner.step_count() as f64);
+        for (key, s) in &self.inner.states {
+            out.set_tensor("m", key, &s.m);
+            out.set_tensor("v", key, &s.v);
+            if let Some(master) = s.master.value() {
+                out.set_tensor("master", key, master);
+            }
+        }
+        out
+    }
+
+    fn import_state(&mut self, state: &OptimizerState) -> Result<(), Exception> {
+        state.expect_kind("adamw")?;
+        let step = state.scalar("step")? as u64;
+        let mut restored = HashMap::new();
+        for (key, m) in state.slot("m") {
+            let v = state.tensor("v", key).ok_or_else(|| {
+                Exception::custom(format!("optimizer state has a first moment for `{key}` but no second"))
+            })?;
+            restored.insert(
+                key.to_string(),
+                crate::optimizer::AdamState::restored(
+                    m.clone(),
+                    v.clone(),
+                    state.tensor("master", key).cloned(),
+                ),
+            );
+        }
+        self.inner.set_step_count(step);
+        self.state = restored
+            .iter()
+            .map(|(k, s)| (Rc::from(k.as_str()), (s.m.clone(), s.v.clone())))
+            .collect();
+        self.inner.states = restored;
+        Ok(())
     }
 }
 

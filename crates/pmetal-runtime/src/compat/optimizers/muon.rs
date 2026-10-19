@@ -25,7 +25,10 @@
 //! matrices, AdamW for embeddings, the output head, norms and biases.
 
 use super::first_order::{f32_of, master_of};
-use super::{AdamW, Optimizer, State, Updatable, apply_updates};
+use super::state::{export_masters, import_masters, import_slot};
+use super::{
+    AdamW, Optimizer, OptimizerState, State, StatefulOptimizer, Updatable, apply_updates,
+};
 use crate::compat::{Array, Dtype, Exception, FlattenedModuleParam, ModuleParameters};
 use crate::optimizer::{MasterWeight, is_embedding_parameter};
 use std::collections::HashMap;
@@ -319,19 +322,64 @@ impl Optimizer for MuonAdamW {
     }
 }
 
+impl StatefulOptimizer for Muon {
+    fn export_state(&self) -> OptimizerState {
+        let mut out = OptimizerState::new("muon");
+        for (key, buf) in &self.state {
+            out.set_tensor("buf", key, buf);
+        }
+        export_masters(&self.masters, &mut out);
+        out
+    }
+
+    fn import_state(&mut self, state: &OptimizerState) -> Result<(), Exception> {
+        state.expect_kind("muon")?;
+        self.state = import_slot(state, "buf");
+        self.masters = import_masters(state);
+        Ok(())
+    }
+}
+
+impl StatefulOptimizer for MuonAdamW {
+    fn export_state(&self) -> OptimizerState {
+        let mut out = OptimizerState::new("muon_adamw");
+        self.muon.export_state().nest("muon", &mut out);
+        self.adamw.export_state().nest("adamw", &mut out);
+        out
+    }
+
+    fn import_state(&mut self, state: &OptimizerState) -> Result<(), Exception> {
+        state.expect_kind("muon_adamw")?;
+        self.muon.import_state(&state.unnest("muon", "muon"))?;
+        self.adamw.import_state(&state.unnest("adamw", "adamw"))
+    }
+}
+
+impl Updatable for Muon {
+    fn updatable_states_len(&self) -> usize {
+        self.updatable_states().len()
+    }
+    fn updatable_states(&self) -> Vec<&Array> {
+        let masters = self.masters.values().filter_map(|m| m.value());
+        self.state.values().chain(masters).collect()
+    }
+    fn updatable_states_mut(&mut self) -> Vec<&mut Array> {
+        let masters = self.masters.values_mut().filter_map(|m| m.value_mut());
+        self.state.values_mut().chain(masters).collect()
+    }
+}
+
 impl Updatable for MuonAdamW {
     fn updatable_states_len(&self) -> usize {
         self.updatable_states().len()
     }
     fn updatable_states(&self) -> Vec<&Array> {
-        let mut states: Vec<&Array> = self.muon.state.values().collect();
-        states.extend(self.muon.masters.values().filter_map(|m| m.value()));
+        let mut states = self.muon.updatable_states();
         states.extend(self.adamw.updatable_states());
         states
     }
     fn updatable_states_mut(&mut self) -> Vec<&mut Array> {
-        let mut states: Vec<&mut Array> = self.muon.state.values_mut().collect();
-        states.extend(self.muon.masters.values_mut().filter_map(|m| m.value_mut()));
+        let mut states = self.muon.updatable_states_mut();
         states.extend(self.adamw.updatable_states_mut());
         states
     }
@@ -538,6 +586,57 @@ mod tests {
                     want[i][j]
                 );
             }
+        }
+    }
+
+    /// With Moonshot's adjustment (`0.2·√max(rows, cols)`) one step of a
+    /// random gradient moves a matrix by an update whose RMS is AdamW's
+    /// (around 0.2), whatever the matrix's shape: the point of the scale,
+    /// and what lets an AdamW learning rate and weight decay carry over.
+    /// The step itself is the f64 reference's, decay and scale included.
+    #[test]
+    fn the_moonshot_scale_gives_the_update_adamw_rms_on_every_shape() {
+        random::seed(34);
+        let (lr, wd) = (0.01_f32, 0.1_f32);
+        for (rows, cols) in [(64usize, 128usize), (128, 64), (96, 96), (16, 256)] {
+            let shape = [rows as i32, cols as i32];
+            let p0 = random::uniform_range(-1.0, 1.0, &shape, Dtype::Float32);
+            let g = random::normal(&shape, Dtype::Float32);
+            let mut opt = Muon::new(lr, wd)
+                .with_lr_adjust(LrAdjust::MatchRmsAdamw)
+                .with_ns_dtype(Dtype::Float32);
+            let key: Rc<str> = Rc::from("layers.0.q_proj.weight");
+            let mut p = p0.clone();
+            opt.update_single(&key, &g, &mut p).expect("update");
+
+            // First step: B = g, Nesterov direction g + μ·g.
+            let g_mat = mat(&read(&g), rows, cols);
+            let direction: Mat = g_mat
+                .iter()
+                .map(|r| r.iter().map(|v| v * (1.0 + 0.95)).collect())
+                .collect();
+            let (a, b, c) = NS_COEFFICIENTS;
+            let o = reference_ns(&direction, 5, (a as f64, b as f64, c as f64), 1e-7);
+            let scale = 0.2 * lr as f64 * (rows.max(cols) as f64).sqrt();
+            let p0m = mat(&read(&p0), rows, cols);
+            let got = read(&p);
+            let mut sq = 0.0;
+            for i in 0..rows {
+                for j in 0..cols {
+                    let want = p0m[i][j] * (1.0 - lr as f64 * wd as f64) - scale * o[i][j];
+                    assert!(
+                        (got[i * cols + j] as f64 - want).abs() < 2e-4,
+                        "{rows}x{cols} [{i}][{j}]"
+                    );
+                    let step = got[i * cols + j] as f64 - p0m[i][j] * (1.0 - lr as f64 * wd as f64);
+                    sq += step * step;
+                }
+            }
+            let rms = (sq / (rows * cols) as f64).sqrt() / lr as f64;
+            assert!(
+                (0.12..0.3).contains(&rms),
+                "{rows}x{cols}: update RMS {rms} over lr, expected about 0.2"
+            );
         }
     }
 
