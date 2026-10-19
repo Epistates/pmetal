@@ -102,7 +102,7 @@ pub(crate) async fn run_train_diffusion(args: TrainDiffusionArgs) -> Result<()> 
         seed: args.seed,
         ..Default::default()
     };
-    let mut trainer = DiffusionGemmaTrainer::new(train_cfg, vocab);
+    let mut trainer = DiffusionGemmaTrainer::new(train_cfg, vocab)?;
 
     tracing::info!(
         "train-diffusion: {} adapter params, {} examples, canvas_len={}, {} steps",

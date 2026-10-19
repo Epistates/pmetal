@@ -50,6 +50,62 @@ pub struct MtpTrainingConfig {
     pub seed: u64,
 }
 
+impl MtpTrainingConfig {
+    /// Check the hyperparameters, naming every one that cannot work. Every
+    /// run entry point checks them before it touches the output directory.
+    pub fn validate(&self) -> Result<(), Exception> {
+        let mut problems = Vec::new();
+        if self.num_steps == 0 {
+            problems.push("num_steps must be at least 1".to_string());
+        }
+        if !(self.learning_rate.is_finite() && self.learning_rate > 0.0) {
+            problems.push(format!(
+                "learning_rate must be positive, got {}",
+                self.learning_rate
+            ));
+        }
+        if !(self.min_lr.is_finite() && self.min_lr >= 0.0 && self.min_lr <= self.learning_rate) {
+            problems.push(format!(
+                "min_lr must be in [0, learning_rate], got {}",
+                self.min_lr
+            ));
+        }
+        for (name, beta) in [("beta1", self.betas.0), ("beta2", self.betas.1)] {
+            if !(0.0..1.0).contains(&beta) {
+                problems.push(format!("{name} must be in [0, 1), got {beta}"));
+            }
+        }
+        if !(self.eps.is_finite() && self.eps > 0.0) {
+            problems.push(format!("eps must be positive, got {}", self.eps));
+        }
+        if !(self.weight_decay.is_finite() && self.weight_decay >= 0.0) {
+            problems.push(format!(
+                "weight_decay must not be negative, got {}",
+                self.weight_decay
+            ));
+        }
+        if let Some(norm) = self.max_grad_norm {
+            if !(norm.is_finite() && norm > 0.0) {
+                problems.push(format!("max_grad_norm must be positive, got {norm}"));
+            }
+        }
+        if self.num_assistant_tokens == 0 {
+            problems.push("num_assistant_tokens must be at least 1".to_string());
+        }
+        if self.dflash_blocks_per_step == 0 {
+            problems.push("dflash_blocks_per_step must be at least 1".to_string());
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(Exception::custom(format!(
+                "invalid MTP training configuration: {}",
+                problems.join("; ")
+            )))
+        }
+    }
+}
+
 impl Default for MtpTrainingConfig {
     fn default() -> Self {
         Self {
@@ -372,6 +428,7 @@ where
     F: FnMut(&mut M, &B) -> Result<Array, Exception>,
     S: FnMut(&Path, &M, &AdamW, &MtpCheckpointMeta) -> Result<(), Exception>,
 {
+    config.validate()?;
     std::fs::create_dir_all(&config.checkpoint_dir)
         .map_err(|e| Exception::custom(format!("create output dir: {e}")))?;
     let mut optimizer = AdamWBuilder::new(config.learning_rate)
@@ -753,6 +810,27 @@ mod tests {
     fn loss_value(loss: &Array) -> f32 {
         loss.eval();
         loss.item_f32()
+    }
+
+    #[test]
+    fn the_training_configuration_is_validated() {
+        assert!(MtpTrainingConfig::default().validate().is_ok());
+        let bad = MtpTrainingConfig {
+            num_steps: 0,
+            learning_rate: f32::NAN,
+            max_grad_norm: Some(-1.0),
+            dflash_blocks_per_step: 0,
+            ..Default::default()
+        };
+        let message = bad.validate().unwrap_err().to_string();
+        for needle in [
+            "num_steps",
+            "learning_rate",
+            "max_grad_norm",
+            "dflash_blocks",
+        ] {
+            assert!(message.contains(needle), "{needle} missing: {message}");
+        }
     }
 
     /// A half-precision parameter's f32 master copy is part of the optimizer
