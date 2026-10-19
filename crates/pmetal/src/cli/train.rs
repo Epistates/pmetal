@@ -71,10 +71,6 @@ pub struct TrainArgs {
     #[arg(long = "gradient-accumulation-steps", default_value = "4")]
     pub gradient_accumulation_steps: usize,
 
-    /// Disable Metal FlashAttention (enabled by default for O(n) memory)
-    #[arg(long = "no-flash-attention")]
-    pub no_flash_attention: bool,
-
     /// Maximum gradient norm for clipping (0 to disable)
     #[arg(long = "max-grad-norm", default_value = "1.0")]
     pub max_grad_norm: f64,
@@ -95,14 +91,6 @@ pub struct TrainArgs {
     #[arg(long = "double-quant")]
     pub double_quant: bool,
 
-    /// Disable fused training step
-    #[arg(long = "no-fused")]
-    pub no_fused: bool,
-
-    /// Disable Metal fused optimizer
-    #[arg(long = "no-metal-fused-optimizer")]
-    pub no_metal_fused_optimizer: bool,
-
     /// Disable sequence packing
     #[arg(long = "no-sequence-packing")]
     pub no_sequence_packing: bool,
@@ -110,10 +98,6 @@ pub struct TrainArgs {
     /// Override the maximum sequence length for packing.
     #[arg(long = "pack-max-seq-len")]
     pub pack_max_seq_len: Option<usize>,
-
-    /// Disable the experimental compiled-training dispatch.
-    #[arg(long = "no-jit-compilation")]
-    pub no_jit_compilation: bool,
 
     /// Disable gradient checkpointing
     #[arg(long = "no-gradient-checkpointing")]
@@ -148,8 +132,9 @@ pub struct TrainArgs {
     #[arg(long = "weight-decay", default_value = "0.01")]
     pub weight_decay: f64,
 
-    /// Optimizer: adamw, sgd, lion or adafactor. Lion wants a 3-10x smaller
-    /// learning rate and 3-10x larger weight decay than AdamW.
+    /// Optimizer: adamw, sgd, lion, adafactor, muon, adamw_schedule_free or
+    /// adamw_8bit. Lion wants a 3-10x smaller learning rate and 3-10x larger
+    /// weight decay than AdamW; schedule-free AdamW wants a constant rate.
     #[arg(long = "optimizer", default_value = "adamw")]
     pub optimizer: pmetal_core::OptimizerType,
 

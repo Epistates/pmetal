@@ -189,16 +189,6 @@ pub struct RlkdSpec {
     #[serde(default)]
     pub reasoning_rewards: bool,
 
-    #[job(
-        label = "Disable Flash Attention",
-        group = "Compute",
-        argv = "--no-flash-attention",
-        flag,
-        default_bool = false
-    )]
-    #[serde(default)]
-    pub no_flash_attention: bool,
-
     #[job(label = "Text Column", group = "Data", argv = "--text-column")]
     #[serde(default)]
     pub text_column: Option<String>,
@@ -254,7 +244,6 @@ impl Default for RlkdSpec {
             max_completion_length: default_max_completion(),
             seed: default_seed(),
             reasoning_rewards: false,
-            no_flash_attention: false,
             text_column: None,
             text_columns: None,
             column_separator: None,

@@ -26,7 +26,6 @@ pub(crate) async fn run_rlkd_cli(
     max_completion_length: usize,
     seed: u64,
     reasoning_rewards: bool,
-    use_metal_flash_attention: bool,
     _log_metrics: Option<String>,
     emit_console_output: bool,
     extra_callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>>,
@@ -259,8 +258,6 @@ pub(crate) async fn run_rlkd_cli(
     if emit_console_output {
         println!("Starting RLKD training loop...");
     }
-
-    let _ = use_metal_flash_attention; // passed through GRPO config; honored by model load
 
     trainer
         .run(

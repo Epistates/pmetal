@@ -341,11 +341,10 @@ fn largest_difference(a: &HashMap<String, Vec<f32>>, b: &HashMap<String, Vec<f32
     worst
 }
 
-/// The fused Metal AdamW `pmetal train` runs by default trains every
-/// parameter group as the standard loop does: a TrainingLoop's two
-/// optimizers, over a model with no-decay parameters, an embedding learning
-/// rate and LoRA+, land on the same weights after every step, a parameter
-/// without a gradient included.
+/// The fused Metal AdamW trains every parameter group as the standard loop's
+/// optimizer does: the two, over a model with no-decay parameters, an
+/// embedding learning rate and LoRA+, land on the same weights after every
+/// step, a parameter without a gradient included.
 #[test]
 fn fused_adamw_trains_the_parameter_groups_the_standard_loop_does() {
     use pmetal_runtime::compat::random;
@@ -357,7 +356,7 @@ fn fused_adamw_trains_the_parameter_groups_the_standard_loop_does() {
     config.training.weight_decay = 0.1;
     config.embedding_lr = Some(2.5e-3);
     config.loraplus_lr_ratio = Some(16.0);
-    let training_loop = TrainingLoop::new(config);
+    let training_loop = TrainingLoop::new(config).unwrap();
 
     random::seed(11);
     let init: Vec<Array> = GROUPED
@@ -393,8 +392,9 @@ fn fused_adamw_trains_the_parameter_groups_the_standard_loop_does() {
     // `Grouped` has no output head of its own; `embed_tokens` is the
     // embedding by name.
     let mut standard = training_loop.build_optimizer(None);
-    let mut fused = training_loop
-        .build_metal_fused_optimizer(None)
+    let mut fused = MlxMetalOptimizerBuilder::new(1e-2)
+        .param_groups(training_loop.parameter_groups(None))
+        .build()
         .expect("fused optimizer");
     // The fused path at the run's weight decay, without its embedding rate
     // and LoRA+ ratio: the update the default loop used to make.

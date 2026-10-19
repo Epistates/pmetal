@@ -145,7 +145,6 @@ impl GrpoTab {
         spec.seed = self.form.value("Seed").parse().unwrap_or(spec.seed);
         spec.dapo = self.form.value("DAPO") == "Enabled";
         spec.reasoning_rewards = self.form.value("Reasoning Rewards") == "Enabled";
-        spec.no_flash_attention = self.form.value("Disable Flash Attention") == "Enabled";
         spec.vlm = self.form.value("VLM Mode") == "Enabled";
         spec.max_image_size = self
             .form

@@ -17,6 +17,9 @@ pub enum SftError {
     /// Training was cancelled by a callback.
     #[error("Training cancelled")]
     Cancelled,
+    /// A setting that cannot work, found before the run started.
+    #[error("invalid training configuration: {0}")]
+    Config(String),
 }
 
 /// Result type for SFT operations.

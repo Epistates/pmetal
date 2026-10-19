@@ -67,11 +67,19 @@ impl LearningRateScheduler {
     /// stable ratio of 3, a power of -1) gets the schedule those numbers
     /// describe, not a corrected one.
     pub fn for_training(config: &crate::TrainingConfig, total_steps: usize) -> Self {
+        // Schedule-free AdamW averages its iterates instead of decaying the
+        // rate: a decaying schedule on top would undo the averaging's point
+        // (Defazio et al., 2024 train at a constant rate after warmup).
+        let scheduler_type = if config.optimizer == crate::OptimizerType::AdamWScheduleFree {
+            LrSchedulerType::Constant
+        } else {
+            config.lr_scheduler
+        };
         let mut scheduler = Self::new(
             config.learning_rate,
             total_steps,
             warmup_steps_for(config, total_steps),
-            config.lr_scheduler,
+            scheduler_type,
         )
         .with_min_lr(config.min_lr.unwrap_or(0.0));
         if let Some(restarts) = config.cosine_num_restarts {

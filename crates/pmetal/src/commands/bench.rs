@@ -2527,12 +2527,8 @@ async fn benchmark_real_training(
                 ..Default::default()
             }),
             dispatch: DispatchConfig {
-                flash_attention: true,
                 sequence_packing: true,
                 pack_max_seq_len: None,
-                jit_compilation: true,
-                fused: true,
-                metal_fused_optimizer: true,
                 gradient_checkpointing: true,
                 gradient_checkpointing_layers: 4,
                 cut_cross_entropy: true,
@@ -3502,7 +3498,6 @@ pub(crate) fn generate_sample_config(output: &str) -> anyhow::Result<()> {
     let config = FullTrainingConfig {
         model: ModelConfig {
             model_id: "meta-llama/Llama-3.2-1B".to_string(),
-            ..Default::default()
         },
         lora: LoraConfig {
             r: 16,

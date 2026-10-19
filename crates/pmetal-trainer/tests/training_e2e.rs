@@ -3,7 +3,6 @@
 //! These tests verify the complete training pipeline works correctly:
 //! - DataLoader → Model → Optimizer flow
 //! - Gradient accumulation
-//! - Optional Metal FlashAttention for forward pass
 //! - Checkpoint saving/loading
 
 use pmetal_core::{LoraConfig, TrainingConfig};
@@ -87,15 +86,13 @@ fn test_training_loop_single_step() {
             pad_token_id: 0,
             ..Default::default()
         },
-        use_metal_flash_attention: false, // Disable for simpler test
         log_every: 1,
         checkpoint_every: 0,
         eval_every: 0,
-        use_jit_compilation: false,
         ..Default::default()
     };
 
-    let mut training_loop = TrainingLoop::new(config);
+    let mut training_loop = TrainingLoop::new(config).unwrap();
 
     // Create a minimal dataset
     let dataset = create_dummy_dataset(4, 16);
@@ -147,15 +144,13 @@ fn test_training_loop_gradient_accumulation() {
             pad_token_id: 0,
             ..Default::default()
         },
-        use_metal_flash_attention: false,
         log_every: 100,
         checkpoint_every: 0,
         eval_every: 0,
-        use_jit_compilation: false,
         ..Default::default()
     };
 
-    let mut training_loop = TrainingLoop::new(config);
+    let mut training_loop = TrainingLoop::new(config).unwrap();
     let dataset = create_dummy_dataset(4, 8);
     let mut dataloader = pmetal_data::DataLoader::new(
         dataset,
@@ -215,15 +210,13 @@ fn test_training_loop_multiple_steps() {
             pad_token_id: 0,
             ..Default::default()
         },
-        use_metal_flash_attention: false,
         log_every: 100,
         checkpoint_every: 0,
         eval_every: 0,
-        use_jit_compilation: false,
         ..Default::default()
     };
 
-    let mut training_loop = TrainingLoop::new(config);
+    let mut training_loop = TrainingLoop::new(config).unwrap();
     let dataset = create_dummy_dataset(8, 16);
     let mut dataloader = pmetal_data::DataLoader::new(
         dataset,
@@ -267,59 +260,6 @@ fn test_training_loop_multiple_steps() {
 }
 
 #[test]
-fn test_training_with_metal_flash_attention() {
-    // This test verifies that Metal FlashAttention integration doesn't break training
-    let mut model = small_model();
-
-    let config = TrainingLoopConfig {
-        training: TrainingConfig {
-            learning_rate: 1e-4,
-            batch_size: 2,
-            gradient_accumulation_steps: 1,
-            ..Default::default()
-        },
-        dataloader: DataLoaderConfig {
-            batch_size: 2,
-            max_seq_len: 16,
-            shuffle: false,
-            pad_token_id: 0,
-            ..Default::default()
-        },
-        use_metal_flash_attention: true, // Enable Metal FlashAttention
-        log_every: 1,
-        checkpoint_every: 0,
-        eval_every: 0,
-        use_jit_compilation: false,
-        ..Default::default()
-    };
-
-    let mut training_loop = TrainingLoop::new(config);
-    let dataset = create_dummy_dataset(4, 16);
-    let mut dataloader = pmetal_data::DataLoader::new(
-        dataset,
-        DataLoaderConfig {
-            batch_size: 2,
-            max_seq_len: 16,
-            shuffle: false,
-            pad_token_id: 0,
-            ..Default::default()
-        },
-        None,
-    );
-
-    let mut optimizer = Sgd::new(1e-4);
-
-    // Should work regardless of whether Metal FA is available
-    let batch = dataloader.next_batch().expect("Should have a batch");
-    let stats = training_loop
-        .train_step(&mut model, &batch, &mut optimizer)
-        .expect("Training step should succeed even with Metal FA");
-
-    assert!(stats.loss > 0.0);
-    assert_eq!(stats.step, 1);
-}
-
-#[test]
 fn test_learning_rate_schedules() {
     // Test different LR schedules
     for scheduler in [
@@ -335,12 +275,10 @@ fn test_learning_rate_schedules() {
                 lr_scheduler: scheduler,
                 ..Default::default()
             },
-            use_metal_flash_attention: false,
-            use_jit_compilation: false,
             ..Default::default()
         };
 
-        let mut training_loop = TrainingLoop::new(config);
+        let mut training_loop = TrainingLoop::new(config).unwrap();
 
         // Test warmup phase
         training_loop.set_step(0);
@@ -414,13 +352,12 @@ fn qlora_loop(learning_rate: f64) -> TrainingLoop {
             pad_token_id: 0,
             ..Default::default()
         },
-        use_metal_flash_attention: false,
         log_every: 100,
         checkpoint_every: 0,
         eval_every: 0,
-        use_jit_compilation: false,
         ..Default::default()
     })
+    .expect("a valid loop configuration")
 }
 
 #[test]
@@ -521,15 +458,13 @@ fn test_evaluation_metrics() {
             pad_token_id: 0,
             ..Default::default()
         },
-        use_metal_flash_attention: false,
         log_every: 1,
         checkpoint_every: 0,
         eval_every: 0,
-        use_jit_compilation: false,
         ..Default::default()
     };
 
-    let training_loop = TrainingLoop::new(config);
+    let training_loop = TrainingLoop::new(config).unwrap();
     let eval_dataset = create_dummy_dataset(4, 16);
 
     // Run evaluation

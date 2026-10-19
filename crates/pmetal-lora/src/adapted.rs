@@ -780,6 +780,10 @@ impl crate::TrainableModel for AdaptedModel {
         self.model.lm_head()
     }
 
+    fn set_neftune_alpha(&mut self, alpha: Option<f32>) -> bool {
+        self.model.set_neftune_alpha(alpha)
+    }
+
     /// Forward with NEFTune noise on the embedding output.
     ///
     /// The alpha is set on the embedding for the duration of the call and

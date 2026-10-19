@@ -414,6 +414,10 @@ impl TrainableModel for DynamicLoraModel {
     fn lm_head(&self) -> Option<pmetal_models::dispatcher::LmHead> {
         TrainableModel::lm_head(&self.inner)
     }
+
+    fn set_neftune_alpha(&mut self, alpha: Option<f32>) -> bool {
+        TrainableModel::set_neftune_alpha(&mut self.inner, alpha)
+    }
 }
 
 /// Errors during dynamic LoRA model loading.

@@ -9,6 +9,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use pmetal_data::LoaderState;
+use pmetal_runtime::compat::optimizers::OptimizerState;
 use pmetal_runtime::compat::{Array, Exception};
 use pmetal_runtime::inline_array;
 use serde::{Deserialize, Serialize};
@@ -75,6 +77,107 @@ pub fn load_best_snapshot(checkpoint_dir: &Path) -> Option<HashMap<Rc<str>, Arra
 
 /// A loaded checkpoint: its parameters by name, and its metadata.
 pub type LoadedCheckpoint = (HashMap<Rc<str>, Array>, CheckpointMetadata);
+
+/// What a resumed run needs beyond the weights to take the steps the
+/// uninterrupted run would have: the optimizer's moments and counters (and the
+/// f32 master copies of half-precision weights), and where the data loader
+/// was in its epoch.
+#[derive(Debug, Clone, Default)]
+pub struct TrainState {
+    /// The optimizer's state.
+    pub optimizer: Option<OptimizerState>,
+    /// The data loader's position, for this rank.
+    pub loader: Option<LoaderState>,
+}
+
+/// The optimizer's tensors, beside the weights.
+const OPTIMIZER_FILE: &str = "optimizer.safetensors";
+/// Everything else a resume needs.
+const TRAIN_STATE_FILE: &str = "train_state.json";
+
+/// The JSON half of [`TrainState`].
+#[derive(Debug, Serialize, Deserialize)]
+struct TrainStateJson {
+    /// The kind of optimizer that wrote the state.
+    optimizer_kind: Option<String>,
+    /// Its counters.
+    #[serde(default)]
+    optimizer_scalars: std::collections::BTreeMap<String, f64>,
+    /// The data loader's position.
+    loader: Option<LoaderState>,
+}
+
+impl TrainState {
+    /// Write the state into `dir`. Every array must be evaluated, as it is
+    /// when this runs on a background thread.
+    fn write(&self, dir: &Path) -> Result<()> {
+        let mut json = TrainStateJson {
+            optimizer_kind: None,
+            optimizer_scalars: Default::default(),
+            loader: self.loader,
+        };
+        if let Some(state) = &self.optimizer {
+            json.optimizer_kind = Some(state.kind.clone());
+            json.optimizer_scalars = state.scalars.clone();
+            let entries: Vec<(&str, &Array)> = state
+                .tensors
+                .iter()
+                .map(|(name, array)| (name.as_str(), array))
+                .collect();
+            Array::save_safetensors(path_as_str(&dir.join(OPTIMIZER_FILE))?, &entries)
+                .map_err(Exception::from)?;
+        }
+        let text = serde_json::to_string_pretty(&json).map_err(|e| {
+            SftError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Failed to serialize the training state: {e}"),
+            ))
+        })?;
+        fs::write(dir.join(TRAIN_STATE_FILE), text).map_err(|e| {
+            SftError::Io(std::io::Error::new(
+                e.kind(),
+                format!("Failed to write the training state: {e}"),
+            ))
+        })
+    }
+
+    /// Read the state the checkpoint at `dir` holds, if it holds one.
+    pub fn load(dir: &Path) -> Result<Option<Self>> {
+        let json_path = dir.join(TRAIN_STATE_FILE);
+        if !json_path.exists() {
+            return Ok(None);
+        }
+        let text = fs::read_to_string(&json_path)?;
+        let json: TrainStateJson = serde_json::from_str(&text).map_err(|e| {
+            SftError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Failed to parse {}: {e}", json_path.display()),
+            ))
+        })?;
+        let optimizer = match json.optimizer_kind {
+            Some(kind) => {
+                let tensors_path = dir.join(OPTIMIZER_FILE);
+                let tensors = inline_array::load_safetensors_shard(path_as_str(&tensors_path)?)
+                    .ok_or_else(|| {
+                        SftError::Io(std::io::Error::other(format!(
+                            "Failed to load the optimizer state from {}",
+                            tensors_path.display()
+                        )))
+                    })?;
+                Some(OptimizerState {
+                    kind,
+                    scalars: json.optimizer_scalars,
+                    tensors: tensors.into_iter().collect(),
+                })
+            }
+            None => None,
+        };
+        Ok(Some(Self {
+            optimizer,
+            loader: json.loader,
+        }))
+    }
+}
 
 /// Training state metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +261,7 @@ fn write_checkpoint_to_dir<'a>(
     dir: &Path,
     params: impl IntoIterator<Item = (&'a str, &'a Array)>,
     metadata_json: &str,
+    state: Option<&TrainState>,
 ) -> Result<()> {
     fs::create_dir_all(dir).map_err(|e| {
         SftError::Io(std::io::Error::new(
@@ -183,6 +287,10 @@ fn write_checkpoint_to_dir<'a>(
             format!("Failed to write metadata: {e}"),
         ))
     })?;
+
+    if let Some(state) = state {
+        state.write(dir)?;
+    }
 
     Ok(())
 }
@@ -239,6 +347,32 @@ impl CheckpointManager {
         metadata: &CheckpointMetadata,
         is_best: bool,
     ) -> Result<PathBuf> {
+        let entries = lora_params.iter().map(|(k, v)| (k.as_ref(), v)).collect();
+        self.save_entries(entries, metadata, is_best, None)
+    }
+
+    /// [`save_checkpoint`](Self::save_checkpoint) with the optimizer's state
+    /// and the data loader's position, which a resume continues from.
+    pub fn save_checkpoint_with_state(
+        &self,
+        lora_params: &HashMap<Rc<str>, Array>,
+        metadata: &CheckpointMetadata,
+        is_best: bool,
+        state: &TrainState,
+    ) -> Result<PathBuf> {
+        let entries = lora_params.iter().map(|(k, v)| (k.as_ref(), v)).collect();
+        self.save_entries(entries, metadata, is_best, Some(state))
+    }
+
+    /// Write one checkpoint (and the best one, when this is it) and trim the
+    /// old ones.
+    fn save_entries(
+        &self,
+        entries: Vec<(&str, &Array)>,
+        metadata: &CheckpointMetadata,
+        is_best: bool,
+        state: Option<&TrainState>,
+    ) -> Result<PathBuf> {
         let metadata_json = serde_json::to_string_pretty(metadata).map_err(|e| {
             SftError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -247,21 +381,13 @@ impl CheckpointManager {
         })?;
 
         let step_dir = self.checkpoint_dir.join(format!("step_{}", metadata.step));
-        write_checkpoint_to_dir(
-            &step_dir,
-            lora_params.iter().map(|(k, v)| (k.as_ref(), v)),
-            &metadata_json,
-        )?;
+        write_checkpoint_to_dir(&step_dir, entries.iter().copied(), &metadata_json, state)?;
 
         self.update_latest_link(metadata.step)?;
 
         if is_best && self.save_best {
             let best_dir = self.checkpoint_dir.join("best");
-            write_checkpoint_to_dir(
-                &best_dir,
-                lora_params.iter().map(|(k, v)| (k.as_ref(), v)),
-                &metadata_json,
-            )?;
+            write_checkpoint_to_dir(&best_dir, entries.iter().copied(), &metadata_json, state)?;
             tracing::info!("Saved best checkpoint at step {}", metadata.step);
         }
 
@@ -391,6 +517,14 @@ impl CheckpointManager {
 
     /// Load the latest checkpoint.
     pub fn load_latest(&self) -> Result<Option<LoadedCheckpoint>> {
+        match self.latest_dir()? {
+            Some(dir) => Self::load_checkpoint(&dir).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The directory of the latest checkpoint, if there is one.
+    pub fn latest_dir(&self) -> Result<Option<PathBuf>> {
         let latest_path = self.checkpoint_dir.join("latest");
         if !latest_path.exists() {
             return Ok(None);
@@ -412,11 +546,7 @@ impl CheckpointManager {
         })?;
 
         let checkpoint_path = self.checkpoint_dir.join(step_name.trim());
-        if checkpoint_path.exists() {
-            Self::load_checkpoint(&checkpoint_path).map(Some)
-        } else {
-            Ok(None)
-        }
+        Ok(checkpoint_path.exists().then_some(checkpoint_path))
     }
 
     /// Load the best checkpoint.
@@ -495,42 +625,10 @@ impl CheckpointManager {
         lora_params: HashMap<String, Array>,
         metadata: &CheckpointMetadata,
         is_best: bool,
+        state: Option<&TrainState>,
     ) -> Result<PathBuf> {
-        let metadata_json = serde_json::to_string_pretty(metadata).map_err(|e| {
-            SftError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Failed to serialize metadata: {e}"),
-            ))
-        })?;
-
-        let step_dir = self.checkpoint_dir.join(format!("step_{}", metadata.step));
-        write_checkpoint_to_dir(
-            &step_dir,
-            lora_params.iter().map(|(k, v)| (k.as_str(), v)),
-            &metadata_json,
-        )?;
-
-        self.update_latest_link(metadata.step)?;
-
-        if is_best && self.save_best {
-            let best_dir = self.checkpoint_dir.join("best");
-            write_checkpoint_to_dir(
-                &best_dir,
-                lora_params.iter().map(|(k, v)| (k.as_str(), v)),
-                &metadata_json,
-            )?;
-            tracing::info!("Saved best checkpoint at step {}", metadata.step);
-        }
-
-        self.cleanup_old_checkpoints()?;
-
-        tracing::info!(
-            "Saved checkpoint at step {} to {:?}",
-            metadata.step,
-            step_dir
-        );
-
-        Ok(step_dir)
+        let entries = lora_params.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        self.save_entries(entries, metadata, is_best, state)
     }
 }
 

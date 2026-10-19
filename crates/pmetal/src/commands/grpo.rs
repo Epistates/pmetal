@@ -1,6 +1,6 @@
 use pmetal_core::TrainingConfig;
-use pmetal_data::{DataLoaderConfig, DatasetFormat, Tokenizer, TrainingDataset};
-use pmetal_trainer::{GrpoConfig, GrpoTrainer, TrainingLoopConfig};
+use pmetal_data::{DatasetFormat, Tokenizer, TrainingDataset};
+use pmetal_trainer::{GrpoConfig, GrpoTrainer};
 use std::path::PathBuf;
 
 /// Run GRPO (Group Relative Policy Optimization) for reasoning models.
@@ -25,7 +25,6 @@ pub(crate) async fn run_grpo_cli(
     loss_type: &str,
     num_iterations: usize,
     reasoning_rewards: bool,
-    use_metal_flash_attention: bool,
     vlm_mode: bool,
     max_image_size: usize,
     reward_model_path: Option<String>,
@@ -291,35 +290,6 @@ pub(crate) async fn run_grpo_cli(
         } else {
             None
         },
-        ..Default::default()
-    };
-
-    #[allow(clippy::needless_update)] // ..Default covers cfg-gated fields (distributed)
-    let _training_loop_config = TrainingLoopConfig {
-        training: training_config.clone(),
-        dataloader: DataLoaderConfig {
-            batch_size: 1,
-            max_seq_len,
-            shuffle: true,
-            seed,
-            pad_token_id: tokenizer.pad_token_id().unwrap_or(0),
-            drop_last: false,
-            ..Default::default()
-        },
-        use_metal_flash_attention,
-        log_every: 1,
-        checkpoint_every: 50,
-        eval_every: 0,
-        use_jit_compilation: true,
-        use_sequence_packing: false, // GRPO usually doesn't pack generations
-        gradient_checkpointing: true,
-        gradient_checkpointing_layers: 4,
-        embedding_lr: None,
-        eager_evaluation: true, // GRPO generates first, then trains - eager helps memory
-        use_metal_fused_optimizer: true,
-        loraplus_lr_ratio: None,
-        neftune_noise_alpha: None,
-        use_cut_cross_entropy: false,
         ..Default::default()
     };
 

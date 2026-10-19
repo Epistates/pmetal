@@ -24,8 +24,8 @@ echo "Dataset: $DATASET"
 echo "LoRA rank: $LORA_R"
 echo ""
 
-# FlashAttention, Sequence Packing, and Gradient Checkpointing are ENABLED BY DEFAULT.
-# Use --no-sequence-packing, --no-flash-attention, or --no-gradient-checkpointing to disable.
+# Sequence Packing and Gradient Checkpointing are ENABLED BY DEFAULT.
+# Use --no-sequence-packing or --no-gradient-checkpointing to disable.
 
 "$PMETAL_BIN" train \
     --model "$MODEL" \

@@ -400,7 +400,10 @@ impl Updatable for MomentumSgd {
         self.updatable_states().len()
     }
     fn updatable_states(&self) -> Vec<&Array> {
-        self.state.values().chain(masters_of(&self.masters)).collect()
+        self.state
+            .values()
+            .chain(masters_of(&self.masters))
+            .collect()
     }
     fn updatable_states_mut(&mut self) -> Vec<&mut Array> {
         self.state
@@ -415,7 +418,10 @@ impl Updatable for Lion {
         self.updatable_states().len()
     }
     fn updatable_states(&self) -> Vec<&Array> {
-        self.state.values().chain(masters_of(&self.masters)).collect()
+        self.state
+            .values()
+            .chain(masters_of(&self.masters))
+            .collect()
     }
     fn updatable_states_mut(&mut self) -> Vec<&mut Array> {
         self.state
@@ -524,7 +530,9 @@ impl StatefulOptimizer for Adafactor {
         let mut moments = HashMap::new();
         for (key, row) in state.slot("row") {
             let col = state.tensor("col", key).ok_or_else(|| {
-                Exception::custom(format!("Adafactor state has a row factor for `{key}` but no column factor"))
+                Exception::custom(format!(
+                    "Adafactor state has a row factor for `{key}` but no column factor"
+                ))
             })?;
             moments.insert(
                 Rc::from(key),

@@ -333,7 +333,10 @@ impl Updatable for ScheduleFreeAdamW {
         self.updatable_states().len()
     }
     fn updatable_states(&self) -> Vec<&Array> {
-        self.state.values().flat_map(|s| [&s.z, &s.v, &s.y]).collect()
+        self.state
+            .values()
+            .flat_map(|s| [&s.z, &s.v, &s.y])
+            .collect()
     }
     fn updatable_states_mut(&mut self) -> Vec<&mut Array> {
         self.state
@@ -403,6 +406,7 @@ mod tests {
             } else {
                 weight / self.weight_sum
             };
+            #[allow(clippy::needless_range_loop)]
             for i in 0..self.y.len() {
                 self.v[i] = self.beta2 * self.v[i] + (1.0 - self.beta2) * g[i] * g[i];
                 let denom = (self.v[i] / bias_correction2).sqrt() + self.eps;

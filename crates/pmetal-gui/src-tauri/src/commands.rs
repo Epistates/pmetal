@@ -1028,8 +1028,6 @@ pub async fn start_training(
         lora_rank: Some(spec.lora_r),
         lora_alpha: Some(spec.lora_alpha),
         sequence_packing: !spec.no_sequence_packing,
-        flash_attention: !spec.no_flash_attention,
-        jit_compilation: !spec.no_jit_compilation,
         gradient_checkpointing: !spec.no_gradient_checkpointing,
     };
 
@@ -1151,12 +1149,8 @@ pub async fn start_training(
             training: training_config,
             columns,
             dispatch: pmetal::trainer::DispatchConfig {
-                flash_attention: !spec.no_flash_attention,
                 sequence_packing: !spec.no_sequence_packing,
                 pack_max_seq_len: spec.pack_max_seq_len,
-                jit_compilation: !spec.no_jit_compilation,
-                fused: !spec.no_fused,
-                metal_fused_optimizer: !spec.no_metal_fused_optimizer,
                 gradient_checkpointing: !spec.no_gradient_checkpointing,
                 gradient_checkpointing_layers: spec.gradient_checkpointing_layers,
                 cut_cross_entropy: spec.cut_cross_entropy,
@@ -3206,23 +3200,19 @@ async fn run_distillation_in_process(
             drop_last: false,
             ..Default::default()
         },
-        use_metal_flash_attention: true,
         log_every: 1,
         checkpoint_every: 100,
         eval_every: 0,
-        use_jit_compilation: true,
         use_sequence_packing: true,
         gradient_checkpointing: true,
         gradient_checkpointing_layers: 4,
         embedding_lr: None,
-        eager_evaluation: false,
-        use_metal_fused_optimizer: true,
         loraplus_lr_ratio: None,
-        neftune_noise_alpha: None,
         ..Default::default()
     };
 
-    let mut trainer = pmetal::trainer::DistillationTrainer::new(distiller, training_loop_config);
+    let mut trainer = pmetal::trainer::DistillationTrainer::new(distiller, training_loop_config)
+        .map_err(|e| AppError(e.to_string()))?;
     let adaptive_config = pmetal::trainer::AdaptiveLrConfig::for_distillation();
     let control_file = PathBuf::from(&spec.output_dir).join(".lr_control.json");
     trainer.enable_adaptive_lr_with_control(adaptive_config, control_file);
@@ -3980,7 +3970,6 @@ pub struct RlkdDto {
     pub max_completion_length: Option<usize>,
     pub seed: Option<u64>,
     pub reasoning_rewards: Option<bool>,
-    pub no_flash_attention: Option<bool>,
     pub text_column: Option<String>,
     pub prompt_column: Option<String>,
     pub response_column: Option<String>,
@@ -4054,9 +4043,6 @@ pub async fn start_rlkd(
     args.extend(["--seed".into(), config.seed.unwrap_or(42).to_string()]);
     if config.reasoning_rewards.unwrap_or(false) {
         args.push("--reasoning-rewards".into());
-    }
-    if config.no_flash_attention.unwrap_or(false) {
-        args.push("--no-flash-attention".into());
     }
     if let Some(ref tc) = config.text_column
         && !tc.is_empty()

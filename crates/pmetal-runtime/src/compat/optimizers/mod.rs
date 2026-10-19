@@ -11,7 +11,9 @@ mod muon;
 mod schedule_free;
 mod state;
 
-pub use adamw_8bit::{AdamW8bit, BLOCK as ADAMW_8BIT_BLOCK, MIN_8BIT_SIZE, dynamic_map, nearest_code};
+pub use adamw_8bit::{
+    AdamW8bit, BLOCK as ADAMW_8BIT_BLOCK, MIN_8BIT_SIZE, dynamic_map, nearest_code,
+};
 pub use first_order::{Adafactor, Lion, MomentumSgd, SecondMoment, Sgd};
 pub use muon::{LrAdjust, Muon, MuonAdamW, NS_COEFFICIENTS, newton_schulz_orthogonalize};
 pub use schedule_free::ScheduleFreeAdamW;
@@ -204,7 +206,9 @@ impl StatefulOptimizer for AdamW {
         let mut restored = HashMap::new();
         for (key, m) in state.slot("m") {
             let v = state.tensor("v", key).ok_or_else(|| {
-                Exception::custom(format!("optimizer state has a first moment for `{key}` but no second"))
+                Exception::custom(format!(
+                    "optimizer state has a first moment for `{key}` but no second"
+                ))
             })?;
             restored.insert(
                 key.to_string(),

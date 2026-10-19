@@ -526,7 +526,6 @@ Rotation-based KV cache quantization for long-context inference on the native Qw
 - **Callback System**: `TrainingCallback` trait with lifecycle hooks (`on_step_start`, `on_step_end`, `should_stop`) for metrics logging, progress reporting, and clean cancellation
 - **Checkpoint Management**: Save and resume training from checkpoints with best-loss rollback
 - **Tool/Function Calling**: Chat templates with native tool definitions for Qwen, Gemma 4, Llama 3.1+, Mistral v3+, and DeepSeek
-- **Metal Fused Optimizer**: GPU-accelerated AdamW parameter updates
 - **LoRA+**: Differentiated learning rates for LoRA A and B matrices
 - **NEFTune**: Noise-augmented fine-tuning for improved generation quality
 - **Distributed Training**: mDNS auto-discovery, Ring All-Reduce with gradient compression
@@ -624,7 +623,6 @@ Multiple distillation methods and loss functions:
 | `--quantization` | none | QLoRA method (nf4, fp4, int8) |
 | `--gradient-accumulation-steps` | 4 | Gradient accumulation steps |
 | `--embedding-lr` | None | Separate LR for embeddings |
-| `--no-metal-fused-optimizer` | false | Disable Metal fused optimizer |
 | `--lr-schedule` | cosine | Schedule type (constant, linear, cosine, cosine_with_restarts, polynomial, wsd) |
 | `--no-gradient-checkpointing` | false | Disable gradient checkpointing (enabled by default) |
 | `--gradient-checkpointing-layers` | 4 | Number of layers per checkpoint block |

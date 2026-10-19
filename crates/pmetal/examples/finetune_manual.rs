@@ -103,9 +103,11 @@ async fn main() -> BoxResult<()> {
 
     // 8. Run training
     println!("Starting training...");
-    let mut training_loop = TrainingLoop::new(loop_config);
-    let model = training_loop
-        .run_packed(model, train_dataset, None, Some(&checkpoint_manager))
+    let mut training_loop =
+        TrainingLoop::new(loop_config).map_err(|e| format!("Invalid configuration: {e}"))?;
+    let mut model = model;
+    training_loop
+        .run(&mut model, train_dataset, None, Some(&checkpoint_manager))
         .map_err(|e| format!("Training failed: {e}"))?;
 
     // 9. Save LoRA weights

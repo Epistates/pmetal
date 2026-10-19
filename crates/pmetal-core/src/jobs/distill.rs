@@ -184,7 +184,7 @@ pub struct DistillSpec {
         group = "Optimization",
         argv = "--optimizer",
         kind = "enum",
-        enum_options = ["adamw", "sgd", "lion", "adafactor"],
+        enum_options = ["adamw", "sgd", "lion", "adafactor", "muon", "adamw_schedule_free", "adamw_8bit"],
         help = "Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW",
         default = "adamw"
     )]

@@ -71,7 +71,7 @@ GRPO expects a reasoning dataset:
 | `--dapo` | `false` | DAPO recipe: token-level loss, no KL, clip-higher (0.2, 0.28), dynamic sampling, overlong penalty, at least 16 completions |
 | `--loss-type` | `dapo` | `dapo` (token-level), `grpo` (each completion averaged over its length), `dr_grpo` (constant normalizer, no std scaling), `gspo` (sequence-level ratio, clip 3e-4/4e-4) |
 | `--num-iterations` | `1` | Optimizer updates per generation batch (μ). The ratio against the generating policy is 1 on the first, so clipping and GSPO only act from the second |
-| `--optimizer` | `adamw` | `adamw`, `sgd` (momentum 0.9), `lion`, `adafactor`. Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW |
+| `--optimizer` | `adamw` | `adamw`, `sgd` (momentum 0.9), `lion`, `adafactor`, `muon`, `adamw_schedule_free`, `adamw_8bit`. Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW; schedule-free AdamW wants a constant rate |
 | `--reasoning-rewards` | `false` | Enable reasoning-aware rewards |
 | `--speculative` | `false` | Speculative decoding for faster rollouts |
 | `--speculative-draft-tokens` | `3` | Draft tokens per speculative step |

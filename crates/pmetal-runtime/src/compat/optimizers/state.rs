@@ -232,7 +232,11 @@ mod tests {
         resumes_exactly("sgd", || Sgd::new(lr * 100.0), |_| {});
         resumes_exactly("momentum sgd", || MomentumSgd::new(lr, 0.01), |_| {});
         resumes_exactly("lion", || Lion::new(lr, 0.01), |_| {});
-        resumes_exactly("adafactor", || Adafactor::new(lr, 0.01), |o| o.advance_step());
+        resumes_exactly(
+            "adafactor",
+            || Adafactor::new(lr, 0.01),
+            |o| o.advance_step(),
+        );
         resumes_exactly("muon", || Muon::new(lr, 0.01), |_| {});
         resumes_exactly(
             "muon + adamw",

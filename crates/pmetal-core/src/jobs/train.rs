@@ -183,7 +183,7 @@ pub struct TrainSpec {
         group = "Optimization",
         argv = "--optimizer",
         kind = "enum",
-        enum_options = ["adamw", "sgd", "lion", "adafactor"],
+        enum_options = ["adamw", "sgd", "lion", "adafactor", "muon", "adamw_schedule_free", "adamw_8bit"],
         help = "Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW",
         default = "adamw"
     )]
@@ -328,16 +328,6 @@ pub struct TrainSpec {
 
     // -- Compute / dispatch flags --------------------------------------------
     #[job(
-        label = "Disable Flash Attention",
-        group = "Compute",
-        argv = "--no-flash-attention",
-        flag,
-        default_bool = false
-    )]
-    #[serde(default)]
-    pub no_flash_attention: bool,
-
-    #[job(
         label = "Disable Sequence Packing",
         group = "Compute",
         argv = "--no-sequence-packing",
@@ -346,36 +336,6 @@ pub struct TrainSpec {
     )]
     #[serde(default)]
     pub no_sequence_packing: bool,
-
-    #[job(
-        label = "Disable JIT",
-        group = "Compute",
-        argv = "--no-jit-compilation",
-        flag,
-        default_bool = false
-    )]
-    #[serde(default)]
-    pub no_jit_compilation: bool,
-
-    #[job(
-        label = "Disable Fused Step",
-        group = "Compute",
-        argv = "--no-fused",
-        flag,
-        default_bool = false
-    )]
-    #[serde(default)]
-    pub no_fused: bool,
-
-    #[job(
-        label = "Disable Fused Optimizer",
-        group = "Compute",
-        argv = "--no-metal-fused-optimizer",
-        flag,
-        default_bool = false
-    )]
-    #[serde(default)]
-    pub no_metal_fused_optimizer: bool,
 
     #[job(
         label = "Cut Cross-Entropy",
@@ -486,11 +446,7 @@ impl Default for TrainSpec {
             column_separator: None,
             prompt_column: None,
             response_column: None,
-            no_flash_attention: false,
             no_sequence_packing: false,
-            no_jit_compilation: false,
-            no_fused: false,
-            no_metal_fused_optimizer: false,
             cut_cross_entropy: false,
             no_adaptive_lr: false,
             ane: false,
@@ -739,7 +695,7 @@ mod tests {
         };
         assert_eq!(
             names(enum_options("optimizer")),
-            names(crate::OptimizerType::SUPPORTED.map(|k| k.as_str()).to_vec())
+            names(crate::OptimizerType::ALL.map(|k| k.as_str()).to_vec())
         );
         assert_eq!(
             names(enum_options("lr_schedule")),

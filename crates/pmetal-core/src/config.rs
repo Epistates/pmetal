@@ -13,25 +13,12 @@ use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Model loading configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     /// Model identifier (HuggingFace repo ID or local path).
     #[serde(default, alias = "name")]
     pub model_id: String,
-
-    /// Use flash attention if available.
-    #[serde(default = "default_true")]
-    pub use_flash_attention: bool,
-}
-
-impl Default for ModelConfig {
-    fn default() -> Self {
-        Self {
-            model_id: String::new(),
-            use_flash_attention: true,
-        }
-    }
 }
 
 /// Bias handling mode for LoRA layers.
@@ -369,6 +356,27 @@ pub struct TrainingConfig {
     /// Maximum sequence length; 0 takes it from the model's config.
     #[serde(default = "default_max_seq_len")]
     pub max_seq_len: usize,
+
+    /// Label smoothing of the training loss, in `[0, 1)`: the target
+    /// distribution is `1 - epsilon` on the label and `epsilon` spread evenly
+    /// over the vocabulary (as PyTorch's `label_smoothing`). 0 is plain
+    /// cross-entropy. Evaluation always reports the plain loss.
+    #[serde(default)]
+    pub label_smoothing: f64,
+
+    /// Weight of the z-loss added to the training loss, `weight * lse^2` per
+    /// token (Chowdhery et al., 2022; `1e-4` is the paper's value), which
+    /// keeps the softmax normalizer near 1 and so bf16 logits stable. 0
+    /// turns it off.
+    #[serde(default)]
+    pub z_loss: f64,
+
+    /// NEFTune noise alpha (Jain et al., 2023): uniform noise of magnitude
+    /// `alpha / sqrt(seq_len * hidden)` is added to the token embeddings of
+    /// each training forward pass. Recommended 5 for small models and 15 for
+    /// larger ones. `None` trains without noise.
+    #[serde(default)]
+    pub neftune_noise_alpha: Option<f64>,
 }
 
 impl Default for TrainingConfig {
@@ -398,6 +406,9 @@ impl Default for TrainingConfig {
             output_dir: default_output_dir(),
             use_packing: true,
             max_seq_len: default_max_seq_len(),
+            label_smoothing: 0.0,
+            z_loss: 0.0,
+            neftune_noise_alpha: None,
         }
     }
 }
@@ -506,12 +517,9 @@ impl WsdDecayStyle {
 /// `pmetal_trainer::optimizer` for the update rules and their defaults. The
 /// learning rate and weight decay do not carry over between kinds: the Lion
 /// paper recommends a learning rate 3-10x smaller and a weight decay 3-10x
-/// larger than AdamW's.
-///
-/// [`SUPPORTED`](Self::SUPPORTED) lists the kinds a trainer runs today. The
-/// rest parse, so a config naming one gets a clear refusal from
-/// [`ConfigValidator`](crate::ConfigValidator) rather than an "unknown
-/// optimizer".
+/// larger than AdamW's. Muon takes AdamW's, since its update is scaled to
+/// AdamW's RMS; schedule-free AdamW wants a constant rate after warmup, as its
+/// iterate averaging takes the place of a decaying schedule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum OptimizerType {
@@ -552,9 +560,6 @@ impl OptimizerType {
         Self::AdamW8bit,
     ];
 
-    /// The kinds a trainer runs today, in the order the CLI lists them.
-    pub const SUPPORTED: [Self; 4] = [Self::AdamW, Self::Sgd, Self::Lion, Self::Adafactor];
-
     /// The name the CLI, job specs and YAML configs use.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -565,17 +570,6 @@ impl OptimizerType {
             Self::Muon => "muon",
             Self::AdamWScheduleFree => "adamw_schedule_free",
             Self::AdamW8bit => "adamw_8bit",
-        }
-    }
-
-    /// Whether a trainer can run this optimizer. Flip a kind's arm here when
-    /// the trainer learns to build it; every surface that lists optimizers
-    /// follows [`SUPPORTED`](Self::SUPPORTED).
-    #[must_use]
-    pub fn is_supported(self) -> bool {
-        match self {
-            Self::AdamW | Self::Sgd | Self::Lion | Self::Adafactor => true,
-            Self::Muon | Self::AdamWScheduleFree | Self::AdamW8bit => false,
         }
     }
 }
@@ -837,15 +831,6 @@ mod tests {
         assert_eq!(config.optimizer, OptimizerType::AdamW);
         let config: TrainingConfig = serde_saphyr::from_str("optimizer: lion").unwrap();
         assert_eq!(config.optimizer, OptimizerType::Lion);
-    }
-
-    #[test]
-    fn supported_optimizers_are_the_ones_marked_supported() {
-        let marked: Vec<_> = OptimizerType::ALL
-            .into_iter()
-            .filter(|k| k.is_supported())
-            .collect();
-        assert_eq!(marked, OptimizerType::SUPPORTED);
     }
 
     #[test]

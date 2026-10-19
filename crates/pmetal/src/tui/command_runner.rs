@@ -671,12 +671,8 @@ async fn run_training_direct(
         },
         columns,
         dispatch: orchestrator::DispatchConfig {
-            flash_attention: !has_flag(&spec.args, "--no-flash-attention"),
             sequence_packing: !has_flag(&spec.args, "--no-sequence-packing"),
             pack_max_seq_len: parse_opt_arg(&spec.args, "--pack-max-seq-len"),
-            jit_compilation: !has_flag(&spec.args, "--no-jit-compilation"),
-            fused: !has_flag(&spec.args, "--no-fused"),
-            metal_fused_optimizer: !has_flag(&spec.args, "--no-metal-fused-optimizer"),
             gradient_checkpointing: !has_flag(&spec.args, "--no-gradient-checkpointing"),
             gradient_checkpointing_layers: parse_arg(
                 &spec.args,
@@ -793,7 +789,6 @@ async fn run_grpo_direct(
         &loss_type,
         parse_arg(&spec.args, "--num-iterations", 1usize)?,
         has_flag(&spec.args, "--reasoning-rewards"),
-        !has_flag(&spec.args, "--no-flash-attention"),
         has_flag(&spec.args, "--vlm"),
         parse_arg(&spec.args, "--max-image-size", 336usize)?,
         optional_arg(&spec.args, "--reward-model"),

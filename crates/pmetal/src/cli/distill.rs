@@ -81,8 +81,9 @@ pub struct DistillArgs {
     #[arg(long = "learning-rate", default_value = "2e-5")]
     pub learning_rate: f32,
 
-    /// Optimizer: adamw, sgd, lion or adafactor. Lion wants a 3-10x smaller
-    /// learning rate and 3-10x larger weight decay than AdamW.
+    /// Optimizer: adamw, sgd, lion, adafactor, muon, adamw_schedule_free or
+    /// adamw_8bit. Lion wants a 3-10x smaller learning rate and 3-10x larger
+    /// weight decay than AdamW; schedule-free AdamW wants a constant rate.
     #[arg(long = "optimizer", default_value = "adamw")]
     pub optimizer: pmetal_core::OptimizerType,
 

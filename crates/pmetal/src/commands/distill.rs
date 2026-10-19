@@ -366,7 +366,6 @@ pub(crate) async fn run_distillation_cli(
             drop_last: false,
             ..Default::default()
         },
-        use_metal_flash_attention: true,
         log_every: 1,
         checkpoint_every,
         eval_every: if eval_dataset.is_some() {
@@ -374,20 +373,16 @@ pub(crate) async fn run_distillation_cli(
         } else {
             0
         },
-        use_jit_compilation: false,
         use_sequence_packing: true,
         gradient_checkpointing: true,
         gradient_checkpointing_layers: 4,
         embedding_lr: None,
-        eager_evaluation: false,
-        use_metal_fused_optimizer: true,
         loraplus_lr_ratio: None,
-        neftune_noise_alpha: None,
         use_cut_cross_entropy: false,
         ..Default::default()
     };
 
-    let mut trainer = DistillationTrainer::new(distiller, training_loop_config);
+    let mut trainer = DistillationTrainer::new(distiller, training_loop_config)?;
 
     {
         let adaptive_config = pmetal_trainer::AdaptiveLrConfig::for_distillation();

@@ -26,9 +26,7 @@
 
 use super::first_order::{f32_of, master_of};
 use super::state::{export_masters, import_masters, import_slot};
-use super::{
-    AdamW, Optimizer, OptimizerState, State, StatefulOptimizer, Updatable, apply_updates,
-};
+use super::{AdamW, Optimizer, OptimizerState, State, StatefulOptimizer, Updatable, apply_updates};
 use crate::compat::{Array, Dtype, Exception, FlattenedModuleParam, ModuleParameters};
 use crate::optimizer::{MasterWeight, is_embedding_parameter};
 use std::collections::HashMap;

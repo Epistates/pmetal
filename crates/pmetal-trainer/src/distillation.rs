@@ -24,11 +24,14 @@ pub struct DistillationTrainer {
 
 impl DistillationTrainer {
     /// Create a new DistillationTrainer.
-    pub fn new(distiller: Distiller, config: TrainingLoopConfig) -> Self {
-        Self {
+    ///
+    /// # Errors
+    /// If `config` cannot work ([`TrainingLoopConfig::validate`]).
+    pub fn new(distiller: Distiller, config: TrainingLoopConfig) -> Result<Self> {
+        Ok(Self {
             distiller,
-            loop_state: TrainingLoop::new(config),
-        }
+            loop_state: TrainingLoop::new(config)?,
+        })
     }
 
     /// Add a training callback for metrics logging or dashboard integration.
@@ -243,19 +246,12 @@ impl DistillationTrainer {
 
         let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
 
-        let (loss, grads) = if self.loop_state.metal_fa_available {
-            with_training_mode(|| {
-                loss_and_grad_fn(
-                    student,
-                    (&batch.input_ids, &batch.labels, teacher_logits, &weights),
-                )
-            })?
-        } else {
+        let (loss, grads) = with_training_mode(|| {
             loss_and_grad_fn(
                 student,
                 (&batch.input_ids, &batch.labels, teacher_logits, &weights),
-            )?
-        };
+            )
+        })?;
 
         let loss_val = crate::step_check::check_step(self.loop_state.step + 1, loss.item_f32())?;
         optimizer.update(student, grads)?;
@@ -771,6 +767,7 @@ mod tests {
                 ..Default::default()
             },
         )
+        .unwrap()
     }
 
     #[test]

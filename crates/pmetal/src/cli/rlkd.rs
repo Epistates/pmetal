@@ -77,10 +77,6 @@ pub struct RlkdArgs {
     #[arg(long = "reasoning-rewards")]
     pub reasoning_rewards: bool,
 
-    /// Disable Metal FlashAttention.
-    #[arg(long = "no-flash-attention")]
-    pub no_flash_attention: bool,
-
     /// Custom text column name in the dataset JSONL.
     #[arg(long = "text-column")]
     pub text_column: Option<String>,

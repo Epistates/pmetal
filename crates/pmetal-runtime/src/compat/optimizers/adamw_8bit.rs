@@ -19,12 +19,10 @@
 
 use super::first_order::{f32_of, master_of};
 use super::state::{export_masters, import_masters};
-use super::{
-    AdamW, Optimizer, OptimizerState, State, StatefulOptimizer, Updatable, apply_updates,
-};
+use super::{AdamW, Optimizer, OptimizerState, State, StatefulOptimizer, Updatable, apply_updates};
+use crate::MetalKernel;
 use crate::compat::{Array, Dtype, Exception, FlattenedModuleParam, ModuleParameters};
 use crate::optimizer::{AdamWStepScalars, MasterWeight, excluded_from_weight_decay};
-use crate::MetalKernel;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -47,7 +45,7 @@ pub fn dynamic_map(signed: bool) -> [f32; 256] {
     const MAX_EXPONENT_BITS: i32 = 7;
     const NON_SIGN_BITS: i32 = 7;
     let mut data: Vec<f64> = Vec::with_capacity(256);
-    let push_range =|exponent: i32, points: usize, data: &mut Vec<f64>| {
+    let push_range = |exponent: i32, points: usize, data: &mut Vec<f64>| {
         // Means of consecutive points of linspace(0.1, 1, points).
         let step = 0.9 / (points - 1) as f64;
         let scale = 10f64.powi(exponent);
@@ -319,12 +317,15 @@ impl AdamW8bit {
             &[8],
         );
         let f32_ = Dtype::Float32.as_i32();
-        let state = self.quantized.entry(key.clone()).or_insert_with(|| Quantized {
-            mq: Array::zeros(&[n as i32], Dtype::Uint8.as_i32()),
-            vq: Array::zeros(&[n as i32], Dtype::Uint8.as_i32()),
-            m_absmax: Array::zeros(&[blocks as i32], f32_),
-            v_absmax: Array::zeros(&[blocks as i32], f32_),
-        });
+        let state = self
+            .quantized
+            .entry(key.clone())
+            .or_insert_with(|| Quantized {
+                mq: Array::zeros(&[n as i32], Dtype::Uint8.as_i32()),
+                vq: Array::zeros(&[n as i32], Dtype::Uint8.as_i32()),
+                m_absmax: Array::zeros(&[blocks as i32], f32_),
+                v_absmax: Array::zeros(&[blocks as i32], f32_),
+            });
         let master = master_of(&mut self.masters, key);
         let shape = parameter.shape().to_vec();
         let weight = master.weight(parameter).reshape(&[-1]);
@@ -415,8 +416,7 @@ impl StatefulOptimizer for AdamW8bit {
     fn import_state(&mut self, state: &OptimizerState) -> Result<(), Exception> {
         state.expect_kind("adamw_8bit")?;
         self.step = state.scalar("step")? as u64;
-        self.small
-            .import_state(&state.unnest("small", "adamw"))?;
+        self.small.import_state(&state.unnest("small", "adamw"))?;
         self.quantized.clear();
         for (key, mq) in state.slot("mq") {
             let get = |slot: &str| {
@@ -495,7 +495,7 @@ mod tests {
             assert!(map.contains(&0.0), "{name} has zero");
         }
         assert_eq!(signed[0], -0.992_968_75);
-        assert_eq!(signed[1], -0.978_906_25);
+        assert_eq!(signed[1], -0.978_906_3_f32);
         assert_eq!(signed[255], 1.0);
         // The signed code sums to its extra +1.0 and nothing else: every
         // other entry has its negation.
@@ -540,7 +540,11 @@ mod tests {
         for i in 0..n as usize {
             let want = p0[i] as f64 * (1.0 - lr as f64 * wd as f64)
                 - (lr as f64 / (1.0 - b1)) * m[i] / ((v[i]).sqrt() / (1.0 - b2).sqrt() + eps);
-            assert!((got_p[i] as f64 - want).abs() < 1e-5, "p[{i}]: {} vs {want}", got_p[i]);
+            assert!(
+                (got_p[i] as f64 - want).abs() < 1e-5,
+                "p[{i}]: {} vs {want}",
+                got_p[i]
+            );
         }
 
         let state = opt.export_state();
@@ -558,8 +562,14 @@ mod tests {
             let range = block * BLOCK..((block + 1) * BLOCK).min(n as usize);
             let bm = m[range.clone()].iter().fold(0f64, |a, x| a.max(x.abs()));
             let bv = v[range.clone()].iter().fold(0f64, |a, x| a.max(*x));
-            assert!((m_abs[block] as f64 - bm).abs() <= 1e-6 * bm, "m absmax {block}");
-            assert!((v_abs[block] as f64 - bv).abs() <= 1e-6 * bv, "v absmax {block}");
+            assert!(
+                (m_abs[block] as f64 - bm).abs() <= 1e-6 * bm,
+                "m absmax {block}"
+            );
+            assert!(
+                (v_abs[block] as f64 - bv).abs() <= 1e-6 * bv,
+                "v absmax {block}"
+            );
             for i in range {
                 let (nm, nv) = ((m[i] / bm) as f32, (v[i] / bv) as f32);
                 let (wm, wv) = (nearest_code(&code_m, nm), nearest_code(&code_v, nv));
@@ -604,7 +614,10 @@ mod tests {
         assert!(moved > 0.02, "the parameters moved ({moved})");
         // The step is lr-sized, and a few percent of it per step is the
         // code's resolution: well under a tenth of the distance moved.
-        assert!(worst < 0.1 * moved, "worst deviation {worst} against {moved} moved");
+        assert!(
+            worst < 0.1 * moved,
+            "worst deviation {worst} against {moved} moved"
+        );
     }
 
     /// The states are held at a quarter of f32's size, and a tensor under the
@@ -627,7 +640,9 @@ mod tests {
         opt.update_single(&big, &gb, &mut pb).expect("big");
         opt.update_single(&tiny, &gt, &mut pt).expect("tiny");
         reference.advance_step();
-        reference.update_single(&tiny, &gt, &mut pt_ref).expect("ref");
+        reference
+            .update_single(&tiny, &gt, &mut pt_ref)
+            .expect("ref");
         assert_eq!(read(&pt), read(&pt_ref), "a small tensor is plain AdamW");
         assert_eq!(opt.num_quantized(), 1);
         let n = 64 * 128;

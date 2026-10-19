@@ -85,17 +85,13 @@ impl Default for QLoraOrchConfig {
 /// Dispatch / optimization flags.
 #[derive(Debug, Clone)]
 pub struct DispatchConfig {
-    pub flash_attention: bool,
     pub sequence_packing: bool,
     /// Explicit override for the packing sequence length.
     ///
-    /// When `None` (default), `run_packed` auto-computes the packing length from
-    /// the p99 of sample lengths, rounded up to the next power of two.
+    /// When `None` (default), packing auto-computes the length from the p99 of
+    /// sample lengths, rounded up to the next power of two.
     /// When `Some(n)`, `n` is used directly, bypassing the adaptive heuristic.
     pub pack_max_seq_len: Option<usize>,
-    pub jit_compilation: bool,
-    pub fused: bool,
-    pub metal_fused_optimizer: bool,
     pub gradient_checkpointing: bool,
     pub gradient_checkpointing_layers: usize,
     pub cut_cross_entropy: bool,
@@ -113,12 +109,8 @@ pub struct DispatchConfig {
 impl Default for DispatchConfig {
     fn default() -> Self {
         Self {
-            flash_attention: true,
             sequence_packing: true,
             pack_max_seq_len: None,
-            jit_compilation: false,
-            fused: true,
-            metal_fused_optimizer: true,
             gradient_checkpointing: true,
             gradient_checkpointing_layers: 4,
             cut_cross_entropy: false,
@@ -309,7 +301,6 @@ fn build_training_loop_config(
     TrainingLoopConfig {
         training: full_config.training.clone(),
         dataloader: dataloader.clone(),
-        use_metal_flash_attention: dispatch.flash_attention,
         log_every: full_config.training.logging_steps.max(1),
         checkpoint_every: full_config.training.save_steps.unwrap_or(500),
         eval_every: if has_eval_dataset {
@@ -317,7 +308,6 @@ fn build_training_loop_config(
         } else {
             0
         },
-        use_jit_compilation: dispatch.jit_compilation,
         use_sequence_packing: dispatch.sequence_packing,
         pack_max_seq_len: dispatch.pack_max_seq_len,
         gradient_checkpointing: dispatch.gradient_checkpointing,
@@ -326,10 +316,7 @@ fn build_training_loop_config(
             .training
             .embedding_learning_rate
             .map(|v| v as f32),
-        eager_evaluation: true,
-        use_metal_fused_optimizer: dispatch.metal_fused_optimizer,
         loraplus_lr_ratio: full_config.lora.loraplus_lr_ratio,
-        neftune_noise_alpha: None,
         use_cut_cross_entropy: dispatch.cut_cross_entropy,
         #[cfg(feature = "distributed")]
         distributed: dispatch.distributed.clone(),
@@ -505,9 +492,6 @@ pub async fn run_training(
         let dispatch_defaults = DispatchConfig::default();
         if config.dispatch.sequence_packing == dispatch_defaults.sequence_packing {
             config.dispatch.sequence_packing = full_config.training.use_packing;
-        }
-        if config.dispatch.flash_attention == dispatch_defaults.flash_attention {
-            config.dispatch.flash_attention = full_config.model.use_flash_attention;
         }
     }
 
@@ -799,18 +783,6 @@ pub async fn run_training(
             ctx.world_size()
         );
         let sync = crate::distributed_bridge::DistributedGradientSync::new(ctx, distributed_config);
-        if config.dispatch.sequence_packing {
-            tracing::warn!(
-                "Sequence packing is disabled for distributed training; using sharded dataloaders instead"
-            );
-            config.dispatch.sequence_packing = false;
-        }
-        if config.dispatch.jit_compilation {
-            tracing::warn!(
-                "Compiled/fused-owned dispatch is disabled for distributed training; using distributed-aware loops"
-            );
-            config.dispatch.jit_compilation = false;
-        }
         Some(sync)
     } else {
         None
@@ -1064,7 +1036,7 @@ fn run_lora_path(
         training_loop_config.gradient_checkpointing = false;
     }
 
-    let mut training_loop = TrainingLoop::new(training_loop_config);
+    let mut training_loop = TrainingLoop::new(training_loop_config)?;
     attach_distributed_sync(&mut training_loop, distributed_sync);
 
     if let Some(cb) = metrics_callback.take() {
@@ -1086,26 +1058,8 @@ fn run_lora_path(
         training_loop.set_snapshot_persist_dir(checkpoint_manager.checkpoint_dir().to_path_buf());
     }
 
-    if config.resume {
-        if let Some((lora_params, metadata)) = checkpoint_manager.load_latest()? {
-            tracing::info!("Resuming from checkpoint at step {}", metadata.step);
-            model.set_lora_parameters(&lora_params);
-            training_loop.set_step(metadata.step);
-            training_loop.set_epoch(metadata.epoch);
-            // Restore persisted best-loss snapshot so rollback works after resume.
-            if let Some(snapshot) =
-                crate::checkpoint::load_best_snapshot(checkpoint_manager.checkpoint_dir())
-            {
-                training_loop.best_lora_snapshot = Some(snapshot);
-                // Notify adaptive LR controller that a snapshot is available for rollback.
-                if let Some(ref mut ctrl) = training_loop.adaptive_lr {
-                    ctrl.set_has_snapshot(metadata.running_loss, metadata.step);
-                }
-                tracing::info!("Restored best snapshot from disk for rollback-on-resume");
-            }
-        } else {
-            tracing::info!("No checkpoint found, starting fresh");
-        }
+    if config.resume && !training_loop.resume_from(&mut model, checkpoint_manager)? {
+        tracing::info!("No checkpoint found, starting fresh");
     }
 
     tracing::info!("Starting LoRA training...");
@@ -1116,74 +1070,19 @@ fn run_lora_path(
         cb.on_train_start();
     }
 
-    // Dispatch: packed > compiled > metal-fused > standard
-    if config.dispatch.sequence_packing {
-        let model = training_loop.run_packed(
-            model,
-            train_dataset.clone(),
-            eval_dataset.clone(),
-            Some(checkpoint_manager),
-        )?;
+    training_loop.run(
+        &mut model,
+        train_dataset,
+        eval_dataset,
+        Some(checkpoint_manager),
+    )?;
 
-        save_adapter(
-            &model,
-            Path::new(output_dir),
-            &config.lora,
-            Some(&full_config.model.model_id),
-        )?;
-    } else if (config.dispatch.fused || config.dispatch.jit_compilation)
-        && full_config.training.gradient_accumulation_steps == 1
-    {
-        let model = training_loop.run_compiled(
-            model,
-            train_dataset,
-            eval_dataset,
-            Some(checkpoint_manager),
-        )?;
-
-        save_adapter(
-            &model,
-            Path::new(output_dir),
-            &config.lora,
-            Some(&full_config.model.model_id),
-        )?;
-    } else if config.dispatch.metal_fused_optimizer {
-        tracing::info!("Using Metal fused optimizer for training");
-        training_loop.run_metal_fused(
-            &mut model,
-            train_dataset,
-            eval_dataset,
-            Some(checkpoint_manager),
-        )?;
-
-        save_adapter(
-            &model,
-            Path::new(output_dir),
-            &config.lora,
-            Some(&full_config.model.model_id),
-        )?;
-    } else {
-        if (config.dispatch.fused || config.dispatch.jit_compilation)
-            && full_config.training.gradient_accumulation_steps != 1
-        {
-            tracing::warn!(
-                "Fused/JIT training requires gradient_accumulation_steps=1, falling back to standard training"
-            );
-        }
-        training_loop.run(
-            &mut model,
-            train_dataset,
-            eval_dataset,
-            Some(checkpoint_manager),
-        )?;
-
-        save_adapter(
-            &model,
-            Path::new(output_dir),
-            &config.lora,
-            Some(&full_config.model.model_id),
-        )?;
-    }
+    save_adapter(
+        &model,
+        Path::new(output_dir),
+        &config.lora,
+        Some(&full_config.model.model_id),
+    )?;
 
     // Recover the metrics callback (always inserted first) for finalization.
     // Only recover if we actually created one — don't grab a user callback by mistake.

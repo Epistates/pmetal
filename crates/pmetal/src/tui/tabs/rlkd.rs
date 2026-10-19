@@ -184,7 +184,6 @@ impl RlkdTab {
             .unwrap_or(spec.max_completion_length);
         spec.seed = self.form.value("Seed").parse().unwrap_or(spec.seed);
         spec.reasoning_rewards = self.form.value("Reasoning Rewards") == "Enabled";
-        spec.no_flash_attention = self.form.value("Disable Flash Attention") == "Enabled";
         spec
     }
 }

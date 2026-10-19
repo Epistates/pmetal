@@ -24,7 +24,7 @@ echo "Dataset: $DATASET"
 echo "LoRA rank: $LORA_R"
 echo ""
 
-# FlashAttention, Sequence Packing, and Gradient Checkpointing are ENABLED BY DEFAULT.
+# Sequence Packing and Gradient Checkpointing are ENABLED BY DEFAULT.
 # QLoRA requires specifying the quantization method (nf4, fp4, or int8).
 
 "$PMETAL_BIN" train \

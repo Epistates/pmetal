@@ -76,7 +76,7 @@ pub struct GrpoSpec {
         group = "Optimization",
         argv = "--optimizer",
         kind = "enum",
-        enum_options = ["adamw", "sgd", "lion", "adafactor"],
+        enum_options = ["adamw", "sgd", "lion", "adafactor", "muon", "adamw_schedule_free", "adamw_8bit"],
         help = "Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW",
         default = "adamw"
     )]
@@ -182,16 +182,6 @@ pub struct GrpoSpec {
     )]
     #[serde(default)]
     pub reasoning_rewards: bool,
-
-    #[job(
-        label = "Disable Flash Attention",
-        group = "Compute",
-        argv = "--no-flash-attention",
-        flag,
-        default_bool = false
-    )]
-    #[serde(default)]
-    pub no_flash_attention: bool,
 
     #[job(
         label = "VLM Mode",
@@ -321,7 +311,6 @@ impl Default for GrpoSpec {
             loss_type: default_loss_type(),
             num_iterations: default_num_iterations(),
             reasoning_rewards: false,
-            no_flash_attention: false,
             vlm: false,
             max_image_size: default_max_image_size(),
             reward_model: None,
