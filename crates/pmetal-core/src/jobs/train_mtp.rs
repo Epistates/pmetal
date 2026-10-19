@@ -225,6 +225,16 @@ pub struct TrainMtpSpec {
     #[serde(default = "default_log_every")]
     pub log_every: usize,
 
+    #[job(
+        label = "Resume From",
+        group = "Output",
+        argv = "--resume",
+        kind = "path",
+        help = "A checkpoint directory, or the output directory of an earlier run (its furthest checkpoint): the weights, the optimizer state and the step are restored and the run continues to Steps"
+    )]
+    #[serde(default)]
+    pub resume: Option<String>,
+
     #[job(label = "Seed", group = "Training", argv = "--seed", default_int = 42)]
     #[serde(default = "default_seed")]
     pub seed: u64,
@@ -254,13 +264,20 @@ impl Default for TrainMtpSpec {
             checkpoint_every: default_checkpoint_every(),
             log_every: default_log_every(),
             seed: default_seed(),
+            resume: None,
         }
     }
 }
 
 impl TrainMtpSpec {
     pub fn normalize(&mut self) -> Result<(), Vec<FieldError>> {
-        let errs = self.validate_descriptors();
+        let mut errs = self.validate_descriptors();
+        if self.resume.is_some() && self.init_mtp.is_some() {
+            errs.push(FieldError::new(
+                "init_mtp",
+                "a resumed run continues from its own checkpoint's weights; give --resume or --init-mtp, not both",
+            ));
+        }
         if errs.is_empty() { Ok(()) } else { Err(errs) }
     }
 }

@@ -1254,3 +1254,127 @@ fn serve_spec_round_trips_every_field_but_the_keys() {
     };
     assert_eq!(args.into_spec().1, ["k1", "k2"]);
 }
+
+#[cfg(feature = "trainer")]
+#[test]
+fn train_mtp_and_draft_specs_round_trip_every_field_resume_included() {
+    use pmetal_core::jobs::{TrainDraftSpec, TrainMtpSpec};
+    round_trips(
+        "train-mtp",
+        [
+            TrainMtpSpec {
+                model: "m".into(),
+                shards: vec!["a.bin".into()],
+                ..Default::default()
+            },
+            TrainMtpSpec {
+                model: "m".into(),
+                family: "gemma4".into(),
+                init_mtp: None,
+                mtp_layers: 2,
+                assistant_layers: 3,
+                num_assistant_tokens: 4,
+                shards: vec!["a.bin".into(), "b.bin".into()],
+                eos_token_id: 2,
+                output: "out".into(),
+                seq_len: 256,
+                batch_size: 2,
+                steps: 50,
+                learning_rate: 1e-4,
+                min_lr: 1e-6,
+                warmup_steps: 5,
+                lr_schedule: "wsd".into(),
+                weight_decay: 0.02,
+                max_grad_norm: 0.5,
+                checkpoint_every: 10,
+                log_every: 2,
+                seed: 7,
+                resume: Some("out/checkpoints/step_10".into()),
+            },
+        ],
+        |c| match c {
+            Commands::TrainMtp(a) => Some(a),
+            _ => None,
+        },
+    );
+    round_trips(
+        "train-draft",
+        [
+            TrainDraftSpec {
+                target: "t".into(),
+                draft_config: Some("c.json".into()),
+                shards: vec!["a.bin".into()],
+                ..Default::default()
+            },
+            TrainDraftSpec {
+                target: "t".into(),
+                draft: None,
+                draft_config: None,
+                shards: vec!["a.bin".into(), "b.bin".into()],
+                eos_token_id: 2,
+                output: "out".into(),
+                seq_len: 256,
+                batch_size: 2,
+                steps: 50,
+                learning_rate: 1e-4,
+                min_lr: 1e-6,
+                warmup_steps: 5,
+                lr_schedule: "linear".into(),
+                weight_decay: 0.02,
+                max_grad_norm: 0.5,
+                checkpoint_every: 10,
+                log_every: 2,
+                seed: 7,
+                resume: Some("out".into()),
+            },
+        ],
+        |c| match c {
+            Commands::TrainDraft(a) => Some(a),
+            _ => None,
+        },
+    );
+}
+
+/// A resumed run continues from its own checkpoint: naming the weights to
+/// start from as well is a contradiction, refused by the parser and by a spec
+/// that did not come through it.
+#[cfg(feature = "trainer")]
+#[test]
+fn resume_and_a_starting_point_are_one_or_the_other() {
+    use pmetal_core::jobs::{TrainDraftSpec, TrainMtpSpec};
+    let argv = |extra: &[&str]| {
+        let mut v: Vec<String> = ["--model", "m", "--shards", "a.bin"]
+            .map(String::from)
+            .to_vec();
+        v.extend(extra.iter().map(|s| s.to_string()));
+        v
+    };
+    assert!(try_parse("train-mtp", argv(&["--resume", "out"])).is_ok());
+    assert!(try_parse("train-mtp", argv(&["--resume", "out", "--init-mtp", "x"])).is_err());
+    let draft = |extra: &[&str]| {
+        let mut v: Vec<String> = ["--target", "t", "--shards", "a.bin"]
+            .map(String::from)
+            .to_vec();
+        v.extend(extra.iter().map(|s| s.to_string()));
+        v
+    };
+    assert!(try_parse("train-draft", draft(&["--resume", "out"])).is_ok());
+    assert!(try_parse("train-draft", draft(&["--resume", "out", "--draft", "d"])).is_err());
+
+    let mut mtp = TrainMtpSpec {
+        model: "m".into(),
+        shards: vec!["a".into()],
+        resume: Some("out".into()),
+        init_mtp: Some("x".into()),
+        ..Default::default()
+    };
+    assert!(mtp.normalize().is_err());
+    let mut draft_spec = TrainDraftSpec {
+        target: "t".into(),
+        shards: vec!["a".into()],
+        resume: Some("out".into()),
+        draft: Some("d".into()),
+        ..Default::default()
+    };
+    assert!(draft_spec.normalize().is_err());
+}

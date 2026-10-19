@@ -62,6 +62,7 @@ pmetal infer \
 | `--shards` | required | Tokenized shard files from `pmetal tokenize` |
 | `--output` | `./mtp-output` | Output checkpoint directory |
 | `--init-mtp` | — | Existing assistant/MTP checkpoint to continue training |
+| `--resume` | — | Continue an interrupted run: a checkpoint directory (`<output>/checkpoints/step_N`) or the output directory (its furthest checkpoint). Restores the predictor's weights, the optimizer state (moments and f32 master copies) and the step, and reads the shards from that step on. Not with `--init-mtp` |
 | `--seq-len` | `512` | Sequence length per sample |
 | `--batch-size` | `1` | Training batch size |
 | `--steps` | `1000` | Optimizer steps |

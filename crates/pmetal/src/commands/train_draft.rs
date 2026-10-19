@@ -9,19 +9,28 @@ use pmetal_models::dflash_drafts::load_dflash_draft_from_dir;
 use pmetal_trainer::{MtpTrainingConfig, batch_from_tokens, run_dflash_draft_training};
 
 use crate::cli::train_draft::TrainDraftArgs;
+use crate::commands::resume::find_resume_point;
 
 pub(crate) async fn run_train_draft(args: TrainDraftArgs) -> Result<()> {
     anyhow::ensure!(
-        args.draft.is_some() || args.draft_config.is_some(),
-        "train-draft requires --draft or --draft-config"
+        args.resume.is_some() || args.draft.is_some() || args.draft_config.is_some(),
+        "train-draft requires --draft, --draft-config or --resume"
     );
-    let config = build_config(&args);
+    let resume = args
+        .resume
+        .as_deref()
+        .map(|dir| find_resume_point(Path::new(dir)))
+        .transpose()?;
+    let mut config = build_config(&args);
+    config.resume_from = resume.as_ref().map(|point| point.dir.clone());
+    // The batches the interrupted run had already consumed are not repeated.
     let batches = shard_batches(
         &args.shards,
         args.seq_len,
         args.batch_size,
         args.eos_token_id,
-    )?;
+    )?
+    .skip(resume.as_ref().map_or(0, |point| point.step));
     let target_path = pmetal_hub::resolve_model_path(&args.target, None, None)
         .await
         .map_err(|e| anyhow::anyhow!("resolve target model {}: {e}", args.target))?;
@@ -35,7 +44,12 @@ pub(crate) async fn run_train_draft(args: TrainDraftArgs) -> Result<()> {
         ),
     };
 
-    let mut draft = if let Some(draft) = args.draft.as_deref() {
+    // A resumed run continues from its checkpoint's weights.
+    let draft_source = resume
+        .as_ref()
+        .map(|point| point.dir.to_string_lossy().into_owned())
+        .or_else(|| args.draft.clone());
+    let mut draft = if let Some(draft) = draft_source.as_deref() {
         let draft_path = pmetal_hub::resolve_model_path(draft, None, None)
             .await
             .map_err(|e| anyhow::anyhow!("resolve draft checkpoint {draft}: {e}"))?;
@@ -74,13 +88,13 @@ pub(crate) async fn run_train_draft(args: TrainDraftArgs) -> Result<()> {
 fn build_config(args: &TrainDraftArgs) -> MtpTrainingConfig {
     MtpTrainingConfig {
         num_steps: args.steps,
-        learning_rate: args.learning_rate,
-        min_lr: args.min_lr,
+        learning_rate: args.learning_rate as f32,
+        min_lr: args.min_lr as f32,
         warmup_steps: args.warmup_steps,
         lr_schedule: args.lr_schedule,
-        weight_decay: args.weight_decay,
+        weight_decay: args.weight_decay as f32,
         max_grad_norm: if args.max_grad_norm > 0.0 {
-            Some(args.max_grad_norm)
+            Some(args.max_grad_norm as f32)
         } else {
             None
         },

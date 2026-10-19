@@ -188,6 +188,16 @@ pub struct TrainDraftSpec {
     #[serde(default = "default_log_every")]
     pub log_every: usize,
 
+    #[job(
+        label = "Resume From",
+        group = "Output",
+        argv = "--resume",
+        kind = "path",
+        help = "A checkpoint directory, or the output directory of an earlier run (its furthest checkpoint): the weights, the optimizer state and the step are restored and the run continues to Steps"
+    )]
+    #[serde(default)]
+    pub resume: Option<String>,
+
     #[job(label = "Seed", group = "Training", argv = "--seed", default_int = 42)]
     #[serde(default = "default_seed")]
     pub seed: u64,
@@ -214,6 +224,7 @@ impl Default for TrainDraftSpec {
             checkpoint_every: default_checkpoint_every(),
             log_every: default_log_every(),
             seed: default_seed(),
+            resume: None,
         }
     }
 }
@@ -225,6 +236,12 @@ impl TrainDraftSpec {
             errs.push(FieldError::new(
                 "draft_config",
                 "give a draft checkpoint or a draft config, not both",
+            ));
+        }
+        if self.resume.is_some() && (self.draft.is_some() || self.draft_config.is_some()) {
+            errs.push(FieldError::new(
+                "resume",
+                "a resumed run continues from its own checkpoint; give --resume or --draft/--draft-config, not both",
             ));
         }
         if errs.is_empty() { Ok(()) } else { Err(errs) }

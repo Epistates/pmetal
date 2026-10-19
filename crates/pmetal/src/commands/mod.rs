@@ -29,6 +29,8 @@ pub(crate) mod preference;
 pub(crate) mod quantize;
 pub(crate) mod quantize_source;
 #[cfg(feature = "trainer")]
+pub(crate) mod resume;
+#[cfg(feature = "trainer")]
 pub(crate) mod rlkd;
 pub(crate) mod search;
 #[cfg(feature = "serve")]

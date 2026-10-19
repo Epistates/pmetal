@@ -14,15 +14,30 @@ use pmetal_trainer::{
 };
 
 use crate::cli::train_mtp::{TrainMtpArgs, TrainMtpFamily};
+use crate::commands::resume::find_resume_point;
 
 pub(crate) async fn run_train_mtp(args: TrainMtpArgs) -> Result<()> {
-    let config = build_config(&args);
+    let resume = args
+        .resume
+        .as_deref()
+        .map(|dir| find_resume_point(Path::new(dir)))
+        .transpose()?;
+    let mut config = build_config(&args);
+    config.resume_from = resume.as_ref().map(|point| point.dir.clone());
+    // The batches the interrupted run had already consumed are not repeated.
     let batches = shard_batches(
         &args.shards,
         args.seq_len,
         args.batch_size,
         args.eos_token_id,
-    )?;
+    )?
+    .skip(resume.as_ref().map_or(0, |point| point.step));
+    // A resumed run continues from its checkpoint's weights, as --init-mtp
+    // would load them.
+    let init_mtp = resume
+        .as_ref()
+        .map(|point| point.dir.to_string_lossy().into_owned())
+        .or_else(|| args.init_mtp.clone());
     let target_path = pmetal_hub::resolve_model_path(&args.model, None, None)
         .await
         .map_err(|e| anyhow::anyhow!("resolve target model {}: {e}", args.model))?;
@@ -42,7 +57,7 @@ pub(crate) async fn run_train_mtp(args: TrainMtpArgs) -> Result<()> {
                 ),
             };
             pmetal_runtime::compat::random::seed(args.seed);
-            let mut mtp = if let Some(init) = args.init_mtp.as_deref() {
+            let mut mtp = if let Some(init) = init_mtp.as_deref() {
                 let init_path = pmetal_hub::resolve_model_path(init, None, None)
                     .await
                     .map_err(|e| anyhow::anyhow!("resolve init MTP {init}: {e}"))?;
@@ -74,7 +89,7 @@ pub(crate) async fn run_train_mtp(args: TrainMtpArgs) -> Result<()> {
                 ),
             };
             pmetal_runtime::compat::random::seed(args.seed);
-            let mut assistant = if let Some(init) = args.init_mtp.as_deref() {
+            let mut assistant = if let Some(init) = init_mtp.as_deref() {
                 let init_path = pmetal_hub::resolve_model_path(init, None, None)
                     .await
                     .map_err(|e| anyhow::anyhow!("resolve init assistant {init}: {e}"))?;
@@ -119,13 +134,13 @@ fn resolve_family(requested: TrainMtpFamily, arch: ModelArchitecture) -> Result<
 fn build_config(args: &TrainMtpArgs) -> MtpTrainingConfig {
     MtpTrainingConfig {
         num_steps: args.steps,
-        learning_rate: args.learning_rate,
-        min_lr: args.min_lr,
+        learning_rate: args.learning_rate as f32,
+        min_lr: args.min_lr as f32,
         warmup_steps: args.warmup_steps,
         lr_schedule: args.lr_schedule,
-        weight_decay: args.weight_decay,
+        weight_decay: args.weight_decay as f32,
         max_grad_norm: if args.max_grad_norm > 0.0 {
-            Some(args.max_grad_norm)
+            Some(args.max_grad_norm as f32)
         } else {
             None
         },
