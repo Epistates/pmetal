@@ -210,20 +210,28 @@ impl TensorSource for SafetensorsSource {
 fn decode(bytes: &[u8], kind: FloatKind) -> Vec<f32> {
     match kind {
         FloatKind::F32 => bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect(),
         FloatKind::F16 => bytes
-            .chunks_exact(2)
-            .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| f16::from_le_bytes(*c).to_f32())
             .collect(),
         FloatKind::Bf16 => bytes
-            .chunks_exact(2)
-            .map(|c| bf16::from_le_bytes([c[0], c[1]]).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| bf16::from_le_bytes(*c).to_f32())
             .collect(),
         FloatKind::F64 => bytes
-            .chunks_exact(8)
-            .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as f32)
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| f64::from_le_bytes(*c) as f32)
             .collect(),
     }
 }

@@ -213,7 +213,7 @@ impl TrainingJobConfig {
             .quantization
             .as_deref()
             .map_or(Ok(QuantizationScheme::None), str::parse)?;
-        let qlora = (scheme != QuantizationScheme::None).then(|| QLoraOrchConfig {
+        let qlora = (scheme != QuantizationScheme::None).then_some(QLoraOrchConfig {
             scheme,
             block_size: spec.quant_block_size,
             double_quant: spec.double_quant,

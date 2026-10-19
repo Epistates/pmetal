@@ -681,7 +681,6 @@ impl TrainSpec {
             output_dir: self.output_dir.clone(),
             max_seq_len: self.max_seq_len,
             use_packing: !self.no_sequence_packing,
-            ..Default::default()
         })
     }
 
