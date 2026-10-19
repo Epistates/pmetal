@@ -186,108 +186,39 @@ fn cli_training_defaults() -> TrainingConfig {
     }
 }
 
+/// Copy into `target` every field of `overrides` that differs from `defaults`.
+///
+/// A field `overrides` leaves at its default is the caller saying nothing
+/// about it, so the file's value stands; a field it sets, even to the value
+/// the file has, wins. The fields are found by serializing, so a field added
+/// to the config is merged without anyone remembering to add a line here (the
+/// hand-copied version of this silently dropped every field added after it
+/// was written).
+fn merge_overrides<T>(target: &mut T, overrides: &T, defaults: &T)
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let to_object = |value: &T| match serde_json::to_value(value) {
+        Ok(serde_json::Value::Object(map)) => map,
+        other => panic!("a config section serializes to an object, got {other:?}"),
+    };
+    let (mut merged, overrides, defaults) =
+        (to_object(target), to_object(overrides), to_object(defaults));
+    for (key, value) in overrides {
+        if defaults.get(&key) != Some(&value) {
+            merged.insert(key, value);
+        }
+    }
+    *target = serde_json::from_value(serde_json::Value::Object(merged))
+        .expect("a merge of two valid config sections is a valid config section");
+}
+
 fn merge_lora_overrides(target: &mut LoraConfig, overrides: &LoraConfig) {
-    let defaults = LoraConfig::default();
-    if overrides.r != defaults.r {
-        target.r = overrides.r;
-    }
-    if overrides.alpha != defaults.alpha {
-        target.alpha = overrides.alpha;
-    }
-    if overrides.dropout != defaults.dropout {
-        target.dropout = overrides.dropout;
-    }
-    if overrides.target_modules != defaults.target_modules {
-        target.target_modules = overrides.target_modules.clone();
-    }
-    if overrides.use_rslora != defaults.use_rslora {
-        target.use_rslora = overrides.use_rslora;
-    }
-    if overrides.use_dora != defaults.use_dora {
-        target.use_dora = overrides.use_dora;
-    }
-    if overrides.bias != defaults.bias {
-        target.bias = overrides.bias;
-    }
-    if overrides.init_lora_weights != defaults.init_lora_weights {
-        target.init_lora_weights = overrides.init_lora_weights;
-    }
-    if overrides.loraplus_lr_ratio != defaults.loraplus_lr_ratio {
-        target.loraplus_lr_ratio = overrides.loraplus_lr_ratio;
-    }
+    merge_overrides(target, overrides, &LoraConfig::default());
 }
 
 fn merge_training_overrides(target: &mut TrainingConfig, overrides: &TrainingConfig) {
-    let defaults = cli_training_defaults();
-    if overrides.learning_rate != defaults.learning_rate {
-        target.learning_rate = overrides.learning_rate;
-    }
-    if overrides.embedding_learning_rate != defaults.embedding_learning_rate {
-        target.embedding_learning_rate = overrides.embedding_learning_rate;
-    }
-    if overrides.batch_size != defaults.batch_size {
-        target.batch_size = overrides.batch_size;
-    }
-    if overrides.gradient_accumulation_steps != defaults.gradient_accumulation_steps {
-        target.gradient_accumulation_steps = overrides.gradient_accumulation_steps;
-    }
-    if overrides.num_epochs != defaults.num_epochs {
-        target.num_epochs = overrides.num_epochs;
-    }
-    if overrides.max_steps != defaults.max_steps {
-        target.max_steps = overrides.max_steps;
-    }
-    if overrides.warmup_steps != defaults.warmup_steps {
-        target.warmup_steps = overrides.warmup_steps;
-    }
-    if overrides.warmup_ratio != defaults.warmup_ratio {
-        target.warmup_ratio = overrides.warmup_ratio;
-    }
-    if overrides.weight_decay != defaults.weight_decay {
-        target.weight_decay = overrides.weight_decay;
-    }
-    if overrides.max_grad_norm != defaults.max_grad_norm {
-        target.max_grad_norm = overrides.max_grad_norm;
-    }
-    if overrides.lr_scheduler != defaults.lr_scheduler {
-        target.lr_scheduler = overrides.lr_scheduler;
-    }
-    if overrides.min_lr != defaults.min_lr {
-        target.min_lr = overrides.min_lr;
-    }
-    if overrides.wsd_stable_ratio != defaults.wsd_stable_ratio {
-        target.wsd_stable_ratio = overrides.wsd_stable_ratio;
-    }
-    if overrides.wsd_decay_style != defaults.wsd_decay_style {
-        target.wsd_decay_style = overrides.wsd_decay_style;
-    }
-    if overrides.cosine_num_restarts != defaults.cosine_num_restarts {
-        target.cosine_num_restarts = overrides.cosine_num_restarts;
-    }
-    if overrides.polynomial_power != defaults.polynomial_power {
-        target.polynomial_power = overrides.polynomial_power;
-    }
-    if overrides.optimizer != defaults.optimizer {
-        target.optimizer = overrides.optimizer;
-    }
-    if overrides.logging_steps != defaults.logging_steps {
-        target.logging_steps = overrides.logging_steps;
-    }
-    if overrides.eval_steps != defaults.eval_steps {
-        target.eval_steps = overrides.eval_steps;
-    }
-    if overrides.save_steps != defaults.save_steps {
-        target.save_steps = overrides.save_steps;
-    }
-    if overrides.output_dir != defaults.output_dir {
-        target.output_dir = overrides.output_dir.clone();
-    }
-    if overrides.use_packing != defaults.use_packing {
-        target.use_packing = overrides.use_packing;
-    }
-    if overrides.max_seq_len != defaults.max_seq_len {
-        target.max_seq_len = overrides.max_seq_len;
-    }
+    merge_overrides(target, overrides, &cli_training_defaults());
 }
 
 /// The training loop's settings for a run: the config's training and LoRA
@@ -1777,5 +1708,34 @@ mod tests {
         assert_eq!(full.lora.r, 8);
         assert_eq!(full.training.num_epochs, 2);
         assert_eq!(full.training.max_steps, Some(5));
+    }
+
+    /// Every field a job sets reaches the merged config, the ones added since
+    /// the merge was written included, and the ones it leaves alone keep the
+    /// file's value.
+    #[test]
+    fn the_override_merge_carries_every_field_a_job_sets() {
+        let mut full = FullTrainingConfig::default();
+        full.training.weight_decay = 0.3;
+        let overrides = TrainingConfig {
+            label_smoothing: 0.1,
+            z_loss: 1e-4,
+            neftune_noise_alpha: Some(5.0),
+            optimizer: pmetal_core::OptimizerType::Muon,
+            ..cli_training_defaults()
+        };
+        let job = TrainingJobConfig {
+            training: overrides,
+            ..TrainingJobConfig::default()
+        };
+        merge_job_overrides_into_full_config(&mut full, &job);
+        assert_eq!(full.training.label_smoothing, 0.1);
+        assert_eq!(full.training.z_loss, 1e-4);
+        assert_eq!(full.training.neftune_noise_alpha, Some(5.0));
+        assert_eq!(full.training.optimizer, pmetal_core::OptimizerType::Muon);
+        assert_eq!(
+            full.training.weight_decay, 0.3,
+            "untouched fields keep the file's value"
+        );
     }
 }

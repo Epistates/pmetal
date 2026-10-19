@@ -2506,6 +2506,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 resume,
                 model_config: _model_config,
                 z_loss,
+                document_mask,
                 gradient_accumulation_steps,
                 log_every,
                 eval_every,
@@ -2607,23 +2608,34 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             if resume.is_some() && resume_position.is_none() && start_step > 0 {
                 let batches_to_skip = start_step.saturating_mul(gradient_accumulation_steps.max(1));
                 for _ in 0..batches_to_skip {
-                    reader.next().ok_or_else(|| {
+                    reader.try_next_batch()?.ok_or_else(|| {
                         anyhow::anyhow!("stream exhausted while seeking resume step")
                     })?;
                 }
             }
 
-            // Convert streaming batches to MLX arrays
-            let batch_iter = reader.map(move |(batch, pos)| {
-                let flat: Vec<i32> = batch
+            // Convert streaming batches to MLX arrays. A shard that cannot be
+            // read is an error that stops the run, not the end of the data.
+            let batch_iter = std::iter::from_fn(move || {
+                let (rows, pos) = match reader.try_next_rows() {
+                    Ok(Some(batch)) => batch,
+                    Ok(None) => return None,
+                    Err(e) => return Some(Err(pretrain::PretrainError::Data(e.to_string()))),
+                };
+                let flat: Vec<i32> = rows
                     .iter()
-                    .flat_map(|seq| seq.iter().map(|&t| t as i32))
+                    .flat_map(|row| row.tokens.iter().map(|&t| t as i32))
                     .collect();
-                let array = pmetal_runtime::InlineArray::from_i32_slice_shaped(
+                let tokens = pmetal_runtime::InlineArray::from_i32_slice_shaped(
                     &flat,
-                    &[batch.len() as i32, seq_len as i32],
+                    &[rows.len() as i32, seq_len as i32],
                 );
-                (array, Some(pos))
+                Some(Ok(pretrain::PretrainBatch {
+                    tokens,
+                    position: Some(pos),
+                    doc_lengths: document_mask
+                        .then(|| rows.into_iter().map(|row| row.doc_lengths).collect()),
+                }))
             });
 
             let eval_iter = if !eval_shards.is_empty() && eval_every > 0 {

@@ -46,7 +46,7 @@ use crate::{CheckpointManager, CheckpointMetadata, Result, SftError};
 
 mod run;
 mod source;
-mod step;
+pub(crate) mod step;
 #[cfg(test)]
 mod tests;
 

@@ -1,20 +1,22 @@
-//! Full-state pretraining checkpoint: model weights + optimizer m/v + metadata.
+//! Full-state pretraining checkpoint: model weights + optimizer state + metadata.
 //!
 //! Saves three files per checkpoint:
 //! - `model.safetensors` — all model parameters
-//! - `optimizer.safetensors` — AdamW momentum + velocity (keyed `param.__m`, `param.__v`)
-//! - `metadata.json` — step count, loss, learning rate
+//! - `optimizer.safetensors` — the optimizer's tensors, named `<slot>/<param>`:
+//!   AdamW's moments (`m`, `v`) and the f32 master copy (`master`) of every
+//!   half-precision parameter, without which a resumed bf16 run lost every
+//!   update the master had accumulated below bf16's resolution
+//! - `metadata.json` — step count, loss, learning rate, the stream position
+//!   and the optimizer's counters
 
-use std::collections::HashMap;
 use std::path::Path;
-use std::rc::Rc;
 
 use pmetal_data::streaming::StreamPosition;
 use pmetal_runtime::InlineArray;
 use pmetal_runtime::compat::{
-    Array, ModuleParametersExt,
+    ModuleParametersExt,
     module::ModuleParameters,
-    optimizers::{AdamW, Optimizer, State},
+    optimizers::{AdamW, OptimizerState, StatefulOptimizer},
 };
 
 use super::PretrainError;
@@ -27,6 +29,28 @@ pub struct CheckpointMeta {
     pub learning_rate: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_position: Option<StreamPosition>,
+}
+
+/// The optimizer's counters, beside [`CheckpointMeta`].
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct OptimizerMeta {
+    kind: String,
+    scalars: std::collections::BTreeMap<String, f64>,
+}
+
+#[derive(serde::Serialize)]
+struct MetadataOut<'a> {
+    #[serde(flatten)]
+    meta: &'a CheckpointMeta,
+    optimizer: OptimizerMeta,
+}
+
+#[derive(serde::Deserialize)]
+struct MetadataIn {
+    #[serde(flatten)]
+    meta: CheckpointMeta,
+    #[serde(default)]
+    optimizer: Option<OptimizerMeta>,
 }
 
 /// Save a full pretraining checkpoint to `dir/`.
@@ -48,26 +72,31 @@ pub fn save_checkpoint<M: ModuleParameters>(
     InlineArray::save_safetensors(&dir.join("model.safetensors").to_string_lossy(), &entries)
         .map_err(|e| PretrainError::Checkpoint(format!("save model weights: {e}")))?;
 
-    // Optimizer state: m and v for each parameter
-    let state = optimizer.state();
-    let mut opt_entries: Vec<(String, &InlineArray)> = Vec::with_capacity(state.len() * 2);
-    for (key, (m, v)) in state {
-        m.eval();
-        v.eval();
-        opt_entries.push((format!("{key}.__m"), m));
-        opt_entries.push((format!("{key}.__v"), v));
-    }
-    let opt_ref: Vec<(&str, &InlineArray)> =
-        opt_entries.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    // Optimizer state: moments, master copies and counters.
+    let state = optimizer.export_state();
+    let opt_entries: Vec<(&str, &InlineArray)> = state
+        .tensors
+        .iter()
+        .map(|(name, array)| {
+            array.eval();
+            (name.as_str(), array)
+        })
+        .collect();
     InlineArray::save_safetensors(
         &dir.join("optimizer.safetensors").to_string_lossy(),
-        &opt_ref,
+        &opt_entries,
     )
     .map_err(|e| PretrainError::Checkpoint(format!("save optimizer state: {e}")))?;
 
     // Metadata JSON
-    let json = serde_json::to_string_pretty(meta)
-        .map_err(|e| PretrainError::Checkpoint(format!("serialize meta: {e}")))?;
+    let json = serde_json::to_string_pretty(&MetadataOut {
+        meta,
+        optimizer: OptimizerMeta {
+            kind: state.kind.clone(),
+            scalars: state.scalars.clone(),
+        },
+    })
+    .map_err(|e| PretrainError::Checkpoint(format!("serialize meta: {e}")))?;
     std::fs::write(dir.join("metadata.json"), json)
         .map_err(|e| PretrainError::Checkpoint(format!("write meta: {e}")))?;
 
@@ -77,8 +106,8 @@ pub fn save_checkpoint<M: ModuleParameters>(
 /// Load a full pretraining checkpoint from `dir/`.
 ///
 /// Populates `model` with loaded weights and `optimizer` with restored
-/// momentum/velocity + step counter. Returns the metadata so the caller
-/// can resume from the saved step.
+/// moments, master copies and step counter. Returns the metadata so the
+/// caller can resume from the saved step.
 pub fn load_checkpoint<M: ModuleParameters>(
     dir: &Path,
     model: &mut M,
@@ -87,7 +116,10 @@ pub fn load_checkpoint<M: ModuleParameters>(
     // Metadata
     let meta_bytes = std::fs::read(dir.join("metadata.json"))
         .map_err(|e| PretrainError::Checkpoint(format!("read meta: {e}")))?;
-    let meta: CheckpointMeta = serde_json::from_slice(&meta_bytes)
+    let MetadataIn {
+        meta,
+        optimizer: optimizer_meta,
+    } = serde_json::from_slice(&meta_bytes)
         .map_err(|e| PretrainError::Checkpoint(format!("parse meta: {e}")))?;
 
     // Model weights
@@ -115,24 +147,36 @@ pub fn load_checkpoint<M: ModuleParameters>(
                 PretrainError::Checkpoint(format!("load optimizer: {}", opt_path.display()))
             })?;
 
-    let mut m_map: HashMap<String, Array> = HashMap::new();
-    let mut v_map: HashMap<String, Array> = HashMap::new();
-    for (key, arr) in opt_loaded {
-        if let Some(param_name) = key.strip_suffix(".__m") {
-            m_map.insert(param_name.to_string(), arr);
-        } else if let Some(param_name) = key.strip_suffix(".__v") {
-            v_map.insert(param_name.to_string(), arr);
+    let mut state = OptimizerState::new("adamw");
+    state.tensors = opt_loaded.into_iter().collect();
+    match optimizer_meta {
+        Some(m) => {
+            state.kind = m.kind;
+            state.scalars = m.scalars;
+        }
+        None => {
+            // A checkpoint from before the counters were recorded: its step
+            // is the optimizer's, and its moments are named `param.__m` and
+            // `param.__v`.
+            state.set_scalar("step", meta.step as f64);
+            let renamed: Vec<(String, InlineArray)> = state
+                .tensors
+                .iter()
+                .filter_map(|(name, array)| {
+                    if let Some(param) = name.strip_suffix(".__m") {
+                        Some((format!("m/{param}"), array.clone()))
+                    } else {
+                        name.strip_suffix(".__v")
+                            .map(|param| (format!("v/{param}"), array.clone()))
+                    }
+                })
+                .collect();
+            state.tensors = renamed.into_iter().collect();
         }
     }
-
-    let mut state: State<(Array, Array)> = HashMap::new();
-    for (key, m) in m_map {
-        if let Some(v) = v_map.remove(&key) {
-            state.insert(Rc::from(key.as_str()), (m, v));
-        }
-    }
-
-    optimizer.restore_state(meta.step, state);
+    optimizer
+        .import_state(&state)
+        .map_err(|e| PretrainError::Checkpoint(format!("restore optimizer: {e}")))?;
 
     Ok(meta)
 }

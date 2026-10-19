@@ -168,6 +168,16 @@ pub struct PretrainSpec {
     pub z_loss: f32,
 
     #[job(
+        label = "Document Mask",
+        group = "Data",
+        argv = "--document-mask",
+        flag,
+        default_bool = false
+    )]
+    #[serde(default)]
+    pub document_mask: bool,
+
+    #[job(
         label = "Grad Accum Steps",
         group = "Optimization",
         argv = "--gradient-accumulation-steps",
@@ -233,6 +243,7 @@ impl Default for PretrainSpec {
             resume: None,
             model_config: None,
             z_loss: 0.0,
+            document_mask: false,
             gradient_accumulation_steps: default_grad_accum(),
             log_every: default_log_every(),
             eval_every: 0,

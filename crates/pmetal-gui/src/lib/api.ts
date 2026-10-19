@@ -1062,6 +1062,7 @@ export interface PretrainSpec {
   resume?: string | null;
   model_config?: string | null;
   z_loss?: number;
+  document_mask?: boolean;
   gradient_accumulation_steps?: number;
   log_every?: number;
   eval_every?: number;

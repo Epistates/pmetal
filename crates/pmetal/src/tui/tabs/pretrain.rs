@@ -150,6 +150,7 @@ impl PretrainTab {
             .parse()
             .unwrap_or(spec.gradient_accumulation_steps);
         spec.z_loss = self.form.value("MoE z-loss").parse().unwrap_or(spec.z_loss);
+        spec.document_mask = self.form.value("Document Mask") == "Enabled";
         spec.seed = self.form.value("Seed").parse().unwrap_or(spec.seed);
         let model_config = self.form.value("Model Config");
         spec.model_config = if model_config.is_empty() {
