@@ -21,6 +21,10 @@ pub(crate) mod fuse;
 pub(crate) mod grpo;
 pub(crate) mod infer;
 pub(crate) mod info;
+#[cfg(feature = "trainer")]
+pub(crate) mod init;
+#[cfg(feature = "trainer")]
+pub(crate) mod machine_load;
 #[cfg(feature = "merge")]
 pub(crate) mod merge;
 pub(crate) mod ollama;

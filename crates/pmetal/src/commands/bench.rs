@@ -1,16 +1,13 @@
+use super::machine_load::{ConditionsWatch, MeasurementConditions};
 use crate::cli::bench::{GdnBenchmarkStage, WorkloadBenchmarkPreset, WorkloadInferenceContext};
 use anyhow::Context;
 use pmetal::inference_runner::{CacheModeRequest, select_cache_mode_for_model};
 use pmetal_cache::kv_cache::CacheMode;
-use pmetal_core::{
-    DatasetConfig, LoraConfig, ModelConfig, StepMetrics, TrainingCallback, TrainingConfig,
-};
+use pmetal_core::{LoraConfig, StepMetrics, TrainingCallback, TrainingConfig};
 use pmetal_data::{DatasetColumnConfig, DatasetFormat, TextSample, Tokenizer, TrainingDataset};
-use pmetal_lora::AdaptedModel;
 use pmetal_metal::MetalContext;
 use pmetal_metal::context::{DeviceTier, MemoryBandwidthSource};
 use pmetal_models::architectures::deepseek::{DeepSeekConfig, DeepSeekMoE};
-use pmetal_models::architectures::llama::LlamaConfig;
 use pmetal_models::architectures::llama4::{Llama4MoE, Llama4TextConfig};
 use pmetal_models::architectures::qwen3_moe::{Qwen3MoEBlock, Qwen3MoEConfig};
 use pmetal_models::architectures::qwen3_next::Qwen3NextGatedDeltaNet;
@@ -18,7 +15,7 @@ use pmetal_models::dispatcher::{DynamicModel, DynamicModelLoadOptions};
 use pmetal_runtime::compat::module::ModuleParameters as _;
 use pmetal_runtime::compat::{Array, ops};
 use pmetal_runtime::nn::gated_delta_update_with_chunk_size_override;
-use pmetal_trainer::orchestrator::{FullTrainingConfig, run_training};
+use pmetal_trainer::orchestrator::run_training;
 use pmetal_trainer::{DispatchConfig, TrainingJobConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -27,84 +24,144 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Run benchmark.
+/// Steps run before the measured ones: the first compiles kernels and sizes
+/// buffers, the second settles the allocator.
+const TRAIN_BENCH_WARMUP_STEPS: usize = 2;
+/// Steps measured.
+const TRAIN_BENCH_MEASURED_STEPS: usize = 8;
+
+/// What the measured steps of a training benchmark came to.
+#[derive(Debug, Clone, PartialEq)]
+struct TrainStepSummary {
+    measured: usize,
+    tokens_per_step: f64,
+    median_step_ms: f64,
+    min_step_ms: f64,
+    max_step_ms: f64,
+    median_tokens_per_sec: f64,
+}
+
+/// The steps after the first `warmup`, as one summary; `None` when no step
+/// was left to measure.
+fn summarize_training_steps(steps: &[StepMetrics], warmup: usize) -> Option<TrainStepSummary> {
+    let measured = steps.get(warmup..).filter(|s| !s.is_empty())?;
+    let mut step_ms: Vec<f64> = measured.iter().map(|s| s.total_ms).collect();
+    let mut tokens_per_sec: Vec<f64> = measured
+        .iter()
+        .map(|s| s.tokens as f64 / (s.total_ms / 1000.0))
+        .collect();
+    let tokens: Vec<f64> = measured.iter().map(|s| s.tokens as f64).collect();
+    Some(TrainStepSummary {
+        measured: measured.len(),
+        tokens_per_step: mean(&tokens),
+        min_step_ms: step_ms.iter().copied().fold(f64::INFINITY, f64::min),
+        max_step_ms: step_ms.iter().copied().fold(0.0, f64::max),
+        median_step_ms: median(&mut step_ms),
+        median_tokens_per_sec: median(&mut tokens_per_sec),
+    })
+}
+
+/// `rows` rows of text, each far longer than `seq_len` tokens (the trainer
+/// cuts a row to `seq_len`, so every row is a full one). Rows differ, so no
+/// batch is `rows` copies of one sample.
+fn write_synthetic_training_set(path: &Path, rows: usize, seq_len: usize) -> anyhow::Result<()> {
+    const WORDS: [&str; 24] = [
+        "the", "model", "reads", "a", "long", "sequence", "of", "ordinary", "words", "and",
+        "learns", "to", "predict", "each", "next", "token", "from", "those", "that", "came",
+        "before", "it", "in", "context",
+    ];
+    // Under eight characters to the token for any tokenizer that has seen
+    // English, so this is more than `seq_len` tokens.
+    let chars = seq_len.saturating_mul(8);
+    let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
+    for row in 0..rows {
+        let mut text = String::with_capacity(chars + 16);
+        let mut word = row;
+        while text.len() < chars {
+            text.push_str(WORDS[word % WORDS.len()]);
+            text.push(' ');
+            word += 7;
+        }
+        writeln!(file, "{}", serde_json::json!({ "text": text }))?;
+    }
+    file.flush()?;
+    Ok(())
+}
+
+/// `pmetal bench`: the time of a LoRA training step on the model, as
+/// `pmetal train` takes it (forward, loss, backward, optimizer) on batches
+/// of `batch_size` rows of `seq_len` tokens.
 pub(crate) async fn run_benchmark(
     model: &str,
     batch_size: usize,
     seq_len: usize,
 ) -> anyhow::Result<()> {
-    tracing::info!(
-        model = %model,
-        batch_size = batch_size,
-        seq_len = seq_len,
-        "Running benchmark"
+    anyhow::ensure!(batch_size > 0, "--batch-size must be greater than 0");
+    anyhow::ensure!(seq_len > 0, "--seq-len must be greater than 0");
+    let watch = ConditionsWatch::start();
+    let steps = TRAIN_BENCH_WARMUP_STEPS + TRAIN_BENCH_MEASURED_STEPS;
+
+    let device = workload_benchmark_device()?;
+    println!("Training benchmark");
+    println!("  Model:        {model}");
+    println!("  Device:       {} ({})", device.name, device.tier);
+    println!(
+        "  Batch:        {batch_size} x {seq_len} tokens, {steps} steps ({TRAIN_BENCH_WARMUP_STEPS} warmup, \
+         {TRAIN_BENCH_MEASURED_STEPS} measured), the LoRA defaults of `pmetal train`"
     );
 
-    println!("Benchmark Configuration:");
-    println!("  Model:      {}", model);
-    println!("  Batch Size: {}", batch_size);
-    println!("  Seq Length: {}", seq_len);
-    println!("\nBenchmarking in progress...");
+    let dir = std::env::temp_dir().join(format!("pmetal-bench-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let dataset = dir.join("synthetic.jsonl");
+    write_synthetic_training_set(&dataset, steps * batch_size, seq_len)?;
 
-    // A TinyLlama-shaped model with random weights. The point is the shape of
-    // the forward pass, not the weights, so it is built from a config rather
-    // than loaded.
-    let lora_config = LoraConfig {
-        r: 16,
-        alpha: 32.0,
+    let spec = pmetal_core::jobs::TrainSpec {
+        model: model.to_string(),
+        dataset: dataset.display().to_string(),
+        output_dir: dir.join("output").display().to_string(),
+        batch_size,
+        max_seq_len: seq_len,
+        gradient_accumulation_steps: 1,
+        epochs: 1,
+        max_steps: Some(steps),
+        warmup_steps: 0,
+        logging_steps: 1,
+        // One row to a sequence: the batch is exactly batch_size x seq_len.
+        no_sequence_packing: true,
         ..Default::default()
     };
+    let mut config = TrainingJobConfig::from_spec(&spec).map_err(anyhow::Error::msg)?;
+    config.emit_console_output = false;
 
-    let base = DynamicModel::from_config(
-        &serde_json::to_string(&LlamaConfig {
-            vocab_size: 32000,
-            hidden_size: 2048,
-            intermediate_size: 5632,
-            num_hidden_layers: 22,
-            num_attention_heads: 32,
-            num_key_value_heads: Some(4),
-            max_position_embeddings: 2048,
-            ..Default::default()
-        })
-        .context("serialize benchmark config")?,
-    )
-    .map_err(|e| anyhow::anyhow!("build benchmark model: {e}"))?;
-    let mut model_inst = AdaptedModel::attach(base, lora_config)?;
+    println!("\nTraining...");
+    let collector = StepMetricsCollector::new();
+    let outcome = run_training(config, None, vec![Box::new(collector.clone())]).await;
+    // The synthetic set and the adapter it trained are scratch.
+    let _ = std::fs::remove_dir_all(&dir);
+    let result = outcome?;
 
-    // Create dummy data
-    let input_ids = pmetal_runtime::compat::ops::zeros(
-        &[batch_size as i32, seq_len as i32],
-        pmetal_runtime::compat::Dtype::Int32,
-    );
-
-    // Warmup
-    println!("Warming up...");
-    for _ in 0..3 {
-        let output = model_inst.forward(&input_ids, None)?;
-        pmetal_runtime::compat::transforms::eval([&output])?;
-    }
-
-    // Benchmark
-    let iterations = 10;
-    let start = std::time::Instant::now();
-
-    for _ in 0..iterations {
-        let output = model_inst.forward(&input_ids, None)?;
-        pmetal_runtime::compat::transforms::eval([&output])?;
-    }
-
-    let elapsed = start.elapsed();
-    let avg_ms = elapsed.as_millis() as f64 / iterations as f64;
-    let tokens_per_sec = (batch_size * seq_len) as f64 / (avg_ms / 1000.0);
-
-    println!("\nResults:");
-    println!("  Avg Time:       {:.2} ms/iteration", avg_ms);
-    println!("  Throughput:     {:.0} tokens/sec", tokens_per_sec);
-
+    let summary = summarize_training_steps(&collector.snapshot(), TRAIN_BENCH_WARMUP_STEPS)
+        .context("the run finished without a measured step")?;
     let stats = pmetal_runtime::memory::get_memory_stats();
-    println!("  Memory Used:    {:.2} GB", stats.used_gb());
-    println!("  Peak Memory:    {:.2} GB", stats.peak_gb());
-
+    println!("\nResults ({} measured steps)", summary.measured);
+    println!(
+        "  Step time:    median {:.1} ms (min {:.1}, max {:.1})",
+        summary.median_step_ms, summary.min_step_ms, summary.max_step_ms
+    );
+    println!(
+        "  Throughput:   median {:.0} tokens/s ({:.0} tokens per step)",
+        summary.median_tokens_per_sec, summary.tokens_per_step
+    );
+    if summary.tokens_per_step < (batch_size * seq_len) as f64 * 0.98 {
+        println!(
+            "  Note:         steps held fewer tokens than batch x seq-len ({}): the model's \
+             tokenizer cut the synthetic rows short",
+            batch_size * seq_len
+        );
+    }
+    println!("  Peak memory:  {:.2} GB", stats.peak_gb());
+    println!("  Final loss:   {:.4}", result.final_loss);
+    println!("\nConditions: {}", watch.finish().describe());
     Ok(())
 }
 
@@ -113,6 +170,10 @@ pub(crate) struct WorkloadBenchmarkReport {
     version: String,
     generated_at_unix_ms: u128,
     device: KernelBenchmarkDevice,
+    /// The machine's load around the run: numbers measured on a busy machine
+    /// are provisional.
+    #[serde(default)]
+    conditions: MeasurementConditions,
     workload: WorkloadBenchmarkConfig,
     inference: WorkloadBenchmarkSection<InferenceWorkloadMetrics>,
     training: WorkloadBenchmarkSection<TrainingWorkloadMetrics>,
@@ -123,6 +184,10 @@ pub(crate) struct GdnDecodeBenchmarkReport {
     version: String,
     generated_at_unix_ms: u128,
     device: KernelBenchmarkDevice,
+    /// The machine's load around the run: numbers measured on a busy machine
+    /// are provisional.
+    #[serde(default)]
+    conditions: MeasurementConditions,
     stage: String,
     model_id: String,
     resolved_model_path: String,
@@ -440,6 +505,10 @@ pub(crate) struct KernelBenchmarkReport {
     warmup_iterations: usize,
     benchmark_iterations: usize,
     device: KernelBenchmarkDevice,
+    /// The machine's load around the run: numbers measured on a busy machine
+    /// are provisional.
+    #[serde(default)]
+    conditions: MeasurementConditions,
     summary: KernelBenchmarkSummary,
     cases: Vec<KernelBenchmarkCaseResult>,
 }
@@ -526,6 +595,7 @@ pub(crate) fn run_kernel_benchmark_corpus(
     output: Option<&Path>,
     json: bool,
 ) -> anyhow::Result<()> {
+    let watch = ConditionsWatch::start();
     let ctx = Arc::new(MetalContext::new().context("failed to initialize Metal context")?);
     let props = ctx.properties();
     let warmup_iterations = if quick { 2 } else { 3 };
@@ -542,6 +612,7 @@ pub(crate) fn run_kernel_benchmark_corpus(
     }
 
     let summary = summarize_kernel_benchmark_results(&results);
+    let conditions = watch.finish();
     let report = KernelBenchmarkReport {
         version: env!("CARGO_PKG_VERSION").to_string(),
         generated_at_unix_ms: SystemTime::now()
@@ -564,6 +635,7 @@ pub(crate) fn run_kernel_benchmark_corpus(
             memory_bandwidth_source: memory_bandwidth_source_label(props.memory_bandwidth_source)
                 .to_string(),
         },
+        conditions,
         summary,
         cases: results,
     };
@@ -606,11 +678,12 @@ pub(crate) async fn run_gdn_decode_benchmark(
         "benchmark_iterations must be greater than 0"
     );
 
+    let watch = ConditionsWatch::start();
     let device = workload_benchmark_device()?;
     let model_path = resolve_workload_model_path(model_id).await?;
     let setup = build_gdn_decode_benchmark_setup(&model_path, stage, layer, batch_size, seq_len)?;
 
-    let report = match setup {
+    let mut report = match setup {
         GdnBenchmarkSetup::InputProj(setup) => {
             let split_outcome = benchmark_operation(
                 warmup_iterations,
@@ -843,6 +916,7 @@ pub(crate) async fn run_gdn_decode_benchmark(
                     .unwrap_or_default()
                     .as_millis(),
                 device,
+                conditions: MeasurementConditions::default(),
                 stage: "input-proj".to_string(),
                 model_id: model_id.to_string(),
                 resolved_model_path: setup.model_path.display().to_string(),
@@ -1001,6 +1075,7 @@ pub(crate) async fn run_gdn_decode_benchmark(
                     .unwrap_or_default()
                     .as_millis(),
                 device,
+                conditions: MeasurementConditions::default(),
                 stage: "out-proj".to_string(),
                 model_id: model_id.to_string(),
                 resolved_model_path: setup.model_path.display().to_string(),
@@ -1049,6 +1124,7 @@ pub(crate) async fn run_gdn_decode_benchmark(
                 .unwrap_or_default()
                 .as_millis(),
             device,
+            conditions: MeasurementConditions::default(),
             stage: "prefill".to_string(),
             model_id: model_id.to_string(),
             resolved_model_path: setup.model_path.display().to_string(),
@@ -1099,6 +1175,8 @@ pub(crate) async fn run_gdn_decode_benchmark(
             ],
         },
     };
+
+    report.conditions = watch.finish();
 
     let report_json = serde_json::to_string_pretty(&report)?;
     if let Some(output_path) = output {
@@ -1273,6 +1351,7 @@ async fn run_workload_benchmark_internal(
     output: Option<&Path>,
     json: bool,
 ) -> anyhow::Result<()> {
+    let watch = ConditionsWatch::start();
     let device = workload_benchmark_device()?;
     let model_path = resolve_workload_model_path(model_id).await?;
     let dataset_path = pmetal_trainer::resolve_dataset_path(dataset_id).await?;
@@ -1368,6 +1447,7 @@ async fn run_workload_benchmark_internal(
             .unwrap_or_default()
             .as_millis(),
         device,
+        conditions: watch.finish(),
         workload: WorkloadBenchmarkConfig {
             preset,
             model_id: model_id.to_string(),
@@ -3050,6 +3130,8 @@ fn print_workload_benchmark_report(report: &WorkloadBenchmarkReport, output: Opt
         }
     }
 
+    println!();
+    println!("Conditions: {}", report.conditions.describe());
     if let Some(path) = output {
         println!();
         println!("Report written to {}", path.display());
@@ -3094,6 +3176,8 @@ fn print_gdn_decode_benchmark_report(report: &GdnDecodeBenchmarkReport, output: 
         }
     }
 
+    println!();
+    println!("Conditions: {}", report.conditions.describe());
     if let Some(path) = output {
         println!();
         println!("Report written to {}", path.display());
@@ -3487,122 +3571,12 @@ fn print_kernel_benchmark_report(report: &KernelBenchmarkReport, output: Option<
         }
     }
 
+    println!();
+    println!("Conditions: {}", report.conditions.describe());
     if let Some(path) = output {
         println!();
         println!("Report written to {}", path.display());
     }
-}
-
-/// Generate a sample configuration file.
-pub(crate) fn generate_sample_config(output: &str) -> anyhow::Result<()> {
-    let config = FullTrainingConfig {
-        model: ModelConfig {
-            model_id: "meta-llama/Llama-3.2-1B".to_string(),
-        },
-        lora: LoraConfig {
-            r: 16,
-            alpha: 32.0,
-            ..Default::default()
-        },
-        training: TrainingConfig {
-            learning_rate: 2e-4,
-            batch_size: 4,
-            num_epochs: 3,
-            warmup_steps: 100,
-            max_seq_len: 2048,
-            output_dir: "./output".to_string(),
-            logging_steps: 10,
-            save_steps: Some(500),
-            ..Default::default()
-        },
-        dataset: DatasetConfig {
-            dataset_id: "./data/train.jsonl".to_string(),
-            shuffle: true,
-        },
-    };
-
-    let yaml = serde_saphyr::to_string(&config)?;
-    std::fs::write(output, yaml)?;
-
-    println!("Sample configuration written to: {}", output);
-    println!("\nYou can edit this file and run training with:");
-    println!("  pmetal train --config {}", output);
-
-    Ok(())
-}
-
-/// Benchmark FFI overhead of the Rust runtime against Python MLX.
-///
-/// Python baseline: ~7420 argmax ops/sec (~0.135ms per op) on Qwen3 vocab size.
-pub(crate) fn run_ffi_benchmark() -> anyhow::Result<()> {
-    use pmetal_runtime::compat::{
-        Array,
-        indexing::{argmax, argmax_axis},
-        transforms::eval,
-    };
-    use std::time::Instant;
-
-    println!("FFI Overhead Benchmark");
-    println!("======================\n");
-
-    // Warmup - ensure Metal is ready
-    println!("Warming up Metal...");
-    let warmup = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
-    let _ = argmax(&warmup);
-    eval([&warmup])?;
-
-    // Create test array similar to Qwen3 logits
-    let vocab_size = 151936; // Qwen3 vocab size
-    println!("Creating logits array with vocab_size = {}", vocab_size);
-    let logits_data: Vec<f32> = (0..vocab_size).map(|i| (i as f32) * 0.001).collect();
-    let logits = Array::from_slice(&logits_data, &[1, vocab_size]);
-    eval([&logits])?;
-
-    // Benchmark 1: argmax operations
-    let n_iters = 1000;
-    println!("\n--- Test 1: argmax({} iterations) ---", n_iters);
-
-    let start = Instant::now();
-    for _ in 0..n_iters {
-        let result = argmax_axis(&logits, -1, false);
-        eval([&result])?;
-    }
-    let elapsed = start.elapsed();
-
-    let per_op_us = elapsed.as_micros() as f64 / n_iters as f64;
-    let per_op_ms = per_op_us / 1000.0;
-    let ops_per_sec = 1_000_000.0 / per_op_us;
-
-    println!("Total time: {:?}", elapsed);
-    println!("Per operation: {:.3} ms ({:.1} us)", per_op_ms, per_op_us);
-    println!("Operations per second: {:.0}", ops_per_sec);
-    println!("Python baseline: ~7420 ops/sec (~0.135 ms/op)");
-    println!("Ratio to Python: {:.2}x", ops_per_sec / 7420.0);
-
-    // Benchmark 2: argmax + reshape (generation loop pattern)
-    println!("\n--- Test 2: argmax + reshape (generation pattern) ---");
-
-    let token = Array::from_slice(&[42i32], &[1]);
-    eval([&token])?;
-
-    let start = Instant::now();
-    for _ in 0..n_iters {
-        // Reshape token [1] -> [1, 1] (like our generation loop)
-        let input = token.reshape(&[1, 1]);
-        // Simulate logits extraction
-        let result = argmax_axis(&logits, -1, false);
-        eval([&input, &result])?;
-    }
-    let elapsed = start.elapsed();
-
-    let per_op_us = elapsed.as_micros() as f64 / n_iters as f64;
-    let per_op_ms = per_op_us / 1000.0;
-
-    println!("Total time: {:?}", elapsed);
-    println!("Per operation: {:.3} ms ({:.1} us)", per_op_ms, per_op_us);
-    println!("Equivalent tok/s: {:.0}", 1_000_000.0 / per_op_us);
-
-    Ok(())
 }
 
 /// Benchmark generation loop timing with a real model.
@@ -3613,6 +3587,7 @@ pub(crate) async fn run_gen_benchmark(model_id: &str) -> anyhow::Result<()> {
     use pmetal_runtime::compat::{Array, indexing::argmax, ops::async_eval, transforms::eval};
     use std::time::Instant;
 
+    let watch = ConditionsWatch::start();
     println!("=== Generation Loop Benchmark ===");
     println!("Model: {}\n", model_id);
 
@@ -3697,9 +3672,18 @@ pub(crate) async fn run_gen_benchmark(model_id: &str) -> anyhow::Result<()> {
         current_token = next_token;
     }
 
-    // Print results
-    println!("=== Generation Loop Timing ===");
-    for (name, durations) in &times {
+    // Print results, in the order a token goes through them.
+    println!("=== Generation Loop Timing ({n_tokens} tokens, mean per token) ===");
+    for name in [
+        "reshape",
+        "forward",
+        "extract_logits",
+        "argmax",
+        "async_eval",
+        "item",
+        "total",
+    ] {
+        let durations = &times[name];
         let avg_us: f64 =
             durations.iter().map(|d| d.as_micros() as f64).sum::<f64>() / durations.len() as f64;
         let avg_ms = avg_us / 1000.0;
@@ -3712,6 +3696,7 @@ pub(crate) async fn run_gen_benchmark(model_id: &str) -> anyhow::Result<()> {
         .sum::<f64>()
         / times["total"].len() as f64;
     println!("\nEffective tok/s: {:.0}", 1_000_000.0 / total_avg);
+    println!("\nConditions: {}", watch.finish().describe());
 
     Ok(())
 }
@@ -3721,16 +3706,55 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
+    fn step(ms: f64, tokens: usize) -> StepMetrics {
+        StepMetrics {
+            total_ms: ms,
+            tokens,
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn the_sample_config_pmetal_init_writes_loads_back_unchanged() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("sample.yaml");
-        generate_sample_config(path.to_str().unwrap()).expect("write sample");
-        let loaded = pmetal_core::FullTrainingConfig::from_yaml_file(&path).expect("load sample");
-        assert!(loaded.notes.is_empty(), "{:?}", loaded.notes);
-        assert_eq!(loaded.config.model.model_id, "meta-llama/Llama-3.2-1B");
-        assert_eq!(loaded.config.training.num_epochs, 3);
-        assert_eq!(loaded.config.training.save_steps, Some(500));
+    fn a_training_benchmark_leaves_out_its_warmup_steps() {
+        // The first two steps are slow (kernels compile); they are not the
+        // time of a step.
+        let steps = [
+            step(900.0, 1000),
+            step(400.0, 1000),
+            step(100.0, 1000),
+            step(120.0, 1000),
+            step(110.0, 1000),
+        ];
+        let summary = summarize_training_steps(&steps, 2).unwrap();
+        assert_eq!(summary.measured, 3);
+        assert_eq!(summary.median_step_ms, 110.0);
+        assert_eq!((summary.min_step_ms, summary.max_step_ms), (100.0, 120.0));
+        assert_eq!(summary.tokens_per_step, 1000.0);
+        // 1000 tokens in 110 ms.
+        assert!((summary.median_tokens_per_sec - 1000.0 / 0.110).abs() < 1e-6);
+        // Nothing left to measure is not a result.
+        assert!(summarize_training_steps(&steps[..2], 2).is_none());
+        assert!(summarize_training_steps(&[], 0).is_none());
+    }
+
+    #[test]
+    fn the_synthetic_training_set_has_a_long_distinct_row_for_every_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("set.jsonl");
+        write_synthetic_training_set(&path, 6, 64).unwrap();
+        let rows: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                v["text"].as_str().unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(rows.len(), 6);
+        // Eight characters to the token, so a row is more than seq_len tokens.
+        assert!(rows.iter().all(|r| r.len() >= 64 * 8));
+        let distinct: std::collections::HashSet<&String> = rows.iter().collect();
+        assert_eq!(distinct.len(), 6);
     }
 
     #[test]
@@ -3776,6 +3800,7 @@ mod tests {
                 memory_bandwidth_gbps: 100.0,
                 memory_bandwidth_source: "spec_table_fallback".to_string(),
             },
+            conditions: MeasurementConditions::default(),
             summary: KernelBenchmarkSummary {
                 completed: 1,
                 skipped: 1,
@@ -3816,6 +3841,7 @@ mod tests {
                 memory_bandwidth_gbps: 546.0,
                 memory_bandwidth_source: "measured_gpu_copy".to_string(),
             },
+            conditions: MeasurementConditions::default(),
             workload: WorkloadBenchmarkConfig {
                 preset: Some("dense-qwen3".to_string()),
                 model_id: "Qwen/Qwen3-0.6B".to_string(),
@@ -3938,6 +3964,7 @@ mod tests {
                 memory_bandwidth_gbps: 546.0,
                 memory_bandwidth_source: "measured_gpu_copy".to_string(),
             },
+            conditions: MeasurementConditions::default(),
             stage: "input-proj".to_string(),
             model_id: "Qwen/Qwen3.5-0.8B".to_string(),
             resolved_model_path: "/tmp/model".to_string(),

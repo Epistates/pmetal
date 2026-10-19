@@ -535,12 +535,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
         Commands::Init { output } => {
             // Validate output path to prevent path traversal attacks
             let validated_output = validate_output_path(&output, "config output")?;
-            commands::bench::generate_sample_config(&validated_output.to_string_lossy())?;
-        }
-
-        #[cfg(feature = "trainer")]
-        Commands::BenchFfi => {
-            commands::bench::run_ffi_benchmark()?;
+            commands::init::generate_sample_config(&validated_output.to_string_lossy())?;
         }
 
         #[cfg(feature = "trainer")]

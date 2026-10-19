@@ -162,7 +162,6 @@ pmetal serve --model Qwen/Qwen3-0.6B --port 8080
 | `init` | Generate a sample configuration file |
 | `bench` | Benchmark training performance |
 | `bench-gen` | Benchmark generation loop timing |
-| `bench-ffi` | Benchmark FFI overhead |
 | `bench-workload` | Benchmark real cached inference/training workloads |
 | `bench-corpus` | Structured kernel benchmarking with JSON reporting |
 | `bench-gdn` | Benchmark Qwen3.5 GDN backends on real layer shapes |

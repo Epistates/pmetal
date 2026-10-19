@@ -121,10 +121,6 @@ pub enum Commands {
         json: bool,
     },
 
-    /// Benchmark FFI overhead (for performance analysis)
-    #[cfg(feature = "trainer")]
-    BenchFfi,
-
     /// Benchmark generation loop timing (detailed profiling)
     #[cfg(feature = "trainer")]
     BenchGen {

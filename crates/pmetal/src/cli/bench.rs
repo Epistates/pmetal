@@ -6,15 +6,15 @@ use pmetal_core::jobs::BenchSpec;
 /// Thin clap argument struct for `pmetal bench`.
 #[derive(Args, Debug)]
 pub struct BenchArgs {
-    /// Model to benchmark
-    #[arg(short, long = "model", default_value = "meta-llama/Llama-3.2-1B")]
+    /// Model to benchmark: a Hub ID or a local directory
+    #[arg(short, long = "model", default_value = "Qwen/Qwen3-0.6B")]
     pub model: String,
 
-    /// Batch size
+    /// Rows per training step
     #[arg(short, long = "batch-size", default_value = "1")]
     pub batch_size: usize,
 
-    /// Sequence length
+    /// Tokens per row
     #[arg(short, long = "seq-len", default_value = "512")]
     pub seq_len: usize,
 }
