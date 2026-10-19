@@ -13,7 +13,7 @@ pub struct BenchSpec {
         group = "Model",
         argv = "--model",
         kind = "model_picker",
-        default = "meta-llama/Llama-3.2-1B"
+        default = "Qwen/Qwen3-0.6B"
     )]
     #[serde(default = "default_model")]
     pub model: String,
@@ -59,7 +59,7 @@ impl BenchSpec {
 }
 
 fn default_model() -> String {
-    "meta-llama/Llama-3.2-1B".to_string()
+    "Qwen/Qwen3-0.6B".to_string()
 }
 fn default_batch_size() -> usize {
     1

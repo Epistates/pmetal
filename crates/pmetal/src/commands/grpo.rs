@@ -1,44 +1,60 @@
 use pmetal_core::TrainingConfig;
+use pmetal_core::jobs::GrpoSpec;
 use pmetal_data::Tokenizer;
 use pmetal_trainer::{GrpoConfig, GrpoTrainer};
 use std::path::PathBuf;
 
+use super::RunContext;
+
 /// Run GRPO (Group Relative Policy Optimization) for reasoning models.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_grpo_cli(
-    model_id: &str,
-    dataset_path: &str,
-    output_dir: &str,
-    num_generations: usize,
-    beta: f64,
-    learning_rate: f64,
-    optimizer: pmetal_core::OptimizerType,
-    epochs: usize,
-    lora_r: usize,
-    lora_alpha: f32,
-    max_seq_len: usize,
-    max_completion_length: usize,
-    seed: u64,
-    checkpoint_every: usize,
-    resume: bool,
-    dapo: bool,
-    loss_type: &str,
-    num_iterations: usize,
-    reasoning_rewards: bool,
-    vlm_mode: bool,
-    max_image_size: usize,
-    reward_model_path: Option<String>,
-    reward_model_max_length: usize,
-    reward_model_weight: f64,
-    reward_model_template: Option<String>,
-    async_rewards: bool,
-    kv_cache_bits: Option<u8>,
-    _log_metrics: Option<String>,
-    emit_console_output: bool,
-    extra_callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>>,
-    prompt_column: Option<String>,
-    response_column: Option<String>,
-) -> anyhow::Result<()> {
+pub(crate) async fn run_grpo(spec: GrpoSpec, ctx: RunContext) -> anyhow::Result<()> {
+    let GrpoSpec {
+        model: ref model_id,
+        dataset: ref dataset_path,
+        ref output_dir,
+        num_generations,
+        beta,
+        learning_rate,
+        epochs,
+        lora_r,
+        lora_alpha,
+        max_seq_len,
+        max_completion_length,
+        seed,
+        checkpoint_every,
+        resume,
+        dapo,
+        ref loss_type,
+        num_iterations,
+        reasoning_rewards,
+        vlm: vlm_mode,
+        max_image_size,
+        reward_model: ref reward_model_path,
+        reward_model_max_length,
+        reward_model_weight,
+        ref reward_model_template,
+        async_rewards,
+        grpo_kv_bits: kv_cache_bits,
+        ref prompt_column,
+        ref response_column,
+        log_metrics: ref _log_metrics,
+        ..
+    } = spec;
+    let optimizer: pmetal_core::OptimizerType =
+        spec.optimizer.parse().map_err(anyhow::Error::msg)?;
+    let RunContext {
+        emit_console_output,
+        callbacks: extra_callbacks,
+    } = ctx;
+    let (model_id, dataset_path, output_dir) = (
+        model_id.as_str(),
+        dataset_path.as_str(),
+        output_dir.as_str(),
+    );
+    let (prompt_column, response_column) = (prompt_column.clone(), response_column.clone());
+    let (reward_model_path, reward_model_template) =
+        (reward_model_path.clone(), reward_model_template.clone());
+    let loss_type = loss_type.as_str();
     use pmetal_core::LoraConfig;
     use pmetal_lora::{DynamicLoraModel, TrainableModel};
     use pmetal_models::DynamicModel;
@@ -84,9 +100,10 @@ pub(crate) async fn run_grpo_cli(
     // 3. Load the prompts: each row's conversation up to where the model
     // writes (generation prompt included), with its answer kept aside as the
     // reference for the accuracy reward.
-    tracing::info!("Loading prompt dataset: {}", dataset_path);
+    let dataset_file = pmetal_trainer::resolve_dataset_path(dataset_path).await?;
+    tracing::info!("Loading prompt dataset: {}", dataset_file.display());
     let prompts = pmetal_trainer::grpo::load_prompts_with(
-        dataset_path,
+        &dataset_file,
         &tokenizer,
         &chat_template,
         max_seq_len,
@@ -229,7 +246,7 @@ pub(crate) async fn run_grpo_cli(
     let mut trainer = GrpoTrainer::new(grpo_config, training_config)?;
 
     // Wire metrics callback if --log-metrics was provided
-    if let Some(ref metrics_path) = _log_metrics {
+    if let Some(metrics_path) = _log_metrics {
         use pmetal_trainer::callbacks::MetricsJsonCallback;
         let path = if metrics_path.contains('/') || metrics_path.contains('\\') {
             PathBuf::from(metrics_path)

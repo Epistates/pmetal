@@ -9,7 +9,7 @@
 //! - All dispatch modes: packed, compiled, metal-fused, standard
 //! - Adaptive LR, checkpointing, metrics callbacks
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 /// The sections of a training config file, loaded and checked by `pmetal-core`.
 pub use pmetal_core::FullTrainingConfig;
@@ -174,6 +174,87 @@ impl Default for TrainingJobConfig {
             seed: 42,
             emit_console_output: true,
         }
+    }
+}
+
+impl std::str::FromStr for QuantizationScheme {
+    type Err = String;
+
+    /// The names `--quantization` and a spec's `quantization` field use.
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "nf4" => Ok(Self::Nf4),
+            "fp4" => Ok(Self::Fp4),
+            "int8" => Ok(Self::Int8),
+            other => Err(format!(
+                "unknown quantization '{other}'; valid: none, nf4, fp4, int8"
+            )),
+        }
+    }
+}
+
+impl TrainingJobConfig {
+    /// The job a [`TrainSpec`](pmetal_core::jobs::TrainSpec) asks for.
+    ///
+    /// Every surface that runs a train spec (the command line, the GUI, the
+    /// TUI) builds its job here, so a field the spec carries cannot reach the
+    /// trainer from one surface and be dropped by another. The caller adjusts
+    /// what is its own: the resolved dataset path, where metrics go, whether
+    /// the run prints a summary.
+    ///
+    /// # Errors
+    ///
+    /// A name the spec holds that the trainer does not know (an optimizer, a
+    /// schedule, a quantization scheme, a compression strategy), and a request
+    /// for distributed training from a build without it.
+    pub fn from_spec(spec: &pmetal_core::jobs::TrainSpec) -> Result<Self, String> {
+        let scheme: QuantizationScheme = spec
+            .quantization
+            .as_deref()
+            .map_or(Ok(QuantizationScheme::None), str::parse)?;
+        let qlora = (scheme != QuantizationScheme::None).then_some(QLoraOrchConfig {
+            scheme,
+            block_size: spec.quant_block_size,
+            double_quant: spec.double_quant,
+        });
+        #[cfg(not(feature = "distributed"))]
+        if spec.distributed_auto || spec.distributed_peers.is_some() {
+            return Err("this build has no distributed training support".to_string());
+        }
+        Ok(Self {
+            model_id: spec.model.clone(),
+            dataset: spec.dataset.clone(),
+            eval_dataset: spec.eval_dataset.clone(),
+            output_dir: spec.output_dir.clone(),
+            lora: spec.lora_config(),
+            qlora,
+            training: spec.training_config()?,
+            columns: DatasetColumnConfig::from_selectors(
+                spec.text_column.clone(),
+                spec.text_columns.as_deref(),
+                spec.column_separator.clone(),
+                spec.prompt_column.clone(),
+                spec.response_column.clone(),
+            ),
+            dispatch: DispatchConfig {
+                sequence_packing: !spec.no_sequence_packing,
+                pack_max_seq_len: spec.pack_max_seq_len,
+                gradient_checkpointing: !spec.no_gradient_checkpointing,
+                cut_cross_entropy: spec.cut_cross_entropy,
+                ane: spec.ane,
+                loss_scale: spec.loss_scale,
+                no_adaptive_lr: spec.no_adaptive_lr,
+                #[cfg(feature = "distributed")]
+                distributed: spec.distributed_config()?,
+                ..DispatchConfig::default()
+            },
+            config_path: spec.config_path.clone(),
+            log_metrics: spec.log_metrics.clone(),
+            resume: spec.resume,
+            seed: spec.seed,
+            emit_console_output: true,
+        })
     }
 }
 
@@ -399,7 +480,7 @@ pub async fn run_training(
         } else {
             config.output_dir.clone()
         };
-    let validated_output = validate_output_path(&output_candidate, "output directory")?;
+    let validated_output = pmetal_core::paths::output_path(&output_candidate, "output directory")?;
     let output_dir = validated_output.to_string_lossy().to_string();
     full_config.training.output_dir = output_dir.clone();
 
@@ -1520,79 +1601,6 @@ pub fn save_adapter<M: pmetal_lora::TrainableModel>(
 }
 
 // ---------------------------------------------------------------------------
-// Helper: validate output path (security)
-// ---------------------------------------------------------------------------
-
-pub fn validate_output_path(path: &str, context: &str) -> anyhow::Result<PathBuf> {
-    let path = PathBuf::from(path);
-
-    for component in path.components() {
-        if matches!(component, Component::ParentDir) {
-            anyhow::bail!(
-                "Path traversal detected in {}: '{}' contains '..' component. \
-                 Please use a path within the current directory.",
-                context,
-                path.display()
-            );
-        }
-    }
-
-    let cwd = std::env::current_dir()?;
-    let resolved = if path.is_absolute() {
-        path.clone()
-    } else {
-        cwd.join(&path)
-    };
-
-    if let Some(parent) = resolved.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-
-    let canonical = if resolved.exists() {
-        resolved.canonicalize()?
-    } else if let Some(parent) = resolved.parent() {
-        let canonical_parent = parent.canonicalize()?;
-        if let Some(filename) = resolved.file_name() {
-            canonical_parent.join(filename)
-        } else {
-            canonical_parent
-        }
-    } else {
-        resolved
-    };
-
-    let cwd_canonical = cwd.canonicalize()?;
-    let home_dir = dirs::home_dir();
-    let temp_dir = std::env::temp_dir().canonicalize().ok();
-
-    let is_safe = canonical.starts_with(&cwd_canonical)
-        || home_dir
-            .as_ref()
-            .map(|h| canonical.starts_with(h))
-            .unwrap_or(false)
-        || temp_dir
-            .as_ref()
-            .map(|t| canonical.starts_with(t))
-            .unwrap_or(false)
-        || canonical.starts_with("/tmp")
-        || canonical.starts_with("/private/tmp");
-
-    if !is_safe {
-        anyhow::bail!(
-            "Unsafe output path for {}: '{}' resolves to '{}' which is outside \
-             the current directory, home directory, and temp directory.",
-            context,
-            path.display(),
-            canonical.display()
-        );
-    }
-
-    Ok(canonical)
-}
-
-// ---------------------------------------------------------------------------
 // Helper: format param count
 // ---------------------------------------------------------------------------
 
@@ -1660,6 +1668,70 @@ mod tests {
             serde_json::json!(["q_proj", "v_proj"])
         );
         assert_eq!(written["base_model_name_or_path"], "Qwen/Qwen3-0.6B");
+    }
+
+    /// Every field a train spec carries reaches the job the trainer runs.
+    #[test]
+    fn a_train_spec_becomes_the_job_it_asks_for() {
+        use pmetal_core::jobs::TrainSpec;
+        let spec = TrainSpec {
+            model: "m".into(),
+            dataset: "d".into(),
+            eval_dataset: Some("e".into()),
+            output_dir: "out".into(),
+            max_steps: Some(9),
+            warmup_ratio: Some(0.1),
+            min_lr: Some(1e-6),
+            save_steps: Some(3),
+            eval_steps: Some(2),
+            logging_steps: 4,
+            lora_targets: vec!["q_proj".into()],
+            quantization: Some("fp4".into()),
+            quant_block_size: 16,
+            text_columns: Some("a,b".into()),
+            prompt_column: Some("p".into()),
+            no_sequence_packing: true,
+            cut_cross_entropy: true,
+            loss_scale: 2.0,
+            resume: true,
+            log_metrics: Some("m.jsonl".into()),
+            config_path: Some("c.yaml".into()),
+            ..TrainSpec::default()
+        };
+        let job = TrainingJobConfig::from_spec(&spec).unwrap();
+        assert_eq!((job.model_id.as_str(), job.dataset.as_str()), ("m", "d"));
+        assert_eq!(job.eval_dataset.as_deref(), Some("e"));
+        assert_eq!(job.output_dir, "out");
+        assert_eq!(job.training.max_steps, Some(9));
+        assert_eq!(job.training.warmup_ratio, Some(0.1));
+        assert_eq!(job.training.min_lr, Some(1e-6));
+        assert_eq!(job.training.save_steps, Some(3));
+        assert_eq!(job.training.eval_steps, Some(2));
+        assert_eq!(job.training.logging_steps, 4);
+        assert_eq!(job.lora.target_modules, ["q_proj"]);
+        let qlora = job.qlora.unwrap();
+        assert_eq!(
+            (qlora.scheme, qlora.block_size),
+            (QuantizationScheme::Fp4, 16)
+        );
+        assert_eq!(job.columns.unwrap().text_columns.unwrap(), ["a", "b"]);
+        assert!(!job.dispatch.sequence_packing && job.dispatch.cut_cross_entropy);
+        assert_eq!(job.dispatch.loss_scale, 2.0);
+        assert!(job.resume);
+        assert_eq!(job.log_metrics.as_deref(), Some("m.jsonl"));
+        assert_eq!(job.config_path.as_deref(), Some("c.yaml"));
+
+        let plain = TrainingJobConfig::from_spec(&TrainSpec::default()).unwrap();
+        assert!(plain.qlora.is_none() && plain.columns.is_none());
+        let bad = TrainSpec {
+            quantization: Some("nf8".into()),
+            ..TrainSpec::default()
+        };
+        assert!(
+            TrainingJobConfig::from_spec(&bad)
+                .unwrap_err()
+                .contains("nf8")
+        );
     }
 
     #[test]

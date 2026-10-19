@@ -74,6 +74,17 @@ pub struct TrainDiffusionSpec {
     pub lora_targets: Vec<String>,
 
     #[job(
+        label = "Corrupted Only",
+        group = "Training",
+        argv = "--corrupted-only",
+        valued,
+        default_bool = true,
+        help = "Restrict the denoising loss to corrupted canvas positions (the ELBO reconstruction term); false averages over the whole canvas"
+    )]
+    #[serde(default = "default_corrupted_only")]
+    pub corrupted_only: bool,
+
+    #[job(
         label = "Quantization",
         group = "LoRA",
         argv = "--quantization",
@@ -197,6 +208,7 @@ impl Default for TrainDiffusionSpec {
             lora_r: default_lora_r(),
             lora_alpha: default_lora_alpha(),
             lora_targets: Vec::new(),
+            corrupted_only: default_corrupted_only(),
             quantization: default_quantization(),
             quant_block_size: default_quant_block_size(),
             double_quant: false,
@@ -233,6 +245,9 @@ fn default_lora_r() -> usize {
 }
 fn default_lora_alpha() -> f32 {
     crate::defaults::LORA_ALPHA
+}
+fn default_corrupted_only() -> bool {
+    true
 }
 fn default_quantization() -> String {
     "none".to_string()

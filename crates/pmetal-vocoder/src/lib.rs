@@ -24,9 +24,9 @@
 //! use pmetal_runtime::compat::Array;
 //! use pmetal_vocoder::{BigVGAN, Result};
 //!
-//! # fn run(mel: &Array) -> Result<Array> {
+//! # async fn run(mel: &Array) -> Result<Array> {
 //! // Load a released model (a Hugging Face id or a local directory).
-//! let vocoder = BigVGAN::from_pretrained("nvidia/bigvgan_v2_24khz_100band_256x")?;
+//! let vocoder = BigVGAN::from_pretrained("nvidia/bigvgan_v2_24khz_100band_256x").await?;
 //!
 //! // `mel` is [batch, 100, frames]; the result is [batch, 1, frames * 256].
 //! vocoder.forward(mel)

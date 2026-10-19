@@ -392,58 +392,35 @@ impl ModelSource {
     }
 
     /// Resolve to a TensorLoader.
-    pub fn resolve(&self) -> Result<Box<dyn TensorLoader>> {
+    ///
+    /// A Hub repository is fetched through `pmetal-hub`: the weights of one
+    /// commit (the revision, else what the cache holds, else the default
+    /// branch), checked for completeness, in the cache every other command
+    /// shares.
+    pub async fn resolve(&self) -> Result<Box<dyn TensorLoader>> {
+        self.resolve_with(&pmetal_hub::DownloadOptions::default())
+            .await
+    }
+
+    /// [`resolve`](Self::resolve) with explicit connection settings (cache
+    /// directory, endpoint, offline mode); the revision of a Hub source
+    /// overrides the options'.
+    pub async fn resolve_with(
+        &self,
+        options: &pmetal_hub::DownloadOptions,
+    ) -> Result<Box<dyn TensorLoader>> {
         match self {
             Self::Local(path) => Ok(Box::new(SafetensorsLoader::new(path)?)),
             Self::Hub { repo_id, revision } => {
-                info!("Downloading model from Hub: {}", repo_id);
-
-                let client = hf_hub::HFClientSync::new()?;
-                let (owner, name) = hf_hub::split_id(repo_id);
-                let repo = client.model(owner, name);
-                let get = |filename: &str| {
-                    repo.download_file()
-                        .filename(filename)
-                        .maybe_revision(revision.clone())
-                        .send()
+                info!("Resolving model from the Hub: {}", repo_id);
+                let options = pmetal_hub::DownloadOptions {
+                    revision: revision.clone().or_else(|| options.revision.clone()),
+                    weights: pmetal_hub::WeightFormat::Safetensors,
+                    ..options.clone()
                 };
-
-                // Download all safetensors files
-                let files = repo
-                    .info()
-                    .maybe_revision(revision.clone())
-                    .send()?
-                    .siblings
-                    .unwrap_or_default();
-                let safetensor_files: Vec<_> = files
-                    .iter()
-                    .filter(|f| f.rfilename.ends_with(".safetensors"))
-                    .collect();
-
-                if safetensor_files.is_empty() {
-                    return Err(MergeError::ModelLoad(format!(
-                        "No safetensors files found in repo {}",
-                        repo_id
-                    )));
-                }
-
-                // Download first file to get the directory
-                let first = get(&safetensor_files[0].rfilename)?;
-                let model_dir = first
-                    .parent()
-                    .ok_or_else(|| {
-                        MergeError::ModelLoad(format!(
-                            "Failed to get parent directory of {:?}",
-                            first
-                        ))
-                    })?
-                    .to_path_buf();
-
-                // Download remaining files
-                for file in &safetensor_files[1..] {
-                    let _ = get(&file.rfilename)?;
-                }
-
+                let model_dir = pmetal_hub::download_model_with(repo_id, &options)
+                    .await
+                    .map_err(|e| MergeError::Hub(format!("{repo_id}: {e}")))?;
                 Ok(Box::new(SafetensorsLoader::new(model_dir)?))
             }
         }
@@ -1029,6 +1006,52 @@ mod tests {
             ModelSource::parse("mistralai/Mistral-7B-v0.1"),
             ModelSource::Hub { .. }
         ));
+    }
+
+    /// A Hub source is read from the Hub cache through `pmetal-hub`: the
+    /// complete snapshot of the revision asked for, and an error naming the
+    /// repository when there is none (here offline, so nothing is fetched).
+    #[tokio::test]
+    async fn a_hub_source_resolves_through_the_hub_cache() {
+        let cache = tempfile::tempdir().unwrap();
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let repo = cache.path().join("models--org--model");
+        let snapshot = repo.join("snapshots").join(commit);
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::create_dir_all(repo.join("refs")).unwrap();
+        std::fs::write(repo.join("refs").join("main"), commit).unwrap();
+        std::fs::write(snapshot.join("config.json"), "{}").unwrap();
+        write_safetensors(
+            &snapshot.join("model.safetensors"),
+            &[("w", &[1.0, 2.0], &[2])],
+        );
+        let options = pmetal_hub::DownloadOptions {
+            hub: pmetal_hub::HubOptions {
+                cache_dir: Some(cache.path().to_path_buf()),
+                offline: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let loader = ModelSource::from_hub("org/model")
+            .resolve_with(&options)
+            .await
+            .unwrap();
+        assert_eq!(loader.tensor_names(), ["w"]);
+        let pinned = ModelSource::from_hub_with_revision("org/model", commit)
+            .resolve_with(&options)
+            .await
+            .unwrap();
+        assert!(pinned.has_tensor("w"));
+
+        let err = ModelSource::from_hub("org/missing")
+            .resolve_with(&options)
+            .await
+            .err()
+            .expect("not cached")
+            .to_string();
+        assert!(err.contains("org/missing"), "{err}");
     }
 
     #[test]

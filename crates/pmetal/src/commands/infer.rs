@@ -1,14 +1,13 @@
 use std::path::Path;
 
 use anyhow::Context;
+use pmetal_core::jobs::InferSpec;
 use pmetal_models::{
     DynamicModel,
     architectures::{Qwen3NextForwardProfile, Qwen3NextLayerProfile},
 };
 use pmetal_runtime::compat::{Array, Exception};
 use std::collections::BTreeMap;
-
-use pmetal::response_parser::{extract_final_response, extract_thinking_content};
 
 #[derive(Debug, serde::Serialize, PartialEq, Eq)]
 struct HybridProfileSectionSummary {
@@ -265,63 +264,118 @@ fn run_qwen3_next_layer_profile(
 /// Uses the shared `InferenceRunner` for model loading, tokenization, chat
 /// template, sampling config, and cache creation. CLI-specific features
 /// (ANE, benchmark) use the runner's prepared state.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_inference(
-    model_id: &str,
-    lora_path: Option<&str>,
-    prompt: &str,
-    max_tokens: Option<usize>,
-    temperature: Option<f32>,
-    top_k: Option<usize>,
-    top_p: Option<f32>,
-    min_p: Option<f32>,
-    repetition_penalty: Option<f32>,
-    frequency_penalty: Option<f32>,
-    presence_penalty: Option<f32>,
-    seed: Option<u64>,
-    chat: bool,
-    system: Option<&str>,
-    no_thinking: bool,
-    chat_template_kwargs: pmetal_data::chat_templates::ChatTemplateKwargs,
-    mode: pmetal_data::inference_config::SamplingMode,
-    backend: pmetal_data::inference_config::InferenceBackend,
-    draft_model: Option<&str>,
-    mtp: bool,
-    mtp_model: Option<&str>,
-    mtp_draft_tokens: usize,
-    hide_thinking: bool,
-    fp8: bool,
-    tools: Option<&[pmetal_data::chat_templates::ToolDefinition]>,
-    ane: bool,
-    #[cfg_attr(not(feature = "ane"), allow(unused_variables))] ane_max_seq_len: usize,
-    benchmark: bool,
-    benchmark_iters: usize,
-    benchmark_prompt_tokens: Option<usize>,
-    profile_layers: bool,
-    profile_output: Option<&Path>,
-    kv_quant: Option<u8>,
-    kv_k_bits: Option<u8>,
-    kv_v_bits: Option<u8>,
-    kv_group_size: usize,
-    kv_turboquant: bool,
-    kv_turboquant_preset: Option<pmetal::inference_runner::TurboQuantPreset>,
-    kv_quant_preset: Option<String>,
-    no_kv_quant: bool,
-    kv_qjl: bool,
-    detect_repetition: bool,
-    experts_dir: Option<&str>,
-    images: &[String],
-    videos: &[String],
-    video_fps: Option<f64>,
-) -> anyhow::Result<()> {
+pub(crate) async fn run_inference(spec: InferSpec) -> anyhow::Result<()> {
+    use pmetal_data::inference_config::{InferenceBackend, SamplingMode};
+
+    let tool_defs: Option<Vec<pmetal_data::chat_templates::ToolDefinition>> =
+        match spec.tools.as_deref() {
+            Some(tools_path) => {
+                let json = std::fs::read_to_string(tools_path)
+                    .map_err(|e| anyhow::anyhow!("--tools: could not read '{tools_path}': {e}"))?;
+                let defs: Vec<pmetal_data::chat_templates::ToolDefinition> =
+                    serde_json::from_str(&json).map_err(|e| {
+                        anyhow::anyhow!("--tools: '{tools_path}' is not a tool list: {e}")
+                    })?;
+                tracing::info!("Loaded {} tool definitions from {tools_path}", defs.len());
+                Some(defs)
+            }
+            None => None,
+        };
+    let validated_profile_output = spec
+        .profile_output
+        .as_deref()
+        .map(|path| crate::validate_output_path(path, "infer profile output"))
+        .transpose()?;
+    let chat_template_kwargs = pmetal_data::chat_templates::ChatTemplateKwargs::from_controls(
+        spec.chat_template_kwargs.as_deref(),
+        spec.no_thinking,
+        spec.reasoning_effort.as_deref(),
+        spec.no_preserve_thinking,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let mode: SamplingMode = spec.mode.parse().map_err(anyhow::Error::msg)?;
+    let backend: InferenceBackend = spec.backend.parse().map_err(anyhow::Error::msg)?;
+    let kv_turboquant_preset = match spec.kv_turboquant_preset.as_deref() {
+        None => None,
+        Some("q2_5") => Some(pmetal::inference_runner::TurboQuantPreset::Q2_5),
+        Some("q3_5") => Some(pmetal::inference_runner::TurboQuantPreset::Q3_5),
+        Some(other) => {
+            anyhow::bail!("--kv-turboquant-preset: unknown preset '{other}'; valid: q2_5, q3_5")
+        }
+    };
+
+    let InferSpec {
+        model: ref model_id,
+        lora: ref lora_path,
+        ref prompt,
+        image: ref images,
+        video: ref videos,
+        video_fps,
+        json,
+        max_tokens,
+        temperature,
+        top_k,
+        top_p,
+        min_p,
+        repetition_penalty,
+        frequency_penalty,
+        presence_penalty,
+        seed,
+        chat,
+        ref system,
+        no_thinking,
+        hide_thinking,
+        ref draft_model,
+        mtp,
+        ref mtp_model,
+        mtp_draft_tokens,
+        fp8,
+        ref experts_dir,
+        ane,
+        ane_max_seq_len,
+        benchmark,
+        benchmark_iters,
+        benchmark_prompt_tokens,
+        profile_layers,
+        kv_quant,
+        kv_k_bits,
+        kv_v_bits,
+        kv_group_size,
+        kv_turboquant,
+        ref kv_quant_preset,
+        no_kv_quant,
+        kv_qjl,
+        detect_repetition,
+        ..
+    } = spec;
+    let model_id = model_id.as_str();
+    let lora_path = lora_path.as_deref();
+    let prompt = prompt.as_str();
+    let system = system.as_deref();
+    let draft_model = draft_model.as_deref();
+    let mtp_model = mtp_model.as_deref();
+    let experts_dir = experts_dir.as_deref();
+    let kv_quant_preset = kv_quant_preset.clone();
+    let tools = tool_defs.as_deref();
+    let profile_output = validated_profile_output.as_deref();
+    // With --json, stdout is the one JSON object; everything a person reads
+    // (the banner, the statistics) goes to stderr.
+    macro_rules! say {
+        ($($arg:tt)*) => {
+            if json { eprintln!($($arg)*) } else { println!($($arg)*) }
+        };
+    }
     #[cfg(not(feature = "ane"))]
-    if ane {
-        anyhow::bail!("ANE inference requires the 'ane' feature: cargo build --features ane");
+    {
+        // Only the ANE engine reads it.
+        let _ = ane_max_seq_len;
+        if ane {
+            anyhow::bail!("ANE inference requires the 'ane' feature: cargo build --features ane");
+        }
     }
     // `--chat-template-kwargs '{"enable_thinking": false}'` is --no-thinking.
     let no_thinking = no_thinking || chat_template_kwargs.enable_thinking() == Some(false);
     let reasoning_effort = chat_template_kwargs.reasoning_effort().map(str::to_string);
-    use pmetal_data::inference_config::InferenceBackend;
     use pmetal_models::GenerationOutput;
 
     // ── Resolve --backend into the generation path ────────────────────────
@@ -538,38 +592,38 @@ pub(crate) async fn run_inference(
     }
 
     // Print configuration
-    println!("\n========================================");
-    println!("  PMetal Inference");
-    println!("========================================");
-    println!("Model:       {}", model_id);
+    say!("\n========================================");
+    say!("  PMetal Inference");
+    say!("========================================");
+    say!("Model:       {}", model_id);
     if let Some(path) = lora_path {
-        println!("LoRA:        {}", path);
+        say!("LoRA:        {}", path);
     }
     if let Some(path) = mtp_assistant_path.as_ref() {
-        println!("MTP:         {}", path.display());
+        say!("MTP:         {}", path.display());
     }
     if mtp {
         if let Some(path) = qwen_mtp_path.as_ref() {
-            println!(
+            say!(
                 "MTP:         {} ({})",
                 path.display(),
                 mtp_draft_tokens.max(1)
             );
         } else {
-            println!("MTP:         bundled Qwen ({})", mtp_draft_tokens.max(1));
+            say!("MTP:         bundled Qwen ({})", mtp_draft_tokens.max(1));
         }
     }
-    println!("Temperature: {}", gen_config.temperature);
-    println!("Top-k:       {}", gen_config.top_k);
-    println!("Top-p:       {}", gen_config.top_p);
-    println!("Min-p:       {}", gen_config.min_p);
-    println!("Rep penalty: {}", gen_config.repetition_penalty);
-    println!("Freq penalty:{}", gen_config.frequency_penalty);
-    println!("Pres penalty:{}", gen_config.presence_penalty);
+    say!("Temperature: {}", gen_config.temperature);
+    say!("Top-k:       {}", gen_config.top_k);
+    say!("Top-p:       {}", gen_config.top_p);
+    say!("Min-p:       {}", gen_config.min_p);
+    say!("Rep penalty: {}", gen_config.repetition_penalty);
+    say!("Freq penalty:{}", gen_config.frequency_penalty);
+    say!("Pres penalty:{}", gen_config.presence_penalty);
     if let Some(s) = gen_config.seed {
-        println!("Seed:        {}", s);
+        say!("Seed:        {}", s);
     }
-    println!(
+    say!(
         "Max tokens:  {}{}",
         gen_config.max_new_tokens,
         if max_tokens.is_none() {
@@ -579,9 +633,9 @@ pub(crate) async fn run_inference(
         }
     );
     if use_chat && thinking_requested_off {
-        println!("Thinking:    disabled");
+        say!("Thinking:    disabled");
     } else if use_chat && !no_thinking {
-        println!(
+        say!(
             "Thinking:    on{}",
             reasoning_effort
                 .as_deref()
@@ -589,12 +643,12 @@ pub(crate) async fn run_inference(
                 .unwrap_or_default()
         );
     }
-    println!("========================================");
-    println!();
+    say!("========================================");
+    say!();
     if runner.state.is_native_only() {
-        println!("Loading model...");
+        say!("Loading model...");
     } else {
-        println!("Generating...");
+        say!("Generating...");
     }
 
     // Extract refs for generation dispatch (split borrow)
@@ -604,7 +658,31 @@ pub(crate) async fn run_inference(
 
     // ── Generation dispatch ────────────────────────────────────────────────
     let start = std::time::Instant::now();
-    let mut already_streamed = false;
+    // Ctrl-C stops the generation after the token in flight, so the text so
+    // far is complete and the statistics are printed; the exit status is 130.
+    let interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let interrupted = std::sync::Arc::clone(&interrupted);
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                interrupted.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+    }
+    // The text: on stdout as it is generated, or kept for the JSON object.
+    let collected = std::cell::RefCell::new(String::new());
+    let emit = |delta: &str| {
+        if delta.is_empty() {
+            return;
+        }
+        if json {
+            collected.borrow_mut().push_str(delta);
+        } else {
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(delta.as_bytes());
+            let _ = std::io::stdout().flush();
+        }
+    };
     // ⚠️ The native engines load their weights inside the dispatch below, so
     // `start` measures load + prefill + decode. Reporting that as generation
     // time made a 1 s generation read as 30 s.
@@ -650,21 +728,16 @@ pub(crate) async fn run_inference(
                 &gen_config,
                 ane_max_seq_len,
                 |token_id| {
-                    use std::io::Write;
                     first_token_at.get_or_insert_with(std::time::Instant::now);
                     if gen_config.stop_tokens.contains(&token_id) {
                         return true;
                     }
                     let delta = formatter.push_token(tokenizer, token_id);
-                    if !delta.is_empty() {
-                        let _ = std::io::stdout().write_all(delta.as_bytes());
-                        let _ = std::io::stdout().flush();
-                    }
-                    true
+                    emit(&delta);
+                    !interrupted.load(std::sync::atomic::Ordering::Relaxed)
                 },
             )
             .map_err(|e| anyhow::anyhow!("ANE inference failed: {e}"))?;
-            already_streamed = true;
             Some(output)
         } else {
             None
@@ -675,70 +748,43 @@ pub(crate) async fn run_inference(
         if let Some(output) = ane_output {
             output
         } else {
-            already_streamed = true;
             let tokenizer = &runner.tokenizer;
             let show_thinking = use_chat && !hide_thinking && !no_thinking;
             let mut formatter =
                 pmetal_data::stream_format::StreamFormatter::new(tokenizer, show_thinking);
             runner.state.generate_streaming(|token_id| {
-                use std::io::Write;
                 first_token_at.get_or_insert_with(std::time::Instant::now);
                 let delta = formatter.push_token(tokenizer, token_id);
-                if !delta.is_empty() {
-                    let _ = std::io::stdout().write_all(delta.as_bytes());
-                    let _ = std::io::stdout().flush();
-                }
-                true
+                emit(&delta);
+                !interrupted.load(std::sync::atomic::Ordering::Relaxed)
             })?
         }
     };
     let elapsed = start.elapsed();
 
-    // For non-streaming paths, decode and print the generated text now
-    if !already_streamed {
-        let generated_tokens = &output.token_ids[input_ids.len()..];
-        let raw_text = runner.tokenizer.decode(generated_tokens)?;
-        let text = if use_chat && !no_thinking {
-            format!("<think>{}", raw_text)
-        } else {
-            raw_text
-        };
-        if use_chat && !hide_thinking {
-            if let Some(thinking) = extract_thinking_content(&text) {
-                println!("=== Thinking ===");
-                println!("{}", thinking);
-                println!("=== Response ===");
-            }
-            println!("{}", extract_final_response(&text));
-        } else if use_chat {
-            println!("{}", extract_final_response(&text));
-        } else {
-            println!("{}", text);
-        }
-    } else {
+    // The streamed text ends without a newline, and the statistics follow.
+    if !json {
         println!();
     }
-
-    // Ensure a clean newline between streamed output and stats
-    println!();
-    println!("---");
+    say!();
+    say!("---");
     match first_token_at {
-        Some(first) => println!(
+        Some(first) => say!(
             "Generated {} tokens in {:.2}s ({:.2}s to the first token, model load included)",
             output.num_generated,
             (elapsed - (first - start)).as_secs_f64(),
             (first - start).as_secs_f64(),
         ),
-        None => println!(
+        None => say!(
             "Generated {} tokens in {:.2}s",
             output.num_generated,
             elapsed.as_secs_f64(),
         ),
     }
     if output.stopped_by_token {
-        println!("Stopped by: EOS token");
+        say!("Stopped by: EOS token");
     } else {
-        println!("Stopped by: max length");
+        say!("Stopped by: max length");
     }
     if let Some(m) = runner.state.last_decode_metrics {
         let chip = if let Ok(ctx) = pmetal_metal::context::MetalContext::global() {
@@ -748,19 +794,26 @@ pub(crate) async fn run_inference(
             String::new()
         };
         if chip.is_empty() {
-            println!(
+            say!(
                 "Decode: {:.0} tok/s (avg={:.2}ms p50={:.2}ms over {} steps)",
-                m.tok_per_sec, m.avg_step_ms, m.p50_step_ms, m.measured_steps,
+                m.tok_per_sec,
+                m.avg_step_ms,
+                m.p50_step_ms,
+                m.measured_steps,
             );
         } else {
-            println!(
+            say!(
                 "Decode: {:.0} tok/s (avg={:.2}ms p50={:.2}ms over {} steps) [{}]",
-                m.tok_per_sec, m.avg_step_ms, m.p50_step_ms, m.measured_steps, chip,
+                m.tok_per_sec,
+                m.avg_step_ms,
+                m.p50_step_ms,
+                m.measured_steps,
+                chip,
             );
         }
     }
     if let Some(m) = output.speculative_metrics.as_ref() {
-        println!(
+        say!(
             "Speculative: {:.1}% accepted ({} / {} draft tokens, avg {:.2}/verify, {} bonus, {} correction)",
             m.acceptance_rate() * 100.0,
             m.accepted_draft_tokens,
@@ -769,6 +822,25 @@ pub(crate) async fn run_inference(
             m.bonus_tokens,
             m.correction_tokens,
         );
+    }
+
+    if json {
+        let report = inference_report(&InferenceFacts {
+            model: model_id,
+            text: &collected.borrow(),
+            prompt_tokens: input_ids.len(),
+            generated_tokens: output.num_generated,
+            stopped_by_token: output.stopped_by_token,
+            elapsed_seconds: elapsed.as_secs_f64(),
+            first_token_seconds: first_token_at.map(|first| (first - start).as_secs_f64()),
+            decode_tokens_per_second: runner.state.last_decode_metrics.map(|m| m.tok_per_sec),
+            speculative_acceptance: output
+                .speculative_metrics
+                .as_ref()
+                .map(|m| f64::from(m.acceptance_rate())),
+            interrupted: interrupted.load(std::sync::atomic::Ordering::Relaxed),
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
     }
 
     // Print what the expert files were asked for if offloading was active
@@ -786,7 +858,50 @@ pub(crate) async fn run_inference(
         }
     }
 
+    if interrupted.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("Interrupted.");
+        return Err(crate::Interrupted.into());
+    }
     Ok(())
+}
+
+/// What a finished generation reports in `--json`.
+struct InferenceFacts<'a> {
+    model: &'a str,
+    text: &'a str,
+    prompt_tokens: usize,
+    generated_tokens: usize,
+    stopped_by_token: bool,
+    elapsed_seconds: f64,
+    first_token_seconds: Option<f64>,
+    decode_tokens_per_second: Option<f64>,
+    speculative_acceptance: Option<f64>,
+    interrupted: bool,
+}
+
+/// The `--json` object. `seconds` is the generation time (the model's load
+/// is in `time_to_first_token_seconds` for the engines that load inside the
+/// run).
+fn inference_report(facts: &InferenceFacts<'_>) -> serde_json::Value {
+    let stopped_by = if facts.interrupted {
+        "interrupted"
+    } else if facts.stopped_by_token {
+        "eos"
+    } else {
+        "length"
+    };
+    let seconds = facts.elapsed_seconds - facts.first_token_seconds.unwrap_or(0.0);
+    serde_json::json!({
+        "model": facts.model,
+        "text": facts.text,
+        "prompt_tokens": facts.prompt_tokens,
+        "generated_tokens": facts.generated_tokens,
+        "stopped_by": stopped_by,
+        "seconds": seconds.max(0.0),
+        "time_to_first_token_seconds": facts.first_token_seconds,
+        "decode_tokens_per_second": facts.decode_tokens_per_second,
+        "speculative_acceptance": facts.speculative_acceptance,
+    })
 }
 
 // NOTE: run_inference_with_lora has been removed — LoRA loading is now handled
@@ -796,6 +911,32 @@ pub(crate) async fn run_inference(
 mod tests {
     use super::*;
     use pmetal_models::architectures::Qwen3NextProfileSection;
+
+    #[test]
+    fn the_json_report_says_why_generation_stopped_and_what_it_cost() {
+        let mut facts = InferenceFacts {
+            model: "m",
+            text: "hello",
+            prompt_tokens: 5,
+            generated_tokens: 3,
+            stopped_by_token: true,
+            elapsed_seconds: 2.5,
+            first_token_seconds: Some(1.0),
+            decode_tokens_per_second: Some(42.0),
+            speculative_acceptance: None,
+            interrupted: false,
+        };
+        let report = inference_report(&facts);
+        assert_eq!(report["text"], "hello");
+        assert_eq!(report["stopped_by"], "eos");
+        assert_eq!(report["seconds"], 1.5);
+        assert_eq!(report["time_to_first_token_seconds"], 1.0);
+        assert!(report["speculative_acceptance"].is_null());
+        facts.stopped_by_token = false;
+        assert_eq!(inference_report(&facts)["stopped_by"], "length");
+        facts.interrupted = true;
+        assert_eq!(inference_report(&facts)["stopped_by"], "interrupted");
+    }
 
     #[test]
     fn qwen3_next_phase_summary_groups_layer_kinds_and_sections() {

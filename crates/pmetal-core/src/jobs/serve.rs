@@ -40,6 +40,28 @@ pub struct ServeSpec {
     pub port: u16,
 
     #[job(
+        label = "CORS Origins",
+        group = "Server",
+        argv = "--cors-origin",
+        repeat,
+        help = "Browser origins whose pages may call the server, or * for any; none sends no CORS headers"
+    )]
+    #[serde(default)]
+    pub cors_origin: Vec<String>,
+
+    #[job(
+        label = "Request Timeout (s)",
+        group = "Server",
+        argv = "--request-timeout",
+        min = 0,
+        max = 604_800,
+        default_int = 1800,
+        help = "Seconds one request may run before the server ends it; 0 for no limit"
+    )]
+    #[serde(default = "default_request_timeout")]
+    pub request_timeout: u64,
+
+    #[job(
         label = "Max Seq Len",
         group = "Inference",
         argv = "--max-seq-len",
@@ -216,6 +238,8 @@ impl Default for ServeSpec {
             model: String::new(),
             host: default_host(),
             port: default_port(),
+            cors_origin: Vec::new(),
+            request_timeout: default_request_timeout(),
             max_seq_len: None,
             experts_dir: None,
             fp8: false,
@@ -256,6 +280,9 @@ fn default_host() -> String {
 }
 fn default_port() -> u16 {
     8080
+}
+fn default_request_timeout() -> u64 {
+    1800
 }
 fn default_kv_group_size() -> usize {
     64

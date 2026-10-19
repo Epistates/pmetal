@@ -59,21 +59,12 @@ pub struct FuseSpec {
     pub rank: Option<usize>,
 
     #[job(
-        label = "Accurate (f64)",
-        group = "Method",
-        argv = "--accurate",
-        flag,
-        default_bool = false
-    )]
-    #[serde(default)]
-    pub accurate: bool,
-
-    #[job(
         label = "Low-Memory",
         group = "Method",
         argv = "--low-memory",
         flag,
-        default_bool = false
+        default_bool = false,
+        help = "Tile the fold (512 rows at a time) to bound memory on very large tensors"
     )]
     #[serde(default)]
     pub low_memory: bool,

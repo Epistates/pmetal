@@ -23,6 +23,7 @@ Shows:
 - **Metal features** (dynamic caching, mesh shaders)
 - **UltraFusion topology** (Ultra chips)
 - **UltraFusion local executor scaffold** (Ultra chips): per-die slices, local stage count, and heuristic interconnect bandwidth
+- **Environment**: the Hub cache directory, whether Hub offline mode is on (`HF_HUB_OFFLINE`), the log directory, and the optional features this build was compiled with (`--json` carries them under `environment`)
 
 ## See Also
 

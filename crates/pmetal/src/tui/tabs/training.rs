@@ -399,11 +399,6 @@ impl TrainingTab {
                 .parse()
                 .unwrap_or(TrainSpec::default().gradient_accumulation_steps),
             no_gradient_checkpointing,
-            gradient_checkpointing_layers: self
-                .form
-                .value("Gradient Checkpointing Layers")
-                .parse()
-                .unwrap_or(TrainSpec::default().gradient_checkpointing_layers),
             max_grad_norm: self
                 .form
                 .value("Max Grad Norm")
@@ -508,6 +503,29 @@ impl TrainingTab {
             },
             config_path: None,
             resume: false,
+            log_metrics: None,
+            warmup_ratio: self.form.value("Warmup Ratio").parse().ok(),
+            min_lr: self.form.value("Min LR").parse().ok(),
+            wsd_stable_ratio: self.form.value("WSD Stable Ratio").parse().ok(),
+            wsd_decay_style: optional_form_value(&self.form.value("WSD Decay Style")),
+            cosine_num_restarts: self.form.value("Cosine Cycles").parse().ok(),
+            polynomial_power: self.form.value("Polynomial Power").parse().ok(),
+            max_steps: self.form.value("Max Steps").parse().ok(),
+            logging_steps: self
+                .form
+                .value("Logging Steps")
+                .parse()
+                .unwrap_or(TrainSpec::default().logging_steps),
+            eval_steps: self.form.value("Eval Steps").parse().ok(),
+            save_steps: self.form.value("Save Steps").parse().ok(),
+            lora_targets: self
+                .form
+                .value("LoRA Targets (csv)")
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty() && *name != "(none)")
+                .map(str::to_string)
+                .collect(),
         }
     }
 }

@@ -1,6 +1,7 @@
 //! Clap argument struct for `pmetal merge`.
 
 use clap::Args;
+use pmetal_core::jobs::MergeSpec;
 
 /// Thin clap argument struct for `pmetal merge`.
 #[derive(Args, Debug)]
@@ -44,4 +45,21 @@ pub struct MergeArgs {
     /// Output dtype (float32, float16, bfloat16)
     #[arg(long = "dtype", default_value = "bfloat16")]
     pub dtype: String,
+}
+
+impl From<MergeArgs> for MergeSpec {
+    fn from(a: MergeArgs) -> Self {
+        MergeSpec {
+            model_a: a.model_a,
+            model_b: a.model_b,
+            output: a.output,
+            method: a.method,
+            base: a.base,
+            t: a.t,
+            weight_a: a.weight_a,
+            weight_b: a.weight_b,
+            density: a.density,
+            dtype: a.dtype,
+        }
+    }
 }

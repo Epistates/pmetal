@@ -34,8 +34,8 @@ use pmetal_runtime::compat::Array;
 use pmetal_vocoder::{BigVGAN, Result};
 
 /// `mel` is `[batch, mel_bins, frames]`; the result is `[batch, 1, samples]`.
-fn vocode(mel: &Array) -> Result<Array> {
-    let vocoder = BigVGAN::from_pretrained("nvidia/bigvgan_v2_24khz_100band_256x")?;
+async fn vocode(mel: &Array) -> Result<Array> {
+    let vocoder = BigVGAN::from_pretrained("nvidia/bigvgan_v2_24khz_100band_256x").await?;
     vocoder.forward(mel)
 }
 ```

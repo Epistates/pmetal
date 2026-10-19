@@ -1,8 +1,9 @@
 //! Clap argument struct for `pmetal distill`.
 
 use clap::Args;
+use pmetal_core::jobs::DistillSpec;
 
-/// Thin clap argument struct for `pmetal distill`.
+/// Knowledge distillation from a teacher into a LoRA-adapted student.
 #[derive(Args, Debug)]
 pub struct DistillArgs {
     /// Teacher model ID or path
@@ -22,12 +23,12 @@ pub struct DistillArgs {
     pub eval_dataset: Option<String>,
 
     /// Output directory for distilled student
-    #[arg(short, long = "output", default_value = "./output/distilled")]
+    #[arg(short, long = "output", default_value = pmetal_core::defaults::DISTILL_OUTPUT_DIR)]
     pub output: String,
 
-    /// Distillation method (online, offline, progressive)
-    #[arg(long = "method", default_value = "online")]
-    pub method: String,
+    /// Distillation method
+    #[arg(long = "method", value_enum, default_value_t = DistillMethodArg::Online)]
+    pub method: DistillMethodArg,
 
     /// Shortcut for `--method offline`.
     #[arg(long = "offline")]
@@ -42,19 +43,30 @@ pub struct DistillArgs {
     pub offline_generate: bool,
 
     /// Compression used for newly created offline logit caches.
-    #[arg(long = "offline-compression", default_value = "top_k")]
-    pub offline_compression: String,
+    #[arg(long = "offline-compression", value_enum, default_value_t = OfflineCompressionArg::TopK)]
+    pub offline_compression: OfflineCompressionArg,
 
     /// Top-k width for newly created offline logit caches.
     #[arg(long = "offline-top-k", default_value_t = 128)]
     pub offline_top_k: usize,
 
-    /// Loss type (kl_divergence, jensen_shannon, soft_cross_entropy, mse_loss)
-    #[arg(long = "loss-type", default_value = "kl_divergence")]
-    pub loss_type: String,
+    /// Loss: forward or reverse KL, Jensen-Shannon, soft cross-entropy, MSE on
+    /// the logits, the skewed JSD (with --on-policy it is GKD) or skew KL of
+    /// DistiLLM, or universal_logit for a teacher with another tokenizer
+    #[arg(long = "loss-type", value_enum, default_value_t = LossTypeArg::KlDivergence)]
+    pub loss_type: LossTypeArg,
+
+    /// Mixing weight of jsd_skewed (default 0.5, the symmetric JSD) and of
+    /// skew_kl / skew_reverse_kl (default 0.1)
+    #[arg(long = "skew-alpha")]
+    pub skew_alpha: Option<f32>,
+
+    /// Entries universal_logit keeps before sorting (default: the whole vocabulary)
+    #[arg(long = "universal-logit-top-k")]
+    pub universal_logit_top_k: Option<usize>,
 
     /// Softmax temperature
-    #[arg(long = "temperature", default_value = "2.0")]
+    #[arg(long = "temperature", default_value_t = 2.0)]
     pub temperature: f32,
 
     /// Alpha for blending hard/soft targets (0.0 to 1.0)
@@ -129,9 +141,9 @@ pub struct DistillArgs {
     #[arg(long = "text-columns", value_delimiter = ',')]
     pub text_columns: Option<Vec<String>>,
 
-    /// Separator used when joining multiple text columns.
-    #[arg(long = "column-separator", default_value = "\n\n")]
-    pub column_separator: String,
+    /// Separator used when joining multiple text columns (default: a blank line).
+    #[arg(long = "column-separator")]
+    pub column_separator: Option<String>,
 
     /// Column name for the prompt portion (enables SFT label masking).
     #[arg(long = "prompt-column")]
@@ -144,4 +156,136 @@ pub struct DistillArgs {
     /// Path to write JSONL metrics log (for TUI dashboard)
     #[arg(long = "log-metrics")]
     pub log_metrics: Option<String>,
+}
+
+/// The distillation method.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DistillMethodArg {
+    /// The teacher runs beside the student
+    Online,
+    /// Teacher logits cached on disk first
+    Offline,
+    /// The teacher's influence is reduced over the run
+    Progressive,
+}
+
+impl DistillMethodArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Online => "online",
+            Self::Offline => "offline",
+            Self::Progressive => "progressive",
+        }
+    }
+}
+
+/// How an offline logit cache is stored.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[value(rename_all = "snake_case")]
+pub enum OfflineCompressionArg {
+    /// The top-k logits of each position
+    TopK,
+    /// Every logit
+    None,
+    /// 8-bit quantized
+    Int8,
+    /// 4-bit quantized
+    Int4,
+    /// Draws from the teacher's distribution
+    Sampled,
+}
+
+impl OfflineCompressionArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TopK => "top_k",
+            Self::None => "none",
+            Self::Int8 => "int8",
+            Self::Int4 => "int4",
+            Self::Sampled => "sampled",
+        }
+    }
+}
+
+/// The distillation loss.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[value(rename_all = "snake_case")]
+pub enum LossTypeArg {
+    /// Forward KL, teacher to student
+    KlDivergence,
+    /// Reverse KL, student to teacher
+    ReverseKl,
+    /// Jensen-Shannon divergence
+    JensenShannon,
+    /// Cross-entropy against the teacher's soft targets
+    SoftCrossEntropy,
+    /// Mean squared error on the logits
+    MseLoss,
+    /// Skewed generalized JSD (GKD's divergence), mixing weight --skew-alpha
+    JsdSkewed,
+    /// DistiLLM's skew KL, mixing weight --skew-alpha
+    SkewKl,
+    /// DistiLLM's skew reverse KL, mixing weight --skew-alpha
+    SkewReverseKl,
+    /// Universal logit distillation, for a teacher with another tokenizer
+    UniversalLogit,
+}
+
+impl LossTypeArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::KlDivergence => "kl_divergence",
+            Self::ReverseKl => "reverse_kl",
+            Self::JensenShannon => "jensen_shannon",
+            Self::SoftCrossEntropy => "soft_cross_entropy",
+            Self::MseLoss => "mse_loss",
+            Self::JsdSkewed => "jsd_skewed",
+            Self::SkewKl => "skew_kl",
+            Self::SkewReverseKl => "skew_reverse_kl",
+            Self::UniversalLogit => "universal_logit",
+        }
+    }
+}
+
+impl From<DistillArgs> for DistillSpec {
+    fn from(a: DistillArgs) -> Self {
+        DistillSpec {
+            teacher: a.teacher,
+            student: a.student,
+            dataset: a.dataset,
+            eval_dataset: a.eval_dataset,
+            output_dir: a.output,
+            method: a.method.as_str().to_string(),
+            offline: a.offline,
+            offline_cache: a.offline_cache,
+            offline_generate: a.offline_generate,
+            offline_compression: a.offline_compression.as_str().to_string(),
+            offline_top_k: a.offline_top_k,
+            loss_type: a.loss_type.as_str().to_string(),
+            skew_alpha: a.skew_alpha,
+            universal_logit_top_k: a.universal_logit_top_k,
+            temperature: a.temperature,
+            alpha: a.alpha,
+            rationale: a.rationale,
+            rationale_weight: a.rationale_weight,
+            on_policy: a.on_policy,
+            on_policy_max_tokens: a.on_policy_max_tokens,
+            lora_r: a.lora_r,
+            lora_alpha: a.lora_alpha,
+            learning_rate: a.learning_rate,
+            optimizer: a.optimizer.to_string(),
+            batch_size: a.batch_size,
+            epochs: a.epochs,
+            max_seq_len: a.max_seq_len,
+            seed: a.seed,
+            checkpoint_every: a.checkpoint_every,
+            text_column: a.text_column,
+            text_columns: a.text_columns.map(|names| names.join(",")),
+            column_separator: a.column_separator,
+            prompt_column: a.prompt_column,
+            response_column: a.response_column,
+            log_metrics: a.log_metrics,
+            resume: a.resume,
+        }
+    }
 }

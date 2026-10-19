@@ -11,7 +11,10 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use pmetal_core::SecretString;
-use pmetal_hub::{download_dataset_parquet, download_model, find_cached_model};
+use pmetal_hub::{
+    DownloadOptions, download_dataset_parquet, download_model, download_tokenizer_with,
+    find_cached_model,
+};
 use support::fixtures::{gguf_file, safetensors_file};
 use support::{Access, FakeHub, Kind, Repo, commit_id};
 
@@ -253,4 +256,67 @@ async fn finding_a_split_does_not_probe_the_hub_with_guesses() {
         requests <= 10,
         "listing the repository once is enough; {requests} requests were made"
     );
+}
+
+#[tokio::test]
+async fn a_tokenizer_download_fetches_the_tokenizer_files_and_no_weights() {
+    let hub = hub();
+    hub.add_model(
+        "tok/only",
+        Repo::with_files(&[
+            ("config.json", CONFIG),
+            ("model.safetensors", &safetensors_file("w", 4000)),
+            ("tokenizer.json", b"{}"),
+            ("tokenizer_config.json", br#"{"chat_template": "x"}"#),
+            ("generation_config.json", b"{}"),
+        ]),
+    );
+
+    let dir = download_tokenizer_with("tok/only", &DownloadOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(read(&dir, "tokenizer.json"), b"{}");
+    assert_eq!(
+        read(&dir, "tokenizer_config.json"),
+        br#"{"chat_template": "x"}"#
+    );
+    assert!(!dir.join("model.safetensors").exists());
+    assert!(!dir.join("config.json").exists());
+    let downloaded: Vec<String> = hub
+        .downloaded()
+        .into_iter()
+        .filter(|f| f.contains("tok/only"))
+        .collect();
+    assert!(
+        !downloaded.iter().any(|f| f.contains("model.safetensors")),
+        "the weights were fetched: {downloaded:?}"
+    );
+    // The snapshot is a tokenizer, not a model: a model lookup must not
+    // mistake it for one.
+    assert!(find_cached_model("tok/only").is_none());
+    // And asking again is answered from the cache.
+    let requests_before = hub.requests_to("tok/only").len();
+    let again = download_tokenizer_with("tok/only", &DownloadOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(again, dir);
+    assert_eq!(hub.requests_to("tok/only").len(), requests_before);
+}
+
+#[tokio::test]
+async fn a_repository_without_a_tokenizer_json_says_so() {
+    let hub = hub();
+    hub.add_model(
+        "tok/none",
+        Repo::with_files(&[
+            ("config.json", CONFIG),
+            ("model.safetensors", &safetensors_file("w", 100)),
+        ]),
+    );
+    let err = download_tokenizer_with("tok/none", &DownloadOptions::default())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no tokenizer.json"), "{err}");
 }

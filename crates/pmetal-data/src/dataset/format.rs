@@ -71,6 +71,44 @@ pub struct DatasetColumnConfig {
     pub response_column: Option<String>,
 }
 
+impl DatasetColumnConfig {
+    /// The configuration the column-selection options of a command ask for,
+    /// or `None` when none of them names a column, which leaves the format
+    /// detection to the rows. `text_columns` is the comma-separated form the
+    /// job specs spell; blanks around a name are dropped, as are empty names.
+    #[must_use]
+    pub fn from_selectors(
+        text_column: Option<String>,
+        text_columns: Option<&str>,
+        column_separator: Option<String>,
+        prompt_column: Option<String>,
+        response_column: Option<String>,
+    ) -> Option<Self> {
+        let text_columns = text_columns.map(|csv| {
+            csv.split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        });
+        let text_columns = text_columns.filter(|names| !names.is_empty());
+        if text_column.is_none()
+            && text_columns.is_none()
+            && prompt_column.is_none()
+            && response_column.is_none()
+        {
+            return None;
+        }
+        Some(Self {
+            text_column,
+            text_columns,
+            column_separator,
+            prompt_column,
+            response_column,
+        })
+    }
+}
+
 /// Columns that can hold the prompt of a prompt/completion row.
 const PROMPT_FIELDS: &[&str] = &["prompt", "question", "query", "input"];
 /// Columns that can hold the completion of a prompt/completion row.
@@ -183,6 +221,41 @@ impl DatasetFormat {
         })
     }
 
+    /// Read one row as a conversation where it is a question and its answer:
+    /// an Alpaca row's instruction (and input) is the user turn and its
+    /// output the assistant's, a reasoning row's problem the user turn and its
+    /// thinking and solution the answer, a prompt and completion of text the
+    /// same. Every other row is read as [`parse`](Self::parse) reads it.
+    ///
+    /// Training leaves such rows as the completion they are (the prompt
+    /// masked, no chat template); this is for putting them in a model's chat
+    /// format.
+    pub(crate) fn parse_as_chat(&self, row: &Row) -> Result<Example> {
+        match self {
+            Self::Auto => Self::detect(row)?.parse_as_chat(row),
+            Self::Alpaca => {
+                let (instruction, input, output) = alpaca_fields(row)?;
+                let question = if input.is_empty() {
+                    instruction
+                } else {
+                    format!("{instruction}\n\n{input}")
+                };
+                Ok(question_and_answer(question, output))
+            }
+            Self::Reasoning => {
+                let (problem, answer) = reasoning_parts(row);
+                Ok(question_and_answer(problem, answer))
+            }
+            Self::PromptCompletion => match self.parse(row)? {
+                Example::Completion { prompt, completion } => {
+                    Ok(question_and_answer(prompt, completion))
+                }
+                other => Ok(other),
+            },
+            _ => self.parse(row),
+        }
+    }
+
     /// Read one row in this format.
     ///
     /// `Auto` is resolved against this row; callers that read many rows
@@ -272,7 +345,8 @@ pub(crate) fn effective_format(
 
 // -- text and completions ------------------------------------------------------
 
-fn parse_alpaca(row: &Row) -> Result<Example> {
+/// The instruction, input (empty when there is none) and output of an Alpaca row.
+fn alpaca_fields(row: &Row) -> Result<(String, String, String)> {
     let instruction = required_text(row, "instruction", "An Alpaca row")?;
     let input = field(row, "input")
         .and_then(scalar_text)
@@ -283,8 +357,13 @@ fn parse_alpaca(row: &Row) -> Result<Example> {
             column_names(row)
         ))
     })?;
-    let completion = scalar_text(output)
+    let output = scalar_text(output)
         .ok_or_else(|| invalid("An Alpaca row's output is not text".to_string()))?;
+    Ok((instruction, input, output))
+}
+
+fn parse_alpaca(row: &Row) -> Result<Example> {
+    let (instruction, input, completion) = alpaca_fields(row)?;
     let prompt = if input.is_empty() {
         format!("### Instruction:\n{instruction}\n\n### Response:\n")
     } else {
@@ -293,17 +372,33 @@ fn parse_alpaca(row: &Row) -> Result<Example> {
     Ok(Example::Completion { prompt, completion })
 }
 
-fn parse_reasoning(row: &Row) -> Result<Example> {
+/// The problem of a reasoning row and the answer to it, the thinking in
+/// `<think>` tags ahead of the solution.
+fn reasoning_parts(row: &Row) -> (String, String) {
     let text = |key: &str| field(row, key).and_then(scalar_text).unwrap_or_default();
     let (problem, thinking, solution) = (text("problem"), text("thinking"), text("solution"));
-    let completion = if thinking.is_empty() {
+    let answer = if thinking.is_empty() {
         solution
     } else {
         format!("<think>\n{thinking}\n</think>\n\n{solution}")
     };
+    (problem, answer)
+}
+
+fn parse_reasoning(row: &Row) -> Result<Example> {
+    let (problem, completion) = reasoning_parts(row);
     Ok(Example::Completion {
         prompt: format!("{problem}\n\n"),
         completion,
+    })
+}
+
+/// A user turn and the assistant's answer to it.
+fn question_and_answer(question: String, answer: String) -> Example {
+    Example::Chat(Conversation {
+        messages: vec![Message::user(question), Message::assistant(answer)],
+        tools: Vec::new(),
+        trained: vec![None, None],
     })
 }
 
@@ -827,6 +922,28 @@ mod tests {
     }
 
     #[test]
+    fn column_selectors_make_a_config_only_when_they_name_a_column() {
+        let none = DatasetColumnConfig::from_selectors(None, None, Some("|".into()), None, None);
+        assert!(none.is_none(), "a separator alone selects nothing");
+        let blank = DatasetColumnConfig::from_selectors(None, Some(" , "), None, None, None);
+        assert!(blank.is_none(), "blank names select nothing");
+        let some = DatasetColumnConfig::from_selectors(
+            None,
+            Some("a, b,,c"),
+            Some("|".into()),
+            Some("q".into()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            some.text_columns.as_deref(),
+            Some(&["a".to_string(), "b".into(), "c".into()][..])
+        );
+        assert_eq!(some.column_separator.as_deref(), Some("|"));
+        assert_eq!(some.prompt_column.as_deref(), Some("q"));
+    }
+
+    #[test]
     fn column_flags_ask_for_a_custom_format_only_when_they_name_something() {
         let none = DatasetColumnConfig::default();
         assert_eq!(
@@ -859,5 +976,46 @@ mod tests {
             effective_format(DatasetFormat::Auto, Some(&reasoning)),
             DatasetFormat::Reasoning
         );
+    }
+
+    #[test]
+    fn instruction_rows_read_as_a_conversation_for_a_chat_template() {
+        let chat = |value: Value| match DatasetFormat::Auto.parse_as_chat(&row(value)).unwrap() {
+            Example::Chat(c) => c
+                .messages
+                .into_iter()
+                .map(|m| (m.role, m.content))
+                .collect::<Vec<_>>(),
+            other => panic!("not a conversation: {other:?}"),
+        };
+        let pair =
+            |q: &str, a: &str| vec![("user".into(), q.into()), ("assistant".into(), a.into())];
+        assert_eq!(
+            chat(json!({"instruction": "Say hi", "input": "politely", "output": "Hello!"})),
+            pair("Say hi\n\npolitely", "Hello!")
+        );
+        assert_eq!(
+            chat(json!({"instruction": "Say hi", "output": "Hello!"})),
+            pair("Say hi", "Hello!")
+        );
+        assert_eq!(
+            chat(json!({"problem": "2+2?", "thinking": "add", "solution": "4"})),
+            pair("2+2?", "<think>\nadd\n</think>\n\n4")
+        );
+        assert_eq!(
+            chat(json!({"prompt": "Q", "completion": "A"})),
+            pair("Q", "A")
+        );
+        // A conversation stays what it is, and a document is not one.
+        assert_eq!(
+            chat(json!({"messages": [{"role": "user", "content": "q"}]})),
+            vec![("user".to_string(), "q".to_string())]
+        );
+        assert!(matches!(
+            DatasetFormat::Auto
+                .parse_as_chat(&row(json!({"text": "plain"})))
+                .unwrap(),
+            Example::Text(_)
+        ));
     }
 }

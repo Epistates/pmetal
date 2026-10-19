@@ -85,6 +85,18 @@ impl TextSample {
         }
     }
 
+    /// How many tokens this sample has in training: the length
+    /// [`TrainingDataset::load`](super::TrainingDataset::load) tokenizes it
+    /// to before truncation. Text no chat template rendered gets the
+    /// tokenizer's special tokens and an end-of-sequence token; rendered text
+    /// is counted as it stands.
+    ///
+    /// # Errors
+    /// If the tokenizer fails on the text.
+    pub fn token_len(&self, tokenizer: &Tokenizer) -> Result<usize> {
+        Ok(tokenize(tokenizer, self, usize::MAX)?.original_len)
+    }
+
     /// The trained byte ranges, `None` for all of the text.
     fn spans(&self) -> Option<Cow<'_, [Range<usize>]>> {
         if let Some(spans) = &self.trained {

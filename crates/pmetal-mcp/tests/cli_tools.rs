@@ -133,8 +133,8 @@ async fn paths_are_checked_and_options_are_closed() {
     assert!(message.contains("unknown parameter `verbose`"), "{message}");
     let message = h
         .call_err(
-            "dataset_convert",
-            json!({"input": h.path("a"), "output": h.path("b"), "format": "xml"}),
+            "dataset_template",
+            json!({"input": h.path("a"), "output": h.path("b"), "template": "klingon"}),
         )
         .await;
     assert!(message.contains("one of"), "{message}");

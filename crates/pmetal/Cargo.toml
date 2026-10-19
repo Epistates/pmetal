@@ -19,7 +19,7 @@ required-features = ["cli"]
 # `pmetal cluster` subcommand and the trainer's `--distributed-auto` flag.
 # Library consumers who don't want libp2p in their dependency tree can
 # opt out via `pmetal = { version = "x", default-features = false, features = [...] }`.
-default = ["cli", "dashboard", "trainer", "lora", "merge", "ane", "distributed"]
+default = ["cli", "dashboard", "trainer", "lora", "merge", "vocoder", "ane", "distributed"]
 
 # Foundation crates (no MLX dependency)
 core = ["dep:pmetal-core"]
@@ -55,10 +55,9 @@ full = [
 # CLI: adds the pmetal binary + all CLI-specific dependencies
 cli = [
     "core", "gguf", "metal", "hub", "runtime", "cache", "models", "data",
-    "dep:clap", "dep:tokio", "dep:tracing-subscriber",
+    "dep:clap", "dep:clap_complete", "dep:tokio", "dep:tracing-subscriber",
     "dep:serde", "dep:serde-saphyr", "dep:indicatif", "dep:anyhow",
     "dep:safetensors", "dep:dirs", "dep:chrono",
-    "dep:parquet", "dep:arrow-array", "dep:arrow-json",
     "dep:rand", "dep:regex", "dep:tempfile", "dep:tokenizers",
     "dep:walkdir", "dep:flate2", "dep:libc", "dep:sha2",
 ]
@@ -99,6 +98,7 @@ half = { workspace = true }
 
 # CLI dependencies (optional, behind "cli" feature)
 clap = { workspace = true, optional = true }
+clap_complete = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
@@ -108,9 +108,6 @@ anyhow = { workspace = true, optional = true }
 safetensors = { workspace = true, optional = true }
 dirs = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
-parquet = { workspace = true, features = ["arrow"], optional = true }
-arrow-array = { workspace = true, optional = true }
-arrow-json = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 regex = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
@@ -131,6 +128,9 @@ flate2 = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+# Parquet fixtures for the dataset commands
+arrow = { workspace = true }
+parquet = { workspace = true }
 # Fail every test at the bridge op that throws (pmetal-runtime `strict-errors`).
 pmetal-runtime = { workspace = true, features = ["strict-errors"] }
 tracing-subscriber = { workspace = true }

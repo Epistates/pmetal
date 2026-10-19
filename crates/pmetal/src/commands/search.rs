@@ -1,51 +1,15 @@
+use crate::cli::hub::SearchArgs;
 use indicatif::ProgressBar;
 
 /// Context length the search results are sized for.
 const FIT_CONTEXT: u32 = 4096;
 
-/// How search results are ordered.
-#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SortArg {
-    /// Most downloaded in the last 30 days
-    Downloads,
-    /// Most liked
-    Likes,
-    /// Trending
-    Trending,
-    /// Most recently updated
-    Updated,
-}
-
-impl From<SortArg> for pmetal_hub::search::SearchSort {
-    fn from(arg: SortArg) -> Self {
-        match arg {
-            SortArg::Downloads => Self::Downloads,
-            SortArg::Likes => Self::Likes,
-            SortArg::Trending => Self::Trending,
-            SortArg::Updated => Self::Updated,
-        }
-    }
-}
-
-/// What `pmetal search` was asked for.
-pub(crate) struct SearchRequest {
-    pub(crate) query: String,
-    pub(crate) limit: usize,
-    pub(crate) download: bool,
-    pub(crate) detailed: bool,
-    pub(crate) json: bool,
-    pub(crate) tags: Vec<String>,
-    pub(crate) author: Option<String>,
-    pub(crate) pipeline_tag: String,
-    pub(crate) sort: SortArg,
-}
-
 /// Run HuggingFace Hub search with device fit analysis.
-pub(crate) async fn run_search(request: SearchRequest) -> anyhow::Result<()> {
+pub(crate) async fn run_search(request: SearchArgs) -> anyhow::Result<()> {
     use pmetal_hub::search::{SearchOptions, search_models_with};
     use pmetal_hub::{DeviceSpec, FitLevel};
 
-    let SearchRequest {
+    let SearchArgs {
         query,
         limit,
         download,

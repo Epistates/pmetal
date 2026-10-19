@@ -162,23 +162,6 @@ pub struct TrainSpec {
     #[serde(default)]
     pub no_gradient_checkpointing: bool,
 
-    /// Deprecated, has no effect.
-    ///
-    /// One decoder layer is the checkpoint unit, as in PyTorch, so
-    /// there is no block size to pick. Kept on the spec so existing job files
-    /// and `--gradient-checkpointing-layers` still parse; `min = max = 1` stops
-    /// the generated UI offering a control that does nothing.
-    #[job(
-        label = "Gradient Checkpointing Layers (deprecated, no effect)",
-        group = "Optimization",
-        argv = "--gradient-checkpointing-layers",
-        min = 1,
-        max = 1,
-        default_int = 1
-    )]
-    #[serde(default = "default_grad_ckpt_layers")]
-    pub gradient_checkpointing_layers: usize,
-
     #[job(
         label = "Max Grad Norm",
         group = "Optimization",
@@ -198,6 +181,117 @@ pub struct TrainSpec {
     )]
     #[serde(default)]
     pub warmup_steps: usize,
+
+    #[job(
+        label = "Warmup Ratio",
+        group = "Optimization",
+        argv = "--warmup-ratio",
+        min = 0.0,
+        max = 1.0,
+        help = "Share of the optimizer steps spent warming up; replaces Warmup Steps when set"
+    )]
+    #[serde(default)]
+    pub warmup_ratio: Option<f64>,
+
+    #[job(
+        label = "Min LR",
+        group = "Optimization",
+        argv = "--min-lr",
+        min = 0.0,
+        max = 1.0,
+        help = "Floor the decaying schedule stops at (default 0)"
+    )]
+    #[serde(default)]
+    pub min_lr: Option<f64>,
+
+    #[job(
+        label = "WSD Stable Ratio",
+        group = "Optimization",
+        argv = "--wsd-stable-ratio",
+        min = 0.0,
+        max = 1.0,
+        help = "Share of the steps the wsd schedule holds the peak rate for (default 0.7)"
+    )]
+    #[serde(default)]
+    pub wsd_stable_ratio: Option<f64>,
+
+    #[job(
+        label = "WSD Decay Style",
+        group = "Optimization",
+        argv = "--wsd-decay-style",
+        kind = "enum",
+        enum_options = ["linear", "cosine", "one_minus_sqrt"],
+        help = "Shape of the wsd schedule's final decay (default linear)"
+    )]
+    #[serde(default)]
+    pub wsd_decay_style: Option<String>,
+
+    #[job(
+        label = "Cosine Cycles",
+        group = "Optimization",
+        argv = "--cosine-num-restarts",
+        min = 1,
+        max = 1000,
+        help = "Cycles of the cosine_with_restarts schedule (default 1)"
+    )]
+    #[serde(default)]
+    pub cosine_num_restarts: Option<usize>,
+
+    #[job(
+        label = "Polynomial Power",
+        group = "Optimization",
+        argv = "--polynomial-power",
+        min = 0.0,
+        max = 100.0,
+        help = "Exponent of the polynomial schedule (default 1, linear)"
+    )]
+    #[serde(default)]
+    pub polynomial_power: Option<f64>,
+
+    #[job(
+        label = "Max Steps",
+        group = "Training",
+        argv = "--max-steps",
+        min = 1,
+        max = 1000000000,
+        help = "Stop after this many optimizer steps, whatever the epochs say"
+    )]
+    #[serde(default)]
+    pub max_steps: Option<usize>,
+
+    #[job(
+        label = "Logging Steps",
+        group = "Training",
+        argv = "--logging-steps",
+        min = 1,
+        max = 1000000,
+        default_int = 10,
+        help = "Log the loss every this many optimizer steps"
+    )]
+    #[serde(default = "default_logging_steps")]
+    pub logging_steps: usize,
+
+    #[job(
+        label = "Eval Steps",
+        group = "Training",
+        argv = "--eval-steps",
+        min = 1,
+        max = 1000000,
+        help = "Evaluate every this many optimizer steps (needs an eval dataset; default 100)"
+    )]
+    #[serde(default)]
+    pub eval_steps: Option<usize>,
+
+    #[job(
+        label = "Save Steps",
+        group = "Training",
+        argv = "--save-steps",
+        min = 1,
+        max = 1000000,
+        help = "Write a checkpoint every this many optimizer steps (default 500)"
+    )]
+    #[serde(default)]
+    pub save_steps: Option<usize>,
 
     #[job(
         label = "Weight Decay",
@@ -301,6 +395,16 @@ pub struct TrainSpec {
     )]
     #[serde(default)]
     pub lora_dropout: f32,
+
+    #[job(
+        label = "LoRA Targets (csv)",
+        group = "LoRA",
+        argv = "--lora-targets",
+        csv,
+        help = "Projections to adapt, e.g. q_proj,v_proj; empty adapts every linear layer. MoE routers never are"
+    )]
+    #[serde(default)]
+    pub lora_targets: Vec<String>,
 
     #[job(
         label = "Quantization",
@@ -441,6 +545,11 @@ pub struct TrainSpec {
     #[job(skip_descriptor, argv = "--resume", flag, default_bool = false)]
     #[serde(default)]
     pub resume: bool,
+
+    /// Write per-step metrics as JSONL to this path.
+    #[job(skip_descriptor, argv = "--log-metrics")]
+    #[serde(default)]
+    pub log_metrics: Option<String>,
 }
 
 impl Default for TrainSpec {
@@ -460,9 +569,18 @@ impl Default for TrainSpec {
             max_seq_len: 0,
             gradient_accumulation_steps: default_grad_accum(),
             no_gradient_checkpointing: false,
-            gradient_checkpointing_layers: default_grad_ckpt_layers(),
             max_grad_norm: default_max_grad_norm(),
             warmup_steps: 0,
+            warmup_ratio: None,
+            min_lr: None,
+            wsd_stable_ratio: None,
+            wsd_decay_style: None,
+            cosine_num_restarts: None,
+            polynomial_power: None,
+            max_steps: None,
+            logging_steps: default_logging_steps(),
+            eval_steps: None,
+            save_steps: None,
             weight_decay: default_weight_decay(),
             optimizer: super::default_optimizer(),
             lr_schedule: default_lr_schedule(),
@@ -473,6 +591,7 @@ impl Default for TrainSpec {
             dora: false,
             rslora: false,
             lora_dropout: 0.0,
+            lora_targets: Vec::new(),
             quantization: None,
             quant_block_size: default_quant_block_size(),
             double_quant: false,
@@ -491,14 +610,24 @@ impl Default for TrainSpec {
             compression_strategy: default_compression_strategy(),
             config_path: None,
             resume: false,
+            log_metrics: None,
         }
     }
 }
 
 impl TrainSpec {
     /// Apply cross-field defaults / sentinels and run descriptor validation.
+    ///
+    /// With a config file (`--config`) the model and dataset may come from
+    /// the file, so their being empty is not an error here; the trainer checks
+    /// them once the file's values are merged in.
     pub fn normalize(&mut self) -> Result<(), Vec<FieldError>> {
-        let errs = self.validate_descriptors();
+        let mut errs = self.validate_descriptors();
+        if self.config_path.is_some() {
+            errs.retain(|e| {
+                !(matches!(e.field.as_str(), "model" | "dataset") && e.message == "required")
+            });
+        }
         if errs.is_empty() { Ok(()) } else { Err(errs) }
     }
 
@@ -512,6 +641,7 @@ impl TrainSpec {
             dropout: self.lora_dropout,
             use_rslora: self.rslora,
             use_dora: self.dora,
+            target_modules: self.lora_targets.clone(),
             ..Default::default()
         }
     }
@@ -528,16 +658,29 @@ impl TrainSpec {
             batch_size: self.batch_size,
             gradient_accumulation_steps: self.gradient_accumulation_steps,
             num_epochs: self.epochs,
+            max_steps: self.max_steps,
             warmup_steps: self.warmup_steps,
+            warmup_ratio: self.warmup_ratio,
             weight_decay: self.weight_decay,
             max_grad_norm: self.max_grad_norm,
             lr_scheduler: super::parse_lr_scheduler(&self.lr_schedule)?,
+            min_lr: self.min_lr,
+            wsd_stable_ratio: self.wsd_stable_ratio,
+            wsd_decay_style: self
+                .wsd_decay_style
+                .as_deref()
+                .map(str::parse)
+                .transpose()?,
+            cosine_num_restarts: self.cosine_num_restarts,
+            polynomial_power: self.polynomial_power,
+            logging_steps: self.logging_steps,
+            eval_steps: self.eval_steps,
+            save_steps: self.save_steps,
             optimizer: super::parse_optimizer(&self.optimizer)?,
             seed: self.seed,
             output_dir: self.output_dir.clone(),
             max_seq_len: self.max_seq_len,
             use_packing: !self.no_sequence_packing,
-            ..Default::default()
         })
     }
 
@@ -585,9 +728,6 @@ fn default_epochs() -> usize {
 fn default_grad_accum() -> usize {
     defaults::GRADIENT_ACCUMULATION_STEPS
 }
-fn default_grad_ckpt_layers() -> usize {
-    1
-}
 fn default_max_grad_norm() -> f64 {
     defaults::MAX_GRAD_NORM
 }
@@ -608,6 +748,9 @@ fn default_lora_r() -> usize {
 }
 fn default_lora_alpha() -> f32 {
     defaults::LORA_ALPHA
+}
+fn default_logging_steps() -> usize {
+    defaults::LOGGING_STEPS
 }
 fn default_quant_block_size() -> usize {
     64

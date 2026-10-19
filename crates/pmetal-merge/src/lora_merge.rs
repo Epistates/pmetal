@@ -528,16 +528,24 @@ enum AdapterPart {
     B,
     /// DoRA magnitude vector, one entry per output row.
     Magnitude,
+    /// A stacked expert projection's down-projections, `[experts, r, in]`.
+    ExpertA,
+    /// A stacked expert projection's up-projections, `[experts, out, r]`.
+    ExpertB,
 }
 
 /// Split an adapter tensor name into its module path and what it holds.
 ///
 /// PEFT: `base_model.model.<module>.lora_A.weight` (also `lora_B`, and
-/// `lora_magnitude_vector[.weight]`). Native (`pmetal train`):
-/// `<module>.lora_a`, `.lora_b`, `.lora_magnitude`.
+/// `lora_magnitude_vector[.weight]`); a routed experts' stacked projection
+/// (`<layer>.switch_mlp.<proj>`) has `lora_expert_A` / `lora_expert_B`, one
+/// factor pair per expert. Native (`pmetal train`): `<module>.lora_a`,
+/// `.lora_b`, `.lora_magnitude`.
 fn classify_adapter_tensor(name: &str) -> Option<(&str, AdapterPart)> {
     let name = name.strip_prefix(ADAPTER_PREFIX).unwrap_or(name);
-    const SUFFIXES: [(&str, AdapterPart); 7] = [
+    const SUFFIXES: [(&str, AdapterPart); 9] = [
+        (".lora_expert_A", AdapterPart::ExpertA),
+        (".lora_expert_B", AdapterPart::ExpertB),
         (".lora_A.weight", AdapterPart::A),
         (".lora_B.weight", AdapterPart::B),
         (".lora_magnitude_vector.weight", AdapterPart::Magnitude),
@@ -562,6 +570,117 @@ struct LoraTarget {
     scaling: f64,
 }
 
+/// One expert's share of a base tensor: `W[expert][rows..] += scaling · B_e A_e`.
+#[derive(Debug, Clone)]
+struct ExpertPatch {
+    /// The adapter's `[experts, r, in]` and `[experts, out, r]` tensors.
+    a: String,
+    b: String,
+    scaling: f64,
+    /// Which expert of the adapter.
+    adapter_expert: usize,
+    /// The expert's slot in a stacked base tensor `[experts, rows, cols]`;
+    /// `None` when the base tensor is that one expert's `[rows, cols]`.
+    base_expert: Option<usize>,
+    /// First row of the expert's `[out, in]` block the patch covers (a fused
+    /// gate and up projection share a block, the up half below the gate's).
+    row_offset: usize,
+}
+
+/// Everything an adapter folds into: dense weights and the experts' tensors.
+struct Targets {
+    dense: HashMap<String, LoraTarget>,
+    /// By base tensor name.
+    experts: HashMap<String, Vec<ExpertPatch>>,
+}
+
+impl Targets {
+    fn len(&self) -> usize {
+        self.dense.len() + self.experts.len()
+    }
+}
+
+/// The base tensors holding the experts of an adapted stacked projection
+/// `module` (`<layer>.switch_mlp.<proj>`), in the layout the checkpoint uses:
+///
+/// * stacked, `<module>.weight` `[experts, out, in]` (an MLX conversion);
+/// * one tensor per expert, `<layer>.experts.{e}.<proj>.weight` (the released
+///   layout);
+/// * fused, `<layer>.experts.gate_up_proj` (the gate projection above the up
+///   projection) and `<layer>.experts.down_proj` (transformers 5).
+///
+/// `fc1` / `fc2` of a gate-less expert (Nemotron-H) are `up_proj` / `down_proj`
+/// in the released layout.
+fn expert_patches(
+    module: &str,
+    experts: usize,
+    out_rows: usize,
+    base_names: &HashSet<&str>,
+    make: impl Fn(Option<usize>, usize, usize) -> ExpertPatch,
+) -> Result<Option<Vec<(String, ExpertPatch)>>> {
+    let exists = |name: &str| base_names.contains(name);
+    // The adapter names modules as the Hugging Face model does, and a native
+    // base may drop the leading `model.`.
+    let prefixes = ["", "model."];
+
+    for prefix in prefixes {
+        let stacked = format!("{prefix}{module}.weight");
+        if exists(&stacked) {
+            return Ok(Some(
+                (0..experts)
+                    .map(|e| (stacked.clone(), make(Some(e), e, 0)))
+                    .collect(),
+            ));
+        }
+    }
+
+    let Some((layer, projection)) = module.split_once(".switch_mlp.") else {
+        return Ok(None);
+    };
+    let released = match projection {
+        "fc1" => "up_proj",
+        "fc2" => "down_proj",
+        other => other,
+    };
+    for prefix in prefixes {
+        let layer = format!("{prefix}{layer}");
+        let names: Vec<String> = (0..experts)
+            .map(|e| format!("{layer}.experts.{e}.{released}.weight"))
+            .collect();
+        let present = names.iter().filter(|n| exists(n)).count();
+        if present == experts {
+            return Ok(Some(
+                names
+                    .into_iter()
+                    .enumerate()
+                    .map(|(e, name)| (name, make(None, e, 0)))
+                    .collect(),
+            ));
+        }
+        if present > 0 {
+            let missing = names.iter().find(|n| !exists(n)).expect("one is missing");
+            return Err(MergeError::InvalidConfig(format!(
+                "the base model holds {present} of the {experts} experts of '{module}' \
+                 ({missing} is missing)"
+            )));
+        }
+        let (fused, row_offset) = match released {
+            "gate_proj" => (format!("{layer}.experts.gate_up_proj"), 0),
+            "up_proj" => (format!("{layer}.experts.gate_up_proj"), out_rows),
+            "down_proj" => (format!("{layer}.experts.down_proj"), 0),
+            _ => continue,
+        };
+        if exists(&fused) {
+            return Ok(Some(
+                (0..experts)
+                    .map(|e| (fused.clone(), make(Some(e), e, row_offset)))
+                    .collect(),
+            ));
+        }
+    }
+    Ok(None)
+}
+
 /// Map each adapted base weight to its [`LoraTarget`].
 ///
 /// The base weight of module `m` is `m.weight`, or `model.m.weight` (the
@@ -573,11 +692,13 @@ fn discover_targets(
     adapter: &MappedFile,
     cfg: &AdapterConfigJson,
     scaling_override: Option<f64>,
-) -> Result<HashMap<String, LoraTarget>> {
+) -> Result<Targets> {
     struct Parts {
         a: Option<String>,
         b: Option<String>,
         magnitude: Option<String>,
+        expert_a: Option<String>,
+        expert_b: Option<String>,
     }
     let mut modules: BTreeMap<&str, Parts> = BTreeMap::new();
     let mut unsupported: Vec<&str> = Vec::new();
@@ -588,11 +709,15 @@ fn discover_targets(
                     a: None,
                     b: None,
                     magnitude: None,
+                    expert_a: None,
+                    expert_b: None,
                 });
                 let slot = match part {
                     AdapterPart::A => &mut parts.a,
                     AdapterPart::B => &mut parts.b,
                     AdapterPart::Magnitude => &mut parts.magnitude,
+                    AdapterPart::ExpertA => &mut parts.expert_a,
+                    AdapterPart::ExpertB => &mut parts.expert_b,
                 };
                 *slot = Some(name.clone());
             }
@@ -612,8 +737,66 @@ fn discover_targets(
     }
 
     let mut targets = HashMap::new();
+    let mut expert_targets: HashMap<String, Vec<ExpertPatch>> = HashMap::new();
     let mut unmatched: Vec<&str> = Vec::new();
     for (module, parts) in &modules {
+        if parts.expert_a.is_some() || parts.expert_b.is_some() {
+            let (Some(a), Some(b)) = (&parts.expert_a, &parts.expert_b) else {
+                return Err(MergeError::InvalidConfig(format!(
+                    "adapter has {} for '{module}' but not its partner",
+                    if parts.expert_a.is_some() {
+                        "lora_expert_A"
+                    } else {
+                        "lora_expert_B"
+                    }
+                )));
+            };
+            if parts.a.is_some() || parts.b.is_some() || parts.magnitude.is_some() {
+                return Err(MergeError::InvalidConfig(format!(
+                    "adapter holds both per-expert and dense factors for '{module}'"
+                )));
+            }
+            let (a_meta, b_meta) = (adapter.tensor_meta(a)?, adapter.tensor_meta(b)?);
+            let (&[experts, rank, _], &[b_experts, out_rows, b_rank]) =
+                (a_meta.shape.as_slice(), b_meta.shape.as_slice())
+            else {
+                return Err(MergeError::InvalidConfig(format!(
+                    "the expert factors of '{module}' are {:?} and {:?}, not [experts, r, in] and \
+                     [experts, out, r]",
+                    a_meta.shape, b_meta.shape
+                )));
+            };
+            if (b_experts, b_rank) != (experts, rank) {
+                return Err(MergeError::ShapeMismatch {
+                    name: format!("expert factors of '{module}'"),
+                    expected: vec![experts as i32, rank as i32],
+                    actual: vec![b_experts as i32, b_rank as i32],
+                });
+            }
+            let scaling = match scaling_override {
+                Some(s) => s,
+                None => cfg.scaling_for(module, rank)?,
+            };
+            let make = |base_expert: Option<usize>, adapter_expert: usize, row_offset: usize| {
+                ExpertPatch {
+                    a: a.clone(),
+                    b: b.clone(),
+                    scaling,
+                    adapter_expert,
+                    base_expert,
+                    row_offset,
+                }
+            };
+            match expert_patches(module, experts, out_rows, base_names, make)? {
+                Some(patches) => {
+                    for (name, patch) in patches {
+                        expert_targets.entry(name).or_default().push(patch);
+                    }
+                }
+                None => unmatched.push(module),
+            }
+            continue;
+        }
         let (Some(a), Some(b)) = (&parts.a, &parts.b) else {
             return Err(MergeError::InvalidConfig(format!(
                 "adapter has {} for '{module}' but not its partner",
@@ -660,12 +843,15 @@ fn discover_targets(
             unmatched[..unmatched.len().min(3)].join(", ")
         )));
     }
-    if targets.is_empty() {
+    if targets.is_empty() && expert_targets.is_empty() {
         return Err(MergeError::InvalidConfig(
             "the adapter holds no LoRA tensors".to_string(),
         ));
     }
-    Ok(targets)
+    Ok(Targets {
+        dense: targets,
+        experts: expert_targets,
+    })
 }
 
 /// Build a mapping from base bias tensor name → adapter bias tensor name.
@@ -865,6 +1051,112 @@ fn merge_and_write_tensor(
     Ok(())
 }
 
+/// Fold per-expert adapters into one base tensor of experts.
+///
+/// The tensor is `[rows, cols]` (one expert) or `[experts, rows, cols]`
+/// (stacked, or fused with the gate above the up projection). Expert by
+/// expert, each patch adds `scaling · B_e A_e` (in f64) to its rows of the
+/// expert's block, so at any moment one expert's delta is live, not the stack's.
+fn merge_and_write_experts(
+    ctx: &MergeContext<'_>,
+    name: &str,
+    base_bytes: &[u8],
+    shape: &[usize],
+    dtype: Dtype,
+    patches: &[ExpertPatch],
+    writer: &mut impl Write,
+) -> Result<()> {
+    let (blocks, rows, cols) = match *shape {
+        [rows, cols] => (1, rows, cols),
+        [experts, rows, cols] => (experts, rows, cols),
+        _ => {
+            return Err(MergeError::InvalidConfig(format!(
+                "expert tensor '{name}' is {shape:?}, not [rows, cols] or [experts, rows, cols]"
+            )));
+        }
+    };
+    let elem = match dtype {
+        Dtype::F16 | Dtype::BF16 => 2usize,
+        Dtype::F32 => 4,
+        other => {
+            return Err(MergeError::ModelLoad(format!(
+                "expert tensor '{name}' is {other:?}: an expert adapter folds into floating-point \
+                 expert weights, not quantized ones"
+            )));
+        }
+    };
+    let block_bytes = rows * cols * elem;
+    if base_bytes.len() != blocks * block_bytes {
+        return Err(MergeError::ShapeMismatch {
+            name: format!("bytes of '{name}'"),
+            expected: vec![(blocks * block_bytes) as i32],
+            actual: vec![base_bytes.len() as i32],
+        });
+    }
+
+    // One expert's `[dim0, dim1]` factor, decoded from the adapter's stack.
+    let factor = |tensor: &str, expert: usize| -> Result<Array2<f64>> {
+        let meta = ctx.adapter.tensor_meta(tensor)?;
+        let [experts, dim0, dim1] = meta.shape[..] else {
+            return Err(MergeError::InvalidConfig(format!(
+                "'{tensor}' is {:?}, not a stack of factors",
+                meta.shape
+            )));
+        };
+        if expert >= experts {
+            return Err(MergeError::InvalidConfig(format!(
+                "'{tensor}' holds {experts} experts, and '{name}' asks for expert {expert}"
+            )));
+        }
+        let size = dtype_elem_size(meta.dtype)?;
+        let at = expert * dim0 * dim1 * size;
+        let bytes = ctx.adapter.tensor_bytes(tensor)?;
+        bytes_to_f64_2d(
+            &bytes[at..at + dim0 * dim1 * size],
+            meta.dtype,
+            &[dim0, dim1],
+            tensor,
+        )
+    };
+
+    for block in 0..blocks {
+        let base_block = &base_bytes[block * block_bytes..(block + 1) * block_bytes];
+        let mut delta = Array2::<f64>::zeros((rows, cols));
+        let mut patched = false;
+        for patch in patches
+            .iter()
+            .filter(|p| p.base_expert.is_none_or(|e| e == block))
+        {
+            let (a, b) = (
+                factor(&patch.a, patch.adapter_expert)?,
+                factor(&patch.b, patch.adapter_expert)?,
+            );
+            let (out_rows, rank) = b.dim();
+            if a.ncols() != cols || a.nrows() != rank || patch.row_offset + out_rows > rows {
+                return Err(MergeError::ShapeMismatch {
+                    name: format!(
+                        "expert {} of '{}' against '{name}'",
+                        patch.adapter_expert, patch.b
+                    ),
+                    expected: vec![rows as i32, cols as i32],
+                    actual: vec![(patch.row_offset + out_rows) as i32, a.ncols() as i32],
+                });
+            }
+            let mut part = b.dot(&a);
+            part *= patch.scaling;
+            let mut window = delta.slice_mut(s![patch.row_offset..patch.row_offset + out_rows, ..]);
+            window += &part;
+            patched = true;
+        }
+        if patched {
+            write_merged_rows(base_block, &delta, rows, cols, dtype, None, writer)?;
+        } else {
+            writer.write_all(base_block)?;
+        }
+    }
+    Ok(())
+}
+
 /// Decode one row of `dtype` bytes into f64.
 fn decode_row(bytes: &[u8], dtype: Dtype, out: &mut [f64]) {
     match dtype {
@@ -977,6 +1269,8 @@ fn write_merged_rows(
 struct MergeContext<'a> {
     adapter: &'a MappedFile,
     targets: &'a HashMap<String, LoraTarget>,
+    /// Per-expert adapters by the base tensor they fold into.
+    experts: &'a HashMap<String, Vec<ExpertPatch>>,
     bias_map: &'a HashMap<String, String>,
     fan_in_fan_out: bool,
     low_memory: bool,
@@ -1299,6 +1593,18 @@ fn merge_shard(
                 if layer.weight.is_none() && layer.scales.is_none() && layer.biases.is_none() {
                     pending.remove(weight_name);
                 }
+            } else if let Some(patches) = ctx.experts.get(name) {
+                debug!("merging {} expert adapter(s) for '{name}'", patches.len());
+                merge_and_write_experts(
+                    ctx,
+                    name,
+                    base_data,
+                    &meta.shape,
+                    meta.dtype,
+                    patches,
+                    writer,
+                )?;
+                stats.tensors_merged += 1;
             } else if let Some(target) = ctx.targets.get(name) {
                 debug!("merging LoRA for '{name}'");
                 let LoraFactors {
@@ -1490,7 +1796,12 @@ fn locate_adapter(adapter_path: &Path) -> Result<(PathBuf, PathBuf)> {
 /// Each adapted weight becomes `W + s·B·A` with `s = alpha / r` (`alpha /
 /// sqrt(r)` under rsLoRA, `alpha_pattern` overriding `alpha` per module), and
 /// DoRA adapters renormalise each output row to their magnitude vector.
-/// MLX-quantized weights are dequantized, folded and quantized again.
+/// MLX-quantized weights are dequantized, folded and quantized again. A
+/// mixture-of-experts adapter (`lora_expert_A` / `lora_expert_B`, one factor
+/// pair per expert) is folded expert by expert into the experts' weights,
+/// whether the base stores them one tensor per expert, fused into
+/// `gate_up_proj` and `down_proj`, or stacked as `switch_mlp`; quantized
+/// experts are refused.
 ///
 /// Non-adapted tensors are copied byte-for-byte (zero-allocation path), and
 /// every output file is written atomically.
@@ -1501,8 +1812,10 @@ fn locate_adapter(adapter_path: &Path) -> Result<(PathBuf, PathBuf)> {
 ///
 /// - `adapter_config.json` is missing or malformed
 /// - the adapter weights are missing
-/// - an adapted module has no weight in the base model, an adapter tensor is
-///   of a kind that cannot be folded, or a factor pair is incomplete
+/// - an adapted module has no weight in the base model (an expert projection
+///   in none of the three layouts, or in a run with an expert missing), an
+///   adapter tensor is of a kind that cannot be folded, or a factor pair is
+///   incomplete
 /// - Base model path does not exist or contains no safetensors files
 /// - A LoRA tensor has an unsupported dtype or unexpected shape
 /// - I/O or serialization errors during output writing
@@ -1592,14 +1905,16 @@ pub fn streaming_lora_merge(config: &AccurateMergeConfig) -> Result<LoraMergeSta
     let targets = discover_targets(&base_names, &adapter, &adapter_cfg, config.scaling)?;
     let bias_map = build_bias_map(&base_name_list, &adapter_names);
     info!(
-        "Identified {} LoRA-adapted tensors, {} adapter biases",
+        "Identified {} LoRA-adapted tensors ({} of experts), {} adapter biases",
         targets.len(),
+        targets.experts.len(),
         bias_map.len()
     );
 
     let ctx = MergeContext {
         adapter: &adapter,
-        targets: &targets,
+        targets: &targets.dense,
+        experts: &targets.experts,
         bias_map: &bias_map,
         fan_in_fan_out: adapter_cfg.fan_in_fan_out,
         low_memory: config.low_memory,
@@ -1925,6 +2240,210 @@ mod tests {
     }
 
     // ---- end-to-end --------------------------------------------------------
+
+    /// An adapter on a 2-expert projection with 2x2 experts, rank 1: expert 0
+    /// adds `[[1,1],[1,1]]` (B = [1,1], A = [1,1]) and expert 1 adds
+    /// `[[2,0],[2,0]]` (B = [1,1], A = [2,0]), both at scaling alpha / r = 1.
+    fn write_expert_adapter(dir: &Path, module: &str) {
+        fs::create_dir_all(dir).unwrap();
+        write_adapter_config(&dir.join("adapter_config.json"), 1, 1.0);
+        write_safetensors_f16(
+            &dir.join("adapter_model.safetensors"),
+            vec![
+                (
+                    &format!("base_model.model.{module}.lora_expert_A"),
+                    vec![1.0, 1.0, 2.0, 0.0],
+                    vec![2, 1, 2],
+                ),
+                (
+                    &format!("base_model.model.{module}.lora_expert_B"),
+                    vec![1.0, 1.0, 1.0, 1.0],
+                    vec![2, 2, 1],
+                ),
+            ],
+        );
+    }
+
+    fn merged(dir: &Path, base: Vec<(&str, Vec<f32>, Vec<usize>)>) -> Result<PathBuf> {
+        let base_path = dir.join("model.safetensors");
+        write_safetensors_f16(&base_path, base);
+        let out = dir.join("merged.safetensors");
+        streaming_lora_merge(&AccurateMergeConfig::new(
+            &base_path,
+            dir.join("adapter"),
+            &out,
+        ))
+        .map(|_| out)
+    }
+
+    const EXPERT_ZERO_PLUS: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+    const EXPERT_ONE_PLUS: [f32; 4] = [2.0, 0.0, 2.0, 0.0];
+
+    fn close(got: &[f32], want: &[f32]) {
+        assert_eq!(got.len(), want.len());
+        for (g, w) in got.iter().zip(want) {
+            assert!((g - w).abs() < 0.02, "{got:?} != {want:?}");
+        }
+    }
+
+    #[test]
+    fn expert_adapters_fold_into_a_stacked_tensor_expert_by_expert() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = "model.layers.0.mlp.switch_mlp.gate_proj";
+        write_expert_adapter(&dir.path().join("adapter"), module);
+        // The base experts are 10 and 20 everywhere, so a fold into the wrong
+        // expert or row shows.
+        let mut base = vec![10.0; 4];
+        base.extend([20.0; 4]);
+        let out = merged(
+            dir.path(),
+            vec![(&format!("{module}.weight"), base, vec![2, 2, 2])],
+        )
+        .unwrap();
+        let got = read_f16_tensor(&out, &format!("{module}.weight"));
+        let want: Vec<f32> = EXPERT_ZERO_PLUS
+            .iter()
+            .map(|d| 10.0 + d)
+            .chain(EXPERT_ONE_PLUS.iter().map(|d| 20.0 + d))
+            .collect();
+        close(&got, &want);
+    }
+
+    #[test]
+    fn expert_adapters_fold_into_one_tensor_per_expert() {
+        let dir = tempfile::tempdir().unwrap();
+        write_expert_adapter(
+            &dir.path().join("adapter"),
+            "model.layers.0.mlp.switch_mlp.up_proj",
+        );
+        let out = merged(
+            dir.path(),
+            vec![
+                (
+                    "model.layers.0.mlp.experts.0.up_proj.weight",
+                    vec![10.0; 4],
+                    vec![2, 2],
+                ),
+                (
+                    "model.layers.0.mlp.experts.1.up_proj.weight",
+                    vec![20.0; 4],
+                    vec![2, 2],
+                ),
+                (
+                    "model.layers.0.mlp.experts.0.down_proj.weight",
+                    vec![5.0; 4],
+                    vec![2, 2],
+                ),
+            ],
+        )
+        .unwrap();
+        let tensor = |n: &str| read_f16_tensor(&out, n);
+        close(
+            &tensor("model.layers.0.mlp.experts.0.up_proj.weight"),
+            &EXPERT_ZERO_PLUS.map(|d| 10.0 + d),
+        );
+        close(
+            &tensor("model.layers.0.mlp.experts.1.up_proj.weight"),
+            &EXPERT_ONE_PLUS.map(|d| 20.0 + d),
+        );
+        // Another projection of the same expert is not the adapter's.
+        close(
+            &tensor("model.layers.0.mlp.experts.0.down_proj.weight"),
+            &[5.0; 4],
+        );
+    }
+
+    /// The gate projection folds into the first half of a fused
+    /// `gate_up_proj`'s rows and the up projection into the second.
+    #[test]
+    fn expert_adapters_fold_into_the_right_half_of_a_fused_gate_up() {
+        let dir = tempfile::tempdir().unwrap();
+        // The up projection is adapted; its rows are the last 2 of 4.
+        write_expert_adapter(
+            &dir.path().join("adapter"),
+            "model.layers.0.mlp.switch_mlp.up_proj",
+        );
+        let out = merged(
+            dir.path(),
+            vec![(
+                "model.layers.0.mlp.experts.gate_up_proj",
+                vec![10.0; 16],
+                vec![2, 4, 2],
+            )],
+        )
+        .unwrap();
+        let got = read_f16_tensor(&out, "model.layers.0.mlp.experts.gate_up_proj");
+        let mut want = Vec::new();
+        for delta in [EXPERT_ZERO_PLUS, EXPERT_ONE_PLUS] {
+            want.extend([10.0; 4]); // gate rows
+            want.extend(delta.map(|d| 10.0 + d)); // up rows
+        }
+        close(&got, &want);
+    }
+
+    #[test]
+    fn an_expert_adapter_with_no_experts_in_the_base_is_refused_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = "model.layers.0.mlp.switch_mlp.gate_proj";
+        write_expert_adapter(&dir.path().join("adapter"), module);
+        let err = merged(
+            dir.path(),
+            vec![("model.embed_tokens.weight", vec![1.0; 4], vec![2, 2])],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains(module) && err.contains("no weight in the base"),
+            "{err}"
+        );
+
+        // A run of experts with one missing is named, not folded partly.
+        let err = merged(
+            dir.path(),
+            vec![(
+                "model.layers.0.mlp.experts.0.gate_proj.weight",
+                vec![1.0; 4],
+                vec![2, 2],
+            )],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("experts.1.gate_proj.weight") && err.contains("missing"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn expert_factors_with_the_wrong_experts_or_rank_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = dir.path().join("adapter");
+        fs::create_dir_all(&adapter).unwrap();
+        write_adapter_config(&adapter.join("adapter_config.json"), 1, 1.0);
+        let module = "model.layers.0.mlp.switch_mlp.gate_proj";
+        write_safetensors_f16(
+            &adapter.join("adapter_model.safetensors"),
+            vec![
+                (
+                    &format!("base_model.model.{module}.lora_expert_A"),
+                    vec![1.0; 4],
+                    vec![2, 1, 2],
+                ),
+                (
+                    &format!("base_model.model.{module}.lora_expert_B"),
+                    vec![1.0; 6],
+                    vec![3, 2, 1],
+                ),
+            ],
+        );
+        let err = merged(
+            dir.path(),
+            vec![(&format!("{module}.weight"), vec![1.0; 8], vec![2, 2, 2])],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("expert factors"), "{err}");
+    }
 
     #[test]
     fn end_to_end_single_file() {

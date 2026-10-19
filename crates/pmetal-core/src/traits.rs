@@ -94,6 +94,8 @@ pub mod defaults {
     pub const LOSS_SCALE: f64 = 1.0;
     /// Default random seed.
     pub const SEED: u64 = 42;
+    /// Default interval, in optimizer steps, between logged losses.
+    pub const LOGGING_STEPS: usize = 10;
     /// Default LoRA rank.
     pub const LORA_R: usize = 16;
     /// Default LoRA alpha.

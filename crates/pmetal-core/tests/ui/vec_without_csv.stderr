@@ -1,4 +1,4 @@
-error: `Vec<String>` fields with `argv` must use `#[job(csv)]`
+error: `Vec<String>` fields with `argv` must use `#[job(csv)]` or `#[job(repeat)]`
  --> tests/ui/vec_without_csv.rs:7:5
   |
 7 |     f: Vec<String>,

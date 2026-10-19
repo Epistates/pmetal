@@ -511,6 +511,97 @@ pub async fn download_file_with(
     .map_err(|e| repo.error(&e))
 }
 
+/// The files a tokenizer and its chat template are read from, at the top level
+/// of a model repository. Only `tokenizer.json` has to exist.
+pub const TOKENIZER_FILES: [&str; 5] = [
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "chat_template.jinja",
+    "chat_template.json",
+];
+
+/// Download a model's tokenizer and chat template, and nothing else: the files
+/// of [`TOKENIZER_FILES`] the repository has, a few megabytes where the model
+/// is gigabytes. The snapshot directory, which a tokenizer loads from but
+/// which holds no weights.
+///
+/// For a tool that measures or formats text against a model (dataset
+/// preparation, token counts) without running it. A cached snapshot with a
+/// tokenizer in it answers without a request unless a branch is named, as for
+/// [`download_model_with`]; offline, the cache answers or the call fails.
+pub async fn download_tokenizer_with(model_id: &str, options: &DownloadOptions) -> Result<PathBuf> {
+    crate::repo::validate_repo_id(model_id)?;
+    let cache_root = options.hub.resolved_cache_dir();
+    let revision = options.revision.as_deref();
+    let cached = || {
+        crate::cache::find_snapshot(
+            &cache_root,
+            crate::cache::RepoKind::Model,
+            model_id,
+            revision,
+            |snapshot| snapshot.join("tokenizer.json").is_file(),
+        )
+    };
+
+    if options.hub.is_offline() {
+        return cached().ok_or_else(|| {
+            PMetalError::Hub(format!(
+                "{model_id} has no cached tokenizer in {} and the Hub is offline",
+                cache_root.display()
+            ))
+        });
+    }
+    if revision.is_none_or(is_commit_sha) {
+        if let Some(path) = cached() {
+            return Ok(path);
+        }
+    }
+
+    let client = options.hub.client()?;
+    let repo = RepoHandle::model(&client, model_id)?;
+    let listed = async {
+        let commit = repo.resolve_commit(revision).await?;
+        let files = repo.list_files(&commit).await?;
+        Ok::<_, hf_hub::HFError>((commit, files))
+    }
+    .await;
+    let (commit, files) = match listed {
+        Ok(listed) => listed,
+        Err(e) if is_network_unavailable(&e) => {
+            // The Hub cannot be reached: a tokenizer already cached beats failing.
+            return cached().ok_or_else(|| repo.error(&e));
+        }
+        Err(e) => return Err(repo.error(&e)),
+    };
+    let wanted: Vec<RepoFile> = files
+        .into_iter()
+        .filter(|f| TOKENIZER_FILES.contains(&f.path.as_str()))
+        .collect();
+    if !wanted.iter().any(|f| f.path == "tokenizer.json") {
+        return Err(PMetalError::Hub(format!(
+            "{model_id} has no tokenizer.json"
+        )));
+    }
+    let paths: Vec<String> = wanted.iter().map(|f| f.path.clone()).collect();
+    let (snapshot, in_progress) = repo
+        .download_snapshot(&commit, &paths, options.max_workers, None)
+        .await?;
+    check_downloaded(&snapshot, &wanted, options.verify)?;
+    let ref_name = match revision {
+        Some(r) if is_commit_sha(r) => None,
+        Some(r) => Some(r),
+        None => Some("main"),
+    };
+    if let Some(name) = ref_name {
+        if let Err(e) = write_ref(&cache_root, &repo.folder(), name, &commit) {
+            tracing::warn!("Could not record {name} for {model_id}: {e}");
+        }
+    }
+    in_progress.finish();
+    Ok(snapshot)
+}
+
 /// Download all safetensors files for a model.
 ///
 /// Exactly the shards the weight index names (or the single `model.safetensors`),

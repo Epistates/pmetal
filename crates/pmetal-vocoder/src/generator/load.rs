@@ -5,7 +5,7 @@ use crate::checkpoint;
 use crate::config::BigVGANConfig;
 use crate::error::{Result, VocoderError};
 use pmetal_runtime::compat::Array;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Weight files to look for, in order: the reference release's name first.
 const WEIGHT_FILES: [&str; 2] = ["bigvgan_generator.pt", "model.safetensors"];
@@ -44,35 +44,44 @@ impl BigVGAN {
     /// [`from_dir`](Self::from_dir)) or a Hugging Face repository id such as
     /// `nvidia/bigvgan_v2_24khz_100band_256x`. Weight normalisation is folded
     /// into the weights, so the model is ready for inference.
-    pub fn from_pretrained(model_id: &str) -> Result<Self> {
+    ///
+    /// The files come through `pmetal-hub`, so the cache, the token, the
+    /// mirror and offline mode are the ones every other command uses, and the
+    /// weights are fetched from the commit the config came from.
+    pub async fn from_pretrained(model_id: &str) -> Result<Self> {
+        Self::from_pretrained_with(model_id, &pmetal_hub::DownloadOptions::default()).await
+    }
+
+    /// [`from_pretrained`](Self::from_pretrained) with explicit connection
+    /// settings (cache directory, offline mode, revision).
+    pub async fn from_pretrained_with(
+        model_id: &str,
+        options: &pmetal_hub::DownloadOptions,
+    ) -> Result<Self> {
         let local = Path::new(model_id);
         if local.is_dir() {
             return Self::from_dir(local);
         }
-        let client = hf_hub::HFClientSync::new().map_err(|e| VocoderError::Hub(e.to_string()))?;
-        let (owner, name) = hf_hub::split_id(model_id);
-        let repo = client.model(owner, name);
-        let fetch = |filename: &str| -> Result<PathBuf> {
-            repo.download_file()
-                .filename(filename)
-                .send()
-                .map_err(|e| VocoderError::Hub(format!("{filename}: {e}")))
+        let fail = |what: &str, e: &dyn std::fmt::Display| {
+            VocoderError::Hub(format!("{model_id}: {what}: {e}"))
         };
-
-        let config_path = fetch("config.json")?;
+        let config_path = pmetal_hub::download_file_with(model_id, "config.json", options)
+            .await
+            .map_err(|e| fail("config.json", &e))?;
+        let snapshot = config_path
+            .parent()
+            .ok_or_else(|| VocoderError::Hub("the config has no snapshot directory".into()))?;
+        // A snapshot directory is named for its commit: every other file
+        // comes from that one, never from whatever the branch has moved to.
+        let mut pinned = options.clone();
+        if let Some(commit) = snapshot.file_name().and_then(|n| n.to_str()) {
+            pinned.revision = Some(commit.to_owned());
+        }
         let mut last_error = None;
         for file in WEIGHT_FILES {
-            match fetch(file) {
-                Ok(weights) => {
-                    // Both files live in the same snapshot directory.
-                    debug_assert_eq!(weights.parent(), config_path.parent());
-                    return Self::from_dir(
-                        config_path
-                            .parent()
-                            .ok_or_else(|| VocoderError::Hub("snapshot has no directory".into()))?,
-                    );
-                }
-                Err(e) => last_error = Some(e),
+            match pmetal_hub::download_file_with(model_id, file, &pinned).await {
+                Ok(_) => return Self::from_dir(snapshot),
+                Err(e) => last_error = Some(fail(file, &e)),
             }
         }
         Err(last_error.unwrap_or_else(|| VocoderError::Hub("no weight file found".into())))

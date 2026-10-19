@@ -74,7 +74,10 @@ pub async fn run_dflash(
     // apply the model's chat template unless the caller explicitly
     // opts out with --no-chat.
     let prompt_ids: Vec<u32> = if no_chat {
-        tokenizer.encode(prompt).context("encoding prompt")?
+        // Nothing wrote a BOS: the tokenizer's post-processor does.
+        tokenizer
+            .encode_with_special_tokens(prompt)
+            .context("encoding prompt")?
     } else {
         let template = detect_chat_template(&target_path, &target_path.to_string_lossy());
         let messages = [Message::user(prompt)];

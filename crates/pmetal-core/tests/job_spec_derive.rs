@@ -181,6 +181,10 @@ struct Argv {
     f: String,
     #[job(label = "H", group = "G")]
     h: String,
+    #[job(label = "V", group = "G", argv = "--v", valued, default_bool = true)]
+    v: bool,
+    #[job(skip_descriptor, argv = "--cli-only", flag)]
+    cli_only: bool,
 }
 
 #[test]
@@ -193,10 +197,24 @@ fn argv_follows_flag_csv_option_and_skip_rules() {
         e: -3,
         f: "ignored".into(),
         h: "form-only".into(),
+        v: false,
+        cli_only: true,
     };
     assert_eq!(
         s.to_argv(),
-        ["--a", "--no-b", "--c", "x,y", "--d", "0.5", "--e", "-3"]
+        [
+            "--a",
+            "--no-b",
+            "--c",
+            "x,y",
+            "--d",
+            "0.5",
+            "--e",
+            "-3",
+            "--v",
+            "false",
+            "--cli-only"
+        ]
     );
     let s = Argv {
         a: false,
@@ -206,6 +224,18 @@ fn argv_follows_flag_csv_option_and_skip_rules() {
         e: 0,
         f: String::new(),
         h: String::new(),
+        v: true,
+        cli_only: false,
     };
-    assert_eq!(s.to_argv(), ["--e", "0"]);
+    assert_eq!(s.to_argv(), ["--e", "0", "--v", "true"]);
+}
+
+/// `argv_flags` lists every flag `to_argv` can spell, the CLI-only ones
+/// included and the form-only and `skip_argv` fields not.
+#[test]
+fn argv_flags_are_every_flag_the_spec_can_spell() {
+    assert_eq!(
+        Argv::argv_flags(),
+        ["--a", "--no-b", "--c", "--d", "--e", "--v", "--cli-only"]
+    );
 }

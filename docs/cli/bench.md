@@ -1,33 +1,35 @@
 # pmetal bench
 
-Benchmark training performance, generation speed, and FFI overhead.
+Benchmark training and inference performance on your hardware.
 
-Benchmark various aspects of PMetal's performance on your hardware.
+Every benchmark reads the machine's load average when it starts and when it ends, prints both
+beside the numbers and, in a JSON report, records them under `conditions`. When the machine was
+not quiet (a load average above a quarter of its logical CPUs, and above 2) the numbers are
+marked **PROVISIONAL**: a compile, a download or another run in the background takes the same
+memory bandwidth and GPU time. Repeat on an idle machine before quoting a figure.
 
 ## Subcommands
 
 ### bench
 
-Benchmark training throughput (tokens/second, step time).
+Benchmark training: the time of a LoRA training step on the model, as `pmetal train` takes it
+(forward, loss, backward, optimizer; the trainer's defaults), on batches of `--batch-size` rows of
+`--seq-len` tokens. Two warmup steps are run and not counted, then eight are measured; the report
+gives the median, minimum and maximum step time, median tokens per second, peak memory and the
+final loss. The rows are synthetic text cut to exactly `--seq-len` tokens, so the batch has the
+shape asked for.
 
 ```bash
-pmetal bench --model Qwen/Qwen3-0.6B --batch-size 4
+pmetal bench --model Qwen/Qwen3-0.6B --batch-size 4 --seq-len 1024
 ```
 
 ### bench-gen
 
-Benchmark the generation loop — tokens per second, time to first token, and decode latency.
+Profile the generation loop of a model: the mean time per token of each stage (reshape, forward,
+logits, argmax, async evaluation, the sync point) and the effective tokens per second.
 
 ```bash
 pmetal bench-gen --model Qwen/Qwen3-0.6B
-```
-
-### bench-ffi
-
-Benchmark FFI overhead between Rust and Metal/MLX.
-
-```bash
-pmetal bench-ffi
 ```
 
 ### bench-corpus

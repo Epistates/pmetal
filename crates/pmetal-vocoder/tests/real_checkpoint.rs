@@ -215,11 +215,16 @@ fn bigvgan_v2_fine_tunes_with_its_released_discriminators() {
 #[test]
 #[ignore = "downloads a 56 MB model from the Hugging Face Hub"]
 fn from_pretrained_downloads_and_loads_a_release() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
     let Some(dir) = model_dir("base24") else {
         eprintln!("BIGVGAN_CHECKPOINT_DIR/base24 not found; skipping");
         return;
     };
-    let model = BigVGAN::from_pretrained("nvidia/bigvgan_base_24khz_100band").expect("download");
+    let model = runtime
+        .block_on(BigVGAN::from_pretrained(
+            "nvidia/bigvgan_base_24khz_100band",
+        ))
+        .expect("download");
     let fx = Fixture::load_path(&dir.join("ref.safetensors"));
     let audio = model.forward(&fx.array("mel")).unwrap();
     let diff = max_abs_diff(&to_vec(&audio), fx.values("audio"));

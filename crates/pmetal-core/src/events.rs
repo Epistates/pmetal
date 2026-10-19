@@ -73,6 +73,8 @@ pub enum JobKind {
     PackExperts,
     /// Tokenize text against a model's tokenizer.
     Tokenize,
+    /// Synthesize a waveform from a mel spectrogram.
+    Vocode,
 }
 
 // ---------------------------------------------------------------------------

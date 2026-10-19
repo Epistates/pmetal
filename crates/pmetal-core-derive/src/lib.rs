@@ -27,7 +27,10 @@
 //! - `flag` — `bool` field; emit `--flag` when `true`, omit when `false`.
 //! - `invert` — pair with `flag`; emit `--flag` when `false`, omit when `true`
 //!   (for `--no-foo` semantics).
+//! - `valued` — `bool` field whose flag takes a value, `--flag true|false`;
+//!   always emitted. For a default of `true` that a switch could not turn off.
 //! - `csv` — `Vec<String>` field; emit `--flag a,b,c` joined with commas.
+//! - `repeat` — `Vec<String>` field; emit `--flag a --flag b`, one per item.
 //! - `required` — non-empty / non-default validation. Valid on `String`,
 //!   `Option<_>` and `Vec<String>` fields.
 //! - `skip_descriptor` — exclude from `field_descriptors()` and from
@@ -106,6 +109,7 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
 
     let mut descriptor_items = Vec::new();
     let mut argv_items = Vec::new();
+    let mut argv_flags = Vec::new();
     let mut validate_items = Vec::new();
 
     for field in fields {
@@ -125,6 +129,9 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
         }
         if !parsed.attrs.skip_argv && parsed.attrs.argv.is_some() {
             argv_items.push(emit_argv(&parsed));
+            if let Some(flag) = &parsed.attrs.argv {
+                argv_flags.push(flag.clone());
+            }
         }
     }
 
@@ -152,6 +159,10 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 let mut args: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
                 #(#argv_items)*
                 args
+            }
+
+            fn argv_flags() -> &'static [&'static str] {
+                &[#(#argv_flags),*]
             }
 
             fn validate_descriptors(&self) -> ::std::vec::Vec<::pmetal_core::FieldError> {
@@ -285,6 +296,8 @@ struct FieldAttrs {
     flag: Option<Span>,
     invert: Option<Span>,
     csv: Option<Span>,
+    repeat: Option<Span>,
+    valued: Option<Span>,
 
     required: Option<Span>,
     skip_descriptor: bool,
@@ -536,6 +549,12 @@ fn parse_field_attrs(attrs: &[Attribute]) -> syn::Result<FieldAttrs> {
             } else if path.is_ident("invert") {
                 reject_duplicate(&meta, out.invert.is_some())?;
                 out.invert = Some(path.span());
+            } else if path.is_ident("repeat") {
+                reject_duplicate(&meta, out.repeat.is_some())?;
+                out.repeat = Some(path.span());
+            } else if path.is_ident("valued") {
+                reject_duplicate(&meta, out.valued.is_some())?;
+                out.valued = Some(path.span());
             } else if path.is_ident("csv") {
                 reject_duplicate(&meta, out.csv.is_some())?;
                 out.csv = Some(path.span());
@@ -663,6 +682,40 @@ fn check_attr_consistency(field: &ParsedField) -> syn::Result<()> {
             return Err(syn::Error::new(span, "`flag` and `csv` cannot be combined"));
         }
     }
+    if let Some(span) = a.repeat {
+        if ty != FieldType::VecString {
+            return Err(syn::Error::new(
+                span,
+                "`repeat` may only be applied to `Vec<String>` fields",
+            ));
+        }
+        if a.argv.is_none() {
+            return Err(syn::Error::new(span, "`repeat` needs `argv = \"...\"`"));
+        }
+        if a.csv.is_some() {
+            return Err(syn::Error::new(
+                span,
+                "`repeat` and `csv` cannot be combined",
+            ));
+        }
+    }
+    if let Some(span) = a.valued {
+        if ty != FieldType::Bool {
+            return Err(syn::Error::new(
+                span,
+                "`valued` may only be applied to `bool` fields",
+            ));
+        }
+        if a.argv.is_none() {
+            return Err(syn::Error::new(span, "`valued` needs `argv = \"...\"`"));
+        }
+        if a.flag.is_some() || a.invert.is_some() || a.csv.is_some() {
+            return Err(syn::Error::new(
+                span,
+                "`valued` cannot be combined with `flag`, `invert` or `csv`",
+            ));
+        }
+    }
     if let Some(span) = a.invert
         && a.flag.is_none()
     {
@@ -682,17 +735,18 @@ fn check_attr_consistency(field: &ParsedField) -> syn::Result<()> {
             return Err(syn::Error::new(span, "`csv` needs `argv = \"...\"`"));
         }
     }
-    if a.argv.is_some() && !a.skip_argv && a.flag.is_none() {
-        if ty == FieldType::VecString && a.csv.is_none() {
+    if a.argv.is_some() && !a.skip_argv && a.flag.is_none() && a.valued.is_none() {
+        if ty == FieldType::VecString && a.csv.is_none() && a.repeat.is_none() {
             return Err(syn::Error::new(
                 here,
-                "`Vec<String>` fields with `argv` must use `#[job(csv)]`",
+                "`Vec<String>` fields with `argv` must use `#[job(csv)]` or `#[job(repeat)]`",
             ));
         }
         if ty == FieldType::Bool {
             return Err(syn::Error::new(
                 here,
-                "bool fields with `argv` must use `#[job(flag)]` or `#[job(flag, invert)]`",
+                "bool fields with `argv` must use `#[job(flag)]`, `#[job(flag, invert)]` or \
+                 `#[job(valued)]`",
             ));
         }
     }
@@ -957,6 +1011,24 @@ fn emit_argv(field: &ParsedField) -> TokenStream2 {
         return quote! {
             if #test {
                 args.push(::std::string::ToString::to_string(#argv));
+            }
+        };
+    }
+
+    // Bool that takes `true` / `false`, so a default of true can be turned off.
+    if attrs.valued.is_some() {
+        return quote! {
+            args.push(::std::string::ToString::to_string(#argv));
+            args.push(::std::string::ToString::to_string(&self.#name));
+        };
+    }
+
+    // Repeated flag, one occurrence per item.
+    if attrs.repeat.is_some() {
+        return quote! {
+            for item in &self.#name {
+                args.push(::std::string::ToString::to_string(#argv));
+                args.push(::std::clone::Clone::clone(item));
             }
         };
     }

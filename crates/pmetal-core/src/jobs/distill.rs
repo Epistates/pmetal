@@ -39,6 +39,16 @@ pub struct DistillSpec {
     pub dataset: String,
 
     #[job(
+        label = "Eval Dataset",
+        group = "Data",
+        argv = "--eval-dataset",
+        kind = "dataset_picker",
+        help = "Evaluated every Checkpoint Every steps"
+    )]
+    #[serde(default)]
+    pub eval_dataset: Option<String>,
+
+    #[job(
         label = "Output Dir",
         group = "Output",
         argv = "--output",
@@ -99,9 +109,33 @@ pub struct DistillSpec {
     pub offline_top_k: usize,
 
     #[job(label = "Loss Type", group = "Distillation", argv = "--loss-type", kind = "enum",
-          enum_options = ["kl_divergence", "jensen_shannon", "soft_cross_entropy", "mse_loss"], default = "kl_divergence")]
+          enum_options = ["kl_divergence", "reverse_kl", "jensen_shannon", "soft_cross_entropy", "mse_loss", "jsd_skewed", "skew_kl", "skew_reverse_kl", "universal_logit"],
+          default = "kl_divergence",
+          help = "jsd_skewed and skew_kl take --skew-alpha, universal_logit (different tokenizers) --universal-logit-top-k; for GKD, pair --on-policy with jsd_skewed")]
     #[serde(default = "default_loss_type")]
     pub loss_type: String,
+
+    #[job(
+        label = "Skew Alpha",
+        group = "Distillation",
+        argv = "--skew-alpha",
+        min = 0.0,
+        max = 1.0,
+        help = "Mixing weight of jsd_skewed (default 0.5, the symmetric JSD) and of skew_kl / skew_reverse_kl (default 0.1)"
+    )]
+    #[serde(default)]
+    pub skew_alpha: Option<f32>,
+
+    #[job(
+        label = "Universal Logit Top-k",
+        group = "Distillation",
+        argv = "--universal-logit-top-k",
+        min = 1,
+        max = 1048576,
+        help = "Truncate to this many entries before the universal_logit loss sorts them (default: the whole vocabulary)"
+    )]
+    #[serde(default)]
+    pub universal_logit_top_k: Option<usize>,
 
     #[job(
         label = "Temperature",
@@ -249,6 +283,18 @@ pub struct DistillSpec {
     #[serde(default = "default_seed")]
     pub seed: u64,
 
+    #[job(
+        label = "Checkpoint Every",
+        group = "Training",
+        argv = "--checkpoint-every",
+        min = 0,
+        max = 1000000,
+        default_int = 100,
+        help = "Save a checkpoint every this many steps (0 disables interval checkpoints)"
+    )]
+    #[serde(default = "default_checkpoint_every")]
+    pub checkpoint_every: usize,
+
     #[job(label = "Text Column", group = "Data", argv = "--text-column")]
     #[serde(default)]
     pub text_column: Option<String>,
@@ -281,6 +327,11 @@ pub struct DistillSpec {
     )]
     #[serde(default)]
     pub log_metrics: Option<String>,
+
+    /// Resume from the latest checkpoint in the output directory.
+    #[job(skip_descriptor, argv = "--resume", flag, default_bool = false)]
+    #[serde(default)]
+    pub resume: bool,
 }
 
 impl Default for DistillSpec {
@@ -289,6 +340,7 @@ impl Default for DistillSpec {
             teacher: String::new(),
             student: String::new(),
             dataset: String::new(),
+            eval_dataset: None,
             output_dir: default_output(),
             method: default_method(),
             offline: false,
@@ -297,6 +349,8 @@ impl Default for DistillSpec {
             offline_compression: default_compression(),
             offline_top_k: default_offline_top_k(),
             loss_type: default_loss_type(),
+            skew_alpha: None,
+            universal_logit_top_k: None,
             temperature: default_temperature(),
             alpha: default_alpha(),
             rationale: false,
@@ -311,19 +365,61 @@ impl Default for DistillSpec {
             epochs: 1,
             max_seq_len: default_max_seq_len(),
             seed: 42,
+            checkpoint_every: default_checkpoint_every(),
             text_column: None,
             text_columns: None,
             column_separator: None,
             prompt_column: None,
             response_column: None,
             log_metrics: None,
+            resume: false,
         }
     }
 }
 
 impl DistillSpec {
+    /// The method the run uses: `--offline` is a shortcut for `--method
+    /// offline`.
+    #[must_use]
+    pub fn effective_method(&self) -> &str {
+        if self.offline {
+            "offline"
+        } else {
+            &self.method
+        }
+    }
+
+    /// Run descriptor validation, then the rules that span fields: the
+    /// offline shortcut against the method, the flags that only an offline
+    /// run reads, and on-policy sampling, which needs the live teacher.
     pub fn normalize(&mut self) -> Result<(), Vec<FieldError>> {
-        let errs = self.validate_descriptors();
+        let mut errs = self.validate_descriptors();
+        if self.offline && !matches!(self.method.as_str(), "online" | "offline") {
+            errs.push(FieldError::new(
+                "offline",
+                format!("conflicts with --method {}", self.method),
+            ));
+        }
+        let offline = self.effective_method() == "offline";
+        if !offline && self.offline_cache.is_some() {
+            errs.push(FieldError::new(
+                "offline_cache",
+                "needs --offline or --method offline",
+            ));
+        }
+        if !offline && self.offline_generate {
+            errs.push(FieldError::new(
+                "offline_generate",
+                "needs --offline or --method offline",
+            ));
+        }
+        if offline && self.on_policy > 0.0 {
+            errs.push(FieldError::new(
+                "on_policy",
+                "needs the live teacher to score the student's samples, so it cannot \
+                 run with an offline cache",
+            ));
+        }
         if errs.is_empty() { Ok(()) } else { Err(errs) }
     }
 }
@@ -376,6 +472,9 @@ fn default_epochs() -> usize {
 fn default_seed() -> u64 {
     42
 }
+fn default_checkpoint_every() -> usize {
+    100
+}
 
 #[cfg(test)]
 mod tests {
@@ -393,5 +492,98 @@ mod tests {
         assert!(argv.contains(&"--teacher".to_string()));
         assert!(argv.contains(&"--student".to_string()));
         assert!(argv.contains(&"--dataset".to_string()));
+    }
+
+    fn spec() -> DistillSpec {
+        DistillSpec {
+            teacher: "t".into(),
+            student: "s".into(),
+            dataset: "d".into(),
+            ..Default::default()
+        }
+    }
+
+    fn rejected(mut spec: DistillSpec) -> Vec<String> {
+        spec.normalize()
+            .expect_err("the spec is invalid")
+            .into_iter()
+            .map(|e| format!("{}: {}", e.field, e.message))
+            .collect()
+    }
+
+    #[test]
+    fn the_offline_shortcut_is_the_offline_method() {
+        let mut offline = DistillSpec {
+            offline: true,
+            ..spec()
+        };
+        assert!(offline.normalize().is_ok());
+        assert_eq!(offline.effective_method(), "offline");
+        assert_eq!(spec().effective_method(), "online");
+        let conflict = rejected(DistillSpec {
+            offline: true,
+            method: "progressive".into(),
+            ..spec()
+        });
+        assert!(
+            conflict[0].contains("conflicts with --method progressive"),
+            "{conflict:?}"
+        );
+    }
+
+    #[test]
+    fn offline_only_flags_need_an_offline_run() {
+        let cache = rejected(DistillSpec {
+            offline_cache: Some("c".into()),
+            ..spec()
+        });
+        assert!(cache[0].starts_with("offline_cache"), "{cache:?}");
+        let generate = rejected(DistillSpec {
+            offline_generate: true,
+            ..spec()
+        });
+        assert!(generate[0].starts_with("offline_generate"), "{generate:?}");
+        let mut ok = DistillSpec {
+            method: "offline".into(),
+            offline_cache: Some("c".into()),
+            offline_generate: true,
+            ..spec()
+        };
+        assert!(ok.normalize().is_ok());
+    }
+
+    #[test]
+    fn on_policy_sampling_cannot_run_offline() {
+        let errors = rejected(DistillSpec {
+            offline: true,
+            on_policy: 0.5,
+            ..spec()
+        });
+        assert!(errors[0].starts_with("on_policy"), "{errors:?}");
+    }
+
+    #[test]
+    fn every_loss_type_the_distiller_has_is_offered() {
+        let crate::FieldKind::Enum { options } = DistillSpec::field_descriptors()
+            .iter()
+            .find(|d| d.name == "loss_type")
+            .expect("a loss type field")
+            .kind
+        else {
+            panic!("loss_type is an enum");
+        };
+        for name in [
+            "kl_divergence",
+            "reverse_kl",
+            "jensen_shannon",
+            "soft_cross_entropy",
+            "mse_loss",
+            "jsd_skewed",
+            "skew_kl",
+            "skew_reverse_kl",
+            "universal_logit",
+        ] {
+            assert!(options.contains(&name), "{name} is not offered");
+        }
     }
 }

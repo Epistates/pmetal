@@ -37,6 +37,7 @@ pub mod train;
 pub mod train_diffusion;
 pub mod train_draft;
 pub mod train_mtp;
+pub mod vocode;
 
 pub use bench::BenchSpec;
 pub use decide::DecideSpec;
@@ -59,6 +60,7 @@ pub use train::TrainSpec;
 pub use train_diffusion::TrainDiffusionSpec;
 pub use train_draft::TrainDraftSpec;
 pub use train_mtp::TrainMtpSpec;
+pub use vocode::VocodeSpec;
 
 /// Default of every spec's `optimizer` field.
 pub(crate) fn default_optimizer() -> String {

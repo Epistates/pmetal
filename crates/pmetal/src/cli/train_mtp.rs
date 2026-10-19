@@ -1,6 +1,7 @@
 //! Clap argument struct for `pmetal train-mtp`.
 
 use clap::{Args, ValueEnum};
+use pmetal_core::jobs::TrainMtpSpec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum TrainMtpFamily {
@@ -31,6 +32,13 @@ pub struct TrainMtpArgs {
     #[arg(long = "init-mtp")]
     pub init_mtp: Option<String>,
 
+    /// Continue an earlier run: a checkpoint directory, or the output
+    /// directory of the run (its furthest checkpoint). The weights, the
+    /// optimizer state and the step are restored and the run goes on to
+    /// --steps; the shards are read from that step on.
+    #[arg(long = "resume", conflicts_with = "init_mtp")]
+    pub resume: Option<String>,
+
     /// Sequence length per training sample.
     #[arg(long = "seq-len", default_value = "512")]
     pub seq_len: usize,
@@ -45,11 +53,11 @@ pub struct TrainMtpArgs {
 
     /// Peak learning rate.
     #[arg(long = "learning-rate", default_value = "2e-4")]
-    pub learning_rate: f32,
+    pub learning_rate: f64,
 
     /// Minimum learning rate for cosine schedule.
     #[arg(long = "min-lr", default_value = "1e-5")]
-    pub min_lr: f32,
+    pub min_lr: f64,
 
     /// Linear warmup steps.
     #[arg(long = "warmup-steps", default_value = "100")]
@@ -62,11 +70,11 @@ pub struct TrainMtpArgs {
 
     /// AdamW weight decay.
     #[arg(long = "weight-decay", default_value = "0.01")]
-    pub weight_decay: f32,
+    pub weight_decay: f64,
 
     /// Max gradient norm. 0 disables clipping.
     #[arg(long = "max-grad-norm", default_value = "1.0")]
-    pub max_grad_norm: f32,
+    pub max_grad_norm: f64,
 
     /// Save checkpoint every N steps. 0 disables periodic checkpoints.
     #[arg(long = "checkpoint-every", default_value = "500")]
@@ -95,4 +103,38 @@ pub struct TrainMtpArgs {
     /// Random seed.
     #[arg(long = "seed", default_value = "42")]
     pub seed: u64,
+}
+
+impl From<TrainMtpArgs> for TrainMtpSpec {
+    fn from(a: TrainMtpArgs) -> Self {
+        TrainMtpSpec {
+            model: a.model,
+            family: match a.family {
+                TrainMtpFamily::Auto => "auto",
+                TrainMtpFamily::Qwen3Next => "qwen3-next",
+                TrainMtpFamily::Gemma4 => "gemma4",
+            }
+            .to_string(),
+            init_mtp: a.init_mtp,
+            mtp_layers: a.mtp_layers,
+            assistant_layers: a.assistant_layers,
+            num_assistant_tokens: a.num_assistant_tokens,
+            shards: a.shards,
+            eos_token_id: a.eos_token_id,
+            output: a.output,
+            seq_len: a.seq_len,
+            batch_size: a.batch_size,
+            steps: a.steps,
+            learning_rate: a.learning_rate,
+            min_lr: a.min_lr,
+            warmup_steps: a.warmup_steps,
+            lr_schedule: a.lr_schedule.to_string(),
+            weight_decay: a.weight_decay,
+            max_grad_norm: a.max_grad_norm,
+            checkpoint_every: a.checkpoint_every,
+            log_every: a.log_every,
+            seed: a.seed,
+            resume: a.resume,
+        }
+    }
 }

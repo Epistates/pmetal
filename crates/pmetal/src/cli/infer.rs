@@ -1,6 +1,7 @@
 //! Clap argument struct for `pmetal infer`.
 
-use clap::Args;
+use clap::{Args, ValueEnum};
+use pmetal_core::jobs::InferSpec;
 
 /// A frame rate: a finite number above zero.
 fn parse_fps(value: &str) -> Result<f64, String> {
@@ -10,7 +11,7 @@ fn parse_fps(value: &str) -> Result<f64, String> {
     }
 }
 
-/// Thin clap argument struct for `pmetal infer`.
+/// Run inference with a model.
 #[derive(Args, Debug)]
 pub struct InferArgs {
     /// Model ID or path
@@ -113,14 +114,14 @@ pub struct InferArgs {
     pub chat_template_kwargs: Option<String>,
 
     /// Sampling mode preset with model-card recommended parameters.
-    #[arg(long = "mode", default_value = "auto")]
+    #[arg(long = "mode", default_value_t = pmetal_data::inference_config::SamplingMode::Auto)]
     pub mode: pmetal_data::inference_config::SamplingMode,
 
     /// Execution backend: auto | standard | ane.
     ///
     /// `auto` runs on the GPU, or on the ANE with --ane; `standard` pins the
     /// GPU and `ane` the ANE.
-    #[arg(long = "backend", default_value = "auto")]
+    #[arg(long = "backend", default_value_t = pmetal_data::inference_config::InferenceBackend::Auto)]
     pub backend: pmetal_data::inference_config::InferenceBackend,
 
     /// Draft model for exact speculative decoding (HF id or local path): a
@@ -128,6 +129,12 @@ pub struct InferArgs {
     /// GPU, for the model on the ANE).
     #[arg(long = "draft-model")]
     pub draft_model: Option<String>,
+
+    /// Print one JSON object on stdout (the text, token counts, timing, why
+    /// generation stopped) instead of streaming the text; the banner and the
+    /// statistics go to stderr.
+    #[arg(long = "json")]
+    pub json: bool,
 
     /// Enable bundled Qwen3Next/Qwen3.6 MTP speculative decoding.
     #[arg(long = "mtp")]
@@ -138,7 +145,7 @@ pub struct InferArgs {
     pub mtp_model: Option<String>,
 
     /// Number of Qwen MTP draft tokens to verify per speculative step.
-    #[arg(long = "mtp-draft-tokens", default_value = "3")]
+    #[arg(long = "mtp-draft-tokens", default_value_t = 3)]
     pub mtp_draft_tokens: usize,
 
     /// Hide thinking trace from output
@@ -158,15 +165,13 @@ pub struct InferArgs {
     pub experts_dir: Option<String>,
 
     /// Enable ANE (Apple Neural Engine) for inference (experimental).
-    #[cfg(feature = "ane")]
     #[arg(long = "ane")]
     pub ane: bool,
 
     /// Largest context (prompt plus output, in tokens) the ANE compiles a
     /// model for. Each request gets the smallest power of two from 512 that
     /// fits it, up to this; a smaller context runs faster.
-    #[cfg(feature = "ane")]
-    #[arg(long = "ane-max-seq-len", default_value = "4096")]
+    #[arg(long = "ane-max-seq-len", default_value_t = 4096)]
     pub ane_max_seq_len: usize,
 
     /// Run a prompt and generation throughput benchmark.
@@ -174,7 +179,7 @@ pub struct InferArgs {
     pub benchmark: bool,
 
     /// Number of measured trials for benchmarking (default: 5)
-    #[arg(long = "benchmark-iters", default_value = "5")]
+    #[arg(long = "benchmark-iters", default_value_t = 5)]
     pub benchmark_iters: usize,
 
     /// Synthetic prompt length for --benchmark.
@@ -202,7 +207,7 @@ pub struct InferArgs {
     pub kv_v_bits: Option<u8>,
 
     /// KV cache quantization group size.
-    #[arg(long = "kv-group-size", default_value = "64")]
+    #[arg(long = "kv-group-size", default_value_t = 64)]
     pub kv_group_size: usize,
 
     /// Use TurboQuant for KV cache compression.
@@ -211,7 +216,7 @@ pub struct InferArgs {
 
     /// Mixed-bit TurboQuant preset (`q2_5` or `q3_5`).
     #[arg(long = "kv-turboquant-preset", value_enum)]
-    pub kv_turboquant_preset: Option<crate::TurboQuantPresetArg>,
+    pub kv_turboquant_preset: Option<crate::cli::infer::TurboQuantPresetArg>,
 
     /// TurboQuant v2 mixed-bit affine preset.
     #[arg(long = "kv-quant-preset", value_parser = ["q2_5", "q3_5"])]
@@ -228,4 +233,80 @@ pub struct InferArgs {
     /// Enable n-gram repetition loop detection.
     #[arg(long = "detect-repetition")]
     pub detect_repetition: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum TurboQuantPresetArg {
+    #[value(name = "q2_5")]
+    Q2_5,
+    #[value(name = "q3_5")]
+    Q3_5,
+}
+
+impl From<TurboQuantPresetArg> for pmetal::inference_runner::TurboQuantPreset {
+    fn from(value: TurboQuantPresetArg) -> Self {
+        match value {
+            TurboQuantPresetArg::Q2_5 => Self::Q2_5,
+            TurboQuantPresetArg::Q3_5 => Self::Q3_5,
+        }
+    }
+}
+
+impl From<InferArgs> for InferSpec {
+    fn from(a: InferArgs) -> Self {
+        InferSpec {
+            model: a.model,
+            lora: a.lora,
+            prompt: a.prompt,
+            image: a.image,
+            video: a.video,
+            video_fps: a.video_fps,
+            json: a.json,
+            max_tokens: a.max_tokens,
+            temperature: a.temperature,
+            top_k: a.top_k,
+            top_p: a.top_p,
+            min_p: a.min_p,
+            repetition_penalty: a.repetition_penalty,
+            frequency_penalty: a.frequency_penalty,
+            presence_penalty: a.presence_penalty,
+            seed: a.seed,
+            chat: a.chat,
+            system: a.system,
+            no_thinking: a.no_thinking,
+            reasoning_effort: a.reasoning_effort,
+            no_preserve_thinking: a.no_preserve_thinking,
+            chat_template_kwargs: a.chat_template_kwargs,
+            hide_thinking: a.hide_thinking,
+            mode: a.mode.to_string(),
+            backend: a.backend.to_string(),
+            draft_model: a.draft_model,
+            mtp: a.mtp,
+            mtp_model: a.mtp_model,
+            mtp_draft_tokens: a.mtp_draft_tokens,
+            tools: a.tools,
+            fp8: a.fp8,
+            experts_dir: a.experts_dir,
+            ane: a.ane,
+            ane_max_seq_len: a.ane_max_seq_len,
+            benchmark: a.benchmark,
+            benchmark_iters: a.benchmark_iters,
+            benchmark_prompt_tokens: a.benchmark_prompt_tokens,
+            profile_layers: a.profile_layers,
+            profile_output: a.profile_output,
+            kv_quant: a.kv_quant,
+            kv_k_bits: a.kv_k_bits,
+            kv_v_bits: a.kv_v_bits,
+            kv_group_size: a.kv_group_size,
+            kv_turboquant: a.kv_turboquant,
+            kv_turboquant_preset: a
+                .kv_turboquant_preset
+                .and_then(|preset| preset.to_possible_value())
+                .map(|value| value.get_name().to_string()),
+            kv_quant_preset: a.kv_quant_preset,
+            no_kv_quant: a.no_kv_quant,
+            kv_qjl: a.kv_qjl,
+            detect_repetition: a.detect_repetition,
+        }
+    }
 }

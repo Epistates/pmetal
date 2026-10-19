@@ -1,31 +1,29 @@
 use std::path::{Path, PathBuf};
 
+use pmetal_core::jobs::FuseSpec;
+
 /// Fuse LoRA weights into base model weights.
 ///
 /// Folds the adapter into the base model with the streaming merge of
 /// `pmetal-merge` (memory-mapped, f64 arithmetic, atomic output), which
 /// reads the scale (`alpha / r`, `alpha / sqrt(r)` under rsLoRA) and DoRA
 /// magnitudes from the adapter itself and keeps the base's tensor layout and
-/// sidecar files. `alpha_override` and `rank_override` replace the adapter's
-/// own values; either one alone is combined with the other from
-/// `adapter_config.json`.
-pub(crate) async fn run_fuse(
-    model_path: &str,
-    lora_path: &str,
-    output_path: &str,
-    alpha_override: Option<f32>,
-    rank_override: Option<usize>,
-) -> anyhow::Result<()> {
+/// sidecar files. `--alpha` and `--rank` replace the adapter's own values;
+/// either one alone is combined with the other from `adapter_config.json`.
+/// `--low-memory` tiles the fold; it combines with either.
+pub(crate) async fn run_fuse(spec: FuseSpec) -> anyhow::Result<()> {
     println!("  PMetal LoRA Fuse");
     println!("========================================");
 
-    let scaling = if alpha_override.is_some() || rank_override.is_some() {
-        let config = read_adapter_config(lora_path);
-        let rank = rank_override
+    let scaling = if spec.alpha.is_some() || spec.rank.is_some() {
+        let config = read_adapter_config(&spec.lora);
+        let rank = spec
+            .rank
             .map(|r| r as f64)
             .or_else(|| config.as_ref().and_then(|c| c["r"].as_f64()))
             .ok_or_else(|| anyhow::anyhow!("--alpha needs --rank: no r in adapter_config.json"))?;
-        let alpha = alpha_override
+        let alpha = spec
+            .alpha
             .map(f64::from)
             .or_else(|| {
                 config
@@ -42,7 +40,14 @@ pub(crate) async fn run_fuse(
         None
     };
 
-    fuse_streaming(model_path, lora_path, output_path, false, scaling).await
+    fuse_streaming(
+        &spec.model,
+        &spec.lora,
+        &spec.output,
+        spec.low_memory,
+        scaling,
+    )
+    .await
 }
 
 /// `adapter_config.json` next to the adapter, if it parses.
@@ -58,23 +63,6 @@ fn read_adapter_config(lora_path: &str) -> Option<serde_json::Value> {
     std::fs::read_to_string(dir.join("adapter_config.json"))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-}
-
-/// Fuse LoRA weights using the f64-accurate streaming merge path.
-///
-/// Reads `adapter_config.json` from the adapter directory, resolves the base
-/// model (single-file or sharded), and writes the merged safetensors to
-/// `output_path`.  Non-weight files (tokenizer, config.json, etc.) are copied
-/// verbatim.
-pub(crate) async fn run_fuse_accurate(
-    model_path: &str,
-    lora_path: &str,
-    output_path: &str,
-    low_memory: bool,
-) -> anyhow::Result<()> {
-    println!("  PMetal LoRA Fuse (f64-accurate path)");
-    println!("========================================");
-    fuse_streaming(model_path, lora_path, output_path, low_memory, None).await
 }
 
 async fn fuse_streaming(

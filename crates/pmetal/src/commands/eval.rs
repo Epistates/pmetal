@@ -51,8 +51,9 @@ pub(crate) async fn run_eval(
 
     // Load dataset
     let chat_template = pmetal_data::chat_templates::detect_chat_template(&model_path, model_id);
+    let dataset_file = pmetal_trainer::resolve_dataset_path(dataset_path).await?;
     let dataset = TrainingDataset::from_jsonl_tokenized(
-        dataset_path,
+        &dataset_file,
         &tokenizer,
         DatasetFormat::Auto,
         max_seq_len,

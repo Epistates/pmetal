@@ -13,19 +13,17 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 
 use pmetal_core::LoraConfig;
+use pmetal_core::jobs::TrainDiffusionSpec;
 use pmetal_data::Tokenizer;
 use pmetal_lora::{AdaptedModel, QLoraConfig, QLoraScheme};
 use pmetal_models::DynamicModel;
 use pmetal_runtime::compat::Array;
-use pmetal_trainer::orchestrator::save_adapter;
+use pmetal_trainer::orchestrator::{QuantizationScheme, save_adapter};
 use pmetal_trainer::{
     DiffusionGemmaTrainConfig, DiffusionGemmaTrainer, quantize_diffusion_gemma_base,
 };
 
-use crate::QuantizationMethod;
-use crate::cli::train_diffusion::TrainDiffusionArgs;
-
-pub(crate) async fn run_train_diffusion(args: TrainDiffusionArgs) -> Result<()> {
+pub(crate) async fn run_train_diffusion(args: TrainDiffusionSpec) -> Result<()> {
     // 1. Resolve + load the model through the inference dispatcher.
     let model_path = pmetal_hub::resolve_model_path(&args.model, None, None)
         .await
@@ -54,11 +52,15 @@ pub(crate) async fn run_train_diffusion(args: TrainDiffusionArgs) -> Result<()> 
     //    then attach LoRA adapters to the encoder and decoder projections.
     //    Packing first seeds a DoRA magnitude from the weight the layer
     //    computes with.
-    let scheme = match args.quantization {
-        QuantizationMethod::None => None,
-        QuantizationMethod::Nf4 => Some(QLoraScheme::Nf4),
-        QuantizationMethod::Fp4 => Some(QLoraScheme::Fp4),
-        QuantizationMethod::Int8 => Some(QLoraScheme::Int8),
+    let scheme = match args
+        .quantization
+        .parse::<pmetal_trainer::orchestrator::QuantizationScheme>()
+        .map_err(anyhow::Error::msg)?
+    {
+        QuantizationScheme::None => None,
+        QuantizationScheme::Nf4 => Some(QLoraScheme::Nf4),
+        QuantizationScheme::Fp4 => Some(QLoraScheme::Fp4),
+        QuantizationScheme::Int8 => Some(QLoraScheme::Int8),
     };
     if let Some(scheme) = scheme {
         let qlora = QLoraConfig {

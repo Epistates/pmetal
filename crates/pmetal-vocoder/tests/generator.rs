@@ -337,3 +337,56 @@ fn tempdir() -> std::path::PathBuf {
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
+
+/// A Hub id loads from the configured Hub cache: the config and the weights
+/// of one snapshot, found through `pmetal-hub` rather than a client of the
+/// crate's own, and a snapshot without weights is an error that names them.
+#[test]
+fn a_hub_id_loads_from_the_hub_cache() {
+    let (mut model, fx) = tiny("generator_v1_tiny");
+    model.fuse_weight_norm();
+    let want = model.forward(&fx.array("mel")).unwrap();
+
+    let cache = std::env::temp_dir().join(format!("pmetal_vocoder_hub_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cache);
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let repo = cache.join("models--org--bigvgan");
+    let snapshot = repo.join("snapshots").join(commit);
+    std::fs::create_dir_all(&snapshot).unwrap();
+    std::fs::create_dir_all(repo.join("refs")).unwrap();
+    std::fs::write(repo.join("refs").join("main"), commit).unwrap();
+    std::fs::write(
+        snapshot.join("config.json"),
+        serde_json::to_string(&model.config).unwrap(),
+    )
+    .unwrap();
+
+    let options = pmetal_hub::DownloadOptions {
+        hub: pmetal_hub::HubOptions {
+            cache_dir: Some(cache.clone()),
+            offline: Some(true),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let load = || runtime.block_on(BigVGAN::from_pretrained_with("org/bigvgan", &options));
+
+    let err = match load() {
+        Ok(_) => panic!("no weights in the snapshot"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("org/bigvgan") && err.contains("model.safetensors"),
+        "{err}"
+    );
+
+    model
+        .save_safetensors(&snapshot.join("model.safetensors"))
+        .unwrap();
+    let loaded = load().expect("loads from the cache");
+    let got = loaded.forward(&fx.array("mel")).unwrap();
+    assert!(max_abs_diff(&to_vec(&got), &to_vec(&want)) < 1e-5);
+    assert_runtime_ok();
+    std::fs::remove_dir_all(cache).ok();
+}

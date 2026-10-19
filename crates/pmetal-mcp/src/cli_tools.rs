@@ -90,19 +90,19 @@ const OLLAMA_TEMPLATES: &[&str] = &["llama3", "qwen3", "gemma", "mistral", "phi3
 pub const CLI_TOOLS: &[CliTool] = &[
     CliTool {
         name: "dataset_analyze",
-        description: "Analyze a JSONL dataset: sample count, format detection, character and token length statistics.",
+        description: "Analyze a dataset: sample count, format detection, character and token length statistics.",
         command: &["dataset", "analyze"],
         params: &[
             p(
                 "path",
-                "Path to the dataset file (JSONL)",
+                "Path to the dataset file or directory (JSONL, JSON, Parquet, Arrow, CSV)",
                 Ty::Path,
                 Flag::Option("--path"),
                 true,
             ),
             p(
                 "model",
-                "Model ID or path whose tokenizer counts tokens",
+                "Model ID or path whose tokenizer counts tokens and whose chat template renders conversations",
                 Ty::Reference,
                 Flag::Option("--model"),
                 false,
@@ -213,7 +213,7 @@ pub const CLI_TOOLS: &[CliTool] = &[
     },
     CliTool {
         name: "dataset_convert",
-        description: "Convert a dataset file (Parquet, JSON, CSV, ShareGPT, Alpaca) to JSONL.",
+        description: "Convert a dataset file (Parquet, Arrow, JSON, JSONL, CSV) to JSONL, optionally renaming columns.",
         command: &["dataset", "convert"],
         params: &[
             p(
@@ -231,15 +231,8 @@ pub const CLI_TOOLS: &[CliTool] = &[
                 true,
             ),
             p(
-                "format",
-                "Input format; detected from the file when left out",
-                Ty::Enum(&["parquet", "json", "jsonl", "csv", "share-gpt", "alpaca"]),
-                Flag::Option("--format"),
-                false,
-            ),
-            p(
                 "columns",
-                "Column mapping, e.g. 'text=content,prompt=instruction'",
+                "Rename columns as target=source pairs, e.g. 'text=content,prompt=instruction' takes text from the column content",
                 Ty::Text,
                 Flag::Option("--columns"),
                 false,
@@ -262,7 +255,7 @@ pub const CLI_TOOLS: &[CliTool] = &[
         params: &[
             p(
                 "input",
-                "Input dataset (JSONL)",
+                "Input dataset (a file or directory: JSONL, JSON, Parquet, Arrow, CSV)",
                 Ty::Path,
                 Flag::Option("--input"),
                 true,
@@ -333,7 +326,7 @@ pub const CLI_TOOLS: &[CliTool] = &[
         params: &[
             p(
                 "input",
-                "Input dataset (JSONL)",
+                "Input dataset (a file or directory: JSONL, JSON, Parquet, Arrow, CSV)",
                 Ty::Path,
                 Flag::Option("--input"),
                 true,
@@ -377,7 +370,7 @@ pub const CLI_TOOLS: &[CliTool] = &[
         params: &[
             p(
                 "inputs",
-                "Input datasets (JSONL)",
+                "Input datasets (files or directories)",
                 Ty::Paths,
                 Flag::Option("--inputs"),
                 true,
@@ -421,7 +414,7 @@ pub const CLI_TOOLS: &[CliTool] = &[
         params: &[
             p(
                 "input",
-                "Input dataset (JSONL)",
+                "Input dataset (a file or directory: JSONL, JSON, Parquet, Arrow, CSV)",
                 Ty::Path,
                 Flag::Option("--input"),
                 true,
@@ -451,7 +444,7 @@ pub const CLI_TOOLS: &[CliTool] = &[
         params: &[
             p(
                 "input",
-                "Input dataset (JSONL with conversations)",
+                "Input dataset (a file or directory)",
                 Ty::Path,
                 Flag::Option("--input"),
                 true,
@@ -465,7 +458,7 @@ pub const CLI_TOOLS: &[CliTool] = &[
             ),
             p(
                 "template",
-                "Chat template (the CLI's default is chatml)",
+                "A built-in chat template in place of the model's own (without it and without a model, chatml)",
                 Ty::Enum(TEMPLATES),
                 Flag::Option("--template"),
                 false,
@@ -479,21 +472,21 @@ pub const CLI_TOOLS: &[CliTool] = &[
             ),
             p(
                 "model",
-                "Model ID or path whose tokenizer supplies the template",
+                "Model ID or path whose chat template formats the conversations",
                 Ty::Reference,
                 Flag::Option("--model"),
                 false,
             ),
             p(
                 "add_generation_prompt",
-                "End with the generation prompt",
+                "Write each conversation only up to the generation prompt of its last assistant turn",
                 Ty::Bool,
                 Flag::Switch("--add-generation-prompt"),
                 false,
             ),
             p(
                 "mask_prompt",
-                "Mask prompt tokens in the labels (SFT)",
+                "Write each sample as a prompt and a completion (the last assistant turn), so a trainer trains on the completion only",
                 Ty::Bool,
                 Flag::Switch("--mask-prompt"),
                 false,
@@ -529,7 +522,7 @@ pub const CLI_TOOLS: &[CliTool] = &[
             ),
             p(
                 "template",
-                "Chat template (the CLI's default is chatml)",
+                "A built-in chat template in place of the model's own",
                 Ty::Enum(TEMPLATES),
                 Flag::Option("--template"),
                 false,

@@ -1,6 +1,7 @@
 //! Clap argument struct for `pmetal dflash`.
 
 use clap::Args;
+use pmetal_core::jobs::DflashSpec;
 
 /// Thin clap argument struct for `pmetal dflash`.
 #[derive(Args, Debug)]
@@ -50,4 +51,22 @@ pub struct DflashArgs {
     /// target, and report its speed and whether DFlash's tokens match it.
     #[arg(long = "compare-greedy")]
     pub compare_greedy: bool,
+}
+
+impl From<DflashArgs> for DflashSpec {
+    fn from(a: DflashArgs) -> Self {
+        DflashSpec {
+            target: a.target,
+            draft: a.draft,
+            prompt: a.prompt,
+            max_new_tokens: a.max_new_tokens,
+            temperature: a.temperature,
+            speculative_tokens: a.speculative_tokens,
+            draft_fp8: a.draft_fp8,
+            json: a.json,
+            no_chat: a.no_chat,
+            tree_budget: a.tree_budget,
+            compare_greedy: a.compare_greedy,
+        }
+    }
 }

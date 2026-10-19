@@ -1,68 +1,62 @@
-/// Who may call the server, and for how long a request may run (the access
-/// flags of `pmetal serve`).
-#[cfg(feature = "serve")]
-pub(crate) struct Access {
-    /// `--api-key`, repeated.
-    pub(crate) api_keys: Vec<String>,
-    /// `--cors-origin`, repeated.
-    pub(crate) cors_origins: Vec<String>,
-    /// `--request-timeout`; 0 for no limit.
-    pub(crate) request_timeout_secs: u64,
-}
+use pmetal_core::jobs::ServeSpec;
 
+/// The server configuration a spec's access options make: its host, port,
+/// CORS origins and request limit, with `api_keys` (`--api-key`) and the keys of
+/// `PMETAL_API_KEY` (comma-separated) as the keys clients must send.
 #[cfg(feature = "serve")]
-impl Access {
-    /// The server configuration these flags make, with the keys of
-    /// `PMETAL_API_KEY` (comma-separated) added to the flags'.
-    fn into_config(self, port: u16, host: String) -> pmetal_serve::ServeConfig {
-        let mut api_keys = self.api_keys;
-        if let Ok(from_env) = std::env::var("PMETAL_API_KEY") {
-            api_keys.extend(
-                from_env
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|key| !key.is_empty())
-                    .map(str::to_owned),
-            );
-        }
-        pmetal_serve::ServeConfig {
-            port,
-            host,
-            api_keys,
-            cors_allowed_origins: self.cors_origins,
-            request_timeout: (self.request_timeout_secs > 0)
-                .then(|| std::time::Duration::from_secs(self.request_timeout_secs)),
-            ..Default::default()
-        }
+fn access_config(spec: &ServeSpec, mut api_keys: Vec<String>) -> pmetal_serve::ServeConfig {
+    if let Ok(from_env) = std::env::var("PMETAL_API_KEY") {
+        api_keys.extend(
+            from_env
+                .split(',')
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .map(str::to_owned),
+        );
+    }
+    pmetal_serve::ServeConfig {
+        port: spec.port,
+        host: spec.host.clone(),
+        api_keys,
+        cors_allowed_origins: spec.cors_origin.clone(),
+        request_timeout: (spec.request_timeout > 0)
+            .then(|| std::time::Duration::from_secs(spec.request_timeout)),
+        ..Default::default()
     }
 }
 
 /// Start the OpenAI-compatible inference server.
 #[cfg(feature = "serve")]
-#[expect(clippy::too_many_arguments, reason = "one argument per CLI flag")]
-pub(crate) async fn run_serve(
-    model_id: String,
-    port: u16,
-    host: String,
-    access: Access,
-    max_seq_len: Option<usize>,
-    experts_dir: Option<String>,
-    fp8: bool,
-    kv_quant: Option<u8>,
-    no_kv_quant: bool,
-    kv_group_size: usize,
-    kv_turboquant: bool,
-    kv_turboquant_preset: Option<String>,
-    ane_enabled: bool,
-    ane_max_seq_len: usize,
-    draft_model: Option<String>,
-    continuous_batch: bool,
-    cb_max_slots: usize,
-    cb_max_queue_depth: usize,
-    cb_block_size: usize,
-    cb_max_blocks: usize,
-    cb_exact: bool,
-) -> anyhow::Result<()> {
+pub(crate) async fn run_serve(spec: ServeSpec, api_keys: Vec<String>) -> anyhow::Result<()> {
+    let ServeSpec {
+        model: ref model_id,
+        max_seq_len,
+        ref experts_dir,
+        fp8,
+        kv_quant,
+        no_kv_quant,
+        kv_group_size,
+        kv_turboquant,
+        ref kv_turboquant_preset,
+        ane: ane_enabled,
+        ane_max_seq_len,
+        ref draft_model,
+        continuous_batch,
+        cb_max_slots,
+        cb_max_queue_depth,
+        cb_block_size,
+        cb_max_blocks,
+        cb_exact,
+        ..
+    } = spec;
+    let model_id = model_id.clone();
+    let experts_dir = experts_dir.clone();
+    let kv_turboquant_preset = kv_turboquant_preset.clone();
+    let draft_model = draft_model.clone();
+    #[cfg(not(feature = "ane"))]
+    if ane_enabled {
+        anyhow::bail!("--ane needs the 'ane' feature: cargo build --features ane");
+    }
     use pmetal::inference_runner::{
         CacheModeRequest, TurboQuantPreset, explicit_cache_mode_override,
     };
@@ -73,7 +67,7 @@ pub(crate) async fn run_serve(
     tracing::info!("Resolving model: {}", model_id);
     let model_path = pmetal_hub::resolve_model_path(&model_id, None, None).await?;
     if pmetal_models::decision::is_decision_model(&model_path) {
-        return run_decision_serve(model_id, &model_path, access.into_config(port, host)).await;
+        return run_decision_serve(model_id, &model_path, access_config(&spec, api_keys)).await;
     }
     let max_seq_len = match max_seq_len {
         Some(tokens) => tokens,
@@ -211,7 +205,7 @@ pub(crate) async fn run_serve(
 
     let config = ServeConfig {
         continuous_batching,
-        ..access.into_config(port, host)
+        ..access_config(&spec, api_keys)
     };
 
     pmetal_serve::server::run_server(engine, config).await?;
