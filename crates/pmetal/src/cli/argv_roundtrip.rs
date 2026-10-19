@@ -21,19 +21,176 @@ fn try_parse(subcommand: &str, spec_argv: Vec<String>) -> Result<Commands, Strin
         .map_err(|e| e.to_string())
 }
 
+/// A spec as JSON, for comparing two specs field by field.
+fn json<S: serde::Serialize>(spec: &S) -> serde_json::Value {
+    serde_json::to_value(spec).expect("a spec serializes")
+}
+
+/// A spec with every field off its default, so a field the parser drops or
+/// misreads shows as a difference.
+#[cfg(feature = "trainer")]
+fn busy_train_spec() -> TrainSpec {
+    TrainSpec {
+        model: "org/model".into(),
+        dataset: "data.jsonl".into(),
+        eval_dataset: Some("eval.jsonl".into()),
+        output_dir: "out".into(),
+        learning_rate: 1e-4,
+        embedding_lr: Some(5e-5),
+        label_smoothing: 0.1,
+        z_loss: 1e-4,
+        neftune_alpha: Some(5.0),
+        batch_size: 2,
+        epochs: 3,
+        max_steps: Some(40),
+        max_seq_len: 512,
+        gradient_accumulation_steps: 8,
+        no_gradient_checkpointing: true,
+        max_grad_norm: 0.5,
+        warmup_steps: 7,
+        warmup_ratio: Some(0.05),
+        weight_decay: 0.02,
+        optimizer: "lion".into(),
+        lr_schedule: "wsd".into(),
+        min_lr: Some(1e-6),
+        wsd_stable_ratio: Some(0.6),
+        wsd_decay_style: Some("one_minus_sqrt".into()),
+        cosine_num_restarts: Some(3),
+        polynomial_power: Some(2.0),
+        logging_steps: 5,
+        eval_steps: Some(20),
+        save_steps: Some(25),
+        seed: 7,
+        loss_scale: 4.0,
+        lora_r: 8,
+        lora_alpha: 24.0,
+        dora: true,
+        rslora: true,
+        lora_dropout: 0.05,
+        lora_targets: vec!["q_proj".into(), "v_proj".into()],
+        quantization: Some("nf4".into()),
+        quant_block_size: 128,
+        double_quant: true,
+        text_column: Some("body".into()),
+        text_columns: Some("a,b".into()),
+        column_separator: Some("\n---\n".into()),
+        prompt_column: Some("q".into()),
+        response_column: Some("r".into()),
+        no_sequence_packing: true,
+        cut_cross_entropy: true,
+        no_adaptive_lr: true,
+        ane: true,
+        pack_max_seq_len: Some(1024),
+        distributed_peers: Some("10.0.0.2:7000,10.0.0.3:7000".into()),
+        distributed_auto: true,
+        compression_strategy: "topk".into(),
+        config_path: Some("train.yaml".into()),
+        resume: true,
+        log_metrics: Some("metrics.jsonl".into()),
+    }
+}
+
+/// Every field of a train spec survives spec -> argv -> parser -> spec, and
+/// so does a spec that is all defaults, so the parser's defaults are the
+/// spec's.
+#[cfg(feature = "trainer")]
 #[test]
-fn train_spec_round_trip() {
-    let spec = TrainSpec {
-        model: "Qwen/Qwen3-0.6B".into(),
-        dataset: "data/train.jsonl".into(),
+fn train_spec_round_trips_every_field() {
+    let plain = TrainSpec {
+        model: "m".into(),
+        dataset: "d".into(),
         ..Default::default()
     };
-    let result = try_parse("train", spec.to_argv());
-    assert!(
-        result.is_ok(),
-        "TrainSpec argv failed to parse: {}",
-        result.unwrap_err()
+    for spec in [plain, busy_train_spec()] {
+        let parsed = match try_parse("train", spec.to_argv()) {
+            Ok(Commands::Train(args)) => TrainSpec::from(args),
+            Ok(_) => panic!("parsed as another command"),
+            Err(e) => panic!("TrainSpec argv failed to parse: {e}"),
+        };
+        assert_eq!(json(&parsed), json(&spec));
+    }
+}
+
+/// The options that shape a run's length, schedule and cadence reach the
+/// trainer's config from the command line.
+#[cfg(feature = "trainer")]
+#[test]
+fn train_flags_reach_the_job_config() {
+    use pmetal_trainer::orchestrator::TrainingJobConfig;
+
+    let spec = busy_train_spec();
+    let Ok(Commands::Train(args)) = try_parse("train", spec.to_argv()) else {
+        panic!("not a train command")
+    };
+    let job = TrainingJobConfig::from_spec(&TrainSpec::from(args)).unwrap();
+    let t = &job.training;
+    assert_eq!(t.max_steps, Some(40));
+    assert_eq!(t.warmup_steps, 7);
+    assert_eq!(t.warmup_ratio, Some(0.05));
+    assert_eq!(t.min_lr, Some(1e-6));
+    assert_eq!(t.lr_scheduler, pmetal_core::LrSchedulerType::Wsd);
+    assert_eq!(t.wsd_stable_ratio, Some(0.6));
+    assert_eq!(
+        t.wsd_decay_style,
+        Some(pmetal_core::WsdDecayStyle::OneMinusSqrt)
     );
+    assert_eq!(t.cosine_num_restarts, Some(3));
+    assert_eq!(t.polynomial_power, Some(2.0));
+    assert_eq!(
+        (t.logging_steps, t.eval_steps, t.save_steps),
+        (5, Some(20), Some(25))
+    );
+    assert_eq!(job.lora.target_modules, ["q_proj", "v_proj"]);
+    assert_eq!(job.log_metrics.as_deref(), Some("metrics.jsonl"));
+    assert_eq!(
+        job.columns
+            .as_ref()
+            .and_then(|c| c.column_separator.as_deref()),
+        Some("\n---\n")
+    );
+    let qlora = job.qlora.expect("nf4 asks for QLoRA");
+    assert_eq!((qlora.block_size, qlora.double_quant), (128, true));
+}
+
+/// A run configured by a file needs no model or dataset on the command line,
+/// and one with neither is refused with the flag named.
+#[cfg(feature = "trainer")]
+#[test]
+fn train_needs_a_model_and_dataset_unless_a_config_file_gives_them() {
+    let parse =
+        |extra: &[&str]| match try_parse("train", extra.iter().map(|s| s.to_string()).collect()) {
+            Ok(Commands::Train(args)) => TrainSpec::from(args),
+            other => panic!("{other:?}"),
+        };
+    assert!(parse(&["--config", "train.yaml"]).normalize().is_ok());
+    let errors = parse(&[]).normalize().unwrap_err();
+    let message = crate::commands::invalid_spec::<TrainSpec>(&errors).to_string();
+    assert!(message.contains("--model is required"), "{message}");
+    assert!(message.contains("--dataset is required"), "{message}");
+    // The option a value cannot be is named too.
+    let errors = parse(&["--config", "c.yaml", "--learning-rate", "5"])
+        .normalize()
+        .unwrap_err();
+    let message = crate::commands::invalid_spec::<TrainSpec>(&errors).to_string();
+    assert!(message.contains("--learning-rate"), "{message}");
+}
+
+#[cfg(feature = "trainer")]
+#[test]
+fn train_refuses_what_it_cannot_run() {
+    for (flag, value) in [
+        ("--lr-schedule", "cosin"),
+        ("--optimizer", "adam"),
+        ("--wsd-decay-style", "sharp"),
+        ("--compression-strategy", "zstd"),
+        ("--quantization", "nf8"),
+    ] {
+        let argv = ["--model", "m", "--dataset", "d", flag, value]
+            .map(String::from)
+            .to_vec();
+        let error = try_parse("train", argv).expect_err(flag);
+        assert!(error.contains(value), "{flag}: {error}");
+    }
 }
 
 #[cfg(feature = "trainer")]
@@ -514,25 +671,261 @@ fn tokenize_spec_round_trip() {
     );
 }
 
-// Smoke-test: default flags only contain the minimum required fields.
-// Any flag that is present in to_argv() but not recognized by clap would
-// have already failed the round-trip test above.
+/// Assert a spec survives spec -> argv -> parser -> spec, field by field.
+/// The specs below are written out in full, so a field added to one fails to
+/// compile here until the round trip covers it.
+#[cfg(feature = "trainer")]
+fn assert_round_trip<S, A>(spec: S, subcommand: &str, args: impl FnOnce(Commands) -> Option<A>)
+where
+    S: JobFields + serde::Serialize + From<A>,
+{
+    let parsed = try_parse(subcommand, spec.to_argv())
+        .unwrap_or_else(|e| panic!("`{subcommand}` argv failed to parse: {e}"));
+    let args = args(parsed).unwrap_or_else(|| panic!("parsed as another command"));
+    assert_eq!(json(&S::from(args)), json(&spec), "{subcommand}");
+}
+
+#[cfg(feature = "trainer")]
 #[test]
-fn train_spec_no_unexpected_flags() {
-    let spec = TrainSpec {
-        model: "m".into(),
-        dataset: "d".into(),
-        no_sequence_packing: true,
-        cut_cross_entropy: true,
-        no_adaptive_lr: true,
-        ane: true,
+fn distill_spec_round_trips_every_field() {
+    let busy = DistillSpec {
+        teacher: "org/teacher".into(),
+        student: "org/student".into(),
+        dataset: "d.jsonl".into(),
+        eval_dataset: Some("e.jsonl".into()),
+        output_dir: "out".into(),
+        method: "offline".into(),
+        offline: false,
+        offline_cache: Some("cache".into()),
+        offline_generate: true,
+        offline_compression: "int8".into(),
+        offline_top_k: 64,
+        loss_type: "skew_kl".into(),
+        skew_alpha: Some(0.2),
+        universal_logit_top_k: Some(32),
+        temperature: 3.0,
+        alpha: 0.7,
+        rationale: true,
+        rationale_weight: 2.0,
+        on_policy: 0.25,
+        on_policy_max_tokens: 128,
+        lora_r: 8,
+        lora_alpha: 16.0,
+        learning_rate: 1e-4,
+        optimizer: "lion".into(),
+        batch_size: 2,
+        epochs: 2,
+        max_seq_len: 2048,
+        seed: 3,
+        checkpoint_every: 10,
+        text_column: Some("t".into()),
+        text_columns: Some("a,b".into()),
+        column_separator: Some("|".into()),
+        prompt_column: Some("p".into()),
+        response_column: Some("r".into()),
+        log_metrics: Some("m.jsonl".into()),
         resume: true,
+    };
+    let plain = DistillSpec {
+        teacher: "t".into(),
+        student: "s".into(),
+        dataset: "d".into(),
         ..Default::default()
     };
-    let result = try_parse("train", spec.to_argv());
-    assert!(
-        result.is_ok(),
-        "TrainSpec flag-heavy argv failed to parse: {}",
-        result.unwrap_err()
-    );
+    for spec in [plain, busy] {
+        assert_round_trip(spec, "distill", |c| match c {
+            Commands::Distill(a) => Some(a),
+            _ => None,
+        });
+    }
+}
+
+#[cfg(feature = "trainer")]
+#[test]
+fn grpo_and_rlkd_specs_round_trip_every_field() {
+    let grpo = GrpoSpec {
+        model: "m".into(),
+        dataset: "d".into(),
+        output_dir: "out".into(),
+        num_generations: 4,
+        beta: 0.04,
+        learning_rate: 1e-6,
+        optimizer: "lion".into(),
+        epochs: 2,
+        lora_r: 8,
+        lora_alpha: 16.0,
+        max_seq_len: 1024,
+        max_completion_length: 256,
+        seed: 9,
+        checkpoint_every: 5,
+        dapo: true,
+        loss_type: "gspo".into(),
+        num_iterations: 2,
+        reasoning_rewards: true,
+        vlm: true,
+        max_image_size: 224,
+        reward_model: Some("rm".into()),
+        reward_model_max_length: 1024,
+        reward_model_weight: 0.5,
+        reward_model_template: Some("chatml".into()),
+        async_rewards: true,
+        prompt_column: Some("q".into()),
+        response_column: Some("a".into()),
+        grpo_kv_bits: Some(4),
+        log_metrics: Some("m.jsonl".into()),
+        resume: true,
+    };
+    for spec in [
+        GrpoSpec {
+            model: "m".into(),
+            dataset: "d".into(),
+            ..Default::default()
+        },
+        grpo,
+    ] {
+        assert_round_trip(spec, "grpo", |c| match c {
+            Commands::Grpo(a) => Some(a),
+            _ => None,
+        });
+    }
+    let rlkd = RlkdSpec {
+        model: "m".into(),
+        teacher_model: "t".into(),
+        dataset: "d".into(),
+        output_dir: "out".into(),
+        distill_alpha: 0.4,
+        final_alpha: 0.1,
+        anneal_alpha: true,
+        distill_temperature: 3.0,
+        num_generations: 4,
+        beta: 0.01,
+        learning_rate: 1e-6,
+        epochs: 2,
+        lora_r: 8,
+        lora_alpha: 16.0,
+        max_seq_len: 1024,
+        max_completion_length: 256,
+        seed: 9,
+        reasoning_rewards: true,
+        prompt_column: Some("q".into()),
+        response_column: Some("a".into()),
+        log_metrics: Some("m.jsonl".into()),
+    };
+    for spec in [
+        RlkdSpec {
+            model: "m".into(),
+            teacher_model: "t".into(),
+            dataset: "d".into(),
+            ..Default::default()
+        },
+        rlkd,
+    ] {
+        assert_round_trip(spec, "rlkd", |c| match c {
+            Commands::Rlkd(a) => Some(a),
+            _ => None,
+        });
+    }
+}
+
+#[cfg(feature = "trainer")]
+#[test]
+fn train_diffusion_spec_round_trips_every_field() {
+    use pmetal_core::jobs::TrainDiffusionSpec;
+    let busy = TrainDiffusionSpec {
+        model: "m".into(),
+        dataset: "d".into(),
+        output: "out".into(),
+        lora_r: 8,
+        lora_alpha: 16.0,
+        lora_targets: vec!["q_proj".into(), "v_proj".into()],
+        corrupted_only: false,
+        quantization: "nf4".into(),
+        quant_block_size: 32,
+        double_quant: true,
+        steps: 50,
+        learning_rate: 1e-4,
+        weight_decay: 0.01,
+        max_grad_norm: 0.5,
+        max_context_len: 256,
+        checkpoint_every: 10,
+        log_every: 5,
+        seed: 3,
+    };
+    let plain = TrainDiffusionSpec {
+        model: "m".into(),
+        dataset: "d".into(),
+        ..Default::default()
+    };
+    for spec in [plain, busy] {
+        assert_round_trip(spec, "train-diffusion", |c| match c {
+            Commands::TrainDiffusion(a) => Some(a),
+            _ => None,
+        });
+    }
+}
+
+#[test]
+fn infer_spec_round_trips_every_field() {
+    let busy = InferSpec {
+        model: "m".into(),
+        lora: Some("adapter".into()),
+        prompt: "hello there".into(),
+        image: vec!["a.png".into(), "b.png".into()],
+        video: vec!["frames".into()],
+        video_fps: Some(2.5),
+        max_tokens: Some(64),
+        temperature: Some(0.7),
+        top_k: Some(40),
+        top_p: Some(0.9),
+        min_p: Some(0.05),
+        repetition_penalty: Some(1.1),
+        frequency_penalty: Some(0.2),
+        presence_penalty: Some(0.3),
+        seed: Some(5),
+        chat: true,
+        system: Some("be brief".into()),
+        no_thinking: true,
+        reasoning_effort: Some("low".into()),
+        no_preserve_thinking: true,
+        chat_template_kwargs: Some("{\"x\": 1}".into()),
+        hide_thinking: true,
+        mode: "thinking-general".into(),
+        backend: "standard".into(),
+        draft_model: Some("draft".into()),
+        mtp: true,
+        mtp_model: Some("mtp".into()),
+        mtp_draft_tokens: 4,
+        tools: Some("tools.json".into()),
+        fp8: true,
+        experts_dir: Some("experts".into()),
+        ane: true,
+        ane_max_seq_len: 2048,
+        benchmark: true,
+        benchmark_iters: 3,
+        benchmark_prompt_tokens: Some(128),
+        profile_layers: true,
+        profile_output: Some("p.json".into()),
+        kv_quant: Some(8),
+        kv_k_bits: Some(4),
+        kv_v_bits: Some(2),
+        kv_group_size: 32,
+        kv_turboquant: true,
+        kv_turboquant_preset: Some("q3_5".into()),
+        kv_quant_preset: Some("q2_5".into()),
+        no_kv_quant: true,
+        kv_qjl: true,
+        detect_repetition: true,
+    };
+    let plain = InferSpec {
+        model: "m".into(),
+        prompt: "hi".into(),
+        ..Default::default()
+    };
+    for spec in [plain, busy] {
+        let parsed = match try_parse("infer", spec.to_argv()) {
+            Ok(Commands::Infer(a)) => InferSpec::from(a),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(json(&parsed), json(&spec));
+    }
 }

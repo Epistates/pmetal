@@ -71,6 +71,44 @@ pub struct DatasetColumnConfig {
     pub response_column: Option<String>,
 }
 
+impl DatasetColumnConfig {
+    /// The configuration the column-selection options of a command ask for,
+    /// or `None` when none of them names a column, which leaves the format
+    /// detection to the rows. `text_columns` is the comma-separated form the
+    /// job specs spell; blanks around a name are dropped, as are empty names.
+    #[must_use]
+    pub fn from_selectors(
+        text_column: Option<String>,
+        text_columns: Option<&str>,
+        column_separator: Option<String>,
+        prompt_column: Option<String>,
+        response_column: Option<String>,
+    ) -> Option<Self> {
+        let text_columns = text_columns.map(|csv| {
+            csv.split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        });
+        let text_columns = text_columns.filter(|names| !names.is_empty());
+        if text_column.is_none()
+            && text_columns.is_none()
+            && prompt_column.is_none()
+            && response_column.is_none()
+        {
+            return None;
+        }
+        Some(Self {
+            text_column,
+            text_columns,
+            column_separator,
+            prompt_column,
+            response_column,
+        })
+    }
+}
+
 /// Columns that can hold the prompt of a prompt/completion row.
 const PROMPT_FIELDS: &[&str] = &["prompt", "question", "query", "input"];
 /// Columns that can hold the completion of a prompt/completion row.
@@ -824,6 +862,28 @@ mod tests {
             panic!("a completion")
         };
         assert_eq!((prompt.as_str(), completion.as_str()), ("2+2=", " 4"));
+    }
+
+    #[test]
+    fn column_selectors_make_a_config_only_when_they_name_a_column() {
+        let none = DatasetColumnConfig::from_selectors(None, None, Some("|".into()), None, None);
+        assert!(none.is_none(), "a separator alone selects nothing");
+        let blank = DatasetColumnConfig::from_selectors(None, Some(" , "), None, None, None);
+        assert!(blank.is_none(), "blank names select nothing");
+        let some = DatasetColumnConfig::from_selectors(
+            None,
+            Some("a, b,,c"),
+            Some("|".into()),
+            Some("q".into()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            some.text_columns.as_deref(),
+            Some(&["a".to_string(), "b".into(), "c".into()][..])
+        );
+        assert_eq!(some.column_separator.as_deref(), Some("|"));
+        assert_eq!(some.prompt_column.as_deref(), Some("q"));
     }
 
     #[test]

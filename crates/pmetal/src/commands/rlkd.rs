@@ -1,37 +1,50 @@
 use pmetal_core::TrainingConfig;
+use pmetal_core::jobs::RlkdSpec;
 use pmetal_data::Tokenizer;
 use pmetal_trainer::{GrpoConfig, RlkdConfig, RlkdTrainer};
 use std::path::PathBuf;
 
+use super::RunContext;
+
 /// Run RLKD (Reinforcement Learning with Knowledge Distillation).
 ///
 /// Combines GRPO policy gradient with teacher distillation in a single backward pass.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_rlkd_cli(
-    model_id: &str,
-    teacher_model_id: &str,
-    dataset_path: &str,
-    output_dir: &str,
-    distill_alpha: f32,
-    final_alpha: f32,
-    anneal_alpha: bool,
-    distill_temperature: f32,
-    num_generations: usize,
-    beta: f64,
-    learning_rate: f64,
-    epochs: usize,
-    lora_r: usize,
-    lora_alpha: f32,
-    max_seq_len: usize,
-    max_completion_length: usize,
-    seed: u64,
-    reasoning_rewards: bool,
-    _log_metrics: Option<String>,
-    emit_console_output: bool,
-    extra_callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>>,
-    prompt_column: Option<String>,
-    response_column: Option<String>,
-) -> anyhow::Result<()> {
+pub(crate) async fn run_rlkd(spec: RlkdSpec, ctx: RunContext) -> anyhow::Result<()> {
+    let RlkdSpec {
+        model: ref model_id,
+        teacher_model: ref teacher_model_id,
+        dataset: ref dataset_path,
+        output_dir: ref output_dir,
+        distill_alpha,
+        final_alpha,
+        anneal_alpha,
+        distill_temperature,
+        num_generations,
+        beta,
+        learning_rate,
+        epochs,
+        lora_r,
+        lora_alpha,
+        max_seq_len,
+        max_completion_length,
+        seed,
+        reasoning_rewards,
+        ref prompt_column,
+        ref response_column,
+        log_metrics: ref _log_metrics,
+        ..
+    } = spec;
+    let RunContext {
+        emit_console_output,
+        callbacks: extra_callbacks,
+    } = ctx;
+    let (model_id, teacher_model_id, dataset_path, output_dir) = (
+        model_id.as_str(),
+        teacher_model_id.as_str(),
+        dataset_path.as_str(),
+        output_dir.as_str(),
+    );
+    let (prompt_column, response_column) = (prompt_column.clone(), response_column.clone());
     use pmetal_core::LoraConfig;
     use pmetal_lora::DynamicLoraModel;
     use pmetal_models::DynamicModel;
@@ -78,9 +91,10 @@ pub(crate) async fn run_rlkd_cli(
 
     // 4. Load the prompts: each row's conversation up to where the model
     // writes, with its answer kept aside as the accuracy reward's reference.
-    tracing::info!("Loading dataset: {}", dataset_path);
+    let dataset_file = pmetal_trainer::resolve_dataset_path(dataset_path).await?;
+    tracing::info!("Loading dataset: {}", dataset_file.display());
     let prompts = pmetal_trainer::grpo::load_prompts_with(
-        dataset_path,
+        &dataset_file,
         &tokenizer,
         &chat_template,
         max_seq_len,
@@ -180,7 +194,7 @@ pub(crate) async fn run_rlkd_cli(
     // 10. Build trainer
     let mut trainer = RlkdTrainer::new(rlkd_config)?;
 
-    if let Some(ref metrics_path) = _log_metrics {
+    if let Some(metrics_path) = _log_metrics {
         let path = if metrics_path.contains('/') || metrics_path.contains('\\') {
             PathBuf::from(metrics_path)
         } else {

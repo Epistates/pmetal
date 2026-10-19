@@ -25,7 +25,7 @@
     { value: 'sft', label: 'SFT', description: 'Full-parameter Supervised Fine-Tuning on GPU' },
   ];
 
-  const lrSchedulers = ['cosine', 'linear', 'constant', 'cosine_with_restarts', 'polynomial'];
+  const lrSchedulers = ['cosine', 'linear', 'constant', 'cosine_with_restarts', 'polynomial', 'wsd'];
   const datasetFormats = ['auto', 'alpaca', 'sharegpt', 'hf', 'jsonl'];
 
   // Form state
@@ -61,7 +61,6 @@
 
   // PMetal optimizations
   let gradientCheckpointing = $state(true);
-  let gradientCheckpointingLayers = $state(4);
   let sequencePacking = $state(true);
   let embeddingLr = $state(0.0);
   let labelSmoothing = $state(0.0);
@@ -275,7 +274,8 @@
         z_loss: zLoss,
         neftune_alpha: neftuneAlpha > 0 ? neftuneAlpha : undefined,
         no_gradient_checkpointing: !gradientCheckpointing,
-        gradient_checkpointing_layers: gradientCheckpointingLayers,
+        save_steps: saveSteps,
+        logging_steps: loggingSteps,
         cut_cross_entropy: cutCrossEntropy,
         no_adaptive_lr: noAdaptiveLr,
         warmup_steps: warmupSteps,
@@ -1018,10 +1018,6 @@
                   <label class="label" for="neftune-alpha">NEFTune Alpha (0 = off)</label>
                   <input id="neftune-alpha" type="number" class="input" step="0.5" min="0" max="100" bind:value={neftuneAlpha} />
                   <p class="text-xs text-surface-400 mt-0.5">Embedding noise: 5 for small models, 15 for larger.</p>
-                </div>
-                <div>
-                  <label class="label" for="ckpt-layers">Checkpoint Layers</label>
-                  <input id="ckpt-layers" type="number" class="input" min="1" bind:value={gradientCheckpointingLayers} />
                 </div>
                 <div>
                   <label class="label" for="pack-max">Pack Max Seq Len</label>

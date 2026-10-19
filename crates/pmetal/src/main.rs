@@ -12,10 +12,7 @@ mod tui;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use cli::train::QuantizationMethod;
 use cli::{Cli, Commands};
-#[cfg(feature = "trainer")]
-use pmetal_core::{LoraConfig, TrainingConfig};
 
 /// The gzip-compressed `mlx.metallib` built with the MLX this binary links,
 /// embedded by build.rs. Empty when the build had none.
@@ -244,189 +241,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         #[cfg(feature = "trainer")]
         Commands::Train(args) => {
-            let crate::cli::train::TrainArgs {
-                config,
-                model,
-                dataset,
-                eval_dataset,
-                output,
-                lora_r,
-                lora_alpha,
-                dora,
-                rslora,
-                lora_dropout,
-                learning_rate,
-                batch_size,
-                epochs,
-                max_seq_len,
-                gradient_accumulation_steps,
-                max_grad_norm,
-                resume,
-                quantization,
-                quant_block_size,
-                double_quant,
-                no_sequence_packing,
-                pack_max_seq_len,
-                no_gradient_checkpointing,
-                gradient_checkpointing_layers,
-                log_metrics,
-                embedding_lr,
-                label_smoothing,
-                z_loss,
-                neftune_alpha,
-                loss_scale,
-                warmup_steps,
-                lr_schedule,
-                weight_decay,
-                optimizer,
-                seed,
-                cut_cross_entropy,
-                no_adaptive_lr,
-                text_column,
-                text_columns,
-                column_separator,
-                prompt_column,
-                response_column,
-                #[cfg(feature = "ane")]
-                ane,
-                #[cfg(feature = "distributed")]
-                distributed_peers,
-                #[cfg(feature = "distributed")]
-                distributed_auto,
-                #[cfg(feature = "distributed")]
-                compression_strategy,
-            } = args;
-            use pmetal_trainer::orchestrator;
-
-            // Parse LR schedule
-            let lr_scheduler = lr_schedule
-                .parse::<pmetal_core::LrSchedulerType>()
-                .map_err(|e| anyhow::anyhow!("--lr-schedule: {e}"))?;
-
-            // Build QLoRA config if quantization is requested
-            let qlora = if !matches!(quantization, QuantizationMethod::None) {
-                Some(orchestrator::QLoraOrchConfig {
-                    scheme: match quantization {
-                        QuantizationMethod::Nf4 => orchestrator::QuantizationScheme::Nf4,
-                        QuantizationMethod::Fp4 => orchestrator::QuantizationScheme::Fp4,
-                        QuantizationMethod::Int8 => orchestrator::QuantizationScheme::Int8,
-                        QuantizationMethod::None => unreachable!(),
-                    },
-                    block_size: quant_block_size,
-                    double_quant,
-                })
-            } else {
-                None
-            };
-
-            // Build column config
-            let columns = commands::build_column_config(
-                text_column,
-                text_columns,
-                column_separator,
-                prompt_column,
-                response_column,
-            );
-
-            // Build distributed config
-            #[cfg(feature = "distributed")]
-            let distributed = {
-                let has_peers = distributed_peers.as_ref().is_some_and(|p| !p.is_empty());
-                if has_peers || distributed_auto {
-                    let compression = match compression_strategy.as_deref() {
-                        Some("topk") => pmetal_core::DistributedCompression::TopK,
-                        Some("fp16") => pmetal_core::DistributedCompression::Fp16,
-                        Some("random") => pmetal_core::DistributedCompression::Random,
-                        _ => pmetal_core::DistributedCompression::None,
-                    };
-                    Some(pmetal_core::DistributedTrainingConfig {
-                        peers: distributed_peers.unwrap_or_default(),
-                        auto_discover: distributed_auto,
-                        compression,
-                        ..Default::default()
-                    })
-                } else {
-                    None
-                }
-            };
-
-            let job_config = orchestrator::TrainingJobConfig {
-                model_id: model.unwrap_or_default(),
-                dataset: dataset.unwrap_or_default(),
-                eval_dataset,
-                output_dir: output,
-                lora: LoraConfig {
-                    r: lora_r,
-                    alpha: lora_alpha,
-                    dropout: lora_dropout,
-                    use_rslora: rslora,
-                    use_dora: dora,
-                    ..Default::default()
-                },
-                qlora,
-                training: TrainingConfig {
-                    learning_rate,
-                    batch_size,
-                    num_epochs: epochs,
-                    max_seq_len,
-                    gradient_accumulation_steps,
-                    max_grad_norm,
-                    warmup_steps,
-                    weight_decay,
-                    lr_scheduler,
-                    optimizer,
-                    embedding_learning_rate: embedding_lr.map(|v| v as f64),
-                    label_smoothing,
-                    z_loss,
-                    neftune_noise_alpha: neftune_alpha,
-                    ..Default::default()
-                },
-                columns,
-                dispatch: orchestrator::DispatchConfig {
-                    sequence_packing: !no_sequence_packing,
-                    pack_max_seq_len,
-                    gradient_checkpointing: !no_gradient_checkpointing,
-                    gradient_checkpointing_layers,
-                    cut_cross_entropy,
-                    no_adaptive_lr,
-                    #[cfg(feature = "ane")]
-                    ane,
-                    #[cfg(not(feature = "ane"))]
-                    ane: false,
-                    loss_scale,
-                    #[cfg(feature = "distributed")]
-                    distributed,
-                },
-                config_path: config,
-                log_metrics,
-                resume,
-                seed,
-                emit_console_output: true,
-            };
-
-            // If --log-events <path> was given, open the file and wrap the
-            // trainer callback chain with a JsonlSink so every JobEvent is
-            // emitted as a JSONL line.  The file is created (or truncated) at
-            // parse time so callers can `tail -f` it immediately.
-            //
-            // Pattern for other entry points (distill, grpo, …): open the
-            // sink the same way, box it as `Box<dyn pmetal_core::TrainingCallback>`,
-            // and push it into the `extra_callbacks` vec that each run_* fn
-            // already accepts.  See `src/cli/README.md` for the full pattern.
-            let mut extra_callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>> = Vec::new();
-            if let Some(path) = log_events_path {
-                // Created before training starts, so a bad path fails at once
-                // rather than partway through.
-                let file = std::fs::File::create(&path).map_err(|e| {
-                    anyhow::anyhow!("--log-events: could not create '{}': {e}", path.display())
-                })?;
-                extra_callbacks.push(Box::new(pmetal_core::TrainingCallbackToSink::new(
-                    job_config.model_id.clone(),
-                    pmetal_core::JsonlSink::new(file),
-                )));
-            }
-
-            orchestrator::run_training(job_config, None, extra_callbacks).await?;
+            commands::train::run_train(args, log_events_path.as_deref()).await?;
         }
 
         #[cfg(feature = "trainer")]
@@ -441,7 +256,11 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
 
         #[cfg(feature = "trainer")]
         Commands::TrainDiffusion(args) => {
-            commands::train_diffusion::run_train_diffusion(args).await?;
+            use pmetal_core::jobs::TrainDiffusionSpec;
+            let mut spec = TrainDiffusionSpec::from(args);
+            spec.normalize()
+                .map_err(|errors| commands::invalid_spec::<TrainDiffusionSpec>(&errors))?;
+            commands::train_diffusion::run_train_diffusion(spec).await?;
         }
 
         #[cfg(feature = "mcp")]
@@ -536,139 +355,11 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
         }
 
         Commands::Infer(args) => {
-            let crate::cli::infer::InferArgs {
-                model,
-                lora,
-                prompt,
-                image,
-                video,
-                video_fps,
-                max_tokens,
-                temperature,
-                top_k,
-                top_p,
-                min_p,
-                repetition_penalty,
-                frequency_penalty,
-                presence_penalty,
-                seed,
-                chat,
-                system,
-                no_thinking,
-                reasoning_effort,
-                no_preserve_thinking,
-                chat_template_kwargs,
-                mode,
-                backend,
-                draft_model,
-                mtp,
-                mtp_model,
-                mtp_draft_tokens,
-                hide_thinking,
-                tools,
-                fp8,
-                experts_dir,
-                #[cfg(feature = "ane")]
-                ane,
-                #[cfg(feature = "ane")]
-                ane_max_seq_len,
-                benchmark,
-                benchmark_iters,
-                benchmark_prompt_tokens,
-                profile_layers,
-                profile_output,
-                kv_quant,
-                kv_k_bits,
-                kv_v_bits,
-                kv_group_size,
-                kv_turboquant,
-                kv_turboquant_preset,
-                kv_quant_preset,
-                no_kv_quant,
-                kv_qjl,
-                detect_repetition,
-            } = args;
-            // Load tool definitions if provided
-            let tool_defs: Option<Vec<pmetal_data::chat_templates::ToolDefinition>> =
-                if let Some(ref tools_path) = tools {
-                    let tools_json = std::fs::read_to_string(tools_path)
-                        .map_err(|e| anyhow::anyhow!("Failed to read tools file: {}", e))?;
-                    let defs: Vec<pmetal_data::chat_templates::ToolDefinition> =
-                        serde_json::from_str(&tools_json)
-                            .map_err(|e| anyhow::anyhow!("Failed to parse tools JSON: {}", e))?;
-                    tracing::info!("Loaded {} tool definitions from {}", defs.len(), tools_path);
-                    Some(defs)
-                } else {
-                    None
-                };
-
-            let validated_profile_output = profile_output
-                .as_deref()
-                .map(|path| validate_output_path(path, "infer profile output"))
-                .transpose()?;
-            let template_kwargs = pmetal_data::chat_templates::ChatTemplateKwargs::from_controls(
-                chat_template_kwargs.as_deref(),
-                no_thinking,
-                reasoning_effort.as_deref(),
-                no_preserve_thinking,
-            )
-            .map_err(anyhow::Error::msg)?;
-
-            commands::infer::run_inference(
-                &model,
-                lora.as_deref(),
-                &prompt,
-                max_tokens,
-                temperature,
-                top_k,
-                top_p,
-                min_p,
-                repetition_penalty,
-                frequency_penalty,
-                presence_penalty,
-                seed,
-                chat,
-                system.as_deref(),
-                no_thinking,
-                template_kwargs,
-                mode,
-                backend,
-                draft_model.as_deref(),
-                mtp,
-                mtp_model.as_deref(),
-                mtp_draft_tokens,
-                hide_thinking,
-                fp8,
-                tool_defs.as_deref(),
-                #[cfg(feature = "ane")]
-                ane,
-                #[cfg(not(feature = "ane"))]
-                false,
-                #[cfg(feature = "ane")]
-                ane_max_seq_len,
-                #[cfg(not(feature = "ane"))]
-                1024,
-                benchmark,
-                benchmark_iters,
-                benchmark_prompt_tokens,
-                profile_layers,
-                validated_profile_output.as_deref(),
-                kv_quant,
-                kv_k_bits,
-                kv_v_bits,
-                kv_group_size,
-                kv_turboquant,
-                kv_turboquant_preset.map(Into::into),
-                kv_quant_preset,
-                no_kv_quant,
-                kv_qjl,
-                detect_repetition,
-                experts_dir.as_deref(),
-                &image,
-                &video,
-                video_fps,
-            )
-            .await?;
+            use pmetal_core::jobs::InferSpec;
+            let mut spec = InferSpec::from(args);
+            spec.normalize()
+                .map_err(|errors| commands::invalid_spec::<InferSpec>(&errors))?;
+            commands::infer::run_inference(spec).await?;
         }
 
         Commands::Download(args) => {
@@ -984,222 +675,54 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
 
         #[cfg(feature = "trainer")]
         Commands::Distill(args) => {
-            let crate::cli::distill::DistillArgs {
-                teacher,
-                student,
-                dataset,
-                eval_dataset,
-                output,
-                method,
-                offline,
-                offline_cache,
-                offline_generate,
-                offline_compression,
-                offline_top_k,
-                loss_type,
-                temperature,
-                alpha,
-                rationale,
-                rationale_weight,
-                on_policy,
-                on_policy_max_tokens,
-                lora_r,
-                lora_alpha,
-                learning_rate,
-                optimizer,
-                batch_size,
-                epochs,
-                max_seq_len,
-                seed,
-                checkpoint_every,
-                resume,
-                text_column,
-                text_columns,
-                column_separator,
-                prompt_column,
-                response_column,
-                log_metrics,
-            } = args;
-            commands::distill::run_distillation_cli(
-                &teacher,
-                &student,
-                &dataset,
-                eval_dataset,
-                &output,
-                &method,
-                &loss_type,
-                temperature,
-                alpha,
-                rationale,
-                rationale_weight,
-                on_policy,
-                on_policy_max_tokens,
-                lora_r,
-                lora_alpha,
-                learning_rate,
-                optimizer,
-                batch_size,
-                epochs,
-                max_seq_len,
-                seed,
-                checkpoint_every,
-                resume,
-                log_metrics,
-                true,
-                Vec::new(),
-                text_column,
-                text_columns,
-                column_separator,
-                prompt_column,
-                response_column,
-                commands::distill::OfflineCliOptions {
-                    enabled: offline,
-                    cache_path: offline_cache,
-                    generate: offline_generate,
-                    compression: offline_compression,
-                    top_k: offline_top_k,
-                },
-            )
+            use pmetal_core::jobs::DistillSpec;
+            let mut spec = DistillSpec::from(args);
+            spec.normalize()
+                .map_err(|errors| commands::invalid_spec::<DistillSpec>(&errors))?;
+            let job_id = format!("distill:{}", spec.student);
+            commands::with_event_log(log_events_path.as_deref(), &job_id, |ctx| {
+                commands::distill::run_distillation(spec, ctx)
+            })
             .await?;
         }
 
         #[cfg(feature = "trainer")]
         Commands::Grpo(args) => {
-            let crate::cli::grpo::GrpoArgs {
-                model,
-                dataset,
-                output,
-                num_generations,
-                beta,
-                learning_rate,
-                optimizer,
-                epochs,
-                lora_r,
-                lora_alpha,
-                max_seq_len,
-                max_completion_length,
-                seed,
-                checkpoint_every,
-                resume,
-                dapo,
-                loss_type,
-                num_iterations,
-                reasoning_rewards,
-                vlm,
-                max_image_size,
-                reward_model,
-                reward_model_max_length,
-                reward_model_weight,
-                reward_model_template,
-                async_rewards,
-                grpo_kv_bits,
-                prompt_column,
-                response_column,
-                log_metrics,
-            } = args;
-            commands::grpo::run_grpo_cli(
-                &model,
-                &dataset,
-                &output,
-                num_generations,
-                beta,
-                learning_rate,
-                optimizer,
-                epochs,
-                lora_r,
-                lora_alpha,
-                max_seq_len,
-                max_completion_length,
-                seed,
-                checkpoint_every,
-                resume,
-                dapo,
-                &loss_type,
-                num_iterations,
-                reasoning_rewards,
-                vlm,
-                max_image_size,
-                reward_model,
-                reward_model_max_length,
-                reward_model_weight,
-                reward_model_template,
-                async_rewards,
-                grpo_kv_bits,
-                log_metrics,
-                true,
-                Vec::new(),
-                prompt_column,
-                response_column,
-            )
+            use pmetal_core::jobs::GrpoSpec;
+            let mut spec = GrpoSpec::from(args);
+            spec.normalize()
+                .map_err(|errors| commands::invalid_spec::<GrpoSpec>(&errors))?;
+            let job_id = format!("grpo:{}", spec.model);
+            commands::with_event_log(log_events_path.as_deref(), &job_id, |ctx| {
+                commands::grpo::run_grpo(spec, ctx)
+            })
             .await?;
         }
 
         #[cfg(feature = "trainer")]
         Commands::Rlkd(args) => {
-            let crate::cli::rlkd::RlkdArgs {
-                model,
-                teacher_model,
-                dataset,
-                output,
-                distill_alpha,
-                final_alpha,
-                anneal_alpha,
-                distill_temperature,
-                num_generations,
-                beta,
-                learning_rate,
-                epochs,
-                lora_r,
-                lora_alpha,
-                max_seq_len,
-                max_completion_length,
-                seed,
-                reasoning_rewards,
-                prompt_column,
-                response_column,
-                log_metrics,
-            } = args;
-            commands::rlkd::run_rlkd_cli(
-                &model,
-                &teacher_model,
-                &dataset,
-                &output,
-                distill_alpha,
-                final_alpha,
-                anneal_alpha,
-                distill_temperature,
-                num_generations,
-                beta,
-                learning_rate,
-                epochs,
-                lora_r,
-                lora_alpha,
-                max_seq_len,
-                max_completion_length,
-                seed,
-                reasoning_rewards,
-                log_metrics,
-                true,
-                Vec::new(),
-                prompt_column,
-                response_column,
-            )
+            use pmetal_core::jobs::RlkdSpec;
+            let mut spec = RlkdSpec::from(args);
+            spec.normalize()
+                .map_err(|errors| commands::invalid_spec::<RlkdSpec>(&errors))?;
+            let job_id = format!("rlkd:{}", spec.model);
+            commands::with_event_log(log_events_path.as_deref(), &job_id, |ctx| {
+                commands::rlkd::run_rlkd(spec, ctx)
+            })
             .await?;
         }
 
         #[cfg(feature = "trainer")]
         Commands::Preference(args) => {
-            let mut spec = pmetal_core::jobs::PreferenceSpec::from(args);
-            spec.normalize().map_err(|errs| {
-                anyhow::anyhow!(
-                    "{}",
-                    errs.iter()
-                        .map(|e| e.message.as_str())
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                )
-            })?;
-            commands::preference::run_preference(spec, true, Vec::new()).await?;
+            use pmetal_core::jobs::PreferenceSpec;
+            let mut spec = PreferenceSpec::from(args);
+            spec.normalize()
+                .map_err(|errors| commands::invalid_spec::<PreferenceSpec>(&errors))?;
+            let job_id = format!("{}:{}", spec.loss, spec.model);
+            commands::with_event_log(log_events_path.as_deref(), &job_id, |ctx| {
+                commands::preference::run_preference(spec, ctx)
+            })
+            .await?;
         }
 
         Commands::Dataset { action } => {
@@ -1268,7 +791,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             .await?;
         }
 
-        #[cfg(feature = "lora")]
+        #[cfg(all(feature = "lora", feature = "trainer"))]
         Commands::Eval(args) => {
             let crate::cli::eval::EvalArgs {
                 model,

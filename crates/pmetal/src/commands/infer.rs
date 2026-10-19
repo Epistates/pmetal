@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::Context;
+use pmetal_core::jobs::InferSpec;
 use pmetal_models::{
     DynamicModel,
     architectures::{Qwen3NextForwardProfile, Qwen3NextLayerProfile},
@@ -265,55 +266,99 @@ fn run_qwen3_next_layer_profile(
 /// Uses the shared `InferenceRunner` for model loading, tokenization, chat
 /// template, sampling config, and cache creation. CLI-specific features
 /// (ANE, benchmark) use the runner's prepared state.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_inference(
-    model_id: &str,
-    lora_path: Option<&str>,
-    prompt: &str,
-    max_tokens: Option<usize>,
-    temperature: Option<f32>,
-    top_k: Option<usize>,
-    top_p: Option<f32>,
-    min_p: Option<f32>,
-    repetition_penalty: Option<f32>,
-    frequency_penalty: Option<f32>,
-    presence_penalty: Option<f32>,
-    seed: Option<u64>,
-    chat: bool,
-    system: Option<&str>,
-    no_thinking: bool,
-    chat_template_kwargs: pmetal_data::chat_templates::ChatTemplateKwargs,
-    mode: pmetal_data::inference_config::SamplingMode,
-    backend: pmetal_data::inference_config::InferenceBackend,
-    draft_model: Option<&str>,
-    mtp: bool,
-    mtp_model: Option<&str>,
-    mtp_draft_tokens: usize,
-    hide_thinking: bool,
-    fp8: bool,
-    tools: Option<&[pmetal_data::chat_templates::ToolDefinition]>,
-    ane: bool,
-    #[cfg_attr(not(feature = "ane"), allow(unused_variables))] ane_max_seq_len: usize,
-    benchmark: bool,
-    benchmark_iters: usize,
-    benchmark_prompt_tokens: Option<usize>,
-    profile_layers: bool,
-    profile_output: Option<&Path>,
-    kv_quant: Option<u8>,
-    kv_k_bits: Option<u8>,
-    kv_v_bits: Option<u8>,
-    kv_group_size: usize,
-    kv_turboquant: bool,
-    kv_turboquant_preset: Option<pmetal::inference_runner::TurboQuantPreset>,
-    kv_quant_preset: Option<String>,
-    no_kv_quant: bool,
-    kv_qjl: bool,
-    detect_repetition: bool,
-    experts_dir: Option<&str>,
-    images: &[String],
-    videos: &[String],
-    video_fps: Option<f64>,
-) -> anyhow::Result<()> {
+pub(crate) async fn run_inference(spec: InferSpec) -> anyhow::Result<()> {
+    use pmetal_data::inference_config::{InferenceBackend, SamplingMode};
+
+    let tool_defs: Option<Vec<pmetal_data::chat_templates::ToolDefinition>> =
+        match spec.tools.as_deref() {
+            Some(tools_path) => {
+                let json = std::fs::read_to_string(tools_path)
+                    .map_err(|e| anyhow::anyhow!("--tools: could not read '{tools_path}': {e}"))?;
+                let defs: Vec<pmetal_data::chat_templates::ToolDefinition> =
+                    serde_json::from_str(&json).map_err(|e| {
+                        anyhow::anyhow!("--tools: '{tools_path}' is not a tool list: {e}")
+                    })?;
+                tracing::info!("Loaded {} tool definitions from {tools_path}", defs.len());
+                Some(defs)
+            }
+            None => None,
+        };
+    let validated_profile_output = spec
+        .profile_output
+        .as_deref()
+        .map(|path| crate::validate_output_path(path, "infer profile output"))
+        .transpose()?;
+    let chat_template_kwargs = pmetal_data::chat_templates::ChatTemplateKwargs::from_controls(
+        spec.chat_template_kwargs.as_deref(),
+        spec.no_thinking,
+        spec.reasoning_effort.as_deref(),
+        spec.no_preserve_thinking,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let mode: SamplingMode = spec.mode.parse().map_err(anyhow::Error::msg)?;
+    let backend: InferenceBackend = spec.backend.parse().map_err(anyhow::Error::msg)?;
+    let kv_turboquant_preset = match spec.kv_turboquant_preset.as_deref() {
+        None => None,
+        Some("q2_5") => Some(pmetal::inference_runner::TurboQuantPreset::Q2_5),
+        Some("q3_5") => Some(pmetal::inference_runner::TurboQuantPreset::Q3_5),
+        Some(other) => {
+            anyhow::bail!("--kv-turboquant-preset: unknown preset '{other}'; valid: q2_5, q3_5")
+        }
+    };
+
+    let InferSpec {
+        model: ref model_id,
+        lora: ref lora_path,
+        ref prompt,
+        image: ref images,
+        video: ref videos,
+        video_fps,
+        max_tokens,
+        temperature,
+        top_k,
+        top_p,
+        min_p,
+        repetition_penalty,
+        frequency_penalty,
+        presence_penalty,
+        seed,
+        chat,
+        ref system,
+        no_thinking,
+        hide_thinking,
+        draft_model: ref draft_model,
+        mtp,
+        mtp_model: ref mtp_model,
+        mtp_draft_tokens,
+        fp8,
+        experts_dir: ref experts_dir,
+        ane,
+        ane_max_seq_len,
+        benchmark,
+        benchmark_iters,
+        benchmark_prompt_tokens,
+        profile_layers,
+        kv_quant,
+        kv_k_bits,
+        kv_v_bits,
+        kv_group_size,
+        kv_turboquant,
+        kv_quant_preset: ref kv_quant_preset,
+        no_kv_quant,
+        kv_qjl,
+        detect_repetition,
+        ..
+    } = spec;
+    let model_id = model_id.as_str();
+    let lora_path = lora_path.as_deref();
+    let prompt = prompt.as_str();
+    let system = system.as_deref();
+    let draft_model = draft_model.as_deref();
+    let mtp_model = mtp_model.as_deref();
+    let experts_dir = experts_dir.as_deref();
+    let kv_quant_preset = kv_quant_preset.clone();
+    let tools = tool_defs.as_deref();
+    let profile_output = validated_profile_output.as_deref();
     #[cfg(not(feature = "ane"))]
     if ane {
         anyhow::bail!("ANE inference requires the 'ane' feature: cargo build --features ane");
@@ -321,7 +366,6 @@ pub(crate) async fn run_inference(
     // `--chat-template-kwargs '{"enable_thinking": false}'` is --no-thinking.
     let no_thinking = no_thinking || chat_template_kwargs.enable_thinking() == Some(false);
     let reasoning_effort = chat_template_kwargs.reasoning_effort().map(str::to_string);
-    use pmetal_data::inference_config::InferenceBackend;
     use pmetal_models::GenerationOutput;
 
     // ── Resolve --backend into the generation path ────────────────────────

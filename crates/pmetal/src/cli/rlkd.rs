@@ -1,8 +1,14 @@
 //! Clap argument struct for `pmetal rlkd`.
 
 use clap::Args;
+use pmetal_core::jobs::RlkdSpec;
 
-/// Thin clap argument struct for `pmetal rlkd`.
+/// RLKD: Reinforcement Learning with Knowledge Distillation.
+///
+/// Combines GRPO policy gradient optimization with knowledge distillation
+/// from a teacher model in a single training loop.
+///
+/// Loss formula: L = (1 - alpha) * L_grpo + alpha * L_distill
 #[derive(Args, Debug)]
 pub struct RlkdArgs {
     /// Policy (student) model ID or local path.
@@ -18,7 +24,7 @@ pub struct RlkdArgs {
     pub dataset: String,
 
     /// Output directory for LoRA adapter weights.
-    #[arg(short, long = "output", default_value = "./output/rlkd")]
+    #[arg(short, long = "output", default_value = pmetal_core::defaults::RLKD_OUTPUT_DIR)]
     pub output: String,
 
     /// Distillation blend factor: 0.0 = pure RL, 1.0 = pure distillation.
@@ -88,4 +94,32 @@ pub struct RlkdArgs {
     /// Path to write JSONL metrics log (for TUI dashboard).
     #[arg(long = "log-metrics")]
     pub log_metrics: Option<String>,
+}
+
+impl From<RlkdArgs> for RlkdSpec {
+    fn from(a: RlkdArgs) -> Self {
+        RlkdSpec {
+            model: a.model,
+            teacher_model: a.teacher_model,
+            dataset: a.dataset,
+            output_dir: a.output,
+            distill_alpha: a.distill_alpha,
+            final_alpha: a.final_alpha,
+            anneal_alpha: a.anneal_alpha,
+            distill_temperature: a.distill_temperature,
+            num_generations: a.num_generations,
+            beta: a.beta,
+            learning_rate: a.learning_rate,
+            epochs: a.epochs,
+            lora_r: a.lora_r,
+            lora_alpha: a.lora_alpha,
+            max_seq_len: a.max_seq_len,
+            max_completion_length: a.max_completion_length,
+            seed: a.seed,
+            reasoning_rewards: a.reasoning_rewards,
+            prompt_column: a.prompt_column,
+            response_column: a.response_column,
+            log_metrics: a.log_metrics,
+        }
+    }
 }

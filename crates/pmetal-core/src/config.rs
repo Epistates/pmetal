@@ -499,6 +499,19 @@ pub enum WsdDecayStyle {
 }
 
 impl WsdDecayStyle {
+    /// Every decay shape, in the order the CLI lists them.
+    pub const ALL: [Self; 3] = [Self::Linear, Self::Cosine, Self::OneMinusSqrt];
+
+    /// The name the CLI, job specs and YAML configs use.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Linear => "linear",
+            Self::Cosine => "cosine",
+            Self::OneMinusSqrt => "one_minus_sqrt",
+        }
+    }
+
     /// The decay factor, 1 at the start of the phase and 0 at its end, for
     /// progress `p` through it (0 to 1).
     #[must_use]
@@ -508,6 +521,33 @@ impl WsdDecayStyle {
             Self::Cosine => 0.5 * (1.0 + (std::f64::consts::PI * p).cos()),
             Self::OneMinusSqrt => 1.0 - p.sqrt(),
         }
+    }
+}
+
+impl std::fmt::Display for WsdDecayStyle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for WsdDecayStyle {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let wanted = normalized_name(s);
+        // The aliases the serde form accepts.
+        let wanted = if wanted == "1sqrt" || wanted == "sqrt" {
+            "oneminussqrt".to_string()
+        } else {
+            wanted
+        };
+        Self::ALL
+            .into_iter()
+            .find(|kind| normalized_name(kind.as_str()) == wanted)
+            .ok_or_else(|| {
+                let valid: Vec<_> = Self::ALL.iter().map(|k| k.as_str()).collect();
+                format!("unknown WSD decay style '{s}'; valid: {}", valid.join(", "))
+            })
     }
 }
 
@@ -785,7 +825,7 @@ fn default_seed() -> u64 {
     defaults::SEED
 }
 fn default_logging_steps() -> usize {
-    10
+    defaults::LOGGING_STEPS
 }
 
 fn default_output_dir() -> String {
@@ -831,6 +871,19 @@ mod tests {
         assert_eq!(config.optimizer, OptimizerType::AdamW);
         let config: TrainingConfig = serde_saphyr::from_str("optimizer: lion").unwrap();
         assert_eq!(config.optimizer, OptimizerType::Lion);
+    }
+
+    #[test]
+    fn wsd_decay_style_names_round_trip_and_unknown_names_are_errors() {
+        for style in WsdDecayStyle::ALL {
+            assert_eq!(style.to_string().parse::<WsdDecayStyle>(), Ok(style));
+        }
+        assert_eq!("1-sqrt".parse(), Ok(WsdDecayStyle::OneMinusSqrt));
+        let err = "sharp".parse::<WsdDecayStyle>().unwrap_err();
+        assert!(
+            err.contains("sharp") && err.contains("one_minus_sqrt"),
+            "{err}"
+        );
     }
 
     #[test]

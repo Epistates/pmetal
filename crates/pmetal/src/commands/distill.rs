@@ -1,66 +1,75 @@
 use pmetal_data::{DataLoaderConfig, DatasetFormat, Tokenizer, TrainingDataset};
 
-// Phase 4 follow-up: the `parse_method` / `parse_loss_type` /
-// `parse_compression_method` / `resolve_offline_config` helpers below duplicate
-// the enum options that are now declared (and descriptor-validated) in
-// `pmetal_core::jobs::DistillSpec`. The Phase 5 CLI adoption sweep should
-// replace `run_distillation_cli`'s flat parameter list with a single
-// `DistillSpec` argument, call `spec.normalize()` at the call site, and remove
-// these matchers in favour of the already-validated typed enums.
+use pmetal_core::jobs::DistillSpec;
 
-#[derive(Debug, Clone, Default)]
-pub(crate) struct OfflineCliOptions {
-    pub enabled: bool,
-    pub cache_path: Option<String>,
-    pub generate: bool,
-    pub compression: String,
-    pub top_k: usize,
-}
+use super::RunContext;
 
-fn parse_method(method_str: &str) -> anyhow::Result<pmetal_distill::DistillMethod> {
+fn parse_method(method: &str) -> anyhow::Result<pmetal_distill::DistillMethod> {
     use pmetal_distill::DistillMethod;
 
-    match method_str.to_lowercase().as_str() {
+    match method.to_lowercase().as_str() {
         "online" => Ok(DistillMethod::Online),
         "offline" => Ok(DistillMethod::Offline),
         "progressive" => Ok(DistillMethod::Progressive),
         other => anyhow::bail!(
-            "Unknown distillation method '{}'. Valid options: online, offline, progressive",
-            other
+            "unknown distillation method '{other}'; valid: online, offline, progressive"
         ),
     }
 }
 
-fn resolve_method(
-    method_str: &str,
-    offline: &OfflineCliOptions,
-) -> anyhow::Result<pmetal_distill::DistillMethod> {
-    let requested = parse_method(method_str)?;
-    if offline.enabled {
-        if requested != pmetal_distill::DistillMethod::Online
-            && requested != pmetal_distill::DistillMethod::Offline
-        {
-            anyhow::bail!("--offline conflicts with --method {method_str}");
-        }
-        Ok(pmetal_distill::DistillMethod::Offline)
-    } else {
-        Ok(requested)
-    }
-}
-
-fn parse_loss_type(loss_type_str: &str) -> anyhow::Result<pmetal_distill::LossType> {
+/// The loss a spec asks for, and whether its KL runs in reverse.
+fn loss_from_spec(spec: &DistillSpec) -> anyhow::Result<(pmetal_distill::LossType, bool)> {
     use pmetal_distill::LossType;
 
-    match loss_type_str.to_lowercase().as_str() {
-        "kl_divergence" => Ok(LossType::KlDivergence),
-        "jensen_shannon" => Ok(LossType::JensenShannon),
-        "soft_cross_entropy" => Ok(LossType::SoftCrossEntropy),
-        "mse_loss" => Ok(LossType::MseLoss),
-        other => anyhow::bail!(
-            "Unknown loss type '{}'. Valid options: kl_divergence, jensen_shannon, soft_cross_entropy, mse_loss",
-            other
-        ),
+    let skew = |default: f32| spec.skew_alpha.unwrap_or(default);
+    let uses_skew = matches!(
+        spec.loss_type.as_str(),
+        "jsd_skewed" | "skew_kl" | "skew_reverse_kl"
+    );
+    if spec.skew_alpha.is_some() && !uses_skew {
+        anyhow::bail!(
+            "--skew-alpha applies to jsd_skewed, skew_kl and skew_reverse_kl, not {}",
+            spec.loss_type
+        );
     }
+    if spec.universal_logit_top_k.is_some() && spec.loss_type != "universal_logit" {
+        anyhow::bail!(
+            "--universal-logit-top-k applies to universal_logit, not {}",
+            spec.loss_type
+        );
+    }
+    Ok(match spec.loss_type.to_lowercase().as_str() {
+        "kl_divergence" => (LossType::KlDivergence, false),
+        "reverse_kl" => (LossType::KlDivergence, true),
+        "jensen_shannon" => (LossType::JensenShannon, false),
+        "soft_cross_entropy" => (LossType::SoftCrossEntropy, false),
+        "mse_loss" => (LossType::MseLoss, false),
+        "jsd_skewed" => (LossType::JsdSkewed { alpha: skew(0.5) }, false),
+        "skew_kl" => (
+            LossType::SkewKl {
+                alpha: skew(0.1),
+                reverse: false,
+            },
+            false,
+        ),
+        "skew_reverse_kl" => (
+            LossType::SkewKl {
+                alpha: skew(0.1),
+                reverse: true,
+            },
+            false,
+        ),
+        "universal_logit" => (
+            LossType::UniversalLogit {
+                top_k: spec.universal_logit_top_k,
+            },
+            false,
+        ),
+        other => anyhow::bail!(
+            "unknown loss type '{other}'; valid: kl_divergence, reverse_kl, jensen_shannon, \
+             soft_cross_entropy, mse_loss, jsd_skewed, skew_kl, skew_reverse_kl, universal_logit"
+        ),
+    })
 }
 
 fn parse_compression_method(
@@ -75,27 +84,23 @@ fn parse_compression_method(
         "int4" => Ok(CompressionMethod::Int4),
         "sampled" => Ok(CompressionMethod::Sampled),
         other => anyhow::bail!(
-            "Unknown offline compression '{}'. Valid options: none, top_k, int8, int4, sampled",
-            other
+            "unknown offline compression '{other}'; valid: none, top_k, int8, int4, sampled"
         ),
     }
 }
 
 fn resolve_offline_config(
-    method: pmetal_distill::DistillMethod,
-    offline: &OfflineCliOptions,
+    spec: &DistillSpec,
+    method: &pmetal_distill::DistillMethod,
     output_dir: &std::path::Path,
 ) -> anyhow::Result<Option<pmetal_distill::OfflineConfig>> {
-    if method != pmetal_distill::DistillMethod::Offline {
-        if offline.cache_path.is_some() || offline.generate {
-            anyhow::bail!("offline-specific flags require --offline or --method offline");
-        }
+    if *method != pmetal_distill::DistillMethod::Offline {
         return Ok(None);
     }
 
-    let compression = parse_compression_method(&offline.compression)?;
-    let logits_path = offline
-        .cache_path
+    let compression = parse_compression_method(&spec.offline_compression)?;
+    let logits_path = spec
+        .offline_cache
         .as_deref()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| output_dir.join("teacher_logits"));
@@ -103,8 +108,8 @@ fn resolve_offline_config(
     Ok(Some(pmetal_distill::OfflineConfig {
         logits_path,
         compression,
-        top_k: offline.top_k,
-        generate: offline.generate,
+        top_k: spec.offline_top_k,
+        generate: spec.offline_generate,
     }))
 }
 
@@ -176,41 +181,41 @@ fn validate_cache_for_generation(
     Ok(())
 }
 /// Run knowledge distillation.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_distillation_cli(
-    teacher_id: &str,
-    student_id: &str,
-    dataset_path: &str,
-    eval_dataset_path: Option<String>,
-    output_dir: &str,
-    method_str: &str,
-    loss_type_str: &str,
-    temperature: f32,
-    alpha: f32,
-    rationale: bool,
-    rationale_weight: f32,
-    on_policy: f32,
-    on_policy_max_tokens: usize,
-    lora_r: usize,
-    lora_alpha: f32,
-    learning_rate: f32,
-    optimizer: pmetal_core::OptimizerType,
-    batch_size: usize,
-    epochs: usize,
-    max_seq_len: usize,
-    seed: u64,
-    checkpoint_every: usize,
-    resume: bool,
-    log_metrics: Option<String>,
-    emit_console_output: bool,
-    extra_callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>>,
-    text_column: Option<String>,
-    text_columns: Option<Vec<String>>,
-    column_separator: String,
-    prompt_column: Option<String>,
-    response_column: Option<String>,
-    offline: OfflineCliOptions,
-) -> anyhow::Result<()> {
+pub(crate) async fn run_distillation(spec: DistillSpec, ctx: RunContext) -> anyhow::Result<()> {
+    let DistillSpec {
+        teacher: ref teacher_id,
+        student: ref student_id,
+        dataset: ref dataset_path,
+        eval_dataset: ref eval_dataset_path,
+        output_dir: ref output_dir,
+        temperature,
+        alpha,
+        rationale,
+        rationale_weight,
+        on_policy,
+        on_policy_max_tokens,
+        lora_r,
+        lora_alpha,
+        learning_rate,
+        batch_size,
+        epochs,
+        max_seq_len,
+        seed,
+        checkpoint_every,
+        resume,
+        ref log_metrics,
+        ..
+    } = spec;
+    let optimizer: pmetal_core::OptimizerType =
+        spec.optimizer.parse().map_err(anyhow::Error::msg)?;
+    let RunContext {
+        emit_console_output,
+        callbacks: extra_callbacks,
+    } = ctx;
+    let teacher_id = teacher_id.as_str();
+    let student_id = student_id.as_str();
+    let dataset_path = dataset_path.as_str();
+    let output_dir = output_dir.as_str();
     use pmetal_core::LoraConfig;
     use pmetal_distill::{DistillConfig, Distiller, LogitCache, LossConfig};
     use pmetal_lora::DynamicLoraModel;
@@ -221,19 +226,18 @@ pub(crate) async fn run_distillation_cli(
     // initialises the student's LoRA weights.
     pmetal_runtime::compat::random::seed(seed);
 
-    let column_cfg = crate::commands::build_column_config(
-        text_column,
-        text_columns,
-        column_separator,
-        prompt_column,
-        response_column,
+    let column_cfg = pmetal_data::DatasetColumnConfig::from_selectors(
+        spec.text_column.clone(),
+        spec.text_columns.as_deref(),
+        spec.column_separator.clone(),
+        spec.prompt_column.clone(),
+        spec.response_column.clone(),
     );
 
     let validated_distill_output = crate::validate_output_path(output_dir, "distillation output")?;
-    let method = resolve_method(method_str, &offline)?;
-    let loss_type = parse_loss_type(loss_type_str)?;
-    let offline_config =
-        resolve_offline_config(method.clone(), &offline, &validated_distill_output)?;
+    let method = parse_method(spec.effective_method())?;
+    let (loss_type, reverse_kl) = loss_from_spec(&spec)?;
+    let offline_config = resolve_offline_config(&spec, &method, &validated_distill_output)?;
 
     if emit_console_output {
         println!("========================================");
@@ -244,7 +248,7 @@ pub(crate) async fn run_distillation_cli(
         println!("Dataset:       {}", dataset_path);
         println!("Output:        {}", output_dir);
         println!("Method:        {:?}", method);
-        println!("Loss Type:     {}", loss_type_str);
+        println!("Loss Type:     {}", spec.loss_type);
         println!("Temperature:   {}", temperature);
         println!("Alpha:         {}", alpha);
         if rationale {
@@ -273,9 +277,11 @@ pub(crate) async fn run_distillation_cli(
     let chat_template =
         pmetal_data::chat_templates::detect_chat_template(&student_path, student_id);
 
-    tracing::info!("Loading dataset: {}", dataset_path);
+    // A Hub dataset ID is downloaded; a path is used as it is.
+    let dataset_file = pmetal_trainer::resolve_dataset_path(dataset_path).await?;
+    tracing::info!("Loading dataset: {}", dataset_file.display());
     let train_dataset = TrainingDataset::from_jsonl_tokenized(
-        dataset_path,
+        &dataset_file,
         &tokenizer,
         DatasetFormat::Auto,
         max_seq_len,
@@ -286,10 +292,11 @@ pub(crate) async fn run_distillation_cli(
         "Distillation dataset loaded: {} samples",
         train_dataset.len()
     );
-    let eval_dataset = if let Some(ref eval_path) = eval_dataset_path {
-        tracing::info!("Loading distillation eval dataset: {}", eval_path);
+    let eval_dataset = if let Some(eval_path) = eval_dataset_path {
+        let eval_file = pmetal_trainer::resolve_dataset_path(eval_path).await?;
+        tracing::info!("Loading distillation eval dataset: {}", eval_file.display());
         let ds = TrainingDataset::from_jsonl_tokenized(
-            eval_path,
+            &eval_file,
             &tokenizer,
             DatasetFormat::Auto,
             max_seq_len,
@@ -330,6 +337,7 @@ pub(crate) async fn run_distillation_cli(
         method: method.clone(),
         loss: LossConfig {
             loss_type,
+            reverse_kl,
             temperature,
             alpha,
             rationale,
@@ -389,12 +397,6 @@ pub(crate) async fn run_distillation_cli(
 
     let mut trainer = DistillationTrainer::new(distiller, training_loop_config)?;
     if on_policy > 0.0 {
-        if method == pmetal_distill::DistillMethod::Offline {
-            anyhow::bail!(
-                "--on-policy needs the live teacher to score the student's samples; it cannot \
-                 run with --offline"
-            );
-        }
         trainer = trainer.with_on_policy(pmetal_trainer::OnPolicyConfig {
             probability: on_policy,
             max_new_tokens: on_policy_max_tokens,
@@ -419,7 +421,7 @@ pub(crate) async fn run_distillation_cli(
         tracing::info!("Adaptive LR enabled (spike/plateau/divergence detection)");
     }
 
-    if let Some(ref metrics_path) = log_metrics {
+    if let Some(metrics_path) = log_metrics {
         use pmetal_trainer::callbacks::MetricsJsonCallback;
         let path = if metrics_path.contains('/') || metrics_path.contains('\\') {
             PathBuf::from(metrics_path)
@@ -552,29 +554,18 @@ pub(crate) async fn run_distillation_cli(
 mod tests {
     use super::*;
 
-    #[test]
-    fn resolve_method_rejects_conflicts() {
-        let err = resolve_method(
-            "progressive",
-            &OfflineCliOptions {
-                enabled: true,
-                ..Default::default()
-            },
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("--offline conflicts"));
+    fn spec(loss_type: &str) -> DistillSpec {
+        DistillSpec {
+            loss_type: loss_type.into(),
+            ..Default::default()
+        }
     }
 
     #[test]
     fn resolve_offline_config_defaults_to_output_cache_dir() {
         let cfg = resolve_offline_config(
-            pmetal_distill::DistillMethod::Offline,
-            &OfflineCliOptions {
-                enabled: true,
-                compression: "top_k".to_string(),
-                top_k: 128,
-                ..Default::default()
-            },
+            &DistillSpec::default(),
+            &pmetal_distill::DistillMethod::Offline,
             std::path::Path::new("./output/distilled"),
         )
         .unwrap()
@@ -583,5 +574,70 @@ mod tests {
             cfg.logits_path,
             std::path::PathBuf::from("./output/distilled/teacher_logits")
         );
+    }
+
+    /// Every loss the distiller can build is one the command line can ask
+    /// for, with the parameters it names reaching it.
+    #[test]
+    fn every_loss_type_reaches_the_distiller() {
+        use pmetal_distill::LossType;
+        let skewed = |alpha: Option<f32>, loss: &str| {
+            let (kind, reverse_kl) = loss_from_spec(&DistillSpec {
+                skew_alpha: alpha,
+                ..spec(loss)
+            })
+            .unwrap();
+            assert!(!reverse_kl);
+            kind
+        };
+        assert!(
+            matches!(skewed(None, "jsd_skewed"), LossType::JsdSkewed { alpha } if alpha == 0.5)
+        );
+        assert!(
+            matches!(skewed(Some(0.1), "jsd_skewed"), LossType::JsdSkewed { alpha } if alpha == 0.1)
+        );
+        assert!(matches!(
+            skewed(None, "skew_kl"),
+            LossType::SkewKl { alpha, reverse: false } if alpha == 0.1
+        ));
+        assert!(matches!(
+            skewed(Some(0.3), "skew_reverse_kl"),
+            LossType::SkewKl { alpha, reverse: true } if alpha == 0.3
+        ));
+        let (kind, reverse_kl) = loss_from_spec(&spec("reverse_kl")).unwrap();
+        assert!(matches!(kind, LossType::KlDivergence) && reverse_kl);
+        let (kind, _) = loss_from_spec(&DistillSpec {
+            universal_logit_top_k: Some(64),
+            ..spec("universal_logit")
+        })
+        .unwrap();
+        assert!(matches!(kind, LossType::UniversalLogit { top_k: Some(64) }));
+        for plain in [
+            "kl_divergence",
+            "jensen_shannon",
+            "soft_cross_entropy",
+            "mse_loss",
+        ] {
+            loss_from_spec(&spec(plain)).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_loss_parameter_the_loss_does_not_read_is_refused() {
+        let skew = loss_from_spec(&DistillSpec {
+            skew_alpha: Some(0.2),
+            ..spec("kl_divergence")
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(skew.contains("--skew-alpha"), "{skew}");
+        let top_k = loss_from_spec(&DistillSpec {
+            universal_logit_top_k: Some(8),
+            ..spec("mse_loss")
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(top_k.contains("--universal-logit-top-k"), "{top_k}");
+        assert!(loss_from_spec(&spec("kl")).is_err());
     }
 }

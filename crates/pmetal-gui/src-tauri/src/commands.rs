@@ -1055,11 +1055,12 @@ pub async fn start_training(
     let state_arc = state.training_runs.clone();
     let event_tx = state.event_tx.clone();
     let cancel_flags = state.cancel_flags.clone();
-    let training_config = pmetal::core::TrainingConfig {
-        output_dir: output_dir.clone(),
-        ..spec.training_config().map_err(AppError)?
-    };
-    let distributed = spec.distributed_config().map_err(AppError)?;
+    // The job every surface runs a train spec as; what is the GUI's own is
+    // set below.
+    let mut job_config = pmetal::trainer::TrainingJobConfig::from_spec(&spec).map_err(AppError)?;
+    job_config.dataset = resolved_dataset.to_string_lossy().into_owned();
+    job_config.log_metrics = Some(metrics_path.display().to_string());
+    job_config.emit_console_output = false;
 
     // Write training_info.json before spawning so the adapter scanner can
     // find base_model + dataset even if training is still running.
@@ -1089,82 +1090,6 @@ pub async fn start_training(
                 let _ = event_tx.send(AppEvent::TrainingUpdate { run: run.clone() });
             }
         }
-
-        // Build orchestrator config from TrainSpec.
-        let qlora = if spec.quantization.as_deref().is_some_and(|q| q == "nf4") {
-            Some(pmetal::trainer::QLoraOrchConfig {
-                scheme: pmetal::trainer::QuantizationScheme::Nf4,
-                block_size: spec.quant_block_size,
-                double_quant: spec.double_quant,
-            })
-        } else if spec.quantization.as_deref().is_some_and(|q| q == "fp4") {
-            Some(pmetal::trainer::QLoraOrchConfig {
-                scheme: pmetal::trainer::QuantizationScheme::Fp4,
-                block_size: spec.quant_block_size,
-                double_quant: spec.double_quant,
-            })
-        } else if spec.quantization.as_deref().is_some_and(|q| q == "int8") {
-            Some(pmetal::trainer::QLoraOrchConfig {
-                scheme: pmetal::trainer::QuantizationScheme::Int8,
-                block_size: spec.quant_block_size,
-                double_quant: spec.double_quant,
-            })
-        } else {
-            None
-        };
-
-        let columns = {
-            let text_column = spec.text_column.clone();
-            let text_columns = spec
-                .text_columns
-                .as_ref()
-                .map(|s| s.split(',').map(str::to_string).collect::<Vec<_>>());
-            let prompt_column = spec.prompt_column.clone();
-            let response_column = spec.response_column.clone();
-            let column_separator = spec.column_separator.clone();
-            if text_column.is_some()
-                || text_columns.is_some()
-                || prompt_column.is_some()
-                || response_column.is_some()
-            {
-                Some(pmetal::data::DatasetColumnConfig {
-                    text_column,
-                    text_columns,
-                    column_separator: column_separator.or(Some("\n\n".to_string())),
-                    prompt_column,
-                    response_column,
-                })
-            } else {
-                None
-            }
-        };
-
-        let job_config = pmetal::trainer::TrainingJobConfig {
-            model_id: spec.model.clone(),
-            dataset: resolved_dataset.to_string_lossy().into_owned(),
-            eval_dataset: spec.eval_dataset.clone(),
-            output_dir: output_dir.clone(),
-            lora: spec.lora_config(),
-            qlora,
-            training: training_config,
-            columns,
-            dispatch: pmetal::trainer::DispatchConfig {
-                sequence_packing: !spec.no_sequence_packing,
-                pack_max_seq_len: spec.pack_max_seq_len,
-                gradient_checkpointing: !spec.no_gradient_checkpointing,
-                gradient_checkpointing_layers: spec.gradient_checkpointing_layers,
-                cut_cross_entropy: spec.cut_cross_entropy,
-                ane: spec.ane,
-                no_adaptive_lr: spec.no_adaptive_lr,
-                loss_scale: spec.loss_scale,
-                distributed,
-            },
-            config_path: spec.config_path.clone(),
-            log_metrics: Some(metrics_path.display().to_string()),
-            resume: spec.resume,
-            seed: spec.seed,
-            emit_console_output: false,
-        };
 
         // Wire PhaseCallback to update the GUI run status
         let status_state = state_arc.clone();

@@ -46,14 +46,11 @@ pub mod train_mtp;
 #[command(name = "pmetal")]
 #[command(author, version, about = "LLM fine-tuning optimized for Apple Silicon", long_about = None)]
 pub struct Cli {
-    /// Write every JobEvent as a JSONL line to this file.
+    /// Write every JobEvent of a training run as a JSONL line to this file.
     ///
-    /// When set, the CLI wraps each long-running job's callback chain with a
-    /// `pmetal_core::JsonlSink<File>` so the event stream is machine-readable.
-    /// This is what TUI subprocess-fallback and MCP subprocess consumers read.
-    ///
-    /// Currently wired for `pmetal train`. Other subcommands will follow the
-    /// same pattern (see `crates/pmetal/src/cli/README.md`).
+    /// Works with every training command (train, distill, grpo, rlkd,
+    /// preference). The TUI's subprocess runner and the MCP server read it. A
+    /// write that fails is reported when the run ends.
     #[cfg(feature = "trainer")]
     #[arg(long, global = true, value_name = "PATH")]
     pub log_events: Option<PathBuf>,
@@ -353,7 +350,7 @@ pub enum Commands {
     #[cfg(feature = "merge")]
     Merge(crate::cli::merge::MergeArgs),
 
-    /// Evaluate a model's perplexity on a dataset
+    #[cfg(all(feature = "lora", feature = "trainer"))]
     #[cfg(feature = "lora")]
     Eval(crate::cli::eval::EvalArgs),
 
@@ -402,3 +399,5 @@ impl Commands {
 mod argv_roundtrip;
 #[cfg(all(test, feature = "mcp", feature = "trainer"))]
 mod mcp_tools;
+#[cfg(test)]
+mod parity;

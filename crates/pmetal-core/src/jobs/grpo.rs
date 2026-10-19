@@ -139,6 +139,18 @@ pub struct GrpoSpec {
     pub seed: u64,
 
     #[job(
+        label = "Checkpoint Every",
+        group = "Training",
+        argv = "--checkpoint-every",
+        min = 0,
+        max = 1000000,
+        default_int = 50,
+        help = "Save a LoRA checkpoint every this many policy updates (0 disables interval checkpoints)"
+    )]
+    #[serde(default = "default_checkpoint_every")]
+    pub checkpoint_every: usize,
+
+    #[job(
         label = "DAPO",
         group = "GRPO",
         argv = "--dapo",
@@ -273,6 +285,11 @@ pub struct GrpoSpec {
     )]
     #[serde(default)]
     pub log_metrics: Option<String>,
+
+    /// Resume LoRA weights from the latest checkpoint in the output directory.
+    #[job(skip_descriptor, argv = "--resume", flag, default_bool = false)]
+    #[serde(default)]
+    pub resume: bool,
 }
 
 impl Default for GrpoSpec {
@@ -291,6 +308,7 @@ impl Default for GrpoSpec {
             max_seq_len: default_max_seq_len(),
             max_completion_length: default_max_completion(),
             seed: default_seed(),
+            checkpoint_every: default_checkpoint_every(),
             dapo: false,
             loss_type: default_loss_type(),
             num_iterations: default_num_iterations(),
@@ -306,6 +324,7 @@ impl Default for GrpoSpec {
             response_column: None,
             grpo_kv_bits: None,
             log_metrics: None,
+            resume: false,
         }
     }
 }
@@ -352,6 +371,9 @@ fn default_max_completion() -> usize {
 }
 fn default_seed() -> u64 {
     42
+}
+fn default_checkpoint_every() -> usize {
+    50
 }
 fn default_max_image_size() -> usize {
     336

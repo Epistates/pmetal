@@ -1,8 +1,9 @@
 //! Clap argument struct for `pmetal grpo`.
 
 use clap::Args;
+use pmetal_core::jobs::GrpoSpec;
 
-/// Thin clap argument struct for `pmetal grpo`.
+/// Group Relative Policy Optimization (GRPO) for reasoning models.
 #[derive(Args, Debug)]
 pub struct GrpoArgs {
     /// Model ID or path
@@ -14,7 +15,7 @@ pub struct GrpoArgs {
     pub dataset: String,
 
     /// Output directory
-    #[arg(short, long = "output", default_value = "./output/grpo")]
+    #[arg(short, long = "output", default_value = pmetal_core::defaults::GRPO_OUTPUT_DIR)]
     pub output: String,
 
     /// Number of generations per prompt (group size)
@@ -132,4 +133,41 @@ pub struct GrpoArgs {
     /// Path to write JSONL metrics log (for TUI dashboard)
     #[arg(long = "log-metrics")]
     pub log_metrics: Option<String>,
+}
+
+impl From<GrpoArgs> for GrpoSpec {
+    fn from(a: GrpoArgs) -> Self {
+        GrpoSpec {
+            model: a.model,
+            dataset: a.dataset,
+            output_dir: a.output,
+            num_generations: a.num_generations,
+            beta: a.beta,
+            learning_rate: a.learning_rate,
+            optimizer: a.optimizer.to_string(),
+            epochs: a.epochs,
+            lora_r: a.lora_r,
+            lora_alpha: a.lora_alpha,
+            max_seq_len: a.max_seq_len,
+            max_completion_length: a.max_completion_length,
+            seed: a.seed,
+            checkpoint_every: a.checkpoint_every,
+            dapo: a.dapo,
+            loss_type: a.loss_type,
+            num_iterations: a.num_iterations,
+            reasoning_rewards: a.reasoning_rewards,
+            vlm: a.vlm,
+            max_image_size: a.max_image_size,
+            reward_model: a.reward_model,
+            reward_model_max_length: a.reward_model_max_length,
+            reward_model_weight: a.reward_model_weight,
+            reward_model_template: a.reward_model_template,
+            async_rewards: a.async_rewards,
+            grpo_kv_bits: a.grpo_kv_bits,
+            prompt_column: a.prompt_column,
+            response_column: a.response_column,
+            log_metrics: a.log_metrics,
+            resume: a.resume,
+        }
+    }
 }

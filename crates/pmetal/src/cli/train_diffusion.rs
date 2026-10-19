@@ -8,7 +8,9 @@
 //! adapters against the decoder denoising cross-entropy.
 
 use clap::Args;
+use pmetal_core::jobs::TrainDiffusionSpec;
 
+/// LoRA fine-tune a DiffusionGemma block-diffusion model.
 #[derive(Args, Debug)]
 pub struct TrainDiffusionArgs {
     /// DiffusionGemma model ID or local path.
@@ -67,7 +69,7 @@ pub struct TrainDiffusionArgs {
     /// train`. Packs every projection but the routers, and the MoE experts
     /// (4-bit affine for nf4 and fp4, 8-bit for int8), so only the f32 LoRA
     /// adapters train. A large memory reduction for the 26B MoE model.
-    #[arg(long = "quantization", value_enum, default_value = "none")]
+    #[arg(long = "quantization", value_enum, default_value_t = crate::cli::train::QuantizationMethod::None)]
     pub quantization: crate::cli::train::QuantizationMethod,
 
     /// Weights per scale for nf4 and int8 (32, 64 or 128; fp4's block is 16)
@@ -93,4 +95,29 @@ pub struct TrainDiffusionArgs {
     /// Random seed.
     #[arg(long = "seed", default_value = "42")]
     pub seed: u64,
+}
+
+impl From<TrainDiffusionArgs> for TrainDiffusionSpec {
+    fn from(a: TrainDiffusionArgs) -> Self {
+        TrainDiffusionSpec {
+            model: a.model,
+            dataset: a.dataset,
+            output: a.output,
+            lora_r: a.lora_r,
+            lora_alpha: a.lora_alpha,
+            lora_targets: a.lora_targets,
+            corrupted_only: a.corrupted_only,
+            quantization: a.quantization.as_str().to_string(),
+            quant_block_size: a.quant_block_size,
+            double_quant: a.double_quant,
+            steps: a.steps,
+            learning_rate: a.learning_rate,
+            weight_decay: a.weight_decay,
+            max_grad_norm: a.max_grad_norm,
+            max_context_len: a.max_context_len,
+            checkpoint_every: a.checkpoint_every,
+            log_every: a.log_every,
+            seed: a.seed,
+        }
+    }
 }

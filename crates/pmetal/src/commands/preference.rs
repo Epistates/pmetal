@@ -3,8 +3,10 @@
 use std::path::PathBuf;
 
 use pmetal_core::jobs::PreferenceSpec;
-use pmetal_core::{LoraConfig, TrainingCallback, TrainingConfig};
+use pmetal_core::{LoraConfig, TrainingConfig};
 use pmetal_data::Tokenizer;
+
+use super::RunContext;
 use pmetal_lora::DynamicLoraModel;
 use pmetal_trainer::preference::{self, KtoConfig, PreferenceLoss, PreferenceStepMetrics};
 use pmetal_trainer::{KtoTrainer, PreferenceTrainer, TrainOptimizer};
@@ -60,11 +62,11 @@ fn training_config(spec: &PreferenceSpec) -> anyhow::Result<TrainingConfig> {
 }
 
 /// Run `pmetal preference` from a normalized spec.
-pub(crate) async fn run_preference(
-    spec: PreferenceSpec,
-    emit_console_output: bool,
-    extra_callbacks: Vec<Box<dyn TrainingCallback>>,
-) -> anyhow::Result<()> {
+pub(crate) async fn run_preference(spec: PreferenceSpec, ctx: RunContext) -> anyhow::Result<()> {
+    let RunContext {
+        emit_console_output,
+        callbacks: extra_callbacks,
+    } = ctx;
     let objective = objective(&spec)?;
     pmetal_runtime::compat::random::seed(spec.seed);
 

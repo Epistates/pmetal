@@ -198,6 +198,70 @@ pub struct InferSpec {
     #[serde(default)]
     pub draft_model: Option<String>,
 
+    #[job(
+        label = "Images",
+        group = "Input",
+        argv = "--image",
+        repeat,
+        help = "Image files shown before the prompt text, in order (Qwen3.5-family vision models)"
+    )]
+    #[serde(default)]
+    pub image: Vec<String>,
+
+    #[job(
+        label = "Videos",
+        group = "Input",
+        argv = "--video",
+        repeat,
+        help = "Directories of extracted video frames, shown after the images, in order"
+    )]
+    #[serde(default)]
+    pub video: Vec<String>,
+
+    #[job(
+        label = "Video FPS",
+        group = "Input",
+        argv = "--video-fps",
+        min = 0.001,
+        max = 1000.0,
+        help = "Frame rate the video frames were extracted at (24 when not given)"
+    )]
+    #[serde(default)]
+    pub video_fps: Option<f64>,
+
+    #[job(
+        label = "Qwen MTP",
+        group = "Speculative decoding",
+        argv = "--mtp",
+        flag,
+        default_bool = false,
+        help = "Bundled Qwen3Next/Qwen3.6 multi-token-prediction speculative decoding"
+    )]
+    #[serde(default)]
+    pub mtp: bool,
+
+    #[job(
+        label = "MTP Checkpoint",
+        group = "Speculative decoding",
+        argv = "--mtp-model",
+        kind = "path",
+        help = "Qwen MTP checkpoint directory; defaults to the mtp.* weights bundled in the model"
+    )]
+    #[serde(default)]
+    pub mtp_model: Option<String>,
+
+    #[job(
+        label = "MTP Draft Tokens",
+        group = "Speculative decoding",
+        argv = "--mtp-draft-tokens",
+        min = 1,
+        max = 16,
+        default_int = 3,
+        help = "Draft tokens verified per speculative step"
+    )]
+    #[serde(default = "default_mtp_draft_tokens")]
+    pub mtp_draft_tokens: usize,
+
     #[job(label = "Tools JSON", group = "Input", argv = "--tools", kind = "path")]
     #[serde(default)]
     pub tools: Option<String>,
@@ -383,6 +447,12 @@ impl Default for InferSpec {
             mode: default_mode(),
             backend: default_backend(),
             draft_model: None,
+            image: Vec::new(),
+            video: Vec::new(),
+            video_fps: None,
+            mtp: false,
+            mtp_model: None,
+            mtp_draft_tokens: default_mtp_draft_tokens(),
             tools: None,
             fp8: false,
             experts_dir: None,
@@ -410,7 +480,13 @@ impl Default for InferSpec {
 impl InferSpec {
     /// Run descriptor + cross-field validation.
     pub fn normalize(&mut self) -> Result<(), Vec<FieldError>> {
-        let errs = self.validate_descriptors();
+        let mut errs = self.validate_descriptors();
+        if self.video_fps.is_some() && self.video.is_empty() {
+            errs.push(FieldError::new("video_fps", "needs at least one --video"));
+        }
+        if self.mtp_model.is_some() && !self.mtp {
+            errs.push(FieldError::new("mtp_model", "needs --mtp"));
+        }
         if errs.is_empty() { Ok(()) } else { Err(errs) }
     }
 }
@@ -426,6 +502,9 @@ fn default_ane_max_seq_len() -> usize {
 }
 fn default_benchmark_iters() -> usize {
     5
+}
+fn default_mtp_draft_tokens() -> usize {
+    3
 }
 fn default_kv_group_size() -> usize {
     64

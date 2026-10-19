@@ -558,146 +558,31 @@ async fn run_training_direct(
     tx: mpsc::Sender<AppMsg>,
     cancel: CancellationToken,
 ) -> Result<(), anyhow::Error> {
+    use clap::Parser;
+    use pmetal_core::jobs::TrainSpec;
     use pmetal_trainer::orchestrator;
 
-    let model = required_arg(&spec.args, "--model")?;
-    let dataset = required_arg(&spec.args, "--dataset")?;
-    let output = required_arg(&spec.args, "--output")?;
-    let eval_dataset = optional_arg(&spec.args, "--eval-dataset");
-
-    let quantization_str = optional_arg(&spec.args, "--quantization")
-        .unwrap_or_else(|| "none".to_string())
-        .to_lowercase();
-    let quant_block_size = parse_arg(&spec.args, "--quant-block-size", 64usize)?;
-    let double_quant = has_flag(&spec.args, "--double-quant");
-    let qlora = match quantization_str.as_str() {
-        "nf4" => Some(orchestrator::QLoraOrchConfig {
-            scheme: orchestrator::QuantizationScheme::Nf4,
-            block_size: quant_block_size,
-            double_quant,
-        }),
-        "fp4" => Some(orchestrator::QLoraOrchConfig {
-            scheme: orchestrator::QuantizationScheme::Fp4,
-            block_size: quant_block_size,
-            double_quant,
-        }),
-        "int8" => Some(orchestrator::QLoraOrchConfig {
-            scheme: orchestrator::QuantizationScheme::Int8,
-            block_size: quant_block_size,
-            double_quant,
-        }),
-        _ => None,
+    // The command line the subprocess runner would spawn, read by the same
+    // parser, so a flag cannot be understood by one runner and dropped by the
+    // other.
+    let argv = ["pmetal", "train"]
+        .into_iter()
+        .map(str::to_string)
+        .chain(spec.args.iter().cloned());
+    let crate::cli::Commands::Train(args) = crate::cli::Cli::try_parse_from(argv)?.command else {
+        anyhow::bail!("the train command line parsed as another command");
     };
-
-    #[cfg(feature = "distributed")]
-    let distributed = {
-        let peers = optional_arg(&spec.args, "--distributed-peers")
-            .map(|s| {
-                s.split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let auto_discover = has_flag(&spec.args, "--distributed-auto");
-        if !peers.is_empty() || auto_discover {
-            let compression = match optional_arg(&spec.args, "--compression-strategy")
-                .unwrap_or_else(|| "none".to_string())
-                .as_str()
-            {
-                "topk" => pmetal_core::DistributedCompression::TopK,
-                "fp16" => pmetal_core::DistributedCompression::Fp16,
-                "random" => pmetal_core::DistributedCompression::Random,
-                _ => pmetal_core::DistributedCompression::None,
-            };
-            Some(pmetal_core::DistributedTrainingConfig {
-                peers,
-                auto_discover,
-                compression,
-                ..Default::default()
-            })
-        } else {
-            None
-        }
-    };
-
-    // Build column config
-    let columns = crate::commands::build_column_config(
-        optional_arg(&spec.args, "--text-column"),
-        optional_arg(&spec.args, "--text-columns")
-            .map(|s| s.split(',').map(str::to_string).collect()),
-        optional_arg(&spec.args, "--column-separator").unwrap_or_else(|| "\n\n".to_string()),
-        optional_arg(&spec.args, "--prompt-column"),
-        optional_arg(&spec.args, "--response-column"),
-    );
+    let mut train_spec = TrainSpec::from(args);
+    train_spec
+        .normalize()
+        .map_err(|errors| crate::commands::invalid_spec::<TrainSpec>(&errors))?;
+    let mut job_config =
+        orchestrator::TrainingJobConfig::from_spec(&train_spec).map_err(anyhow::Error::msg)?;
+    // In-process: metrics stream through ChannelMetricsCallback, not a JSONL file.
+    job_config.log_metrics = None;
+    job_config.emit_console_output = false;
 
     let callbacks = direct_training_callbacks(job_id, tx, cancel);
-
-    let job_config = orchestrator::TrainingJobConfig {
-        model_id: model,
-        dataset,
-        eval_dataset,
-        output_dir: output,
-        lora: pmetal_core::LoraConfig {
-            r: parse_arg(&spec.args, "--lora-r", 16usize)?,
-            alpha: parse_arg(&spec.args, "--lora-alpha", 32.0f32)?,
-            ..Default::default()
-        },
-        qlora,
-        training: pmetal_core::TrainingConfig {
-            learning_rate: parse_arg(&spec.args, "--learning-rate", 2e-4f64)?,
-            batch_size: parse_arg(&spec.args, "--batch-size", 1usize)?,
-            num_epochs: parse_arg(&spec.args, "--epochs", 1usize)?,
-            max_seq_len: parse_arg(&spec.args, "--max-seq-len", 2048usize)?,
-            gradient_accumulation_steps: parse_arg(
-                &spec.args,
-                "--gradient-accumulation-steps",
-                4usize,
-            )?,
-            max_grad_norm: parse_arg(&spec.args, "--max-grad-norm", 1.0f64)?,
-            warmup_steps: parse_arg(&spec.args, "--warmup-steps", 0usize)?,
-            weight_decay: parse_arg(&spec.args, "--weight-decay", 0.01f64)?,
-            optimizer: parse_arg(&spec.args, "--optimizer", pmetal_core::OptimizerType::AdamW)?,
-            seed: parse_arg(&spec.args, "--seed", 42u64)?,
-            embedding_learning_rate: optional_arg(&spec.args, "--embedding-lr")
-                .and_then(|s| s.parse::<f64>().ok()),
-            label_smoothing: parse_arg(&spec.args, "--label-smoothing", 0.0f64)?,
-            z_loss: parse_arg(&spec.args, "--z-loss", 0.0f64)?,
-            neftune_noise_alpha: optional_arg(&spec.args, "--neftune-alpha")
-                .and_then(|s| s.parse::<f64>().ok()),
-            lr_scheduler: parse_arg(
-                &spec.args,
-                "--lr-schedule",
-                pmetal_core::LrSchedulerType::Cosine,
-            )?,
-            ..Default::default()
-        },
-        columns,
-        dispatch: orchestrator::DispatchConfig {
-            sequence_packing: !has_flag(&spec.args, "--no-sequence-packing"),
-            pack_max_seq_len: parse_opt_arg(&spec.args, "--pack-max-seq-len"),
-            gradient_checkpointing: !has_flag(&spec.args, "--no-gradient-checkpointing"),
-            gradient_checkpointing_layers: parse_arg(
-                &spec.args,
-                "--gradient-checkpointing-layers",
-                4usize,
-            )?,
-            cut_cross_entropy: has_flag(&spec.args, "--cut-cross-entropy"),
-            no_adaptive_lr: has_flag(&spec.args, "--no-adaptive-lr"),
-            ane: has_flag(&spec.args, "--ane"),
-            loss_scale: parse_arg(&spec.args, "--loss-scale", 1.0f32)?,
-            #[cfg(feature = "distributed")]
-            distributed,
-        },
-        config_path: optional_arg(&spec.args, "--config"),
-        // In-process: metrics stream through ChannelMetricsCallback — skip JSONL.
-        log_metrics: None,
-        resume: has_flag(&spec.args, "--resume"),
-        seed: parse_arg(&spec.args, "--seed", 42u64)?,
-        emit_console_output: false,
-    };
-
     orchestrator::run_training(job_config, None, callbacks).await?;
     Ok(())
 }
@@ -708,58 +593,40 @@ async fn run_distillation_direct(
     tx: mpsc::Sender<AppMsg>,
     cancel: CancellationToken,
 ) -> Result<(), anyhow::Error> {
-    let teacher = required_arg(&spec.args, "--teacher")?;
-    let student = required_arg(&spec.args, "--student")?;
-    let dataset = required_arg(&spec.args, "--dataset")?;
-    let output = required_arg(&spec.args, "--output")?;
-    let method = optional_arg(&spec.args, "--method").unwrap_or_else(|| "online".to_string());
-    let loss_type =
-        optional_arg(&spec.args, "--loss-type").unwrap_or_else(|| "kl_divergence".to_string());
-    let callbacks = direct_training_callbacks(job_id, tx, cancel);
+    use pmetal_core::jobs::DistillSpec;
 
-    crate::commands::distill::run_distillation_cli(
-        &teacher,
-        &student,
-        &dataset,
-        optional_arg(&spec.args, "--eval-dataset"),
-        &output,
-        &method,
-        &loss_type,
-        parse_arg(&spec.args, "--temperature", 2.0f32)?,
-        parse_arg(&spec.args, "--alpha", 0.5f32)?,
-        has_flag(&spec.args, "--rationale"),
-        parse_arg(&spec.args, "--rationale-weight", 1.0f32)?,
-        parse_arg(&spec.args, "--on-policy", 0.0f32)?,
-        parse_arg(&spec.args, "--on-policy-max-tokens", 256usize)?,
-        parse_arg(&spec.args, "--lora-r", 16usize)?,
-        parse_arg(&spec.args, "--lora-alpha", 32.0f32)?,
-        parse_arg(&spec.args, "--learning-rate", 2e-5f32)?,
-        parse_arg(&spec.args, "--optimizer", pmetal_core::OptimizerType::AdamW)?,
-        parse_arg(&spec.args, "--batch-size", 1usize)?,
-        parse_arg(&spec.args, "--epochs", 1usize)?,
-        parse_arg(&spec.args, "--max-seq-len", 1024usize)?,
-        parse_arg(&spec.args, "--seed", 42u64)?,
-        parse_arg(&spec.args, "--checkpoint-every", 100usize)?,
-        has_flag(&spec.args, "--resume"),
-        spec.metrics_file.as_ref().map(|p| p.display().to_string()),
-        false,
-        callbacks,
-        optional_arg(&spec.args, "--text-column"),
-        optional_arg(&spec.args, "--text-columns")
-            .map(|s| s.split(',').map(str::to_string).collect()),
-        optional_arg(&spec.args, "--column-separator").unwrap_or_else(|| "\n\n".to_string()),
-        optional_arg(&spec.args, "--prompt-column"),
-        optional_arg(&spec.args, "--response-column"),
-        crate::commands::distill::OfflineCliOptions {
-            enabled: has_flag(&spec.args, "--offline"),
-            cache_path: optional_arg(&spec.args, "--offline-cache"),
-            generate: has_flag(&spec.args, "--offline-generate"),
-            compression: optional_arg(&spec.args, "--offline-compression")
-                .unwrap_or_else(|| "top_k".to_string()),
-            top_k: parse_arg(&spec.args, "--offline-top-k", 128usize)?,
+    let crate::cli::Commands::Distill(args) = parse_command("distill", spec)? else {
+        anyhow::bail!("the distill command line parsed as another command");
+    };
+    let mut distill_spec = DistillSpec::from(args);
+    // In-process: metrics stream through the callbacks, and the dashboard's
+    // own metrics file is the one the run writes.
+    distill_spec.log_metrics = spec.metrics_file.as_ref().map(|p| p.display().to_string());
+    distill_spec
+        .normalize()
+        .map_err(|errors| crate::commands::invalid_spec::<DistillSpec>(&errors))?;
+    crate::commands::distill::run_distillation(
+        distill_spec,
+        crate::commands::RunContext {
+            emit_console_output: false,
+            callbacks: direct_training_callbacks(job_id, tx, cancel),
         },
     )
     .await
+}
+
+/// The command a TUI job's arguments spell, read by the parser the
+/// subprocess runner's command line goes through.
+fn parse_command(
+    subcommand: &str,
+    spec: &CommandSpec,
+) -> Result<crate::cli::Commands, anyhow::Error> {
+    use clap::Parser;
+    let argv = ["pmetal", subcommand]
+        .into_iter()
+        .map(str::to_string)
+        .chain(spec.args.iter().cloned());
+    Ok(crate::cli::Cli::try_parse_from(argv)?.command)
 }
 
 async fn run_grpo_direct(
@@ -768,46 +635,22 @@ async fn run_grpo_direct(
     tx: mpsc::Sender<AppMsg>,
     cancel: CancellationToken,
 ) -> Result<(), anyhow::Error> {
-    let model = required_arg(&spec.args, "--model")?;
-    let dataset = required_arg(&spec.args, "--dataset")?;
-    let output = required_arg(&spec.args, "--output")?;
-    let callbacks = direct_training_callbacks(job_id, tx, cancel);
+    use pmetal_core::jobs::GrpoSpec;
 
-    let loss_type = optional_arg(&spec.args, "--loss-type").unwrap_or_else(|| "dapo".to_string());
-
-    crate::commands::grpo::run_grpo_cli(
-        &model,
-        &dataset,
-        &output,
-        parse_arg(&spec.args, "--num-generations", 8usize)?,
-        parse_arg(&spec.args, "--beta", 0.001f64)?,
-        parse_arg(&spec.args, "--learning-rate", 5e-6f64)?,
-        parse_arg(&spec.args, "--optimizer", pmetal_core::OptimizerType::AdamW)?,
-        parse_arg(&spec.args, "--epochs", 1usize)?,
-        parse_arg(&spec.args, "--lora-r", 16usize)?,
-        parse_arg(&spec.args, "--lora-alpha", 32.0f32)?,
-        parse_arg(&spec.args, "--max-seq-len", 512usize)?,
-        parse_arg(&spec.args, "--max-completion-length", 512usize)?,
-        parse_arg(&spec.args, "--seed", 42u64)?,
-        parse_arg(&spec.args, "--checkpoint-every", 50usize)?,
-        has_flag(&spec.args, "--resume"),
-        has_flag(&spec.args, "--dapo"),
-        &loss_type,
-        parse_arg(&spec.args, "--num-iterations", 1usize)?,
-        has_flag(&spec.args, "--reasoning-rewards"),
-        has_flag(&spec.args, "--vlm"),
-        parse_arg(&spec.args, "--max-image-size", 336usize)?,
-        optional_arg(&spec.args, "--reward-model"),
-        parse_arg(&spec.args, "--reward-model-max-length", 512usize)?,
-        parse_arg(&spec.args, "--reward-model-weight", 1.0f64)?,
-        optional_arg(&spec.args, "--reward-model-template"),
-        has_flag(&spec.args, "--async-rewards"),
-        optional_arg(&spec.args, "--grpo-kv-bits").and_then(|s| s.parse::<u8>().ok()),
-        spec.metrics_file.as_ref().map(|p| p.display().to_string()),
-        false,
-        callbacks,
-        optional_arg(&spec.args, "--prompt-column"),
-        optional_arg(&spec.args, "--response-column"),
+    let crate::cli::Commands::Grpo(args) = parse_command("grpo", spec)? else {
+        anyhow::bail!("the grpo command line parsed as another command");
+    };
+    let mut grpo_spec = GrpoSpec::from(args);
+    grpo_spec.log_metrics = spec.metrics_file.as_ref().map(|p| p.display().to_string());
+    grpo_spec
+        .normalize()
+        .map_err(|errors| crate::commands::invalid_spec::<GrpoSpec>(&errors))?;
+    crate::commands::grpo::run_grpo(
+        grpo_spec,
+        crate::commands::RunContext {
+            emit_console_output: false,
+            callbacks: direct_training_callbacks(job_id, tx, cancel),
+        },
     )
     .await
 }
