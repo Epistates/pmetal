@@ -147,6 +147,7 @@ impl PreferenceTrainer {
     /// `logging_steps` and the shuffling seed.
     pub fn new(loss: PreferenceLoss, config: TrainingConfig) -> PreferenceResult<Self> {
         loss.validate().map_err(PreferenceError::Config)?;
+        validate_training(&config)?;
         Ok(Self {
             loss,
             config,
@@ -256,6 +257,13 @@ pub(crate) struct MicroBatch {
     /// Whether `chosen_rewards[i]` and `rejected_rewards[i]` belong to one pair.
     pub paired: bool,
     pub kl: Option<Array>,
+}
+
+/// The training configuration, validated: a learning rate, schedule or
+/// clipping threshold that cannot run is an error naming it, at construction.
+fn validate_training(config: &TrainingConfig) -> PreferenceResult<()> {
+    pmetal_core::ConfigValidator::validate(config)
+        .map_err(|e| PreferenceError::Config(e.to_string()))
 }
 
 fn f32_array(values: &[f32]) -> Array {

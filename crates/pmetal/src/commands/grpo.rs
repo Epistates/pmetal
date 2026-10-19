@@ -193,8 +193,6 @@ pub(crate) async fn run_grpo_cli(
             model_path: rm_path_str.clone(),
             max_length: reward_model_max_length,
             chat_template: reward_model_template.clone(),
-            weight: reward_model_weight,
-            ..Default::default()
         };
 
         let ml_reward = pmetal_trainer::reward_model::MLRewardModel::from_pretrained(

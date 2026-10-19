@@ -117,6 +117,7 @@ impl KtoTrainer {
     /// `config` controls.
     pub fn new(kto: KtoConfig, config: TrainingConfig) -> PreferenceResult<Self> {
         kto.validate().map_err(PreferenceError::Config)?;
+        super::validate_training(&config)?;
         Ok(Self {
             kto,
             config,

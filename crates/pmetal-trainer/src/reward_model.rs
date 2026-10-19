@@ -7,13 +7,18 @@
 //!
 //! # Architecture
 //!
-//! Reward models are typically causal LMs with a scalar head:
+//! A reward model is a causal LM trunk with a scalar head on its last hidden
+//! state, as a sequence-classification head is:
+//!
 //! ```text
-//! input_ids → Transformer → hidden_states[-1] → Linear(hidden_dim, 1) → scalar reward
+//! input_ids → Transformer → final-norm hidden state of the last token
+//!           → Linear(hidden_dim, 1) → scalar reward
 //! ```
 //!
-//! Some models output rewards via the logits of specific tokens (e.g., "good"/"bad"),
-//! while others have an explicit `model.score` weight.
+//! The head is the checkpoint's `score.weight` (`[1, hidden_dim]`) and, when it
+//! has one, `score.bias`. A model without that head is not a reward model and
+//! is refused: the logits of a language model are not a score, and training
+//! against their mean would optimize an arbitrary number.
 //!
 //! # Usage
 //!
@@ -35,7 +40,7 @@
 //! ```
 
 use pmetal_data::Tokenizer;
-use pmetal_runtime::compat::{Array, ops};
+use pmetal_runtime::compat::{Array, Dtype, ops};
 use pmetal_runtime::inline_array;
 use std::path::Path;
 use std::sync::Mutex;
@@ -54,16 +59,6 @@ pub struct RewardModelConfig {
     ///
     /// Inputs longer than this are truncated from the right.
     pub max_length: usize,
-    /// Batch size for reward model inference.
-    ///
-    /// Currently unused — scoring is done one at a time to avoid OOM.
-    /// Future batched path can use this field.
-    pub batch_size: usize,
-    /// Whether to extract the reward from the last token position (true)
-    /// or via mean pooling over all token positions (false).
-    ///
-    /// Most reward models (ArmoRM, Skywork-Reward) use the last token.
-    pub use_last_token: bool,
     /// Optional template string for formatting prompt+completion into a single
     /// input sequence for the reward model.
     ///
@@ -74,12 +69,6 @@ pub struct RewardModelConfig {
     ///
     /// When `None`, the prompt and completion are concatenated directly.
     pub chat_template: Option<String>,
-    /// Optional weight to apply to the ML reward relative to other reward
-    /// functions in the CombinedReward.
-    ///
-    /// This is informational — the actual weight is set when calling
-    /// `CombinedReward::add`.
-    pub weight: f64,
 }
 
 impl Default for RewardModelConfig {
@@ -87,27 +76,9 @@ impl Default for RewardModelConfig {
         Self {
             model_path: String::new(),
             max_length: 2048,
-            batch_size: 4,
-            use_last_token: true,
             chat_template: None,
-            weight: 1.0,
         }
     }
-}
-
-/// Scoring strategy for a reward model.
-///
-/// Determines how the scalar reward value is extracted from the model's output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScoringStrategy {
-    /// Apply an explicit `score` linear layer (weight `[hidden_dim, 1]`) to the
-    /// last-token hidden state.  Used by ArmoRM, Skywork-Reward, and most HF
-    /// reward models.  Requires `score.weight` in the checkpoint.
-    ScoreHead,
-    /// Treat the raw logits of the last token as the score vector.  Takes the
-    /// mean across the vocabulary dimension as the scalar reward.  Useful as a
-    /// baseline when no explicit score head is present.
-    MeanLogits,
 }
 
 /// ML-based reward model wrapping a pretrained language model.
@@ -124,23 +95,52 @@ pub struct MLRewardModel {
     model: Mutex<pmetal_models::DynamicModel>,
     /// Tokenizer for the reward model (may differ from the policy tokenizer).
     tokenizer: Tokenizer,
-    /// Explicit score head weight `[hidden_dim, 1]` (transposed for matmul).
-    ///
-    /// Loaded from `score.weight` or `model.score.weight` in the checkpoint.
-    score_weight: Option<Array>,
-    /// Explicit score head bias `[1]`.
+    /// The score head's weight, `[1, hidden_dim]`.
+    score_weight: Array,
+    /// The score head's bias, `[1]`, if it has one.
     score_bias: Option<Array>,
-    /// Strategy used to derive a scalar reward from model output.
-    strategy: ScoringStrategy,
     /// Configuration.
     config: RewardModelConfig,
+}
+
+/// The scalar a score head reads from the last token's hidden state:
+/// `hidden[last] · weight + bias`, in f32 whatever the checkpoint's dtype.
+///
+/// `hidden` is `[1, seq, hidden_dim]` and `weight` `[1, hidden_dim]`.
+fn score_last_token(hidden: &Array, weight: &Array, bias: Option<&Array>) -> f64 {
+    let f32_dtype = Dtype::Float32.as_i32();
+    let (batch, seq, dim) = (hidden.dim(0), hidden.dim(1), hidden.dim(2));
+    let last = hidden
+        .slice(&[0, seq - 1, 0], &[batch, seq, dim])
+        .reshape(&[batch, dim])
+        .as_dtype(f32_dtype);
+    let mut score = ops::matmul(&last, &weight.as_dtype(f32_dtype).transpose_axes(&[1, 0]));
+    if let Some(bias) = bias {
+        score = score.add(&bias.as_dtype(f32_dtype));
+    }
+    score.eval();
+    f64::from(score.item_f32())
+}
+
+/// Whether a `score.weight` of `shape` is a scalar head over a trunk of
+/// `hidden_size`: `[1, hidden_size]`.
+fn check_score_head(shape: &[i32], hidden_size: usize) -> GrpoResult<()> {
+    match shape {
+        [1, inner] if *inner as usize == hidden_size => Ok(()),
+        _ => Err(GrpoError::Reward(format!(
+            "the score head has shape {shape:?}; a reward model's is [1, {hidden_size}] (a scalar \
+             head on the {hidden_size}-wide hidden state)"
+        ))),
+    }
 }
 
 impl MLRewardModel {
     /// Load a reward model from a pretrained checkpoint directory.
     ///
     /// Automatically detects the architecture from `config.json`, loads weights
-    /// via `DynamicModel::load`, and probes for an explicit `score` head.
+    /// via `DynamicModel::load`, and loads the `score` head from the
+    /// safetensors files. A checkpoint without a scalar score head over the
+    /// trunk's hidden size is an error.
     ///
     /// # Arguments
     ///
@@ -160,79 +160,26 @@ impl MLRewardModel {
             .map_err(|e| GrpoError::Reward(format!("Failed to load reward model: {}", e)))?;
 
         let (score_weight, score_bias) = Self::try_load_score_head(path);
-
-        // Determine scoring strategy, with a correctness check for ScoreHead.
-        //
-        // `DynamicModel::forward` returns logits [batch, seq, vocab_size].
-        // A score head (from ArmoRM / Skywork-Reward style models) has shape
-        // [1, hidden_size] and must be applied to the *hidden state* before
-        // the lm_head projection — not to the final logits.
-        //
-        // `DynamicModel` does not currently expose a `forward_hidden` method,
-        // so we cannot obtain the raw hidden states.  Attempting to apply
-        // `score.weight [1, hidden_size]` to `logits [1, vocab_size]` will
-        // produce a dimension mismatch at runtime when hidden_size ≠ vocab_size.
-        //
-        // Rather than silently producing garbage results, we degrade to
-        // MeanLogits and emit a clear diagnostic.  True reward-head scoring
-        // can be re-enabled once DynamicModel exposes a `forward_hidden` API.
-        let strategy = if let Some(ref sw) = score_weight {
-            let score_in_features = sw.shape().get(1).copied().unwrap_or(0) as usize;
-            let vocab_size = model.vocab_size() as usize;
-            let hidden_size = model.hidden_size() as usize;
-
-            if score_in_features == hidden_size {
-                // score.weight inner dim matches hidden_size: this is the
-                // canonical reward-head layout.  However, DynamicModel only
-                // provides logits (post-lm_head), not hidden states.
-                // Applying score.weight to logits would be incorrect unless
-                // vocab_size == hidden_size (rare / only tiny models).
-                if vocab_size == hidden_size {
-                    // Degenerate case where lm_head is square: logits ≈ hidden
-                    // states scaled by lm_head, so the score head is technically
-                    // applicable.  Use it.
-                    tracing::info!(
-                        "Reward model: score head enabled (hidden_size={hidden_size} == vocab_size); \
-                         note that scoring is applied to logits, not raw hidden states."
-                    );
-                    ScoringStrategy::ScoreHead
-                } else {
-                    tracing::warn!(
-                        "Reward model: score.weight inner dim ({score_in_features}) matches \
-                         hidden_size ({hidden_size}) but DynamicModel::forward returns logits \
-                         of shape [batch, seq, {vocab_size}], not hidden states. \
-                         Applying score.weight to logits would produce a dimension mismatch. \
-                         Degrading to MeanLogits. To use true reward-head scoring, expose \
-                         DynamicModel::forward_hidden."
-                    );
-                    ScoringStrategy::MeanLogits
-                }
-            } else if score_in_features == vocab_size {
-                // score.weight inner dim matches vocab_size: the score head
-                // was designed to operate on logits (unusual but valid for
-                // token-level reward models).
-                tracing::info!(
-                    "Reward model: score head inner dim ({score_in_features}) matches \
-                     vocab_size ({vocab_size}); applying score head to last-token logits."
-                );
-                ScoringStrategy::ScoreHead
-            } else {
-                tracing::warn!(
-                    "Reward model: score.weight inner dim ({score_in_features}) matches \
-                     neither hidden_size ({hidden_size}) nor vocab_size ({vocab_size}). \
-                     Cannot apply score head safely. Degrading to MeanLogits."
-                );
-                ScoringStrategy::MeanLogits
+        let score_weight = score_weight.ok_or_else(|| {
+            GrpoError::Reward(format!(
+                "{} has no `score.weight`: it is not a reward model (a language model's logits \
+                 are not a score)",
+                path.display()
+            ))
+        })?;
+        check_score_head(score_weight.shape(), model.hidden_size() as usize)?;
+        if let Some(bias) = &score_bias {
+            if bias.size() != 1 {
+                return Err(GrpoError::Reward(format!(
+                    "the score head's bias has {} entries, expected 1",
+                    bias.size()
+                )));
             }
-        } else {
-            tracing::info!("Reward model: no score head found, using mean-logit scoring");
-            ScoringStrategy::MeanLogits
-        };
+        }
 
         tracing::info!(
-            "Reward model ready: arch={:?}, strategy={:?}",
+            "Reward model ready: arch={:?}, scalar score head over the last token's hidden state",
             model.architecture(),
-            strategy
         );
 
         Ok(Self {
@@ -240,7 +187,6 @@ impl MLRewardModel {
             tokenizer,
             score_weight,
             score_bias,
-            strategy,
             config,
         })
     }
@@ -249,8 +195,7 @@ impl MLRewardModel {
     /// from the safetensors files in `model_dir`.
     ///
     /// Scans every `.safetensors` file in the directory and returns the first
-    /// match.  Returns `(None, None)` if no score head is found — this is not
-    /// an error; the caller selects `MeanLogits` scoring instead.
+    /// match, or `(None, None)` if there is none.
     fn try_load_score_head(model_dir: &Path) -> (Option<Array>, Option<Array>) {
         // Collect all safetensors files in the directory (non-recursive).
         let sf_paths: Vec<std::path::PathBuf> = std::fs::read_dir(model_dir)
@@ -315,8 +260,7 @@ impl MLRewardModel {
 
     /// Tokenize the formatted input string and truncate to `max_length`.
     ///
-    /// Returns `(input_ids_array, seq_len)` where `input_ids_array` has shape
-    /// `[1, seq_len]` with dtype `int32`.
+    /// Returns the `[1, seq_len]` int32 ids.
     fn tokenize_input(&self, text: &str) -> GrpoResult<Array> {
         let ids = self
             .tokenizer
@@ -335,10 +279,8 @@ impl MLRewardModel {
         Ok(input_ids)
     }
 
-    /// Score a single prompt+completion pair.
-    ///
-    /// Runs a full forward pass on the reward model and extracts a scalar
-    /// reward.  No gradient tape is active during this call.
+    /// Score a single prompt+completion pair: the score head on the last
+    /// token's final-norm hidden state. Inference only; no gradient is taken.
     fn score_single(
         &self,
         model: &mut pmetal_models::DynamicModel,
@@ -347,68 +289,24 @@ impl MLRewardModel {
     ) -> GrpoResult<f64> {
         let text = self.format_input(prompt, completion);
         let input_ids = self.tokenize_input(&text)?;
+        if input_ids.dim(1) == 0 {
+            return Err(GrpoError::Reward(
+                "the reward model's input is empty".into(),
+            ));
+        }
 
-        // Forward pass — inference only, gradient tape is not active during
-        // GRPO reward scoring.
-        let logits = model
-            .forward(&input_ids, None)
+        let hidden = model
+            .forward_hidden(&input_ids, None)
             .map_err(|e| GrpoError::Reward(format!("Reward model forward pass failed: {}", e)))?;
-        // logits shape: [1, seq_len, vocab_size]
-
-        let reward = match self.strategy {
-            ScoringStrategy::ScoreHead => {
-                // NOTE: DynamicModel::forward returns logit projections
-                // [batch, seq_len, vocab_size], not raw hidden states.
-                //
-                // For true reward-head models (ArmoRM, Skywork-Reward), the
-                // `score.weight` tensor is `[1, hidden_size]`.  Since we only
-                // have access to logits here, we apply the score head to the
-                // last-token logit vector `[1, vocab_size]`.  This is an
-                // approximation — it is correct only when the reward model's
-                // `lm_head` is weight-tied with the embedding layer, so logits
-                // and hidden states are related by a fixed projection.
-                //
-                // For best accuracy with ArmoRM-style models, the logit vector
-                // dimension must match `score.weight`'s inner dimension.  If
-                // they differ at runtime, MLX's matmul will return an error.
-                //
-                // Shape: [1, vocab_size]
-                let last_token_vec = logits.index((.., -1i32, ..));
-
-                // score.weight shape from HF: [out_features=1, in_features=hidden_dim].
-                // Transpose to [hidden_dim, 1] for matmul [1, hidden_dim] × [hidden_dim, 1].
-                let w = self.score_weight.as_ref().unwrap();
-                let w_t = w.transpose_axes(&[1, 0]);
-                // [1, vocab_size] × [vocab_size, 1] → [1, 1]
-                let score = ops::matmul(&last_token_vec, &w_t);
-
-                let score = if let Some(b) = &self.score_bias {
-                    score.add(b)
-                } else {
-                    score
-                };
-
-                score.eval();
-                score.item::<f32>() as f64
-            }
-
-            ScoringStrategy::MeanLogits => {
-                // No explicit score head.  Use the mean of the last-token
-                // logits as a heuristic scalar reward.
-                // Shape: [1, vocab_size] → scalar
-                let last_token_logits = logits.index((.., -1i32, ..));
-                let mean = last_token_logits.mean(None);
-                mean.eval();
-                mean.item::<f32>() as f64
-            }
-        };
-
-        Ok(reward)
-    }
-
-    /// Return the active scoring strategy.
-    pub fn strategy(&self) -> ScoringStrategy {
-        self.strategy
+        let score = score_last_token(&hidden, &self.score_weight, self.score_bias.as_ref());
+        pmetal_runtime::check_unobserved_error()
+            .map_err(|e| GrpoError::Reward(format!("reward scoring failed: {e}")))?;
+        if !score.is_finite() {
+            return Err(GrpoError::Reward(format!(
+                "the reward model scored {score}"
+            )));
+        }
+        Ok(score)
     }
 
     /// Return a reference to the reward model config.
@@ -423,7 +321,7 @@ impl MLRewardModel {
 // access — only one thread holds the lock at a time — which is the only safe
 // access pattern that MLX supports for concurrent callers sharing a model.
 // The `Tokenizer` wraps `tokenizers::Tokenizer` which is `Send + Sync`.
-// The `Option<Array>` fields (score head) are read-only after construction.
+// The score head arrays are read-only after construction.
 unsafe impl Send for MLRewardModel {}
 unsafe impl Sync for MLRewardModel {}
 
@@ -455,9 +353,8 @@ impl RewardFunction for MLRewardModel {
 impl std::fmt::Debug for MLRewardModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MLRewardModel")
-            .field("strategy", &self.strategy)
             .field("max_length", &self.config.max_length)
-            .field("has_score_head", &self.score_weight.is_some())
+            .field("has_score_bias", &self.score_bias.is_some())
             .finish()
     }
 }
@@ -470,10 +367,45 @@ mod tests {
     fn test_reward_model_config_default() {
         let config = RewardModelConfig::default();
         assert_eq!(config.max_length, 2048);
-        assert_eq!(config.batch_size, 4);
-        assert!(config.use_last_token);
         assert!(config.chat_template.is_none());
-        assert_eq!(config.weight, 1.0);
+    }
+
+    /// The score is the head applied to the *last* token's hidden state (not
+    /// the logits, whose mean the old fallback took), in f32: `w · h_last + b`.
+    #[test]
+    fn the_score_is_the_head_on_the_last_hidden_state() {
+        // [1, 3 tokens, 4 dims]: only the last row counts.
+        let hidden = Array::from_slice(
+            &[
+                9.0f32, 9.0, 9.0, 9.0, // ignored
+                8.0, 8.0, 8.0, 8.0, // ignored
+                1.0, -2.0, 0.5, 4.0, // last
+            ],
+            &[1, 3, 4],
+        )
+        .as_dtype(Dtype::Bfloat16.as_i32());
+        let weight = Array::from_slice(&[0.5f32, 0.25, -1.0, 0.125], &[1, 4]);
+        let bias = Array::from_slice(&[0.75f32], &[1]);
+        // 0.5 - 0.5 - 0.5 + 0.5 = 0, plus the bias.
+        let got = score_last_token(&hidden, &weight, Some(&bias));
+        assert!((got - 0.75).abs() < 1e-6, "{got}");
+        let got = score_last_token(&hidden, &weight, None);
+        assert!(got.abs() < 1e-6, "{got}");
+        // Another head reads the same hidden state differently.
+        let weight = Array::from_slice(&[1.0f32, 1.0, 1.0, 1.0], &[1, 4]);
+        let got = score_last_token(&hidden, &weight, None);
+        assert!((got - 3.5).abs() < 1e-6, "{got}");
+    }
+
+    /// Only a scalar head over the trunk's hidden size is a reward head.
+    #[test]
+    fn only_a_scalar_head_over_the_hidden_size_is_accepted() {
+        assert!(check_score_head(&[1, 32], 32).is_ok());
+        // A classification head, a head over another width and a vocabulary-
+        // sized head (the old logits fallback) are refused.
+        assert!(check_score_head(&[2, 32], 32).is_err());
+        assert!(check_score_head(&[1, 64], 32).is_err());
+        assert!(check_score_head(&[1000, 1], 32).is_err());
     }
 
     #[test]
