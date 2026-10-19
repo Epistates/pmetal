@@ -366,8 +366,12 @@ pub(crate) async fn run_inference(spec: InferSpec) -> anyhow::Result<()> {
         };
     }
     #[cfg(not(feature = "ane"))]
-    if ane {
-        anyhow::bail!("ANE inference requires the 'ane' feature: cargo build --features ane");
+    {
+        // Only the ANE engine reads it.
+        let _ = ane_max_seq_len;
+        if ane {
+            anyhow::bail!("ANE inference requires the 'ane' feature: cargo build --features ane");
+        }
     }
     // `--chat-template-kwargs '{"enable_thinking": false}'` is --no-thinking.
     let no_thinking = no_thinking || chat_template_kwargs.enable_thinking() == Some(false);

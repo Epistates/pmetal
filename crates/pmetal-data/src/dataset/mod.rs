@@ -1029,6 +1029,7 @@ mod tests {
     /// The length a sample has in training: the tokenizer's special tokens
     /// for text no template rendered, an end-of-sequence token after it.
     #[test]
+    #[allow(clippy::single_range_in_vec_init)] // one trained span
     fn a_sample_counts_the_tokens_training_would_see() {
         let tokenizer = crate::tokenizer::testing::word_level(
             &["<unk>", "a", "b"],

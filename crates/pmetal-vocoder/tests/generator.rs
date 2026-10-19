@@ -372,10 +372,10 @@ fn a_hub_id_loads_from_the_hub_cache() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let load = || runtime.block_on(BigVGAN::from_pretrained_with("org/bigvgan", &options));
 
-    let err = load()
-        .err()
-        .expect("no weights in the snapshot")
-        .to_string();
+    let err = match load() {
+        Ok(_) => panic!("no weights in the snapshot"),
+        Err(e) => e.to_string(),
+    };
     assert!(
         err.contains("org/bigvgan") && err.contains("model.safetensors"),
         "{err}"

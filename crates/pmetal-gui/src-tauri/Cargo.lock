@@ -1284,6 +1284,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap_complete"
+version = "4.6.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "037e2a1a92236d0aff7e845093f64661d6df4c02c9fcc61a60e9e1d736fa392f"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "clap_derive"
 version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6083,10 +6092,9 @@ name = "pmetal"
 version = "0.6.0"
 dependencies = [
  "anyhow",
- "arrow-array",
- "arrow-json",
  "chrono",
  "clap",
+ "clap_complete",
  "crossterm",
  "dirs 7.0.0",
  "flate2",
@@ -6094,7 +6102,6 @@ dependencies = [
  "half",
  "indicatif",
  "libc",
- "parquet",
  "pmetal-cache",
  "pmetal-core",
  "pmetal-data",
@@ -6300,9 +6307,9 @@ name = "pmetal-merge"
 version = "0.6.0"
 dependencies = [
  "half",
- "hf-hub",
  "memmap2",
  "ndarray",
+ "pmetal-hub",
  "pmetal-runtime",
  "rand 0.10.3",
  "regex",
@@ -6422,7 +6429,6 @@ name = "pmetal-vocoder"
 version = "0.6.0"
 dependencies = [
  "half",
- "hf-hub",
  "pmetal-hub",
  "pmetal-runtime",
  "safetensors",
