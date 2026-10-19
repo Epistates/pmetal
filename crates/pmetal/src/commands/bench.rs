@@ -1,4 +1,4 @@
-use crate::{GdnBenchmarkStage, WorkloadBenchmarkPreset, WorkloadInferenceContext};
+use crate::cli::bench::{GdnBenchmarkStage, WorkloadBenchmarkPreset, WorkloadInferenceContext};
 use anyhow::Context;
 use pmetal::inference_runner::{CacheModeRequest, select_cache_mode_for_model};
 use pmetal_cache::kv_cache::CacheMode;

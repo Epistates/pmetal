@@ -2,50 +2,16 @@
 
 use std::sync::Arc;
 
+use crate::cli::hub::DownloadArgs;
 use indicatif::{ProgressBar, ProgressStyle};
 use pmetal_hub::{
     DownloadOptions, HubOptions, ProgressCallback, TransferProgress, Verification, WeightFormat,
     download_model_with, plan_model_download, split_quant_selector, verify_model_dir,
 };
 
-/// The weight format to fetch.
-#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WeightsArg {
-    /// Safetensors, else GGUF
-    Auto,
-    /// Safetensors only
-    Safetensors,
-    /// One GGUF quantization
-    Gguf,
-    /// PyTorch `pytorch_model*.bin` pickles
-    Pytorch,
-}
-
-impl From<WeightsArg> for WeightFormat {
-    fn from(arg: WeightsArg) -> Self {
-        match arg {
-            WeightsArg::Auto => WeightFormat::Auto,
-            WeightsArg::Safetensors => WeightFormat::Safetensors,
-            WeightsArg::Gguf => WeightFormat::Gguf,
-            WeightsArg::Pytorch => WeightFormat::PyTorch,
-        }
-    }
-}
-
-/// What `pmetal download` was asked for.
-pub(crate) struct DownloadRequest {
-    pub(crate) model: String,
-    pub(crate) revision: Option<String>,
-    pub(crate) format: WeightsArg,
-    pub(crate) quant: Option<String>,
-    pub(crate) verify_sha256: bool,
-    pub(crate) dry_run: bool,
-    pub(crate) offline: bool,
-}
-
 /// The download options a request stands for. A `:QUANT` suffix on the model
 /// and `--quant` both select a GGUF quantization and so imply the GGUF format.
-fn options_for(request: &DownloadRequest) -> (String, DownloadOptions) {
+fn options_for(request: &DownloadArgs) -> (String, DownloadOptions) {
     let (id, suffix_quant) = split_quant_selector(&request.model);
     let quant = request
         .quant
@@ -116,7 +82,7 @@ pub(crate) fn transfer_bar() -> anyhow::Result<(ProgressBar, ProgressCallback)> 
 }
 
 /// Run `pmetal download`.
-pub(crate) async fn run_download(request: DownloadRequest) -> anyhow::Result<()> {
+pub(crate) async fn run_download(request: DownloadArgs) -> anyhow::Result<()> {
     let (model, mut options) = options_for(&request);
 
     if request.dry_run {
@@ -154,12 +120,36 @@ pub(crate) async fn run_download(request: DownloadRequest) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Run `pmetal upload`.
+pub(crate) async fn run_upload(args: crate::cli::hub::UploadArgs) -> anyhow::Result<()> {
+    tracing::info!(path = %args.path, repo = %args.repo, "Uploading model");
+    let (bar, progress) = transfer_bar()?;
+    let options = pmetal_hub::UploadOptions {
+        private: args.private,
+        revision: args.revision,
+        commit_message: args.message,
+        create_pr: args.create_pr,
+        ignore: args.exclude,
+        progress: Some(progress),
+        ..Default::default()
+    };
+    let report = pmetal_hub::upload_model(&args.path, &args.repo, None, &options).await;
+    bar.finish_and_clear();
+    let report = report?;
+    println!("Uploaded {} to {}", args.path, report.repo_url);
+    if let Some(commit) = report.commit_url {
+        println!("Commit: {commit}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::hub::WeightsArg;
 
-    fn request(model: &str) -> DownloadRequest {
-        DownloadRequest {
+    fn request(model: &str) -> DownloadArgs {
+        DownloadArgs {
             model: model.to_owned(),
             revision: None,
             format: WeightsArg::Auto,

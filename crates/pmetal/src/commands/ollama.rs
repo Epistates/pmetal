@@ -1,7 +1,7 @@
 use pmetal_models::ollama::{ModelfileBuilder, templates as ollama_templates};
 
-use crate::OllamaAction;
-use crate::OllamaTemplate;
+use crate::cli::ollama::OllamaAction;
+use crate::cli::ollama::OllamaTemplate;
 
 /// Run Modelfile export helpers.
 pub(crate) async fn run_ollama_command(action: OllamaAction) -> anyhow::Result<()> {

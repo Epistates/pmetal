@@ -21,33 +21,35 @@ fn lower_hex(bytes: &[u8]) -> String {
     output
 }
 
-fn quantize_method_file_type(method: crate::QuantizeMethod) -> pmetal_gguf::FileType {
+fn quantize_method_file_type(
+    method: crate::cli::quantize::QuantizeMethod,
+) -> pmetal_gguf::FileType {
     use pmetal_gguf::FileType;
     match method {
-        crate::QuantizeMethod::Dynamic => FileType::MostlyQ4KM,
-        crate::QuantizeMethod::Q8_0 => FileType::MostlyQ8_0,
-        crate::QuantizeMethod::Q8_1 => FileType::MostlyQ8_0,
-        crate::QuantizeMethod::Q6K => FileType::MostlyQ6K,
-        crate::QuantizeMethod::Q5KM => FileType::MostlyQ5KM,
-        crate::QuantizeMethod::Q5KS => FileType::MostlyQ5KS,
-        crate::QuantizeMethod::Q5_0 => FileType::MostlyQ5_0,
-        crate::QuantizeMethod::Q5_1 => FileType::MostlyQ5_1,
-        crate::QuantizeMethod::Q4KM => FileType::MostlyQ4KM,
-        crate::QuantizeMethod::Q4KS => FileType::MostlyQ4KS,
-        crate::QuantizeMethod::Q4_0 => FileType::MostlyQ4_0,
-        crate::QuantizeMethod::Q4_1 => FileType::MostlyQ4_1,
-        crate::QuantizeMethod::Q3KM => FileType::MostlyQ3KM,
-        crate::QuantizeMethod::Q3KS => FileType::MostlyQ3KS,
-        crate::QuantizeMethod::Q3KL => FileType::MostlyQ3KL,
-        crate::QuantizeMethod::Q2K => FileType::MostlyQ2K,
-        crate::QuantizeMethod::Q1_0 => FileType::MostlyQ1_0,
-        crate::QuantizeMethod::Tq1_0 => FileType::MostlyTq1_0,
-        crate::QuantizeMethod::Tq2_0 => FileType::MostlyTq2_0,
-        crate::QuantizeMethod::Mxfp4 => FileType::MostlyMxfp4Moe,
-        crate::QuantizeMethod::Nvfp4 => FileType::MostlyNvfp4,
-        crate::QuantizeMethod::Bf16 => FileType::MostlyBf16,
-        crate::QuantizeMethod::F16 => FileType::MostlyF16,
-        crate::QuantizeMethod::F32 => FileType::AllF32,
+        crate::cli::quantize::QuantizeMethod::Dynamic => FileType::MostlyQ4KM,
+        crate::cli::quantize::QuantizeMethod::Q8_0 => FileType::MostlyQ8_0,
+        crate::cli::quantize::QuantizeMethod::Q8_1 => FileType::MostlyQ8_0,
+        crate::cli::quantize::QuantizeMethod::Q6K => FileType::MostlyQ6K,
+        crate::cli::quantize::QuantizeMethod::Q5KM => FileType::MostlyQ5KM,
+        crate::cli::quantize::QuantizeMethod::Q5KS => FileType::MostlyQ5KS,
+        crate::cli::quantize::QuantizeMethod::Q5_0 => FileType::MostlyQ5_0,
+        crate::cli::quantize::QuantizeMethod::Q5_1 => FileType::MostlyQ5_1,
+        crate::cli::quantize::QuantizeMethod::Q4KM => FileType::MostlyQ4KM,
+        crate::cli::quantize::QuantizeMethod::Q4KS => FileType::MostlyQ4KS,
+        crate::cli::quantize::QuantizeMethod::Q4_0 => FileType::MostlyQ4_0,
+        crate::cli::quantize::QuantizeMethod::Q4_1 => FileType::MostlyQ4_1,
+        crate::cli::quantize::QuantizeMethod::Q3KM => FileType::MostlyQ3KM,
+        crate::cli::quantize::QuantizeMethod::Q3KS => FileType::MostlyQ3KS,
+        crate::cli::quantize::QuantizeMethod::Q3KL => FileType::MostlyQ3KL,
+        crate::cli::quantize::QuantizeMethod::Q2K => FileType::MostlyQ2K,
+        crate::cli::quantize::QuantizeMethod::Q1_0 => FileType::MostlyQ1_0,
+        crate::cli::quantize::QuantizeMethod::Tq1_0 => FileType::MostlyTq1_0,
+        crate::cli::quantize::QuantizeMethod::Tq2_0 => FileType::MostlyTq2_0,
+        crate::cli::quantize::QuantizeMethod::Mxfp4 => FileType::MostlyMxfp4Moe,
+        crate::cli::quantize::QuantizeMethod::Nvfp4 => FileType::MostlyNvfp4,
+        crate::cli::quantize::QuantizeMethod::Bf16 => FileType::MostlyBf16,
+        crate::cli::quantize::QuantizeMethod::F16 => FileType::MostlyF16,
+        crate::cli::quantize::QuantizeMethod::F32 => FileType::AllF32,
     }
 }
 
@@ -106,7 +108,7 @@ fn add_hf_config_metadata(
     builder: &mut pmetal_gguf::GgufBuilder,
     architecture: &str,
     config_json: Option<&serde_json::Value>,
-    method: crate::QuantizeMethod,
+    method: crate::cli::quantize::QuantizeMethod,
 ) {
     builder.add_string("general.type", "model");
     builder.add_u32(
@@ -996,12 +998,12 @@ fn use_more_bits(layer: usize, n_layers: usize) -> bool {
     layer < n_layers / 8 || layer >= 7 * n_layers / 8 || layer.saturating_sub(n_layers / 8) % 3 == 2
 }
 
-fn llama_default_type(method: crate::QuantizeMethod) -> pmetal_gguf::GgmlType {
+fn llama_default_type(method: crate::cli::quantize::QuantizeMethod) -> pmetal_gguf::GgmlType {
     method.to_ggml_type().unwrap_or(pmetal_gguf::GgmlType::Q4K)
 }
 
 fn llama_style_tensor_type(
-    method: crate::QuantizeMethod,
+    method: crate::cli::quantize::QuantizeMethod,
     gguf_name: &str,
     shape: &[u64],
     config_json: Option<&serde_json::Value>,
@@ -1011,7 +1013,9 @@ fn llama_style_tensor_type(
 
     if matches!(
         method,
-        crate::QuantizeMethod::F32 | crate::QuantizeMethod::F16 | crate::QuantizeMethod::Bf16
+        crate::cli::quantize::QuantizeMethod::F32
+            | crate::cli::quantize::QuantizeMethod::F16
+            | crate::cli::quantize::QuantizeMethod::Bf16
     ) {
         return llama_default_type(method);
     }
@@ -1020,7 +1024,7 @@ fn llama_style_tensor_type(
         return GgmlType::F16;
     }
 
-    let mut dtype = if matches!(method, crate::QuantizeMethod::Dynamic) {
+    let mut dtype = if matches!(method, crate::cli::quantize::QuantizeMethod::Dynamic) {
         proposed
     } else {
         llama_default_type(method)
@@ -1039,51 +1043,52 @@ fn llama_style_tensor_type(
 
     if gguf_name == "output.weight" || gguf_name == "token_embd.weight" {
         return match method {
-            crate::QuantizeMethod::Q1_0
-            | crate::QuantizeMethod::Tq1_0
-            | crate::QuantizeMethod::Tq2_0
-            | crate::QuantizeMethod::Mxfp4
-            | crate::QuantizeMethod::Nvfp4 => GgmlType::F16,
+            crate::cli::quantize::QuantizeMethod::Q1_0
+            | crate::cli::quantize::QuantizeMethod::Tq1_0
+            | crate::cli::quantize::QuantizeMethod::Tq2_0
+            | crate::cli::quantize::QuantizeMethod::Mxfp4
+            | crate::cli::quantize::QuantizeMethod::Nvfp4 => GgmlType::F16,
             _ if dtype == GgmlType::Q8_0 => GgmlType::Q8_0,
-            crate::QuantizeMethod::Dynamic
-            | crate::QuantizeMethod::Q2K
-            | crate::QuantizeMethod::Q3KM
-            | crate::QuantizeMethod::Q3KS
-            | crate::QuantizeMethod::Q3KL
-            | crate::QuantizeMethod::Q4KM
-            | crate::QuantizeMethod::Q4KS
-            | crate::QuantizeMethod::Q5KM
-            | crate::QuantizeMethod::Q5KS
-            | crate::QuantizeMethod::Q6K => GgmlType::Q6K,
+            crate::cli::quantize::QuantizeMethod::Dynamic
+            | crate::cli::quantize::QuantizeMethod::Q2K
+            | crate::cli::quantize::QuantizeMethod::Q3KM
+            | crate::cli::quantize::QuantizeMethod::Q3KS
+            | crate::cli::quantize::QuantizeMethod::Q3KL
+            | crate::cli::quantize::QuantizeMethod::Q4KM
+            | crate::cli::quantize::QuantizeMethod::Q4KS
+            | crate::cli::quantize::QuantizeMethod::Q5KM
+            | crate::cli::quantize::QuantizeMethod::Q5KS
+            | crate::cli::quantize::QuantizeMethod::Q6K => GgmlType::Q6K,
             _ => dtype,
         };
     }
 
     if gguf_name.contains("attn_v.weight") {
         dtype = match method {
-            crate::QuantizeMethod::Q2K => {
+            crate::cli::quantize::QuantizeMethod::Q2K => {
                 if n_gqa >= 4 {
                     GgmlType::Q4K
                 } else {
                     GgmlType::Q3K
                 }
             }
-            crate::QuantizeMethod::Q3KM => {
+            crate::cli::quantize::QuantizeMethod::Q3KM => {
                 if layer < 2 {
                     GgmlType::Q5K
                 } else {
                     GgmlType::Q4K
                 }
             }
-            crate::QuantizeMethod::Q3KL => GgmlType::Q5K,
-            crate::QuantizeMethod::Q4KM | crate::QuantizeMethod::Q5KM => {
+            crate::cli::quantize::QuantizeMethod::Q3KL => GgmlType::Q5K,
+            crate::cli::quantize::QuantizeMethod::Q4KM
+            | crate::cli::quantize::QuantizeMethod::Q5KM => {
                 if use_more_bits(layer, n_layers) {
                     GgmlType::Q6K
                 } else {
                     dtype
                 }
             }
-            crate::QuantizeMethod::Q4KS => {
+            crate::cli::quantize::QuantizeMethod::Q4KS => {
                 if layer < 4 {
                     GgmlType::Q5K
                 } else {
@@ -1094,8 +1099,8 @@ fn llama_style_tensor_type(
         };
     } else if gguf_name.contains("ffn_down.weight") || gguf_name.contains("ffn_down_exps.weight") {
         dtype = match method {
-            crate::QuantizeMethod::Q2K => GgmlType::Q3K,
-            crate::QuantizeMethod::Q3KM => {
+            crate::cli::quantize::QuantizeMethod::Q2K => GgmlType::Q3K,
+            crate::cli::quantize::QuantizeMethod::Q3KM => {
                 if layer < n_layers / 16 {
                     GgmlType::Q5K
                 } else if use_more_bits(layer, n_layers) {
@@ -1104,15 +1109,16 @@ fn llama_style_tensor_type(
                     GgmlType::Q3K
                 }
             }
-            crate::QuantizeMethod::Q3KL => GgmlType::Q5K,
-            crate::QuantizeMethod::Q4KM | crate::QuantizeMethod::Q5KM => {
+            crate::cli::quantize::QuantizeMethod::Q3KL => GgmlType::Q5K,
+            crate::cli::quantize::QuantizeMethod::Q4KM
+            | crate::cli::quantize::QuantizeMethod::Q5KM => {
                 if use_more_bits(layer, n_layers) {
                     GgmlType::Q6K
                 } else {
                     dtype
                 }
             }
-            crate::QuantizeMethod::Q4KS => {
+            crate::cli::quantize::QuantizeMethod::Q4KS => {
                 if layer < n_layers / 8 {
                     GgmlType::Q5K
                 } else {
@@ -1123,16 +1129,17 @@ fn llama_style_tensor_type(
         };
     } else if gguf_name.contains("attn_output.weight") {
         dtype = match method {
-            crate::QuantizeMethod::Q2K => GgmlType::Q3K,
-            crate::QuantizeMethod::Q3KM => GgmlType::Q4K,
-            crate::QuantizeMethod::Q3KL => GgmlType::Q5K,
+            crate::cli::quantize::QuantizeMethod::Q2K => GgmlType::Q3K,
+            crate::cli::quantize::QuantizeMethod::Q3KM => GgmlType::Q4K,
+            crate::cli::quantize::QuantizeMethod::Q3KL => GgmlType::Q5K,
             _ => dtype,
         };
     } else if gguf_name.contains("attn_qkv.weight") {
         dtype = match method {
-            crate::QuantizeMethod::Q3KM | crate::QuantizeMethod::Q3KL => GgmlType::Q4K,
-            crate::QuantizeMethod::Q4KM => GgmlType::Q5K,
-            crate::QuantizeMethod::Q5KM => GgmlType::Q6K,
+            crate::cli::quantize::QuantizeMethod::Q3KM
+            | crate::cli::quantize::QuantizeMethod::Q3KL => GgmlType::Q4K,
+            crate::cli::quantize::QuantizeMethod::Q4KM => GgmlType::Q5K,
+            crate::cli::quantize::QuantizeMethod::Q5KM => GgmlType::Q6K,
             _ => dtype,
         };
     }
@@ -1163,7 +1170,7 @@ pub(crate) async fn run_quantization(
     model_path: &str,
     output_path: &str,
     imatrix_path: Option<&str>,
-    method: crate::QuantizeMethod,
+    method: crate::cli::quantize::QuantizeMethod,
     kl_calibrate: bool,
     target_bpw: Option<f32>,
     kl_threshold: f64,
@@ -1586,7 +1593,7 @@ mod tests {
 
         assert_eq!(
             llama_style_tensor_type(
-                crate::QuantizeMethod::Q4KM,
+                crate::cli::quantize::QuantizeMethod::Q4KM,
                 "blk.0.ffn_down.weight",
                 &[4096, 14336],
                 Some(&config),
@@ -1596,7 +1603,7 @@ mod tests {
         );
         assert_eq!(
             llama_style_tensor_type(
-                crate::QuantizeMethod::Q4KM,
+                crate::cli::quantize::QuantizeMethod::Q4KM,
                 "blk.0.attn_norm.weight",
                 &[4096],
                 Some(&config),
@@ -1606,7 +1613,7 @@ mod tests {
         );
         assert_eq!(
             llama_style_tensor_type(
-                crate::QuantizeMethod::Q4KM,
+                crate::cli::quantize::QuantizeMethod::Q4KM,
                 "output.weight",
                 &[32000, 4096],
                 Some(&config),
@@ -1616,7 +1623,7 @@ mod tests {
         );
         assert_eq!(
             llama_style_tensor_type(
-                crate::QuantizeMethod::Tq1_0,
+                crate::cli::quantize::QuantizeMethod::Tq1_0,
                 "token_embd.weight",
                 &[32000, 4096],
                 Some(&config),
@@ -1631,23 +1638,23 @@ mod tests {
         use pmetal_gguf::FileType;
 
         assert_eq!(
-            quantize_method_file_type(crate::QuantizeMethod::Q4_0),
+            quantize_method_file_type(crate::cli::quantize::QuantizeMethod::Q4_0),
             FileType::MostlyQ4_0
         );
         assert_eq!(
-            quantize_method_file_type(crate::QuantizeMethod::Q5_1),
+            quantize_method_file_type(crate::cli::quantize::QuantizeMethod::Q5_1),
             FileType::MostlyQ5_1
         );
         assert_eq!(
-            quantize_method_file_type(crate::QuantizeMethod::Q1_0),
+            quantize_method_file_type(crate::cli::quantize::QuantizeMethod::Q1_0),
             FileType::MostlyQ1_0
         );
         assert_eq!(
-            quantize_method_file_type(crate::QuantizeMethod::Mxfp4),
+            quantize_method_file_type(crate::cli::quantize::QuantizeMethod::Mxfp4),
             FileType::MostlyMxfp4Moe
         );
         assert_eq!(
-            quantize_method_file_type(crate::QuantizeMethod::Nvfp4),
+            quantize_method_file_type(crate::cli::quantize::QuantizeMethod::Nvfp4),
             FileType::MostlyNvfp4
         );
     }
@@ -1707,7 +1714,7 @@ mod tests {
             &mut builder,
             "qwen3",
             Some(&config),
-            crate::QuantizeMethod::Q4KM,
+            crate::cli::quantize::QuantizeMethod::Q4KM,
         );
 
         let bytes = builder.build_to_bytes().unwrap();

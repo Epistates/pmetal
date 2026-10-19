@@ -68,7 +68,7 @@ pub struct TrainDiffusionArgs {
     /// (4-bit affine for nf4 and fp4, 8-bit for int8), so only the f32 LoRA
     /// adapters train. A large memory reduction for the 26B MoE model.
     #[arg(long = "quantization", value_enum, default_value = "none")]
-    pub quantization: crate::QuantizationMethod,
+    pub quantization: crate::cli::train::QuantizationMethod,
 
     /// Weights per scale for nf4 and int8 (32, 64 or 128; fp4's block is 16)
     #[arg(long = "quant-block-size", default_value = "64")]

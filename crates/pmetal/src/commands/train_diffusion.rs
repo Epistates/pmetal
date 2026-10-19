@@ -22,7 +22,7 @@ use pmetal_trainer::{
     DiffusionGemmaTrainConfig, DiffusionGemmaTrainer, quantize_diffusion_gemma_base,
 };
 
-use crate::QuantizationMethod;
+use crate::cli::train::QuantizationMethod;
 use crate::cli::train_diffusion::TrainDiffusionArgs;
 
 pub(crate) async fn run_train_diffusion(args: TrainDiffusionArgs) -> Result<()> {

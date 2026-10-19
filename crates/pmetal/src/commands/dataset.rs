@@ -1,7 +1,7 @@
 use pmetal_data::Tokenizer;
 
-use crate::ChatTemplate;
-use crate::DatasetAction;
+use crate::cli::dataset::ChatTemplate;
+use crate::cli::dataset::DatasetAction;
 
 /// Run dataset subcommands.
 pub(crate) async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {

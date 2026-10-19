@@ -3,7 +3,7 @@
 //! Field `#[arg(long = "...")]` strings MUST match the `argv = "..."` attribute
 //! in `TrainSpec` (pmetal-core/src/jobs/train.rs).
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 
 /// Thin clap argument struct for `pmetal train`.
 #[derive(Args, Debug)]
@@ -81,7 +81,7 @@ pub struct TrainArgs {
 
     /// Quantization method for QLoRA (none, nf4, fp4, int8)
     #[arg(long = "quantization", value_enum, default_value = "none")]
-    pub quantization: crate::QuantizationMethod,
+    pub quantization: crate::cli::train::QuantizationMethod,
 
     /// Weights per scale for nf4 and int8 (32, 64 or 128; fp4's block is 16)
     #[arg(long = "quant-block-size", default_value = "64")]
@@ -209,4 +209,18 @@ pub struct TrainArgs {
     #[cfg(feature = "distributed")]
     #[arg(long = "compression-strategy", default_value = "none")]
     pub compression_strategy: Option<String>,
+}
+
+/// Quantization method for QLoRA.
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum QuantizationMethod {
+    /// No quantization (standard LoRA)
+    #[default]
+    None,
+    /// NF4 (4-bit NormalFloat), the QLoRA paper's data type - recommended
+    Nf4,
+    /// NVFP4: E2M1 values with an E4M3 scale per 16 and an FP32 scale per tensor
+    Fp4,
+    /// 8-bit affine integers
+    Int8,
 }

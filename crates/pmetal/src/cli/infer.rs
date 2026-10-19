@@ -1,6 +1,6 @@
 //! Clap argument struct for `pmetal infer`.
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 
 /// A frame rate: a finite number above zero.
 fn parse_fps(value: &str) -> Result<f64, String> {
@@ -211,7 +211,7 @@ pub struct InferArgs {
 
     /// Mixed-bit TurboQuant preset (`q2_5` or `q3_5`).
     #[arg(long = "kv-turboquant-preset", value_enum)]
-    pub kv_turboquant_preset: Option<crate::TurboQuantPresetArg>,
+    pub kv_turboquant_preset: Option<crate::cli::infer::TurboQuantPresetArg>,
 
     /// TurboQuant v2 mixed-bit affine preset.
     #[arg(long = "kv-quant-preset", value_parser = ["q2_5", "q3_5"])]
@@ -228,4 +228,21 @@ pub struct InferArgs {
     /// Enable n-gram repetition loop detection.
     #[arg(long = "detect-repetition")]
     pub detect_repetition: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum TurboQuantPresetArg {
+    #[value(name = "q2_5")]
+    Q2_5,
+    #[value(name = "q3_5")]
+    Q3_5,
+}
+
+impl From<TurboQuantPresetArg> for pmetal::inference_runner::TurboQuantPreset {
+    fn from(value: TurboQuantPresetArg) -> Self {
+        match value {
+            TurboQuantPresetArg::Q2_5 => Self::Q2_5,
+            TurboQuantPresetArg::Q3_5 => Self::Q3_5,
+        }
+    }
 }
