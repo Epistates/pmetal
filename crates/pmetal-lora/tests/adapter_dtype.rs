@@ -26,12 +26,28 @@ const KINDS: [&str; 7] = [
     "gemma4",
 ];
 
+/// Kinds whose experts are chosen by a top-k router. Rounding the folded
+/// weights to bf16 moves a token's router scores by a bf16 step, which can
+/// swap two near-tied experts and move the logits far more than the rounding
+/// itself; their merge is held to the f32 forward instead.
+const ROUTED: [&str; 5] = [
+    "qwen3_moe",
+    "deepseek",
+    "nemotron_h",
+    "granitemoehybrid",
+    "qwen3_next",
+];
+
 fn bf16_model(name: &str) -> (AdaptedModel, i32) {
+    model_in(name, Dtype::Bfloat16)
+}
+
+fn model_in(name: &str, dtype: Dtype) -> (AdaptedModel, i32) {
     let case = cases().into_iter().find(|c| c.name == name).unwrap();
     random::seed(71);
     let mut base = DynamicModel::from_config(case.config_json).expect("build");
     for (_, param) in base.flatten_params_mut() {
-        *param = param.as_dtype(Dtype::Bfloat16.as_i32());
+        *param = param.as_dtype(dtype.as_i32());
     }
     let config = LoraConfig {
         r: 8,
@@ -66,39 +82,71 @@ fn a_bf16_base_computes_in_bf16_and_keeps_f32_adapters() {
     }
 }
 
+/// Nonzero adapters, so a merge has something to fold. Drawn in key order:
+/// the map's own order differs between processes, which handed the seeded
+/// draws to different adapters on every run.
+fn randomize_adapters(model: &mut AdaptedModel) {
+    random::seed(3);
+    let mut params: Vec<_> = model.lora_parameters().into_iter().collect();
+    params.sort_by(|a, b| a.0.cmp(&b.0));
+    let set = params
+        .into_iter()
+        .map(|(k, p)| {
+            let fresh = random::uniform_range(-0.05, 0.05, p.shape(), Dtype::Float32);
+            (k, fresh)
+        })
+        .collect();
+    model.set_lora_parameters(&set);
+}
+
+fn largest_logit(logits: &pmetal_runtime::compat::Array) -> f32 {
+    logits
+        .as_dtype(Dtype::Float32.as_i32())
+        .abs()
+        .max(None)
+        .item_f32()
+}
+
+#[test]
+fn merging_an_f32_base_reproduces_the_adapted_model() {
+    for name in KINDS {
+        let (mut model, vocab) = model_in(name, Dtype::Float32);
+        let ids = input_ids(vocab);
+        randomize_adapters(&mut model);
+        let adapted = model.forward(&ids, None).unwrap();
+        model.merge().unwrap_or_else(|e| panic!("{name}: {e}"));
+        let merged = model.forward(&ids, None).unwrap();
+        let scale = largest_logit(&adapted);
+        let diff = max_abs_diff(&adapted, &merged);
+        assert!(
+            diff <= 1e-4 * scale.max(1.0),
+            "{name}: merge moved the logits by {diff} (scale {scale})"
+        );
+        drain(name);
+    }
+}
+
 #[test]
 fn merging_into_a_bf16_base_keeps_it_bf16_and_the_output() {
     for name in KINDS {
         let (mut model, vocab) = bf16_model(name);
         let ids = input_ids(vocab);
-        // Nonzero adapters, so the merge has something to fold.
-        random::seed(3);
-        let set = model
-            .lora_parameters()
-            .into_iter()
-            .map(|(k, p)| {
-                let fresh = random::uniform_range(-0.05, 0.05, p.shape(), Dtype::Float32);
-                (k, fresh)
-            })
-            .collect();
-        model.set_lora_parameters(&set);
+        randomize_adapters(&mut model);
         let adapted = model.forward(&ids, None).unwrap();
 
         model.merge().unwrap_or_else(|e| panic!("{name}: {e}"));
         let merged = model.forward(&ids, None).unwrap();
         assert_eq!(merged.dtype(), Dtype::Bfloat16, "{name}");
-        // Folding rounds each weight to bf16 once; the logits agree to the
-        // resolution of bf16 at their size.
-        let scale = adapted
-            .as_dtype(Dtype::Float32.as_i32())
-            .abs()
-            .max(None)
-            .item_f32();
-        let diff = max_abs_diff(&adapted, &merged);
-        assert!(
-            diff <= 0.05 * scale.max(1.0),
-            "{name}: merge moved the logits by {diff} (scale {scale})"
-        );
+        // Folding rounds each weight to bf16 once; without a router the
+        // logits agree to the resolution of bf16 at their size.
+        if !ROUTED.contains(&name) {
+            let scale = largest_logit(&adapted);
+            let diff = max_abs_diff(&adapted, &merged);
+            assert!(
+                diff <= 0.05 * scale.max(1.0),
+                "{name}: merge moved the logits by {diff} (scale {scale})"
+            );
+        }
 
         model.fuse().unwrap_or_else(|e| panic!("{name}: {e}"));
         for (key, weight) in model.model().flatten_params() {
