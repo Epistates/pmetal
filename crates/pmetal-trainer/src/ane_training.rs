@@ -94,6 +94,27 @@ impl AneTrainingLoop {
         self.trainer.save_safetensors(path)
     }
 
+    /// Resume from a checkpoint directory this loop wrote: the weights, the
+    /// optimizer's moments and step count, and the training state, so that
+    /// [`train`](Self::train) continues from the step it was saved at with the
+    /// update the uninterrupted run would have taken. Call it in place of
+    /// `load_weights_*`, before [`compile_kernels`](Self::compile_kernels).
+    pub fn resume_from(&mut self, dir: &Path) -> Result<(), pmetal_metal::error::MetalError> {
+        self.trainer
+            .load_weights_safetensors(&dir.join("model.safetensors"))?;
+        self.trainer.load_optimizer_state(dir)?;
+        let state_path = dir.join("training_state.json");
+        let state = std::fs::read_to_string(&state_path)
+            .map_err(|e| format!("{}: {e}", state_path.display()))
+            .and_then(|text| serde_json::from_str(&text).map_err(|e| e.to_string()))
+            .map_err(|e| {
+                pmetal_metal::error::MetalError::InvalidConfig(format!("training state: {e}"))
+            })?;
+        self.state = state;
+        tracing::info!(step = self.state.step, "Resumed the ANE training state");
+        Ok(())
+    }
+
     /// Install a vocab map, so batches can carry compact u16 token ids.
     ///
     /// Must be called after `load_weights_*` and before `compile_kernels()`.
@@ -126,7 +147,9 @@ impl AneTrainingLoop {
         let seq_len = self.config.trainer.seq_len;
         let max_steps = self.config.max_steps;
 
-        for (batch_idx, batch) in data.iter().enumerate().take(num_batches) {
+        // A resumed run continues from the step it was saved at.
+        let first_batch = self.state.step;
+        for (batch_idx, batch) in data.iter().enumerate().take(num_batches).skip(first_batch) {
             if batch_idx == 0 {
                 tracing::info!("ANE training: warming up (first step initializes optimizer)...");
             }
@@ -152,7 +175,8 @@ impl AneTrainingLoop {
             // Update state
             self.state.step = batch_idx + 1;
             self.state.loss = loss as f64;
-            self.state.learning_rate = self.config.trainer.learning_rate as f64;
+            let lr = self.trainer.last_learning_rate();
+            self.state.learning_rate = f64::from(lr);
             self.state.tokens_processed += batch.len() * seq_len;
             self.state.elapsed_secs = start.elapsed().as_secs_f64();
 
@@ -176,7 +200,7 @@ impl AneTrainingLoop {
                 total_epochs: 1,
                 total_steps: max_steps,
                 loss: loss as f64,
-                lr: self.config.trainer.learning_rate as f64,
+                lr: f64::from(lr),
                 tok_sec,
                 ane_fwd_ms: timings.ane_fwd_us as f64 / 1000.0,
                 ane_bwd_ms: timings.ane_bwd_us as f64 / 1000.0,
@@ -236,6 +260,12 @@ impl AneTrainingLoop {
             tracing::error!(error = %e, "Failed to write checkpoint weights");
         }
 
+        // The optimizer's moments and step count: without them a resume
+        // restarts Adam cold, at step 1 of its bias correction.
+        if let Err(e) = self.trainer.save_optimizer_state(path) {
+            tracing::error!(error = %e, "Failed to write the optimizer state");
+        }
+
         let state_path = path.join("training_state.json");
         match serde_json::to_string_pretty(&self.state) {
             Ok(json) => {
@@ -281,6 +311,47 @@ mod tests {
         assert_eq!(training_loop.state().step, 0);
         assert_eq!(training_loop.trainer().config().n_layers, 2);
         assert_eq!(training_loop.trainer().compile_count(), 0);
+    }
+
+    /// A checkpoint carries what a resume needs: the weights, the optimizer's
+    /// step, and the training state the loop continues from.
+    #[test]
+    fn a_checkpoint_resumes_the_weights_the_optimizer_and_the_step() {
+        let config = AneTrainingLoopConfig {
+            trainer: DynamicAneTrainerConfig {
+                dim: 16,
+                hidden_dim: 32,
+                n_heads: 4,
+                n_kv_heads: 2,
+                n_layers: 2,
+                vocab_size: 50,
+                seq_len: 4,
+                ..Default::default()
+            },
+            num_batches: 10,
+            max_steps: 100,
+            log_every: 1,
+            save_every: None,
+            output_dir: PathBuf::from("unused"),
+        };
+        let mut training_loop = AneTrainingLoop::new(config.clone());
+        let n = training_loop.trainer().export_weights_flat().len();
+        let weights: Vec<f32> = (0..n).map(|i| (i % 89) as f32 * 0.002 - 0.08).collect();
+        training_loop.load_weights_flat(&weights);
+        training_loop.state.step = 7;
+        training_loop.state.loss = 3.25;
+
+        let dir = tempfile::tempdir().unwrap();
+        training_loop.save_checkpoint(dir.path());
+        assert!(dir.path().join("optimizer.safetensors").exists());
+
+        let mut resumed = AneTrainingLoop::new(config);
+        resumed.resume_from(dir.path()).unwrap();
+        assert_eq!(resumed.state().step, 7);
+        assert_eq!(resumed.state().loss, 3.25);
+        assert_eq!(resumed.trainer().export_weights_flat(), weights);
+        // A directory with no checkpoint is refused.
+        assert!(resumed.resume_from(&dir.path().join("absent")).is_err());
     }
 
     #[test]
