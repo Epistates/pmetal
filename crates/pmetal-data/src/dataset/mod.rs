@@ -187,6 +187,31 @@ fn for_each_chunk<T: Send>(
     }
 }
 
+impl DatasetFormat {
+    /// Read one row in this format and render it to text, with the chat
+    /// template for a conversation (or plain `Role: content` blocks without
+    /// one). Usually one sample; see [`TextSample`].
+    ///
+    /// `Auto` is resolved against this row. A caller that reads many rows
+    /// and wants them all read as the first one is resolves it once with
+    /// [`DatasetFormat::detect`].
+    ///
+    /// # Errors
+    /// A row without the columns of the format; the message lists the row's
+    /// columns.
+    pub fn render_row(
+        &self,
+        row: &Row,
+        template: Option<&ChatTemplate>,
+    ) -> Result<Vec<TextSample>> {
+        Ok(render::render(
+            self.parse(row)?,
+            template,
+            AssistantLoss::default(),
+        ))
+    }
+}
+
 /// Dataset for training.
 #[derive(Clone)]
 pub struct TrainingDataset {
@@ -368,13 +393,7 @@ impl TrainingDataset {
             path.as_ref(),
             &format,
             columns,
-            |format, row| {
-                Ok(render::render(
-                    format.parse(row)?,
-                    template,
-                    AssistantLoss::default(),
-                ))
-            },
+            |format, row| format.render_row(row, template),
             |row_samples| {
                 out.extend(row_samples);
                 Ok(())
@@ -957,5 +976,51 @@ mod tests {
         assert_eq!(peek_columns(file.path()).unwrap(), ["b", "a"]);
         let empty = NamedTempFile::new().unwrap();
         assert!(peek_columns(empty.path()).unwrap().is_empty());
+    }
+
+    /// One row, read and rendered on its own: the layout is the row's, the
+    /// text the chat template's, and a row of no known layout is an error
+    /// that names its columns.
+    #[test]
+    fn a_row_renders_on_its_own() {
+        let row: Row = serde_json::from_str(
+            r#"{"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]}"#,
+        )
+        .unwrap();
+        let template = ChatTemplate::chatml();
+        let samples = DatasetFormat::Auto
+            .render_row(&row, Some(&template))
+            .unwrap();
+        assert_eq!(samples.len(), 1);
+        assert!(samples[0].templated);
+        assert!(samples[0].text.contains("<|im_start|>user\nhi<|im_end|>"));
+        assert!(samples[0].text.contains("<|im_start|>assistant\nyo"));
+        // Without a template, the plain blocks.
+        let plain = DatasetFormat::Auto.render_row(&row, None).unwrap();
+        assert_eq!(plain[0].text, "User: hi\n\nAssistant: yo\n\n");
+
+        let odd: Row = serde_json::from_str(r#"{"weird": 1}"#).unwrap();
+        let err = DatasetFormat::Auto
+            .render_row(&odd, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("weird"), "{err}");
+    }
+
+    /// The length a sample has in training: the tokenizer's special tokens
+    /// for text no template rendered, an end-of-sequence token after it.
+    #[test]
+    fn a_sample_counts_the_tokens_training_would_see() {
+        let tokenizer = crate::tokenizer::testing::word_level(
+            &["<unk>", "a", "b"],
+            &[("<s>", true), ("</s>", true)],
+        );
+        let document = TextSample::document("a b a");
+        let rendered = TextSample::with_spans("a b a".into(), vec![2..5], true);
+        // Rendered text is counted as it stands.
+        assert_eq!(rendered.token_len(&tokenizer).unwrap(), 3);
+        // A document carries nothing the rendered text does not, so it is
+        // never shorter.
+        assert!(document.token_len(&tokenizer).unwrap() >= 3);
     }
 }
