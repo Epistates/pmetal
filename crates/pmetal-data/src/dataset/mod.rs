@@ -188,6 +188,25 @@ fn for_each_chunk<T: Send>(
 }
 
 impl DatasetFormat {
+    /// [`render_row`](Self::render_row) for putting a dataset in a model's chat
+    /// format: a row that is a question and its answer (Alpaca, reasoning,
+    /// prompt and completion of text) is rendered as the conversation it
+    /// stands for, where training reads it as a completion in its own layout.
+    ///
+    /// # Errors
+    /// As [`render_row`](Self::render_row).
+    pub fn render_row_as_chat(
+        &self,
+        row: &Row,
+        template: Option<&ChatTemplate>,
+    ) -> Result<Vec<TextSample>> {
+        Ok(render::render(
+            self.parse_as_chat(row)?,
+            template,
+            AssistantLoss::default(),
+        ))
+    }
+
     /// Read one row in this format and render it to text, with the chat
     /// template for a conversation (or plain `Role: content` blocks without
     /// one). Usually one sample; see [`TextSample`].
@@ -1022,5 +1041,29 @@ mod tests {
         // A document carries nothing the rendered text does not, so it is
         // never shorter.
         assert!(document.token_len(&tokenizer).unwrap() >= 3);
+    }
+
+    #[test]
+    fn an_instruction_row_is_put_in_the_chat_format_on_request() {
+        let row: Row =
+            serde_json::from_str(r#"{"instruction": "Say hi", "output": "Hello!"}"#).unwrap();
+        let template = ChatTemplate::chatml();
+        // As training reads it: the Alpaca layout.
+        let as_trained = DatasetFormat::Auto
+            .render_row(&row, Some(&template))
+            .unwrap();
+        assert!(as_trained[0].text.starts_with("### Instruction:"));
+        // As a chat: the model's format, the answer the span the loss covers.
+        let as_chat = DatasetFormat::Auto
+            .render_row_as_chat(&row, Some(&template))
+            .unwrap();
+        assert!(
+            as_chat[0]
+                .text
+                .contains("<|im_start|>user\nSay hi<|im_end|>")
+        );
+        assert!(as_chat[0].templated);
+        let span = as_chat[0].trained.as_ref().unwrap()[0].clone();
+        assert!(as_chat[0].text[span].starts_with("Hello!"));
     }
 }
