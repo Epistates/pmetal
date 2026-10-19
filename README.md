@@ -542,7 +542,7 @@ Auto-detected training data formats (from a row's columns, structured layouts be
 - **Simple**: `{"text": "..."}`
 - **Containers**: JSONL, JSON, Parquet, Arrow and CSV files, or a directory of shards (a dataset's `train` split)
 
-**Custom columns**: Use `--text-column` for arbitrary field names, `--text-columns col1,col2` to concatenate multiple columns, and `--prompt-column`/`--response-column` for SFT loss masking. All training commands (train, distill, grpo, rlkd) support column flags uniformly.
+**Custom columns**: Use `--text-column` for arbitrary field names, `--text-columns col1,col2` to concatenate multiple columns, and `--prompt-column`/`--response-column` for SFT loss masking. `train` and `distill` take all of them; `grpo` and `rlkd` train on prompts, not on supervised text, so they take only `--prompt-column` and `--response-column` (the reference answer).
 
 The `pmetal dataset` subcommand provides utilities for analysis, download from HuggingFace, and format conversion (Parquet, JSON, JSONL, CSV, ShareGPT, Alpaca).
 

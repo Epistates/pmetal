@@ -22,10 +22,11 @@ use pmetal_models::architectures::{
 use pmetal_models::{Gemma4MtpKvSources, validate_gemma4_mtp_pair, validate_qwen3_next_mtp_pair};
 use pmetal_runtime::compat::{
     Array, Exception, ModuleParameters, ModuleParametersExt, Param, nn, ops,
-    optimizers::{AdamW, AdamWBuilder, Optimizer},
+    optimizers::{AdamW, AdamWBuilder, Optimizer, StatefulOptimizer},
 };
 use serde::{Deserialize, Serialize};
 
+use crate::checkpoint::TrainState;
 use crate::dflash_training::{DFlashTrainStepConfig, dflash_train_step};
 
 #[derive(Debug, Clone)]
@@ -43,6 +44,73 @@ pub struct MtpTrainingConfig {
     pub checkpoint_dir: PathBuf,
     pub log_every: usize,
     pub num_assistant_tokens: usize,
+    /// DFlash drafts: block anchors trained per sequence per step, sharing one
+    /// target pass.
+    pub dflash_blocks_per_step: usize,
+    /// DFlash drafts: seed of the anchors' random positions.
+    pub seed: u64,
+    /// A checkpoint directory of an earlier run to continue: its optimizer
+    /// moments, f32 master copies and step are restored and the run picks up
+    /// at that step of `num_steps`. The model must already hold that
+    /// checkpoint's weights, and `batches` must supply the batches from that
+    /// step on; the data position is not recorded.
+    pub resume_from: Option<PathBuf>,
+}
+
+impl MtpTrainingConfig {
+    /// Check the hyperparameters, naming every one that cannot work. Every
+    /// run entry point checks them before it touches the output directory.
+    pub fn validate(&self) -> Result<(), Exception> {
+        let mut problems = Vec::new();
+        if self.num_steps == 0 {
+            problems.push("num_steps must be at least 1".to_string());
+        }
+        if !(self.learning_rate.is_finite() && self.learning_rate > 0.0) {
+            problems.push(format!(
+                "learning_rate must be positive, got {}",
+                self.learning_rate
+            ));
+        }
+        if !(self.min_lr.is_finite() && self.min_lr >= 0.0 && self.min_lr <= self.learning_rate) {
+            problems.push(format!(
+                "min_lr must be in [0, learning_rate], got {}",
+                self.min_lr
+            ));
+        }
+        for (name, beta) in [("beta1", self.betas.0), ("beta2", self.betas.1)] {
+            if !(0.0..1.0).contains(&beta) {
+                problems.push(format!("{name} must be in [0, 1), got {beta}"));
+            }
+        }
+        if !(self.eps.is_finite() && self.eps > 0.0) {
+            problems.push(format!("eps must be positive, got {}", self.eps));
+        }
+        if !(self.weight_decay.is_finite() && self.weight_decay >= 0.0) {
+            problems.push(format!(
+                "weight_decay must not be negative, got {}",
+                self.weight_decay
+            ));
+        }
+        if let Some(norm) = self.max_grad_norm {
+            if !(norm.is_finite() && norm > 0.0) {
+                problems.push(format!("max_grad_norm must be positive, got {norm}"));
+            }
+        }
+        if self.num_assistant_tokens == 0 {
+            problems.push("num_assistant_tokens must be at least 1".to_string());
+        }
+        if self.dflash_blocks_per_step == 0 {
+            problems.push("dflash_blocks_per_step must be at least 1".to_string());
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(Exception::custom(format!(
+                "invalid MTP training configuration: {}",
+                problems.join("; ")
+            )))
+        }
+    }
 }
 
 impl Default for MtpTrainingConfig {
@@ -61,6 +129,9 @@ impl Default for MtpTrainingConfig {
             checkpoint_dir: PathBuf::from("./mtp-output"),
             log_every: 10,
             num_assistant_tokens: 6,
+            dflash_blocks_per_step: 4,
+            seed: 42,
+            resume_from: None,
         }
     }
 }
@@ -318,24 +389,31 @@ where
         |model, (step, batch)| {
             let seq = batch.dim(1) as usize;
             let block_size = model.block_size();
-            if block_size < 2 || block_size > seq {
+            // An anchor needs a token of context before it and a whole block after.
+            if block_size < 2 || block_size + 1 > seq {
                 return Err(Exception::custom(format!(
-                    "DFlash block_size {block_size} must be in 2..={seq}"
+                    "DFlash block_size {block_size} needs sequences of at least {} tokens, got {seq}",
+                    block_size + 1
                 )));
             }
-            let max_start = seq - block_size;
-            let block_start = if max_start == 0 {
-                0
-            } else {
-                step % (max_start + 1)
-            };
+            let anchors = config.dflash_blocks_per_step.max(1);
+            let block_starts = (0..anchors)
+                .map(|i| {
+                    let draw = pmetal_runtime::decode::draw_bits(
+                        config.seed,
+                        (*step * anchors + i) as u64,
+                    );
+                    1 + (draw % (seq - block_size) as u64) as usize
+                })
+                .collect();
             let out = dflash_train_step(
                 target,
                 model,
                 batch,
                 &DFlashTrainStepConfig {
                     block_size,
-                    block_start,
+                    block_starts,
+                    position_decay: None,
                 },
             )?;
             Ok(out.loss)
@@ -358,6 +436,7 @@ where
     F: FnMut(&mut M, &B) -> Result<Array, Exception>,
     S: FnMut(&Path, &M, &AdamW, &MtpCheckpointMeta) -> Result<(), Exception>,
 {
+    config.validate()?;
     std::fs::create_dir_all(&config.checkpoint_dir)
         .map_err(|e| Exception::custom(format!("create output dir: {e}")))?;
     let mut optimizer = AdamWBuilder::new(config.learning_rate)
@@ -365,6 +444,19 @@ where
         .betas(config.betas)
         .eps(config.eps)
         .build()?;
+    let mut first_step = 0;
+    if let Some(dir) = &config.resume_from {
+        load_optimizer_state(dir, &mut optimizer)?;
+        first_step = optimizer.step_count() as usize;
+        if first_step >= config.num_steps {
+            return Err(Exception::custom(format!(
+                "{} is at step {first_step}, which leaves nothing of the {} steps asked for",
+                dir.display(),
+                config.num_steps
+            )));
+        }
+        eprintln!("resumed from {} at step {first_step}", dir.display());
+    }
     let scheduler = LearningRateScheduler::new(
         config.learning_rate as f64,
         config.num_steps,
@@ -375,7 +467,7 @@ where
 
     let mut losses = Vec::with_capacity(config.num_steps);
     let start = std::time::Instant::now();
-    for step in 0..config.num_steps {
+    for step in first_step..config.num_steps {
         let lr = scheduler.get_lr(step) as f32;
         optimizer.set_lr(lr);
         let batch = batches.next().ok_or_else(|| {
@@ -550,23 +642,37 @@ where
     Ok(())
 }
 
+/// Write the optimizer's moments, counters and f32 master copies into `dir`,
+/// in the layout every trainer shares ([`TrainState`]). The model file holds
+/// the weights rounded to bf16, so a run that resumed from only those would
+/// drop everything the rounding discarded.
 fn save_optimizer_state(dir: &Path, optimizer: &AdamW) -> Result<(), Exception> {
-    let mut entries_owned = Vec::with_capacity(optimizer.state().len() * 2);
-    for (key, (m, v)) in optimizer.state() {
-        m.eval();
-        v.eval();
-        entries_owned.push((format!("{key}.__m"), m.clone()));
-        entries_owned.push((format!("{key}.__v"), v.clone()));
+    let state = optimizer.export_state();
+    for array in state.tensors.values() {
+        array.eval();
     }
-    let entries: Vec<(&str, &Array)> = entries_owned
-        .iter()
-        .map(|(key, value)| (key.as_str(), value))
-        .collect();
-    Array::save_safetensors(
-        path_string(&dir.join("optimizer.safetensors"))?.as_str(),
-        &entries,
-    )?;
-    Ok(())
+    TrainState {
+        optimizer: Some(state),
+        loader: None,
+    }
+    .write(dir)
+    .map_err(|e| Exception::custom(e.to_string()))
+}
+
+/// Restore `optimizer` from the checkpoint at `dir`. The model must already
+/// hold that checkpoint's weights, as the f32 master copies are kept against
+/// them.
+fn load_optimizer_state(dir: &Path, optimizer: &mut AdamW) -> Result<(), Exception> {
+    let state = TrainState::load(dir)
+        .map_err(|e| Exception::custom(e.to_string()))?
+        .and_then(|state| state.optimizer)
+        .ok_or_else(|| {
+            Exception::custom(format!(
+                "{} holds no optimizer state to resume from",
+                dir.display()
+            ))
+        })?;
+    optimizer.import_state(&state)
 }
 
 fn qwen_mtp_export_key(key: &str) -> String {
@@ -734,6 +840,181 @@ mod tests {
         loss.item_f32()
     }
 
+    #[test]
+    fn the_training_configuration_is_validated() {
+        assert!(MtpTrainingConfig::default().validate().is_ok());
+        let bad = MtpTrainingConfig {
+            num_steps: 0,
+            learning_rate: f32::NAN,
+            max_grad_norm: Some(-1.0),
+            dflash_blocks_per_step: 0,
+            ..Default::default()
+        };
+        let message = bad.validate().unwrap_err().to_string();
+        for needle in [
+            "num_steps",
+            "learning_rate",
+            "max_grad_norm",
+            "dflash_blocks",
+        ] {
+            assert!(message.contains(needle), "{needle} missing: {message}");
+        }
+    }
+
+    /// A half-precision parameter's f32 master copy is part of the optimizer
+    /// checkpoint; an f32 parameter has none.
+    #[test]
+    fn the_optimizer_checkpoint_carries_the_f32_master_copies() {
+        let mut optimizer = AdamWBuilder::new(1e-2).build().unwrap();
+        optimizer.advance_step();
+        let key: std::rc::Rc<str> = "w".into();
+        let mut half = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4])
+            .as_dtype(pmetal_runtime::compat::Dtype::Bfloat16.as_i32());
+        let mut full = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]);
+        let grad = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.0], &[4]);
+        optimizer.update_single(&key, &grad, &mut half).unwrap();
+        optimizer
+            .update_single(&"f".into(), &grad, &mut full)
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        save_optimizer_state(dir.path(), &optimizer).unwrap();
+        let saved = pmetal_runtime::inline_array::load_safetensors_shard(
+            dir.path().join("optimizer.safetensors").to_str().unwrap(),
+        )
+        .unwrap();
+        let names: Vec<&str> = saved.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"master/w"), "{names:?}");
+        assert!(!names.contains(&"master/f"), "{names:?}");
+        let master = &saved.iter().find(|(n, _)| n == "master/w").unwrap().1;
+        assert_eq!(
+            master.dtype_raw(),
+            pmetal_runtime::compat::Dtype::Float32.as_i32()
+        );
+
+        // ... and a fresh optimizer restored from it holds the same copy and
+        // the same step.
+        let mut restored = AdamWBuilder::new(1e-2).build().unwrap();
+        load_optimizer_state(dir.path(), &mut restored).unwrap();
+        assert_eq!(restored.step_count(), optimizer.step_count());
+        let kept = restored.master_weights().count();
+        assert_eq!(kept, 1);
+    }
+
+    /// A run stopped halfway and resumed from its checkpoint goes on as the
+    /// uninterrupted run does: the moments, the f32 masters and the step come
+    /// back. Without them the second half restarts Adam's bias correction and
+    /// its losses part from the straight run's.
+    #[test]
+    fn a_resumed_mtp_run_continues_the_uninterrupted_one() {
+        let config = tiny_qwen_config();
+        let tokens: Vec<u32> = (0..16).map(|i| (i * 7 % 23) as u32 + 1).collect();
+        let batch = batch_from_tokens(&[tokens]).unwrap();
+        let settings = |dir: &Path, steps: usize, resume: Option<PathBuf>| MtpTrainingConfig {
+            num_steps: steps,
+            learning_rate: 5e-3,
+            warmup_steps: 0,
+            lr_schedule: LrSchedulerType::Constant,
+            checkpoint_every: None,
+            checkpoint_dir: dir.to_path_buf(),
+            log_every: 0,
+            resume_from: resume,
+            ..Default::default()
+        };
+        let fresh = || {
+            pmetal_runtime::compat::random::seed(9);
+            let target = Qwen3NextForCausalLM::new(config.clone()).unwrap();
+            let mut mtp = Qwen3NextMtpForCausalLM::new(config.clone()).unwrap();
+            initialize_qwen3_next_mtp_from_target(&target, &mut mtp);
+            (target, mtp)
+        };
+
+        let straight_dir = tempfile::tempdir().unwrap();
+        let (mut target, mut mtp) = fresh();
+        let straight = run_qwen3_next_mtp_training(
+            &mut target,
+            &mut mtp,
+            &settings(straight_dir.path(), 16, None),
+            std::iter::repeat_n(batch.clone(), 16),
+        )
+        .unwrap();
+
+        let half_dir = tempfile::tempdir().unwrap();
+        let (mut target, mut mtp) = fresh();
+        run_qwen3_next_mtp_training(
+            &mut target,
+            &mut mtp,
+            &settings(half_dir.path(), 8, None),
+            std::iter::repeat_n(batch.clone(), 8),
+        )
+        .unwrap();
+        let resumed = run_qwen3_next_mtp_training(
+            &mut target,
+            &mut mtp,
+            &settings(half_dir.path(), 16, Some(half_dir.path().to_path_buf())),
+            std::iter::repeat_n(batch.clone(), 8),
+        )
+        .unwrap();
+        pmetal_runtime::check_unobserved_error().unwrap();
+
+        assert_eq!(resumed.losses.len(), 8);
+        for (i, (a, b)) in straight.losses[8..].iter().zip(&resumed.losses).enumerate() {
+            assert!(
+                (a - b).abs() <= 2e-3 * a.abs().max(1.0),
+                "step {}: straight {a}, resumed {b}",
+                8 + i
+            );
+        }
+    }
+
+    /// The predictor trains: against the target's own next-next choices the
+    /// loss falls over a run, the predictor's parameters move, the frozen
+    /// target's do not, and the exported checkpoint loads back.
+    #[test]
+    fn the_qwen_mtp_trains_against_the_frozen_target() {
+        pmetal_runtime::compat::random::seed(9);
+        let config = tiny_qwen_config();
+        let mut target = Qwen3NextForCausalLM::new(config.clone()).unwrap();
+        let mut mtp = Qwen3NextMtpForCausalLM::new(config.clone()).unwrap();
+        initialize_qwen3_next_mtp_from_target(&target, &mut mtp);
+        let before = mtp.model.embed_tokens.weight.value.clone();
+        let target_before = target.model.embed_tokens.weight.value.clone();
+        let tokens: Vec<u32> = (0..16).map(|i| (i * 7 % 23) as u32 + 1).collect();
+        let batch = batch_from_tokens(&[tokens]).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = run_qwen3_next_mtp_training(
+            &mut target,
+            &mut mtp,
+            &MtpTrainingConfig {
+                num_steps: 50,
+                learning_rate: 5e-3,
+                warmup_steps: 0,
+                lr_schedule: LrSchedulerType::Constant,
+                checkpoint_every: None,
+                checkpoint_dir: dir.path().to_path_buf(),
+                log_every: 0,
+                ..Default::default()
+            },
+            std::iter::repeat_n(batch, 50),
+        )
+        .unwrap();
+        pmetal_runtime::check_unobserved_error().unwrap();
+        let (first, last) = (result.losses[0], *result.losses.last().unwrap());
+        assert!(last < 0.6 * first, "loss {first} -> {last}");
+        let moved = |a: &Array, b: &Array| {
+            let d = a.subtract(b).abs().max(None);
+            d.eval();
+            d.item_f32()
+        };
+        assert!(moved(&mtp.model.embed_tokens.weight.value, &before) > 1e-6);
+        assert_eq!(
+            moved(&target.model.embed_tokens.weight.value, &target_before),
+            0.0
+        );
+        pmetal_models::architectures::load_qwen3_next_mtp_from_dir(dir.path(), &config).unwrap();
+    }
+
     /// The predictor learns on the pairing it drafts with: the target's state
     /// at `i` beside the next token `x[i + 1]`, against the target's own
     /// choice at `i + 1`, which is its choice for `x[i + 2]`.
@@ -794,6 +1075,74 @@ mod tests {
             top_k_experts: None,
             moe_intermediate_size: None,
         }
+    }
+
+    /// The Gemma 4 assistant trains too: the loss falls over a run and its
+    /// parameters move while the frozen target's stay put.
+    #[test]
+    fn the_gemma4_assistant_trains_against_the_frozen_target() {
+        pmetal_runtime::compat::random::seed(12);
+        let mut target = Gemma4ForCausalLM::new(tiny_gemma_config(
+            &["sliding_attention", "full_attention"],
+            32,
+            0,
+        ))
+        .unwrap();
+        let mut assistant = Gemma4AssistantForCausalLM::new(Gemma4AssistantConfig {
+            model_type: "gemma4_assistant".to_string(),
+            text_config: tiny_gemma_config(&["sliding_attention", "full_attention"], 16, 2),
+            backbone_hidden_size: 32,
+            use_ordered_embeddings: false,
+            num_centroids: 2048,
+            centroid_intermediate_top_k: 32,
+            tie_word_embeddings: true,
+        })
+        .unwrap();
+        let before: Vec<(String, Array)> = assistant
+            .flatten_params()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        let target_before = target.model.embed_tokens.weight.value.clone();
+        let batch = batch_from_tokens(&[vec![5u32, 9, 1, 33, 7, 12]]).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = run_gemma4_assistant_mtp_training(
+            &mut target,
+            &mut assistant,
+            &MtpTrainingConfig {
+                num_steps: 40,
+                learning_rate: 5e-3,
+                warmup_steps: 0,
+                lr_schedule: LrSchedulerType::Constant,
+                checkpoint_every: None,
+                checkpoint_dir: dir.path().to_path_buf(),
+                log_every: 0,
+                ..Default::default()
+            },
+            std::iter::repeat_n(batch, 40),
+        )
+        .unwrap();
+        pmetal_runtime::check_unobserved_error().unwrap();
+        let (first, last) = (result.losses[0], *result.losses.last().unwrap());
+        assert!(last < 0.7 * first, "loss {first} -> {last}");
+        let after = assistant.flatten_params();
+        let moved = before.iter().any(|(k, b)| {
+            let d = after[k.as_str()].subtract(b).abs().max(None);
+            d.eval();
+            d.item_f32() > 1e-6
+        });
+        assert!(moved, "no assistant parameter moved");
+        let d = target
+            .model
+            .embed_tokens
+            .weight
+            .value
+            .subtract(&target_before)
+            .abs()
+            .max(None);
+        d.eval();
+        assert_eq!(d.item_f32(), 0.0);
     }
 
     /// The assistant learns on the inputs it drafts from: the target's state

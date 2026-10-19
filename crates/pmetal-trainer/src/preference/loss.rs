@@ -10,10 +10,10 @@
 //! - whether a **reference** model enters ([`PreferenceLoss::uses_reference`]);
 //! - the function of the margin that is minimised.
 //!
-//! The formulas follow the papers and their reference implementations: TRL's
-//! `DPOTrainer` for DPO (`sigmoid`, `robust`), IPO and hinge, including IPO's
-//! length-averaged log-probs; the SimPO authors' trainer for SimPO; TRL's
-//! `ORPOTrainer` for ORPO.
+//! The formulas follow the papers: DPO (the sigmoid and the robust form), IPO
+//! (on length-averaged log-probs, as its authors evaluate it) and the SLiC
+//! hinge on summed log-probs; SimPO with its target margin `γ/β`; ORPO's
+//! log-odds ratio on length-averaged log-probs.
 
 use pmetal_runtime::compat::{Array, Exception, ops};
 
@@ -296,7 +296,7 @@ mod tests {
         assert!(close(values(&out.rejected_rewards), [-0.2, 0.1]));
     }
 
-    /// Robust DPO, as in its paper and TRL's `loss_type="robust"`:
+    /// Robust DPO, as in its paper:
     /// `((1−ε)·softplus(−z) − ε·softplus(z)) / (1 − 2ε)`.
     #[test]
     fn robust_dpo_matches_hand_computation() {

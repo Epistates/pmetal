@@ -227,3 +227,20 @@ fn kto_learns_desirable_from_undesirable() {
     assert!(last.chosen_reward > last.rejected_reward);
     assert!(last.kl.is_some());
 }
+
+/// A training configuration that cannot run is refused when the trainer is
+/// built, not somewhere in the first step.
+#[test]
+fn trainers_validate_their_training_configuration_at_construction() {
+    let bad = TrainingConfig {
+        learning_rate: f64::NAN,
+        ..config(1, 1e-3)
+    };
+    let dpo = PreferenceLoss::Dpo {
+        beta: 0.1,
+        label_smoothing: 0.0,
+    };
+    assert!(PreferenceTrainer::new(dpo, bad.clone()).is_err());
+    assert!(KtoTrainer::new(KtoConfig::default(), bad).is_err());
+    assert!(PreferenceTrainer::new(dpo, config(1, 1e-3)).is_ok());
+}

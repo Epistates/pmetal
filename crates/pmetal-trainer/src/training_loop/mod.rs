@@ -3,8 +3,8 @@
 //! checkpointing and resume.
 //!
 //! There is one loop, [`TrainingLoop::run`]. It reads micro-batches from a
-//! source (padded batches, or rows of packed sequences; see [`source`]), turns
-//! each into a loss and gradients ([`step`]), adds them up until an optimizer
+//! source (padded batches, or rows of packed sequences), turns
+//! each into a loss and gradients, adds them up until an optimizer
 //! step's worth has been seen, and takes the step. Packing, cut cross-entropy,
 //! NEFTune, vision inputs and data-parallel training are properties of the
 //! source, the loss and the gradient exchange, not separate loops.

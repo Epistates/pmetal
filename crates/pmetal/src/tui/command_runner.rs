@@ -729,6 +729,8 @@ async fn run_distillation_direct(
         parse_arg(&spec.args, "--alpha", 0.5f32)?,
         has_flag(&spec.args, "--rationale"),
         parse_arg(&spec.args, "--rationale-weight", 1.0f32)?,
+        parse_arg(&spec.args, "--on-policy", 0.0f32)?,
+        parse_arg(&spec.args, "--on-policy-max-tokens", 256usize)?,
         parse_arg(&spec.args, "--lora-r", 16usize)?,
         parse_arg(&spec.args, "--lora-alpha", 32.0f32)?,
         parse_arg(&spec.args, "--learning-rate", 2e-5f32)?,
@@ -804,10 +806,6 @@ async fn run_grpo_direct(
         spec.metrics_file.as_ref().map(|p| p.display().to_string()),
         false,
         callbacks,
-        optional_arg(&spec.args, "--text-column"),
-        optional_arg(&spec.args, "--text-columns")
-            .map(|s| s.split(',').map(str::to_string).collect()),
-        optional_arg(&spec.args, "--column-separator").unwrap_or_else(|| "\n\n".to_string()),
         optional_arg(&spec.args, "--prompt-column"),
         optional_arg(&spec.args, "--response-column"),
     )

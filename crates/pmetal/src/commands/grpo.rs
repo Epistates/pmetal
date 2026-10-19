@@ -1,5 +1,5 @@
 use pmetal_core::TrainingConfig;
-use pmetal_data::{DatasetFormat, Tokenizer, TrainingDataset};
+use pmetal_data::Tokenizer;
 use pmetal_trainer::{GrpoConfig, GrpoTrainer};
 use std::path::PathBuf;
 
@@ -36,9 +36,6 @@ pub(crate) async fn run_grpo_cli(
     _log_metrics: Option<String>,
     emit_console_output: bool,
     extra_callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>>,
-    text_column: Option<String>,
-    text_columns: Option<Vec<String>>,
-    column_separator: String,
     prompt_column: Option<String>,
     response_column: Option<String>,
 ) -> anyhow::Result<()> {
@@ -48,13 +45,10 @@ pub(crate) async fn run_grpo_cli(
 
     pmetal_runtime::compat::random::seed(seed);
 
-    let column_cfg = crate::commands::build_column_config(
-        text_column,
-        text_columns,
-        column_separator,
-        prompt_column,
-        response_column,
-    );
+    let prompt_columns = pmetal_trainer::grpo::PromptColumns {
+        prompt: prompt_column,
+        reference: response_column,
+    };
 
     if emit_console_output {
         println!("========================================");
@@ -87,30 +81,17 @@ pub(crate) async fn run_grpo_cli(
     // 2b. Detect chat template
     let chat_template = pmetal_data::chat_templates::detect_chat_template(&model_path, model_id);
 
-    // 3. Load Dataset (Prompts — supports both JSONL and Parquet)
+    // 3. Load the prompts: each row's conversation up to where the model
+    // writes (generation prompt included), with its answer kept aside as the
+    // reference for the accuracy reward.
     tracing::info!("Loading prompt dataset: {}", dataset_path);
-    let dataset = TrainingDataset::from_jsonl_tokenized(
+    let prompts = pmetal_trainer::grpo::load_prompts_with(
         dataset_path,
         &tokenizer,
-        DatasetFormat::Auto,
+        &chat_template,
         max_seq_len,
-        Some(&chat_template),
-        column_cfg.as_ref(),
+        &prompt_columns,
     )?;
-    tracing::info!("GRPO dataset loaded: {} samples", dataset.len());
-    {
-        let stats = dataset.compute_statistics(max_seq_len);
-        tracing::info!(
-            "Dataset: lengths mean={:.0}, p95={}, p99={}, truncated={:.1}%",
-            stats.mean_length,
-            stats.p95_length,
-            stats.p99_length,
-            stats.truncated_pct,
-        );
-        for w in &dataset.validate_seq_len(max_seq_len) {
-            tracing::warn!("{}", w);
-        }
-    }
 
     // 4. Resolve the reward model's path before loading anything, so a bad ID
     // fails now rather than after minutes of weight loading. It also has to
@@ -147,6 +128,13 @@ pub(crate) async fn run_grpo_cli(
     grpo_config.async_rewards = async_rewards;
     grpo_config.kv_cache_bits = kv_cache_bits;
     grpo_config.seed = Some(seed);
+    // A completion ends where the model would stop: every end-of-turn and
+    // end-of-text token it declares, not only the tokenizer's EOS.
+    grpo_config.stop_tokens = pmetal_data::inference_config::collect_all_stop_tokens(
+        std::path::Path::new(&model_path),
+        &tokenizer,
+        Some(chat_template.template_type),
+    );
 
     if dapo {
         grpo_config = grpo_config.for_dapo();
@@ -164,86 +152,24 @@ pub(crate) async fn run_grpo_cli(
         );
     }
 
-    // 6. Setup Reward Functions
-    let mut rewards = pmetal_trainer::CombinedReward::new();
-
-    if reasoning_rewards {
-        // Simple reasoning format reward: favors completions with <thinking> tags
-        struct FormatReward;
-        impl pmetal_trainer::RewardFunction for FormatReward {
-            fn compute(
-                &self,
-                _prompts: &[String],
-                completions: &[String],
-                _images: Option<&[Vec<pmetal_runtime::compat::Array>]>,
-            ) -> pmetal_trainer::GrpoResult<Vec<f64>> {
-                Ok(completions
-                    .iter()
-                    .map(|c| {
-                        if c.contains("<thinking>") && c.contains("</thinking>") {
-                            1.0
-                        } else if c.contains("<thinking>") {
-                            0.5
-                        } else {
-                            0.0
-                        }
-                    })
-                    .collect())
-            }
-            fn name(&self) -> &str {
-                "format_reward"
-            }
-        }
-
-        // Length reward: small penalty for being too long or too short
-        struct LengthReward(usize);
-        impl pmetal_trainer::RewardFunction for LengthReward {
-            fn compute(
-                &self,
-                _prompts: &[String],
-                completions: &[String],
-                _images: Option<&[Vec<pmetal_runtime::compat::Array>]>,
-            ) -> pmetal_trainer::GrpoResult<Vec<f64>> {
-                Ok(completions
-                    .iter()
-                    .map(|c| {
-                        let len = c.len();
-                        if len > self.0 {
-                            -0.1
-                        } else if len < 10 {
-                            -0.5
-                        } else {
-                            0.1
-                        }
-                    })
-                    .collect())
-            }
-            fn name(&self) -> &str {
-                "length_reward"
-            }
-        }
-
-        rewards = rewards
-            .add(Box::new(FormatReward), 1.0)
-            .add(Box::new(LengthReward(max_seq_len * 2)), 0.2);
-    } else {
-        // Default dummy reward if none specified
-        struct DummyReward;
-        impl pmetal_trainer::RewardFunction for DummyReward {
-            fn compute(
-                &self,
-                _p: &[String],
-                completions: &[String],
-                _i: Option<&[Vec<pmetal_runtime::compat::Array>]>,
-            ) -> pmetal_trainer::GrpoResult<Vec<f64>> {
-                Ok(vec![0.1; completions.len()])
-            }
-            fn name(&self) -> &str {
-                "dummy"
-            }
-        }
-        rewards = rewards.add(Box::new(DummyReward), 1.0);
+    // 6. Reward functions: the reasoning rewards, which add the accuracy of
+    // the final answer when every prompt has a reference answer; or the
+    // accuracy alone; and the ML reward model, if configured.
+    let with_references = prompts.iter().all(|p| p.reference.is_some());
+    if !with_references && prompts.iter().any(|p| p.reference.is_some()) {
+        tracing::warn!(
+            "only some prompts have a reference answer; the accuracy reward is off. Give every \
+             row an `answer` to use it"
+        );
     }
+    let mut rewards = if reasoning_rewards {
+        pmetal_trainer::CombinedReward::reasoning(max_seq_len * 2, with_references)
+    } else if with_references {
+        pmetal_trainer::CombinedReward::new()
+            .add(Box::new(pmetal_trainer::AccuracyReward::new()), 1.0)
+    } else {
+        pmetal_trainer::CombinedReward::new()
+    };
 
     // 6b. Load ML reward model if configured. Its path was resolved in step 4.
     if let Some((ref rm_path_str, ref rm_path)) = resolved_reward_model_path {
@@ -259,8 +185,6 @@ pub(crate) async fn run_grpo_cli(
             model_path: rm_path_str.clone(),
             max_length: reward_model_max_length,
             chat_template: reward_model_template.clone(),
-            weight: reward_model_weight,
-            ..Default::default()
         };
 
         let ml_reward = pmetal_trainer::reward_model::MLRewardModel::from_pretrained(
@@ -275,6 +199,15 @@ pub(crate) async fn run_grpo_cli(
         if emit_console_output {
             println!("ML reward model loaded (weight={:.2})", reward_model_weight);
         }
+    }
+
+    // A group of completions that all score alike has no advantage to learn
+    // from, so a run with nothing to score by would train on nothing.
+    if rewards.is_empty() {
+        anyhow::bail!(
+            "GRPO needs a reward: pass --reasoning-rewards, give the dataset an `answer` column \
+             (every row) to reward correct answers, or configure --reward-model"
+        );
     }
 
     // 7. Setup Trainer
@@ -345,12 +278,19 @@ pub(crate) async fn run_grpo_cli(
         println!("Starting GRPO training loop...");
     }
 
-    // Load reference model (frozen)
-    if emit_console_output {
-        println!("Loading reference model...");
-    }
-    let mut ref_model = DynamicModel::load(&model_path)
-        .map_err(|e| anyhow::anyhow!("Failed to load reference model: {}", e))?;
+    // The reference model (frozen) is only the KL penalty's, so it is loaded
+    // only when the penalty is on.
+    let mut ref_model = if beta > 0.0 {
+        if emit_console_output {
+            println!("Loading reference model...");
+        }
+        Some(
+            DynamicModel::load(&model_path)
+                .map_err(|e| anyhow::anyhow!("Failed to load reference model: {}", e))?,
+        )
+    } else {
+        None
+    };
 
     if async_rewards {
         // Pipelined path: reward scoring runs in a background thread so the GPU
@@ -361,9 +301,9 @@ pub(crate) async fn run_grpo_cli(
         trainer
             .run_async(
                 &mut model,
-                Some(&mut ref_model),
+                ref_model.as_mut(),
                 &tokenizer,
-                &dataset,
+                &prompts,
                 Box::new(rewards),
                 &mut optimizer,
                 |opt, lr| opt.set_lr(lr),
@@ -373,9 +313,9 @@ pub(crate) async fn run_grpo_cli(
         trainer
             .run(
                 &mut model,
-                Some(&mut ref_model),
+                ref_model.as_mut(),
                 &tokenizer,
-                &dataset,
+                &prompts,
                 &rewards,
                 &mut optimizer,
                 |opt, lr| opt.set_lr(lr),

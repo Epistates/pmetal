@@ -110,7 +110,7 @@ struct TrainStateJson {
 impl TrainState {
     /// Write the state into `dir`. Every array must be evaluated, as it is
     /// when this runs on a background thread.
-    fn write(&self, dir: &Path) -> Result<()> {
+    pub(crate) fn write(&self, dir: &Path) -> Result<()> {
         let mut json = TrainStateJson {
             optimizer_kind: None,
             optimizer_scalars: Default::default(),

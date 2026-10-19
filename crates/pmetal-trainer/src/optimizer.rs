@@ -18,7 +18,10 @@
 //! | AdamW | Loshchilov & Hutter, *Decoupled Weight Decay Regularization* (arXiv 1711.05101), bias-corrected | β = (0.9, 0.999), ε = 1e-8 | `torch.optim.AdamW` |
 //! | SGD | heavy-ball momentum, Sutskever et al., *On the importance of initialization and momentum in deep learning* (ICML 2013); L2 weight decay added to the gradient | momentum 0.9 | `torch.optim.SGD` |
 //! | Lion | Chen et al., *Symbolic Discovery of Optimization Algorithms* (arXiv 2302.06675) | β = (0.9, 0.99), decoupled weight decay | the authors' PyTorch implementation |
-//! | Adafactor | Shazeer & Stern, *Adafactor: Adaptive Learning Rates with Sublinear Memory Cost* (arXiv 1804.04235) | ε₁ = 1e-30, update clip d = 1, β̂₂ₜ = 1 − t^-0.8, no first moment, external learning rate | `transformers` `Adafactor(relative_step=False, scale_parameter=False)` |
+//! | Adafactor | Shazeer & Stern, *Adafactor: Adaptive Learning Rates with Sublinear Memory Cost* (arXiv 1804.04235) | ε₁ = 1e-30, update clip d = 1, β̂₂ₜ = 1 − t^-0.8, no first moment, external learning rate | the reference Adafactor with `relative_step=False, scale_parameter=False` |
+//! | Muon | Jordan et al., *Muon: An optimizer for hidden layers in neural networks* (2024): momentum 0.95 with Nesterov, five quintic Newton-Schulz steps; update scaled by `0.2·sqrt(max(rows, cols))` to AdamW's RMS (Liu et al., arXiv 2502.16982), decoupled weight decay; embeddings, the head, norms and biases train with AdamW | momentum 0.95, ns steps 5 | `torch.optim.Muon` with `adjust_lr_fn="match_rms_adamw"` |
+//! | Schedule-free AdamW | Defazio et al., *The Road Less Scheduled* (arXiv 2405.15682): iterate averaging, weight decay at `y`, `r = 0`, `weight_lr_power = 2`; a constant rate after warmup | β = (0.9, 0.999), ε = 1e-8 | the authors' `AdamWScheduleFree` |
+//! | 8-bit AdamW | Dettmers et al., *8-bit Optimizers via Block-wise Quantization* (arXiv 2110.02861): both moments one byte per element, blocks of 256, dynamic code; tensors under 4096 elements keep f32 moments | as AdamW | the authors' blockwise 8-bit AdamW |
 //!
 //! The learning rate and weight decay are the caller's. They are not
 //! interchangeable between kinds: the Lion paper recommends a learning rate

@@ -189,22 +189,6 @@ pub struct RlkdSpec {
     #[serde(default)]
     pub reasoning_rewards: bool,
 
-    #[job(label = "Text Column", group = "Data", argv = "--text-column")]
-    #[serde(default)]
-    pub text_column: Option<String>,
-
-    #[job(label = "Text Columns (csv)", group = "Data", argv = "--text-columns")]
-    #[serde(default)]
-    pub text_columns: Option<String>,
-
-    #[job(
-        label = "Column Separator",
-        group = "Data",
-        argv = "--column-separator"
-    )]
-    #[serde(default)]
-    pub column_separator: Option<String>,
-
     #[job(label = "Prompt Column", group = "Data", argv = "--prompt-column")]
     #[serde(default)]
     pub prompt_column: Option<String>,
@@ -244,9 +228,6 @@ impl Default for RlkdSpec {
             max_completion_length: default_max_completion(),
             seed: default_seed(),
             reasoning_rewards: false,
-            text_column: None,
-            text_columns: None,
-            column_separator: None,
             prompt_column: None,
             response_column: None,
             log_metrics: None,

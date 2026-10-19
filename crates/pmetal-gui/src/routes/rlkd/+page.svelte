@@ -12,7 +12,7 @@
   let annealAlpha = $state(false);
   let distillTemperature = $state(2.0);
   let numGenerations = $state(8);
-  let beta = $state(0.001);
+  let beta = $state(0);
   let learningRate = $state(5e-6);
   let epochs = $state(1);
   let loraR = $state(16);
@@ -21,7 +21,6 @@
   let maxCompletionLength = $state(512);
   let seed = $state(42);
   let reasoningRewards = $state(false);
-  let textColumn = $state('');
   let promptColumn = $state('');
   let responseColumn = $state('');
 
@@ -70,7 +69,6 @@
       max_completion_length: maxCompletionLength,
       seed,
       reasoning_rewards: reasoningRewards,
-      text_column: textColumn.trim() || null,
       prompt_column: promptColumn.trim() || null,
       response_column: responseColumn.trim() || null,
     };
@@ -145,11 +143,7 @@
           <label class="label" for="rlkd-output">Output Directory</label>
           <input id="rlkd-output" type="text" class="input" bind:value={outputDir} />
         </div>
-        <div class="grid grid-cols-3 gap-3">
-          <div>
-            <label class="label" for="rlkd-textcol">Text Column</label>
-            <input id="rlkd-textcol" type="text" class="input" placeholder="optional" bind:value={textColumn} />
-          </div>
+        <div class="grid grid-cols-2 gap-3">
           <div>
             <label class="label" for="rlkd-promptcol">Prompt Column</label>
             <input id="rlkd-promptcol" type="text" class="input" placeholder="optional" bind:value={promptColumn} />

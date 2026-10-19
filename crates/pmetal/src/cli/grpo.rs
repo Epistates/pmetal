@@ -22,7 +22,7 @@ pub struct GrpoArgs {
     pub num_generations: usize,
 
     /// KL penalty coefficient (beta)
-    #[arg(long = "beta", default_value = "0.001")]
+    #[arg(long = "beta", default_value = "0.0")]
     pub beta: f64,
 
     /// Learning rate
@@ -116,18 +116,6 @@ pub struct GrpoArgs {
     /// Enable pipelined (asynchronous) reward scoring.
     #[arg(long = "async-rewards")]
     pub async_rewards: bool,
-
-    /// Custom text column name in the dataset JSONL.
-    #[arg(long = "text-column")]
-    pub text_column: Option<String>,
-
-    /// Comma-separated list of columns to concatenate as the text field.
-    #[arg(long = "text-columns", value_delimiter = ',')]
-    pub text_columns: Option<Vec<String>>,
-
-    /// Separator used when joining multiple text columns.
-    #[arg(long = "column-separator", default_value = "\n\n")]
-    pub column_separator: String,
 
     /// Column name for the prompt portion (enables SFT label masking).
     #[arg(long = "prompt-column")]

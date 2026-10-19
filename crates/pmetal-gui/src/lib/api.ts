@@ -1162,7 +1162,6 @@ export interface RlkdConfig {
   max_completion_length?: number | null;
   seed?: number | null;
   reasoning_rewards?: boolean | null;
-  text_column?: string | null;
   prompt_column?: string | null;
   response_column?: string | null;
 }

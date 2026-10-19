@@ -9,7 +9,7 @@
 //! undesirable:  λ_U · (1 − σ(β·(z − r)))
 //! ```
 //!
-//! averaged over the batch. As in the paper and TRL's `KTOTrainer`, `z` is
+//! averaged over the batch. As in the paper, `z` is
 //! the batch mean of `log π − log π_ref` over *mismatched* completions (each
 //! prompt paired with another example's completion), clamped at zero and kept
 //! out of the gradient. It is the reference point the prospect-theory value
@@ -117,6 +117,7 @@ impl KtoTrainer {
     /// `config` controls.
     pub fn new(kto: KtoConfig, config: TrainingConfig) -> PreferenceResult<Self> {
         kto.validate().map_err(PreferenceError::Config)?;
+        super::validate_training(&config)?;
         Ok(Self {
             kto,
             config,

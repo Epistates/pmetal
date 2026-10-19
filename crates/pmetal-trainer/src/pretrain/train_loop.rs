@@ -2,7 +2,7 @@
 //! gradient clipping, periodic eval, and step logging.
 //!
 //! A step takes the shared machinery of the fine-tuning loop: micro-batches
-//! add up in a [`GradAccumulator`] (the step's gradient is the mean over all
+//! add up in a `GradAccumulator` (the step's gradient is the mean over all
 //! its tokens, and the one multiplication that divides by the count also
 //! clips), and the loss, gradient norm, every parameter and the optimizer's
 //! state are evaluated in one call.

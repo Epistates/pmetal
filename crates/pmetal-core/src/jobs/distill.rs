@@ -83,7 +83,7 @@ pub struct DistillSpec {
     pub offline_generate: bool,
 
     #[job(label = "Offline Compression", group = "Distillation", argv = "--offline-compression", kind = "enum",
-          enum_options = ["top_k", "top_p", "fp16", "fp8", "none"], default = "top_k")]
+          enum_options = ["top_k", "none", "int8", "int4", "sampled"], default = "top_k")]
     #[serde(default = "default_compression")]
     pub offline_compression: String,
 
@@ -145,6 +145,29 @@ pub struct DistillSpec {
     )]
     #[serde(default = "default_rationale_weight")]
     pub rationale_weight: f32,
+
+    #[job(
+        label = "On-policy Share",
+        group = "Distillation",
+        argv = "--on-policy",
+        min = 0.0,
+        max = 1.0,
+        default_float = 0.0,
+        help = "Share of batches whose responses the student samples itself and the teacher scores (GKD); online and progressive runs only"
+    )]
+    #[serde(default)]
+    pub on_policy: f32,
+
+    #[job(
+        label = "On-policy Max Tokens",
+        group = "Distillation",
+        argv = "--on-policy-max-tokens",
+        min = 1,
+        max = 32768,
+        default_int = 256
+    )]
+    #[serde(default = "default_on_policy_max_tokens")]
+    pub on_policy_max_tokens: usize,
 
     #[job(
         label = "LoRA r",
@@ -278,6 +301,8 @@ impl Default for DistillSpec {
             alpha: default_alpha(),
             rationale: false,
             rationale_weight: default_rationale_weight(),
+            on_policy: 0.0,
+            on_policy_max_tokens: default_on_policy_max_tokens(),
             lora_r: 16,
             lora_alpha: 32.0,
             learning_rate: default_lr(),
@@ -323,6 +348,9 @@ fn default_temperature() -> f32 {
 }
 fn default_alpha() -> f32 {
     0.5
+}
+fn default_on_policy_max_tokens() -> usize {
+    256
 }
 fn default_rationale_weight() -> f32 {
     1.0

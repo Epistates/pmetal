@@ -587,7 +587,7 @@ pub const IGNORE_INDEX: u32 = u32::MAX;
 
 /// The number of positions in `targets` that count, and the gradient scale
 /// `1 / count` for their mean.
-fn counted_targets(targets: &[u32]) -> (usize, f32) {
+pub(crate) fn counted_targets(targets: &[u32]) -> (usize, f32) {
     let n = targets.iter().filter(|&&t| t != IGNORE_INDEX).count();
     (n, if n == 0 { 0.0 } else { 1.0 / n as f32 })
 }
@@ -635,6 +635,12 @@ pub fn cross_entropy_loss(
                 continue;
             }
 
+            let tgt = targets[t] as usize;
+            // The target's logit under the row's max, and the log of the
+            // softmax's denominator: the loss is their difference, exact
+            // however improbable the target (`-ln(p + eps)` caps at -ln eps).
+            let shifted_target: f32;
+            let log_sum: f32;
             unsafe {
                 // max for numerical stability
                 let mut maxv: f32 = 0.0;
@@ -643,6 +649,7 @@ pub fn cross_entropy_loss(
                 // subtract max
                 let neg_max = -maxv;
                 ffi::vDSP_vsadd(row.as_ptr(), 1, &neg_max, row.as_mut_ptr(), 1, vocab);
+                shifted_target = row[tgt];
 
                 // exp
                 let len = vocab as i32;
@@ -651,13 +658,13 @@ pub fn cross_entropy_loss(
                 // sum and normalize
                 let mut sum: f32 = 0.0;
                 ffi::vDSP_sve(row.as_ptr(), 1, &mut sum, vocab);
+                log_sum = sum.ln();
                 let inv_sum = 1.0 / sum;
                 ffi::vDSP_vsmul(row.as_ptr(), 1, &inv_sum, row.as_mut_ptr(), 1, vocab);
             }
 
             // loss
-            let tgt = targets[t] as usize;
-            total_loss -= (row[tgt] + 1e-10).ln();
+            total_loss += log_sum - shifted_target;
 
             // gradient: softmax - one_hot, over the counted positions
             row[tgt] -= 1.0;
@@ -699,9 +706,9 @@ pub fn cross_entropy_loss(
                 dlogits[v * seq + t] /= sum;
             }
 
-            // Loss
+            // Loss: log of the denominator less the target's shifted logit.
             let tgt = targets[t] as usize;
-            total_loss -= (dlogits[tgt * seq + t] + 1e-10).ln();
+            total_loss += sum.ln() - (logits[tgt * seq + t] - maxv);
 
             // Gradient
             dlogits[tgt * seq + t] -= 1.0;
@@ -1005,6 +1012,26 @@ mod tests {
         let rms0 = ((1.0 + 9.0 + 25.0 + 49.0) / 4.0 + 1e-5f32).sqrt();
         assert!((out[0] - 1.0 / rms0).abs() < 1e-4);
         assert!((out[2] - 3.0 / rms0).abs() < 1e-4);
+    }
+
+    /// A token the model gives next to no probability costs its full negative
+    /// log-likelihood: `ln(p + 1e-10)` capped every loss at 23 (the loss of a
+    /// target 50 nats below the top logit read 23.03), so a run diverging on
+    /// confident mistakes looked bounded.
+    #[test]
+    fn a_confident_mistake_costs_its_full_nll() {
+        // [V = 2, S = 2] channel-first: position 0's target sits 50 below the
+        // top logit, position 1's 100 below.
+        let logits = vec![0.0f32, 0.0, 50.0, 100.0];
+        let targets = vec![0u32, 0];
+        let mut dlogits = vec![0.0f32; 4];
+        let loss = cross_entropy_loss(&mut dlogits, &logits, &targets, 2, 2);
+        // ln(1 + e^50) = 50 and ln(1 + e^100) = 100, in f64: mean 75.
+        let want = (50.0f64 + (-50.0f64).exp().ln_1p() + 100.0) / 2.0;
+        assert!((loss as f64 - want).abs() < 1e-3, "loss {loss} vs {want}");
+        // The gradient is softmax - one-hot over the counted positions.
+        assert!((dlogits[0] - (-0.5)).abs() < 1e-4);
+        assert!((dlogits[2] - 0.5).abs() < 1e-4);
     }
 
     #[test]

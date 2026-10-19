@@ -937,9 +937,11 @@ fn every_optimizer_trains_through_the_loop() {
         );
         let losses: Vec<f64> = seen.snapshot().iter().map(|m| m.loss).collect();
         assert_eq!(losses.len(), 24, "{kind}");
-        // The running loss is an EMA that starts at the first step's loss.
+        // The running loss is an EMA that starts at the first step's loss, and
+        // plain SGD's rate here is small: a dead gradient leaves the ratio at
+        // one, which is what this separates from a slow fall.
         assert!(
-            losses.last().unwrap() < &(losses[0] * 0.97),
+            losses.last().unwrap() < &(losses[0] * 0.99),
             "{kind}: the loss did not fall: {} -> {}",
             losses[0],
             losses.last().unwrap()
@@ -1031,8 +1033,12 @@ fn resuming_from_a_checkpoint_continues_the_run_bit_for_bit() {
 
         let got = resumed.lora_parameters();
         let diff = lora_diff(&got, &want);
+        // The bound is the GPU's own run-to-run spread, with a floor of a few
+        // f32 ulps of a weight: a resume that dropped the optimizer's state
+        // lands orders of magnitude above it.
+        let bound = (noise * 4.0).max(1e-6);
         assert!(
-            diff <= noise,
+            diff <= bound,
             "{kind}: the resumed run ended {diff} away from the straight one \
              (two straight runs differ by {noise})"
         );

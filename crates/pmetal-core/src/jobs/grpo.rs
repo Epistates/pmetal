@@ -55,7 +55,7 @@ pub struct GrpoSpec {
         argv = "--beta",
         min = 0.0,
         max = 1.0,
-        default_float = 0.001
+        default_float = 0.0
     )]
     #[serde(default = "default_beta")]
     pub beta: f64,
@@ -249,22 +249,6 @@ pub struct GrpoSpec {
     #[serde(default)]
     pub async_rewards: bool,
 
-    #[job(label = "Text Column", group = "Data", argv = "--text-column")]
-    #[serde(default)]
-    pub text_column: Option<String>,
-
-    #[job(label = "Text Columns (csv)", group = "Data", argv = "--text-columns")]
-    #[serde(default)]
-    pub text_columns: Option<String>,
-
-    #[job(
-        label = "Column Separator",
-        group = "Data",
-        argv = "--column-separator"
-    )]
-    #[serde(default)]
-    pub column_separator: Option<String>,
-
     #[job(label = "Prompt Column", group = "Data", argv = "--prompt-column")]
     #[serde(default)]
     pub prompt_column: Option<String>,
@@ -318,9 +302,6 @@ impl Default for GrpoSpec {
             reward_model_weight: default_reward_model_weight(),
             reward_model_template: None,
             async_rewards: false,
-            text_column: None,
-            text_columns: None,
-            column_separator: None,
             prompt_column: None,
             response_column: None,
             grpo_kv_bits: None,
@@ -349,7 +330,7 @@ fn default_num_generations() -> usize {
     8
 }
 fn default_beta() -> f64 {
-    0.001
+    0.0
 }
 fn default_lr() -> f64 {
     5e-6

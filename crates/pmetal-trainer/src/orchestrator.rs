@@ -1225,7 +1225,7 @@ async fn attempt_ane_training(
     let trainer_config = DynamicAneTrainerConfig {
         seq_len: max_seq_len,
         // Full-parameter training wants about a tenth of LoRA's learning
-        // rate: TRL's reference is 2e-5 for full fine-tuning against 2e-4
+        // rate: the usual recipe is 2e-5 for full fine-tuning against 2e-4
         // for LoRA, and published full SFT of models this size runs at 1e-5
         // to 2e-5. A LoRA rate here would diverge, so the rate is capped at
         // 2e-5 (the GUI's ANE default); a lower one is kept as given.

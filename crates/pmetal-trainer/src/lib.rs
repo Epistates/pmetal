@@ -49,6 +49,7 @@ pub mod preference;
 pub mod pretrain;
 pub mod reward_model;
 pub mod rlkd;
+pub mod rollout;
 pub mod scheduler;
 pub mod sft;
 pub mod step_check;
@@ -81,7 +82,7 @@ pub use diffusion_gemma_train::{
 };
 pub use distillation::*;
 pub use embedding_trainer::{
-    EmbeddingLossType, EmbeddingResult, EmbeddingTrainer, EmbeddingTrainerConfig,
+    EmbeddingLossType, EmbeddingModel, EmbeddingResult, EmbeddingTrainer, EmbeddingTrainerConfig,
     EmbeddingTrainerError,
 };
 pub use grpo::*;

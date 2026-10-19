@@ -50,6 +50,8 @@ use crate::grpo::{GrpoError, GrpoResult, RewardFunction};
 struct ScoreRequest {
     prompts: Vec<String>,
     completions: Vec<String>,
+    /// Each completion's reference answer; empty when the prompts have none.
+    references: Vec<Option<String>>,
     /// One-shot channel: the worker sends the result back here.
     response_tx: mpsc::SyncSender<GrpoResult<Vec<f64>>>,
 }
@@ -166,7 +168,17 @@ impl AsyncRewardModel {
             .spawn(move || {
                 // Worker loop: process requests until the sender side is dropped.
                 while let Ok(req) = request_rx.recv() {
-                    let result = inner.compute(&req.prompts, &req.completions, None);
+                    let references = if req.references.is_empty() {
+                        vec![None; req.completions.len()]
+                    } else {
+                        req.references
+                    };
+                    let result = inner.compute_with_references(
+                        &req.prompts,
+                        &req.completions,
+                        &references,
+                        None,
+                    );
                     // Ignore send errors: the caller may have dropped the
                     // receiver if it timed out or exited early.
                     let _ = req.response_tx.send(result);
@@ -206,6 +218,17 @@ impl AsyncRewardModel {
         prompts: Vec<String>,
         completions: Vec<String>,
     ) -> GrpoResult<PendingRewards> {
+        self.score_async_with_references(prompts, completions, Vec::new())
+    }
+
+    /// [`score_async`](Self::score_async) with each completion's reference
+    /// answer, for rewards that compare against one.
+    pub fn score_async_with_references(
+        &self,
+        prompts: Vec<String>,
+        completions: Vec<String>,
+        references: Vec<Option<String>>,
+    ) -> GrpoResult<PendingRewards> {
         // One-shot channel for this specific request's response.
         // SyncSender with capacity 1: the worker sends exactly one result.
         let (response_tx, response_rx) = mpsc::sync_channel(1);
@@ -213,6 +236,7 @@ impl AsyncRewardModel {
         let req = ScoreRequest {
             prompts,
             completions,
+            references,
             response_tx,
         };
 
@@ -244,6 +268,21 @@ impl RewardFunction for AsyncRewardModel {
     ) -> GrpoResult<Vec<f64>> {
         let pending = self.score_async(prompts.to_vec(), completions.to_vec())?;
         pending.collect()
+    }
+
+    fn compute_with_references(
+        &self,
+        prompts: &[String],
+        completions: &[String],
+        references: &[Option<String>],
+        _images: Option<&[Vec<Array>]>,
+    ) -> GrpoResult<Vec<f64>> {
+        self.score_async_with_references(
+            prompts.to_vec(),
+            completions.to_vec(),
+            references.to_vec(),
+        )?
+        .collect()
     }
 
     fn name(&self) -> &str {
@@ -305,12 +344,24 @@ impl<'a> PipelinedGrpoSession<'a> {
         prompts: Vec<String>,
         completions: Vec<String>,
     ) -> GrpoResult<Option<Vec<f64>>> {
+        self.begin_step_with_references(prompts, completions, Vec::new())
+    }
+
+    /// [`begin_step`](Self::begin_step) with each completion's reference answer.
+    pub fn begin_step_with_references(
+        &mut self,
+        prompts: Vec<String>,
+        completions: Vec<String>,
+        references: Vec<Option<String>>,
+    ) -> GrpoResult<Option<Vec<f64>>> {
         // Collect results from the previous step before we submit the new request
         // (the bounded channel has capacity 1 and would block if we submitted first).
         let prev_rewards = self.pending.take().map(|p| p.collect()).transpose()?;
 
         // Submit the new scoring request for this step.
-        let new_pending = self.model.score_async(prompts, completions)?;
+        let new_pending =
+            self.model
+                .score_async_with_references(prompts, completions, references)?;
         self.pending = Some(new_pending);
 
         Ok(prev_rewards)
