@@ -42,18 +42,25 @@ pmetal distill \
 
 ## Loss Functions
 
-### Token-Level
-- **KL Divergence** — Standard distribution matching
-- **Jensen-Shannon** — Symmetric divergence
-- **Soft Cross-Entropy** — Temperature-scaled cross-entropy
-- **TVD** — Total variation distance
-- **Hinge Ranking** — Rank-based loss
-- **Logistic Ranking** — Logistic rank loss
+`--loss-type` takes one of these:
 
-### Hidden State
-- **MSE** — Mean squared error on hidden states
-- **Cosine** — Cosine similarity matching
-- **L1** — L1 distance
+| Loss | What it is |
+|------|------------|
+| `kl_divergence` (default) | Forward KL, teacher to student |
+| `reverse_kl` | Reverse KL, student to teacher |
+| `jensen_shannon` | Jensen-Shannon divergence |
+| `soft_cross_entropy` | Cross-entropy against the teacher's soft targets |
+| `mse_loss` | Mean squared error on the logits |
+| `jsd_skewed` | The generalized JSD of GKD (Agarwal et al., 2024), mixing weight `--skew-alpha` (default 0.5, the symmetric JSD) |
+| `skew_kl` / `skew_reverse_kl` | DistiLLM's skew KL (Ko et al., 2024), mixing weight `--skew-alpha` (default 0.1) |
+| `universal_logit` | Universal logit distillation (Boizard et al., 2024) for a teacher with another tokenizer; `--universal-logit-top-k` truncates before sorting |
+
+GKD is `--on-policy 0.5` with `--loss-type jsd_skewed`: that share of the batches are the student's
+own samples, scored by the teacher.
+
+Other options: `--temperature`, `--alpha` (the blend of soft and hard targets), `--rationale` and
+`--rationale-weight` (reasoning-aware weighting), `--eval-dataset`, `--checkpoint-every` and
+`--resume`. `--dataset` and `--eval-dataset` are a file, a directory of shards or a Hub dataset ID.
 
 ## See Also
 

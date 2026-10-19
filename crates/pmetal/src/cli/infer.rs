@@ -130,6 +130,12 @@ pub struct InferArgs {
     #[arg(long = "draft-model")]
     pub draft_model: Option<String>,
 
+    /// Print one JSON object on stdout (the text, token counts, timing, why
+    /// generation stopped) instead of streaming the text; the banner and the
+    /// statistics go to stderr.
+    #[arg(long = "json")]
+    pub json: bool,
+
     /// Enable bundled Qwen3Next/Qwen3.6 MTP speculative decoding.
     #[arg(long = "mtp")]
     pub mtp: bool,
@@ -255,6 +261,7 @@ impl From<InferArgs> for InferSpec {
             image: a.image,
             video: a.video,
             video_fps: a.video_fps,
+            json: a.json,
             max_tokens: a.max_tokens,
             temperature: a.temperature,
             top_k: a.top_k,

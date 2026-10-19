@@ -187,7 +187,7 @@ pub(crate) async fn run_distillation(spec: DistillSpec, ctx: RunContext) -> anyh
         student: ref student_id,
         dataset: ref dataset_path,
         eval_dataset: ref eval_dataset_path,
-        output_dir: ref output_dir,
+        ref output_dir,
         temperature,
         alpha,
         rationale,

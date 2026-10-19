@@ -555,6 +555,25 @@ fn quantize_spec_round_trip() {
     );
 }
 
+/// `--format` is gguf or mlx: any other word used to quantize to GGUF without
+/// saying so.
+#[test]
+fn quantize_refuses_a_format_it_does_not_have() {
+    let argv = |format: &str| {
+        ["--model", "m", "--output", "o", "--format", format]
+            .map(String::from)
+            .to_vec()
+    };
+    assert!(try_parse("quantize", argv("mlx")).is_ok());
+    for typo in ["MLX", "safetensors", "gguff"] {
+        let error = try_parse("quantize", argv(typo)).unwrap_err();
+        assert!(
+            error.contains(typo) && error.contains("gguf"),
+            "{typo}: {error}"
+        );
+    }
+}
+
 #[test]
 fn quantize_methods_parse_canonical_names() {
     let methods = [
@@ -873,6 +892,7 @@ fn infer_spec_round_trips_every_field() {
         image: vec!["a.png".into(), "b.png".into()],
         video: vec!["frames".into()],
         video_fps: Some(2.5),
+        json: true,
         max_tokens: Some(64),
         temperature: Some(0.7),
         top_k: Some(40),

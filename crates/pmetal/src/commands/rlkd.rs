@@ -14,7 +14,7 @@ pub(crate) async fn run_rlkd(spec: RlkdSpec, ctx: RunContext) -> anyhow::Result<
         model: ref model_id,
         teacher_model: ref teacher_model_id,
         dataset: ref dataset_path,
-        output_dir: ref output_dir,
+        ref output_dir,
         distill_alpha,
         final_alpha,
         anneal_alpha,

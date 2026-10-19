@@ -625,8 +625,10 @@ Multiple distillation methods and loss functions:
 | `--embedding-lr` | None | Separate LR for embeddings |
 | `--lr-schedule` | cosine | Schedule type (constant, linear, cosine, cosine_with_restarts, polynomial, wsd) |
 | `--no-gradient-checkpointing` | false | Disable gradient checkpointing (enabled by default) |
-| `--gradient-checkpointing-layers` | 4 | Number of layers per checkpoint block |
-| `--warmup-steps` | 100 | Learning rate warmup steps |
+| `--warmup-steps` | 0 | Learning rate warmup steps |
+| `--max-steps`, `--save-steps`, `--eval-steps`, `--logging-steps` | — | Run length and cadence, in optimizer steps |
+| `--warmup-ratio`, `--min-lr`, `--wsd-stable-ratio`, `--wsd-decay-style`, `--cosine-num-restarts`, `--polynomial-power` | — | Schedule shape (see `pmetal train --help`) |
+| `--lora-targets` | all linear | Projections to adapt (comma-separated) |
 | `--weight-decay` | 0.01 | AdamW weight decay coefficient |
 | `--no-sequence-packing` | false | Disable sequence packing |
 | `--cut-cross-entropy` | false | Loss from fused Metal kernels that never hold the logits; gradient as precise as the full logits' |

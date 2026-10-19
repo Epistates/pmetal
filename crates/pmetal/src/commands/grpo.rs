@@ -11,7 +11,7 @@ pub(crate) async fn run_grpo(spec: GrpoSpec, ctx: RunContext) -> anyhow::Result<
     let GrpoSpec {
         model: ref model_id,
         dataset: ref dataset_path,
-        output_dir: ref output_dir,
+        ref output_dir,
         num_generations,
         beta,
         learning_rate,
@@ -32,7 +32,7 @@ pub(crate) async fn run_grpo(spec: GrpoSpec, ctx: RunContext) -> anyhow::Result<
         reward_model: ref reward_model_path,
         reward_model_max_length,
         reward_model_weight,
-        reward_model_template: ref reward_model_template,
+        ref reward_model_template,
         async_rewards,
         grpo_kv_bits: kv_cache_bits,
         ref prompt_column,

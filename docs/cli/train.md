@@ -54,6 +54,13 @@ pmetal train --config training.yaml
 | `--learning-rate` | `2e-4` | Learning rate |
 | `--max-seq-len` | `0` | Max sequence length (0 = auto-detect) |
 | `--epochs` | `1` | Number of training epochs |
+| `--max-steps` | None | Stop after this many optimizer steps, whatever `--epochs` says |
+| `--lora-targets` | all linear layers | Projections to adapt, comma-separated (`q_proj,v_proj`); MoE routers never are |
+| `--logging-steps` | `10` | Log the loss every this many optimizer steps |
+| `--eval-steps` | `100` | Evaluate every this many optimizer steps (needs `--eval-dataset`) |
+| `--save-steps` | `500` | Write a checkpoint every this many optimizer steps |
+| `--eval-dataset` | None | Evaluation dataset (same formats as `--dataset`) |
+| `--log-metrics` | None | Write per-step metrics as JSONL to this path |
 | `--max-grad-norm` | `1.0` | Gradient clipping |
 | `--quantization` | none | QLoRA base format: `nf4`, `fp4` (NVFP4), `int8` |
 | `--quant-block-size` | `64` | Weights per scale for `nf4` and `int8` (32, 64 or 128) |
@@ -64,8 +71,13 @@ pmetal train --config training.yaml
 | `--z-loss` | `0.0` | Weight of the z-loss `weight * lse^2` added to each token's loss (PaLM; 1e-4 is the paper's value) |
 | `--neftune-alpha` | None | NEFTune noise alpha on the token embeddings of every training forward pass (5 for small models, 15 for larger) |
 | `--lr-schedule` | `cosine` | `constant`, `linear`, `cosine`, `cosine_with_restarts`, `polynomial`, `wsd` |
+| `--warmup-ratio` | None | Share of the optimizer steps spent warming up (0 to 1); replaces `--warmup-steps` when set |
+| `--min-lr` | `0` | Floor the decaying schedules stop at |
+| `--wsd-stable-ratio` | `0.7` | Share of the steps the `wsd` schedule holds the peak rate for |
+| `--wsd-decay-style` | `linear` | Shape of the `wsd` decay: `linear`, `cosine`, `one_minus_sqrt` |
+| `--cosine-num-restarts` | `1` | Cycles of `cosine_with_restarts` |
+| `--polynomial-power` | `1` | Exponent of the `polynomial` schedule |
 | `--no-gradient-checkpointing` | `false` | Disable gradient checkpointing |
-| `--gradient-checkpointing-layers` | `4` | Layers per checkpoint block |
 | `--warmup-steps` | `0` | Learning rate warmup steps |
 | `--weight-decay` | `0.01` | Weight decay |
 | `--optimizer` | `adamw` | `adamw`, `sgd` (momentum 0.9), `lion`, `adafactor`, `muon`, `adamw_schedule_free`, `adamw_8bit`. Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW; schedule-free AdamW wants a constant rate |

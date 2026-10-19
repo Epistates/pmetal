@@ -230,6 +230,17 @@ pub struct InferSpec {
     pub video_fps: Option<f64>,
 
     #[job(
+        label = "JSON Output",
+        group = "Output",
+        argv = "--json",
+        flag,
+        default_bool = false,
+        help = "Print one JSON object (the text, token counts, timing, why it stopped) on stdout instead of streaming the text; the banner and statistics go to stderr"
+    )]
+    #[serde(default)]
+    pub json: bool,
+
+    #[job(
         label = "Qwen MTP",
         group = "Speculative decoding",
         argv = "--mtp",
@@ -450,6 +461,7 @@ impl Default for InferSpec {
             image: Vec::new(),
             video: Vec::new(),
             video_fps: None,
+            json: false,
             mtp: false,
             mtp_model: None,
             mtp_draft_tokens: default_mtp_draft_tokens(),
