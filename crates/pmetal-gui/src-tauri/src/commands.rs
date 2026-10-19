@@ -3348,10 +3348,7 @@ async fn run_grpo_in_process(
     let mut optimizer = pmetal::trainer::TrainOptimizer::from_config(&trainer.training_config);
     // The reference model is only the KL penalty's.
     let mut ref_model = if spec.beta > 0.0 {
-        Some(
-            pmetal::models::DynamicModel::load(&model_path)
-                .map_err(|e| AppError(e.to_string()))?,
-        )
+        Some(pmetal::models::DynamicModel::load(&model_path).map_err(|e| AppError(e.to_string()))?)
     } else {
         None
     };
