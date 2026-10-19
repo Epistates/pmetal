@@ -572,18 +572,51 @@ impl DynamicQuantizer {
     ) -> CalibrationMap {
         let mut map = CalibrationMap::new();
 
+        let mut sizes: HashMap<String, u64> = HashMap::with_capacity(tensors.len());
         for (name, data, shape) in tensors {
             let result = self.calibrate_tensor(name, data, shape, kl_config);
             // Per-tensor diagnostic output is left to the caller (e.g. the CLI) to avoid
             // a `tracing`/`log` dependency in this library crate.
             map.insert(name.clone(), result);
+            sizes.insert(name.clone(), data.len() as u64);
         }
 
         if let Some(target_bpw) = kl_config.target_bpw {
-            self.apply_bpw_budget(&mut map, tensors, target_bpw, kl_config);
+            self.apply_bpw_budget(&mut map, &sizes, target_bpw, kl_config);
         }
 
         map
+    }
+
+    /// [`calibrate_all`](Self::calibrate_all) for a model too large to hold:
+    /// `tensors` lists each tensor's name and shape, and `load` produces one
+    /// tensor's values when it is its turn, so only one tensor is ever in
+    /// memory. The result is what `calibrate_all` gives for the same tensors,
+    /// the bits-per-weight budget included (it needs only each tensor's size).
+    ///
+    /// # Errors
+    ///
+    /// The first error `load` returns.
+    pub fn calibrate_streaming<E>(
+        &self,
+        tensors: &[(String, Vec<i32>)],
+        mut load: impl FnMut(&str) -> std::result::Result<Vec<f32>, E>,
+        kl_config: &KlCalibrationConfig,
+    ) -> std::result::Result<CalibrationMap, E> {
+        let mut map = CalibrationMap::new();
+        let mut sizes: HashMap<String, u64> = HashMap::with_capacity(tensors.len());
+        for (name, shape) in tensors {
+            let data = load(name)?;
+            map.insert(
+                name.clone(),
+                self.calibrate_tensor(name, &data, shape, kl_config),
+            );
+            sizes.insert(name.clone(), data.len() as u64);
+        }
+        if let Some(target_bpw) = kl_config.target_bpw {
+            self.apply_bpw_budget(&mut map, &sizes, target_bpw, kl_config);
+        }
+        Ok(map)
     }
 
     /// Get the quantization type for a tensor using a pre-computed calibration map.
@@ -668,14 +701,10 @@ impl DynamicQuantizer {
     fn apply_bpw_budget(
         &self,
         map: &mut CalibrationMap,
-        tensors: &[(String, Vec<f32>, Vec<i32>)],
+        sizes: &HashMap<String, u64>,
         target_bpw: f32,
         _kl_config: &KlCalibrationConfig,
     ) {
-        let sizes: HashMap<&str, u64> = tensors
-            .iter()
-            .map(|(name, data, _)| (name.as_str(), data.len() as u64))
-            .collect();
         let total_elements: u64 = sizes.values().sum();
         if total_elements == 0 {
             return;
@@ -683,8 +712,7 @@ impl DynamicQuantizer {
         let bits_of = |map: &CalibrationMap| -> f64 {
             map.iter()
                 .map(|(name, cal)| {
-                    sizes.get(name.as_str()).copied().unwrap_or(0) as f64
-                        * bits_per_element(cal.quant_type)
+                    sizes.get(name).copied().unwrap_or(0) as f64 * bits_per_element(cal.quant_type)
                 })
                 .sum()
         };
@@ -695,7 +723,7 @@ impl DynamicQuantizer {
         // Deterministic order for ties.
         let mut names: Vec<String> = map
             .keys()
-            .filter(|n| !Self::is_critical_layer(n) && sizes.contains_key(n.as_str()))
+            .filter(|n| !Self::is_critical_layer(n) && sizes.contains_key(*n))
             .cloned()
             .collect();
         names.sort();
@@ -705,7 +733,7 @@ impl DynamicQuantizer {
             let mut best: Option<(f64, &str, GgmlType, f64, f64)> = None;
             for name in &names {
                 let cal = &map[name];
-                let n = sizes[name.as_str()] as f64;
+                let n = sizes[name] as f64;
                 let current = bits_per_element(cal.quant_type);
                 for &(candidate, score) in &cal.all_scores {
                     let saved = n * (current - bits_per_element(candidate));
@@ -1258,6 +1286,58 @@ mod tests {
             "downgraded further than needed: {}",
             summary.estimated_bpw
         );
+    }
+
+    /// Calibrating one tensor at a time gives the map calibrating them all at
+    /// once does, the bit budget included, and never asks for two at once.
+    #[test]
+    fn streaming_calibration_matches_calibrating_everything_at_once() {
+        let quantizer = DynamicQuantizer::new(DynamicQuantizationConfig::default(), None);
+        let tensors: Vec<(String, Vec<f32>, Vec<i32>)> = (0..4)
+            .map(|i| {
+                (
+                    format!("blk.{i}.ffn_up.weight"),
+                    weight_like(256 * 8, 7 + i),
+                    vec![8, 256],
+                )
+            })
+            .collect();
+        let kl_config = KlCalibrationConfig {
+            kl_threshold: 0.0,
+            target_bpw: Some(3.0),
+            ..Default::default()
+        };
+        let all = quantizer.calibrate_all(&tensors, &kl_config);
+
+        let listing: Vec<(String, Vec<i32>)> = tensors
+            .iter()
+            .map(|(n, _, shape)| (n.clone(), shape.clone()))
+            .collect();
+        let loads = std::cell::Cell::new(0usize);
+        let streamed = quantizer
+            .calibrate_streaming(
+                &listing,
+                |name| {
+                    loads.set(loads.get() + 1);
+                    let data = tensors.iter().find(|(n, ..)| n == name).unwrap().1.clone();
+                    Ok::<_, std::convert::Infallible>(data)
+                },
+                &kl_config,
+            )
+            .unwrap();
+        assert_eq!(loads.get(), 4, "each tensor is loaded once");
+        assert_eq!(all.len(), streamed.len());
+        for (name, want) in &all {
+            let got = &streamed[name];
+            assert_eq!(got.quant_type, want.quant_type, "{name}");
+            assert_eq!(got.kl_score, want.kl_score, "{name}");
+        }
+
+        // A failing load is the caller's error, and stops the pass.
+        let err = quantizer
+            .calibrate_streaming(&listing, |_| Err::<Vec<f32>, _>("disk gone"), &kl_config)
+            .unwrap_err();
+        assert_eq!(err, "disk gone");
     }
 
     #[test]

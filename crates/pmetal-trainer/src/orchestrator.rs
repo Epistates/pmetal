@@ -9,7 +9,7 @@
 //! - All dispatch modes: packed, compiled, metal-fused, standard
 //! - Adaptive LR, checkpointing, metrics callbacks
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 /// The sections of a training config file, loaded and checked by `pmetal-core`.
 pub use pmetal_core::FullTrainingConfig;
@@ -480,7 +480,7 @@ pub async fn run_training(
         } else {
             config.output_dir.clone()
         };
-    let validated_output = validate_output_path(&output_candidate, "output directory")?;
+    let validated_output = pmetal_core::paths::output_path(&output_candidate, "output directory")?;
     let output_dir = validated_output.to_string_lossy().to_string();
     full_config.training.output_dir = output_dir.clone();
 
@@ -1598,79 +1598,6 @@ pub fn save_adapter<M: pmetal_lora::TrainableModel>(
     )?;
     tracing::info!("Saved adapter to {:?}", dir);
     Ok(weights)
-}
-
-// ---------------------------------------------------------------------------
-// Helper: validate output path (security)
-// ---------------------------------------------------------------------------
-
-pub fn validate_output_path(path: &str, context: &str) -> anyhow::Result<PathBuf> {
-    let path = PathBuf::from(path);
-
-    for component in path.components() {
-        if matches!(component, Component::ParentDir) {
-            anyhow::bail!(
-                "Path traversal detected in {}: '{}' contains '..' component. \
-                 Please use a path within the current directory.",
-                context,
-                path.display()
-            );
-        }
-    }
-
-    let cwd = std::env::current_dir()?;
-    let resolved = if path.is_absolute() {
-        path.clone()
-    } else {
-        cwd.join(&path)
-    };
-
-    if let Some(parent) = resolved.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-
-    let canonical = if resolved.exists() {
-        resolved.canonicalize()?
-    } else if let Some(parent) = resolved.parent() {
-        let canonical_parent = parent.canonicalize()?;
-        if let Some(filename) = resolved.file_name() {
-            canonical_parent.join(filename)
-        } else {
-            canonical_parent
-        }
-    } else {
-        resolved
-    };
-
-    let cwd_canonical = cwd.canonicalize()?;
-    let home_dir = dirs::home_dir();
-    let temp_dir = std::env::temp_dir().canonicalize().ok();
-
-    let is_safe = canonical.starts_with(&cwd_canonical)
-        || home_dir
-            .as_ref()
-            .map(|h| canonical.starts_with(h))
-            .unwrap_or(false)
-        || temp_dir
-            .as_ref()
-            .map(|t| canonical.starts_with(t))
-            .unwrap_or(false)
-        || canonical.starts_with("/tmp")
-        || canonical.starts_with("/private/tmp");
-
-    if !is_safe {
-        anyhow::bail!(
-            "Unsafe output path for {}: '{}' resolves to '{}' which is outside \
-             the current directory, home directory, and temp directory.",
-            context,
-            path.display(),
-            canonical.display()
-        );
-    }
-
-    Ok(canonical)
 }
 
 // ---------------------------------------------------------------------------

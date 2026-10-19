@@ -109,7 +109,39 @@ fn ensure_metallib() {
 /// searching for (or downloading) a metallib. MLX's Metal device is then built
 /// before any command that uses MLX, which measured no slower than not doing
 /// it; the others (`Commands::uses_mlx`) skip both steps.
-fn main() -> anyhow::Result<()> {
+/// A run stopped by Ctrl-C after finishing what it was doing: the exit status
+/// is 130 (128 + SIGINT), as for any process the interrupt ends.
+#[derive(Debug)]
+pub(crate) struct Interrupted;
+
+impl std::fmt::Display for Interrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("interrupted")
+    }
+}
+
+impl std::error::Error for Interrupted {}
+
+/// The exit status of a failed run: 130 for an interrupt, 1 otherwise (2 is
+/// the argument parser's, for a command line it cannot read).
+fn exit_status(error: &anyhow::Error) -> u8 {
+    if error.is::<Interrupted>() { 130 } else { 1 }
+}
+
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            let status = exit_status(&error);
+            if status != 130 {
+                eprintln!("Error: {error:#}");
+            }
+            std::process::ExitCode::from(status)
+        }
+    }
+}
+
+fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // The TUI owns the terminal, so it logs to the file only.
@@ -539,87 +571,11 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
         }
 
         Commands::Quantize(args) => {
-            let crate::cli::quantize::QuantizeArgs {
-                model,
-                output,
-                imatrix,
-                method,
-                lora,
-                kl_calibrate,
-                target_bpw,
-                kl_threshold,
-                format,
-                bits,
-                group_size,
-            } = args;
-            if format == "mlx" {
-                // MLX safetensors path — no LoRA fusion support in this path yet.
-                if lora.is_some() {
-                    anyhow::bail!(
-                        "--lora is not yet supported with --format mlx; \
-                         fuse the adapter first with `pmetal fuse` then quantize"
-                    );
-                }
-                commands::quantize::run_quantization_mlx(
-                    &model, &output, bits, group_size, target_bpw,
-                )
-                .await?;
-            } else {
-                #[cfg(feature = "lora")]
-                if let Some(lora_path) = &lora {
-                    // Fuse LoRA first, then quantize the fused model
-                    let fused_dir = format!("{output}.fused_tmp");
-                    commands::fuse::run_fuse(pmetal_core::jobs::FuseSpec {
-                        model: model.clone(),
-                        lora: lora_path.clone(),
-                        output: fused_dir.clone(),
-                        ..Default::default()
-                    })
-                    .await?;
-                    commands::quantize::run_quantization(
-                        &fused_dir,
-                        &output,
-                        imatrix.as_deref(),
-                        method,
-                        kl_calibrate,
-                        target_bpw,
-                        kl_threshold,
-                    )
-                    .await?;
-                    // Clean up temp dir
-                    let _ = std::fs::remove_dir_all(&fused_dir);
-                } else {
-                    commands::quantize::run_quantization(
-                        &model,
-                        &output,
-                        imatrix.as_deref(),
-                        method,
-                        kl_calibrate,
-                        target_bpw,
-                        kl_threshold,
-                    )
-                    .await?;
-                }
-
-                #[cfg(not(feature = "lora"))]
-                {
-                    if lora.is_some() {
-                        anyhow::bail!(
-                            "LoRA fusion during quantization requires the `lora` feature"
-                        );
-                    }
-                    commands::quantize::run_quantization(
-                        &model,
-                        &output,
-                        imatrix.as_deref(),
-                        method,
-                        kl_calibrate,
-                        target_bpw,
-                        kl_threshold,
-                    )
-                    .await?;
-                }
-            }
+            use pmetal_core::jobs::QuantizeSpec;
+            let mut spec = QuantizeSpec::from(args);
+            spec.normalize()
+                .map_err(|errors| commands::invalid_spec::<QuantizeSpec>(&errors))?;
+            commands::quantize::run_quantize(spec).await?;
         }
 
         #[cfg(feature = "trainer")]
@@ -1006,71 +962,22 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The absolute path an output option names, its directory created
+/// ([`pmetal_core::paths::output_path`]).
 fn validate_output_path(path: &str, context: &str) -> anyhow::Result<PathBuf> {
-    use std::path::{Component, PathBuf};
+    Ok(pmetal_core::paths::output_path(path, context)?)
+}
 
-    let path = PathBuf::from(path);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    for component in path.components() {
-        if matches!(component, Component::ParentDir) {
-            anyhow::bail!(
-                "Path traversal detected in {}: '{}' contains '..' component. Please use a safe path.",
-                context,
-                path.display()
-            );
-        }
+    #[test]
+    fn an_interrupt_exits_130_and_any_other_failure_1() {
+        assert_eq!(exit_status(&Interrupted.into()), 130);
+        assert_eq!(exit_status(&anyhow::anyhow!("boom")), 1);
+        // Wrapped in context, an interrupt is still one.
+        let wrapped = anyhow::Error::from(Interrupted).context("generating");
+        assert_eq!(exit_status(&wrapped), 130);
     }
-
-    let cwd = std::env::current_dir()?;
-    let resolved = if path.is_absolute() {
-        path.clone()
-    } else {
-        cwd.join(&path)
-    };
-
-    if let Some(parent) = resolved.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-
-    let canonical = if resolved.exists() {
-        resolved.canonicalize()?
-    } else if let Some(parent) = resolved.parent() {
-        let canonical_parent = parent.canonicalize()?;
-        if let Some(filename) = resolved.file_name() {
-            canonical_parent.join(filename)
-        } else {
-            canonical_parent
-        }
-    } else {
-        resolved
-    };
-
-    let cwd_canonical = cwd.canonicalize()?;
-    let home_dir = dirs::home_dir();
-    let temp_dir = std::env::temp_dir().canonicalize().ok();
-
-    let is_safe = canonical.starts_with(&cwd_canonical)
-        || home_dir
-            .as_ref()
-            .map(|h| canonical.starts_with(h))
-            .unwrap_or(false)
-        || temp_dir
-            .as_ref()
-            .map(|t| canonical.starts_with(t))
-            .unwrap_or(false)
-        || canonical.starts_with("/tmp")
-        || canonical.starts_with("/private/tmp");
-
-    if !is_safe {
-        anyhow::bail!(
-            "Unsafe output path for {}: '{}' resolves to '{}'",
-            context,
-            path.display(),
-            canonical.display()
-        );
-    }
-
-    Ok(canonical)
 }

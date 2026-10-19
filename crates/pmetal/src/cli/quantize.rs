@@ -39,7 +39,7 @@ pub struct QuantizeArgs {
     pub kl_threshold: f64,
 
     /// Output format: "gguf" (default) or "mlx".
-    #[arg(long = "format", default_value = "gguf")]
+    #[arg(long = "format", default_value = "gguf", value_parser = ["gguf", "mlx"])]
     pub format: String,
 
     /// Default bit-width for MLX-format quantization (3, 4, 5, 6, or 8).

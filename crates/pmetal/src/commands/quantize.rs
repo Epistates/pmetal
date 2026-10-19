@@ -1,7 +1,7 @@
+use crate::commands::quantize_source::TensorMeta;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use pmetal_runtime::compat::{Array, Dtype};
 use sha2::{Digest, Sha256};
 
 const TOKEN_TYPE_NORMAL: i32 = 1;
@@ -889,15 +889,15 @@ fn parse_expert_tensor_name(name: &str) -> Option<(ExpertGroupKey, usize)> {
     None
 }
 
-fn collect_expert_groups(
-    weights: &HashMap<String, Array>,
+fn collect_expert_groups<'a>(
+    names: impl Iterator<Item = &'a str>,
 ) -> HashMap<ExpertGroupKey, Vec<ExpertTensor>> {
     let mut groups: HashMap<ExpertGroupKey, Vec<ExpertTensor>> = HashMap::new();
-    for name in weights.keys() {
+    for name in names {
         if let Some((key, expert)) = parse_expert_tensor_name(name) {
             groups.entry(key).or_default().push(ExpertTensor {
                 expert,
-                name: name.clone(),
+                name: name.to_string(),
             });
         }
     }
@@ -905,10 +905,12 @@ fn collect_expert_groups(
     groups
 }
 
-fn stack_expert_group(
-    weights: &HashMap<String, Array>,
+/// The experts of a group in expert order, and the shape of their stack
+/// `[experts, out, in]`; the experts must be the run `0..n` and agree in shape.
+fn expert_stack_layout(
     group: &[ExpertTensor],
-) -> anyhow::Result<(Vec<f32>, Vec<u64>)> {
+    shapes: &HashMap<&str, &Vec<usize>>,
+) -> anyhow::Result<(Vec<ExpertTensor>, Vec<u64>)> {
     let mut sorted = group.to_vec();
     sorted.sort_by_key(|tensor| tensor.expert);
     for (expected, tensor) in sorted.iter().enumerate() {
@@ -921,11 +923,13 @@ fn stack_expert_group(
             );
         }
     }
-
-    let first = weights
-        .get(&sorted[0].name)
-        .ok_or_else(|| anyhow::anyhow!("Missing expert tensor {}", sorted[0].name))?;
-    let base_shape = first.shape();
+    let shape_of = |tensor: &ExpertTensor| {
+        shapes
+            .get(tensor.name.as_str())
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("Expert tensor {} is not a float tensor", tensor.name))
+    };
+    let base_shape = shape_of(&sorted[0])?;
     if base_shape.len() != 2 {
         anyhow::bail!(
             "Expert tensor {} must be 2D for GGUF expert stacking, got {:?}",
@@ -933,29 +937,21 @@ fn stack_expert_group(
             base_shape
         );
     }
-
-    let mut data = Vec::new();
-    for tensor_ref in &sorted {
-        let tensor = weights
-            .get(&tensor_ref.name)
-            .ok_or_else(|| anyhow::anyhow!("Missing expert tensor {}", tensor_ref.name))?;
-        if tensor.shape() != base_shape {
+    for tensor in &sorted {
+        let shape = shape_of(tensor)?;
+        if shape != base_shape {
             anyhow::bail!(
                 "Expert tensor {} shape {:?} does not match {:?}",
-                tensor_ref.name,
-                tensor.shape(),
+                tensor.name,
+                shape,
                 base_shape
             );
         }
-        let mut tensor_data = tensor_to_f32_vec(&tensor_ref.name, tensor)?
-            .ok_or_else(|| anyhow::anyhow!("Expert tensor {} is not float", tensor_ref.name))?;
-        data.append(&mut tensor_data);
     }
-
     let mut shape = Vec::with_capacity(base_shape.len() + 1);
     shape.push(sorted.len() as u64);
     shape.extend(base_shape.iter().map(|&dim| dim as u64));
-    Ok((data, shape))
+    Ok((sorted, shape))
 }
 
 fn is_quantizable_gguf_tensor(gguf_name: &str, shape: &[u64]) -> bool {
@@ -1147,21 +1143,84 @@ fn llama_style_tensor_type(
     dtype
 }
 
-fn tensor_to_f32_vec(name: &str, tensor: &Array) -> anyhow::Result<Option<Vec<f32>>> {
-    let materialized = tensor.clone();
-    materialized.eval();
+/// Run `pmetal quantize`: GGUF (the default) or MLX safetensors, from the base
+/// model, or from the base model with a LoRA adapter fused in first.
+pub(crate) async fn run_quantize(spec: pmetal_core::jobs::QuantizeSpec) -> anyhow::Result<()> {
+    use clap::ValueEnum;
 
-    match materialized.dtype() {
-        Dtype::Float32 => Ok(Some(materialized.as_slice::<f32>().to_vec())),
-        Dtype::Float16 | Dtype::Bfloat16 => {
-            let float32 = materialized.as_dtype(Dtype::Float32.as_i32());
-            float32.eval();
-            Ok(Some(float32.as_slice::<f32>().to_vec()))
-        }
-        other => {
-            tracing::debug!("Skipping non-float tensor {name} with dtype {:?}", other);
-            Ok(None)
-        }
+    if spec.format == "mlx" {
+        // The MLX path takes no adapter: fuse it first with `pmetal fuse`.
+        anyhow::ensure!(
+            spec.lora.is_none(),
+            "--lora is not supported with --format mlx; fuse the adapter first with `pmetal fuse`, \
+             then quantize the fused model"
+        );
+        return run_quantization_mlx(
+            &spec.model,
+            &spec.output,
+            spec.bits,
+            spec.group_size,
+            spec.target_bpw,
+        )
+        .await;
+    }
+
+    let method = crate::cli::quantize::QuantizeMethod::from_str(&spec.method, true)
+        .map_err(|e| anyhow::anyhow!("--method: {e}"))?;
+    let Some(lora) = spec.lora.as_deref() else {
+        return run_quantization(
+            &spec.model,
+            &spec.output,
+            spec.imatrix.as_deref(),
+            method,
+            spec.kl_calibrate,
+            spec.target_bpw,
+            spec.kl_threshold,
+        )
+        .await;
+    };
+
+    // Fuse the adapter into a scratch copy beside the output, quantize that,
+    // and remove it however the run ends: it is as large as the model.
+    #[cfg(not(feature = "lora"))]
+    {
+        let _ = lora;
+        anyhow::bail!("fusing a LoRA adapter while quantizing needs the `lora` feature");
+    }
+    #[cfg(feature = "lora")]
+    {
+        let output = crate::validate_output_path(&spec.output, "quantization output")?;
+        let scratch_parent = output
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let scratch = tempfile::Builder::new()
+            .prefix(".pmetal-fused-")
+            .tempdir_in(&scratch_parent)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "could not make a scratch directory in '{}': {e}",
+                    scratch_parent.display()
+                )
+            })?;
+        let fused = scratch.path().join("model");
+        crate::commands::fuse::run_fuse(pmetal_core::jobs::FuseSpec {
+            model: spec.model.clone(),
+            lora: lora.to_string(),
+            output: fused.to_string_lossy().into_owned(),
+            ..Default::default()
+        })
+        .await?;
+        run_quantization(
+            &fused.to_string_lossy(),
+            &spec.output,
+            spec.imatrix.as_deref(),
+            method,
+            spec.kl_calibrate,
+            spec.target_bpw,
+            spec.kl_threshold,
+        )
+        .await
     }
 }
 
@@ -1176,7 +1235,7 @@ pub(crate) async fn run_quantization(
     kl_threshold: f64,
 ) -> anyhow::Result<()> {
     use pmetal_gguf::{
-        GgufBuilder,
+        GgufBuilder, TensorInfo,
         dynamic::{
             CalibrationMap, DynamicQuantizationConfig, DynamicQuantizer, KlCalibrationConfig,
         },
@@ -1230,11 +1289,13 @@ pub(crate) async fn run_quantization(
         DynamicQuantizer::new(config, imatrix)
     };
 
-    // 3. Load Model Weights
-    tracing::info!("Scanning model weights from {:?}...", resolved_model_path);
-    let weights = pmetal_models::loader::load_weights(&resolved_model_path)
-        .map_err(|e| anyhow::anyhow!("Failed to load weights: {}", e))?;
-    tracing::info!("Loaded {} tensors", weights.len());
+    // 3. Open the weights. They are read one tensor at a time, here and below:
+    // the model is never held in memory (only one tensor, its f32 copy and its
+    // quantized bytes are, and the experts of one layer's projection).
+    let validated_output = crate::validate_output_path(output_path, "quantization output")?;
+    let mut source = crate::commands::quantize_source::open(&resolved_model_path)?;
+    let metas: Vec<TensorMeta> = source.tensors().to_vec();
+    tracing::info!("Found {} float tensors", metas.len());
 
     // 4. Detect Architecture
     let config_path = resolved_model_path.join("config.json");
@@ -1288,51 +1349,45 @@ pub(crate) async fn run_quantization(
         tracing::warn!("config.json not found, defaulting architecture to 'llama'");
     }
 
-    // 5. KL-divergence calibration pass (optional)
-    let mut float_cache: std::collections::HashMap<String, (Vec<f32>, Vec<i32>)> =
-        std::collections::HashMap::new();
-    let calibration_map: CalibrationMap;
-
-    if kl_calibrate {
+    // 5. KL-divergence calibration pass (optional): each tensor is read, scored
+    // and let go of; only the choices are kept.
+    let calibration_map: CalibrationMap = if kl_calibrate {
         println!(
             "Running KL calibration pass over {} tensors...",
-            weights.len()
+            metas.len()
         );
-
-        let mut tensor_data: Vec<(String, Vec<f32>, Vec<i32>)> = Vec::new();
-        let mut sorted_names: Vec<_> = weights.keys().cloned().collect();
-        sorted_names.sort();
-
-        for name in &sorted_names {
-            let tensor = weights
-                .get(name)
-                .ok_or_else(|| anyhow::anyhow!("Tensor {} missing after key listing", name))?;
-
-            let data_f32 = match tensor_to_f32_vec(name, tensor)? {
-                Some(data) => data,
-                None => continue,
-            };
-
-            let shape_i32: Vec<i32> = tensor.shape().to_vec();
-            float_cache.insert(name.clone(), (data_f32.clone(), shape_i32.clone()));
-            // Keyed by GGUF name: that is what the imatrix and the lookups below use.
-            let gguf_name = pmetal_models::weight_format::WeightLoader::hf_to_gguf_name(name);
-            tensor_data.push((gguf_name, data_f32, shape_i32));
-        }
-
+        // Keyed by GGUF name: that is what the imatrix and the lookups below use.
+        let mut hf_by_gguf: HashMap<String, &str> = HashMap::with_capacity(metas.len());
+        let listing: Vec<(String, Vec<i32>)> = metas
+            .iter()
+            .map(|meta| {
+                let gguf_name =
+                    pmetal_models::weight_format::WeightLoader::hf_to_gguf_name(&meta.name);
+                hf_by_gguf.insert(gguf_name.clone(), meta.name.as_str());
+                (gguf_name, meta.shape.iter().map(|&d| d as i32).collect())
+            })
+            .collect();
         let kl_config = KlCalibrationConfig {
             kl_threshold,
             target_bpw,
             ..Default::default()
         };
+        let map = quantizer.calibrate_streaming(
+            &listing,
+            |gguf_name| source.read_f32(hf_by_gguf[gguf_name]),
+            &kl_config,
+        )?;
 
-        calibration_map = quantizer.calibrate_all(&tensor_data, &kl_config);
-
-        let tensor_sizes: Vec<(String, usize)> = tensor_data
+        let tensor_sizes: Vec<(String, usize)> = metas
             .iter()
-            .map(|(n, d, _)| (n.clone(), d.len()))
+            .map(|meta| {
+                (
+                    pmetal_models::weight_format::WeightLoader::hf_to_gguf_name(&meta.name),
+                    meta.elements(),
+                )
+            })
             .collect();
-        let summary = quantizer.summarize_calibration(&calibration_map, &tensor_sizes);
+        let summary = quantizer.summarize_calibration(&map, &tensor_sizes);
         println!(
             "Calibration complete: {} tensors, avg KL={:.6}, worst={} ({:.6}), est. BPW={:.2}",
             summary.total_tensors,
@@ -1347,119 +1402,145 @@ pub(crate) async fn run_quantization(
             println!("  {:?}: {} tensors", dtype, count);
         }
         println!();
+        map
     } else {
-        calibration_map = CalibrationMap::new();
-    }
+        CalibrationMap::new()
+    };
 
-    // 6. Initialize GGUF Builder
+    // 6. Metadata
     let mut builder = GgufBuilder::with_model(&architecture, "quantized-model");
     add_hf_config_metadata(&mut builder, &architecture, config_json.as_ref(), method);
     add_tokenizer_metadata(&mut builder, &resolved_model_path, config_json.as_ref())?;
 
-    // 7. Quantize and Write
-    tracing::info!("Starting quantization...");
-
-    let expert_groups = collect_expert_groups(&weights);
-    let expert_source_keys: HashSet<String> = expert_groups
+    // 7. Plan: which tensors the file holds, in what order, as what type. The
+    // header of a GGUF file comes first and names every tensor's type and
+    // size, which depend on the shapes alone.
+    tracing::info!("Planning the quantization...");
+    let shapes: HashMap<&str, &Vec<usize>> = metas
+        .iter()
+        .map(|meta| (meta.name.as_str(), &meta.shape))
+        .collect();
+    let expert_groups = collect_expert_groups(metas.iter().map(|meta| meta.name.as_str()));
+    let expert_source_keys: HashSet<&str> = expert_groups
         .values()
-        .flat_map(|group| group.iter().map(|tensor| tensor.name.clone()))
+        .flat_map(|group| group.iter().map(|tensor| tensor.name.as_str()))
         .collect();
 
-    let mut keys: Vec<_> = weights.keys().collect();
-    keys.sort();
-
-    for (key, group) in &expert_groups {
-        let (data_f32, shape_u64) = stack_expert_group(&weights, group)?;
-        let gguf_name = format!("blk.{}.{}", key.layer, key.projection.gguf_suffix());
-        let proposed_type = if calibration_map.is_empty() {
-            quantizer.get_tensor_type(&gguf_name, &shape_u64)
+    let choose_type = |gguf_name: &str, shape_u64: &[u64]| {
+        let proposed = if calibration_map.is_empty() {
+            quantizer.get_tensor_type(gguf_name, shape_u64)
         } else {
-            quantizer.get_tensor_type_calibrated(&gguf_name, &shape_u64, &calibration_map)
+            quantizer.get_tensor_type_calibrated(gguf_name, shape_u64, &calibration_map)
         };
-        let target_type = llama_style_tensor_type(
-            method,
-            &gguf_name,
-            &shape_u64,
-            config_json.as_ref(),
-            proposed_type,
-        );
-
+        let chosen =
+            llama_style_tensor_type(method, gguf_name, shape_u64, config_json.as_ref(), proposed);
         // A block never straddles a row: fall back to a type whose block
         // divides the row, as the reference does.
         let n_per_row = shape_u64.last().copied().unwrap_or(1) as usize;
-        let target_type = fit_to_row_length(target_type, n_per_row);
+        fit_to_row_length(chosen, n_per_row)
+    };
 
-        tracing::info!(
-            "Quantizing stacked expert tensor {} ({} experts) to {:?}",
+    let mut plan: Vec<PlannedTensor> = Vec::new();
+    // Stacked experts first, in layer order.
+    let mut group_keys: Vec<ExpertGroupKey> = expert_groups.keys().copied().collect();
+    group_keys.sort_by_key(|key| (key.layer, key.projection.gguf_suffix()));
+    for key in group_keys {
+        let (experts, shape) = expert_stack_layout(&expert_groups[&key], &shapes)?;
+        let gguf_name = format!("blk.{}.{}", key.layer, key.projection.gguf_suffix());
+        let dtype = choose_type(&gguf_name, &shape);
+        plan.push(PlannedTensor {
             gguf_name,
-            group.len(),
-            target_type
-        );
-        let importance = quantizer.importance_for(&gguf_name);
-        let quantized_data =
-            quantize_tensor(&data_f32, target_type, n_per_row, importance.as_deref())
-                .map_err(|e| anyhow::anyhow!("Quantization error for {}: {:?}", gguf_name, e))?;
-        builder.add_raw_tensor(gguf_name, shape_u64, target_type, quantized_data);
+            shape,
+            dtype,
+            from: Origin::Experts(experts),
+        });
     }
-
-    for name in keys {
-        if expert_source_keys.contains(name.as_str()) {
+    for meta in &metas {
+        if expert_source_keys.contains(meta.name.as_str()) {
             continue;
         }
-
-        let shape_u64: Vec<u64>;
-        let data_f32: Vec<f32>;
-
-        if let Some((cached_data, cached_shape)) = float_cache.remove(name) {
-            shape_u64 = cached_shape.iter().map(|&d| d as u64).collect();
-            data_f32 = cached_data;
-        } else {
-            let tensor = weights
-                .get(name)
-                .ok_or_else(|| anyhow::anyhow!("Tensor {} not found in loaded weights", name))?;
-
-            let shape = tensor.shape();
-            shape_u64 = shape.iter().map(|&d| d as u64).collect();
-
-            data_f32 = match tensor_to_f32_vec(name, tensor)? {
-                Some(data) => data,
-                None => continue,
-            };
-        }
-
-        let gguf_name = pmetal_models::weight_format::WeightLoader::hf_to_gguf_name(name);
-
-        let target_type = if calibration_map.is_empty() {
-            quantizer.get_tensor_type(&gguf_name, &shape_u64)
-        } else {
-            quantizer.get_tensor_type_calibrated(&gguf_name, &shape_u64, &calibration_map)
-        };
-        let target_type = llama_style_tensor_type(
-            method,
-            &gguf_name,
-            &shape_u64,
-            config_json.as_ref(),
-            target_type,
-        );
-
-        let n_per_row = shape_u64.last().copied().unwrap_or(1) as usize;
-        let target_type = fit_to_row_length(target_type, n_per_row);
-
-        tracing::info!("Quantizing {} ({}) to {:?}", name, gguf_name, target_type);
-        let importance = quantizer.importance_for(&gguf_name);
-        let quantized_data =
-            quantize_tensor(&data_f32, target_type, n_per_row, importance.as_deref())
-                .map_err(|e| anyhow::anyhow!("Quantization error for {}: {:?}", name, e))?;
-
-        builder.add_raw_tensor(gguf_name, shape_u64, target_type, quantized_data);
+        let gguf_name = pmetal_models::weight_format::WeightLoader::hf_to_gguf_name(&meta.name);
+        let shape: Vec<u64> = meta.shape.iter().map(|&d| d as u64).collect();
+        let dtype = choose_type(&gguf_name, &shape);
+        plan.push(PlannedTensor {
+            gguf_name,
+            shape,
+            dtype,
+            from: Origin::Tensor(meta.name.clone()),
+        });
     }
 
-    // 8. Write GGUF output
-    let validated_output = crate::validate_output_path(output_path, "quantization output")?;
-    builder.write_file(&validated_output)?;
+    // 8. Quantize and write, one tensor at a time. The file is built beside the
+    // destination and moved into place when complete.
+    let infos: Vec<TensorInfo> = plan
+        .iter()
+        .map(|t| TensorInfo::new(t.gguf_name.clone(), t.shape.clone(), t.dtype))
+        .collect();
+    let mut writer = builder
+        .file_writer(&validated_output, infos)
+        .map_err(|e| anyhow::anyhow!("could not start '{}': {e}", validated_output.display()))?;
+    let total = plan.len();
+    for (done, planned) in plan.iter().enumerate() {
+        let data_f32 = match &planned.from {
+            Origin::Tensor(name) => source.read_f32(name)?,
+            Origin::Experts(experts) => {
+                let mut stacked = Vec::new();
+                for expert in experts {
+                    stacked.append(&mut source.read_f32(&expert.name)?);
+                }
+                stacked
+            }
+        };
+        let n_per_row = planned.shape.last().copied().unwrap_or(1) as usize;
+        match &planned.from {
+            Origin::Tensor(name) => tracing::info!(
+                "[{}/{total}] Quantizing {} ({}) to {:?}",
+                done + 1,
+                name,
+                planned.gguf_name,
+                planned.dtype
+            ),
+            Origin::Experts(experts) => tracing::info!(
+                "[{}/{total}] Quantizing stacked expert tensor {} ({} experts) to {:?}",
+                done + 1,
+                planned.gguf_name,
+                experts.len(),
+                planned.dtype
+            ),
+        }
+        let importance = quantizer.importance_for(&planned.gguf_name);
+        let quantized = quantize_tensor(&data_f32, planned.dtype, n_per_row, importance.as_deref())
+            .map_err(|e| {
+                anyhow::anyhow!("Quantization error for {}: {:?}", planned.gguf_name, e)
+            })?;
+        drop(data_f32);
+        writer
+            .write_tensor(&planned.gguf_name, &quantized)
+            .map_err(|e| anyhow::anyhow!("could not write {}: {e}", planned.gguf_name))?;
+    }
+    writer
+        .finish()
+        .map_err(|e| anyhow::anyhow!("could not finish '{}': {e}", validated_output.display()))?;
 
     println!("Quantization complete!");
     Ok(())
+}
+
+/// One tensor of the output file, in file order.
+struct PlannedTensor {
+    gguf_name: String,
+    /// Row-major, as the builder takes it (the writer reverses).
+    shape: Vec<u64>,
+    dtype: pmetal_gguf::GgmlType,
+    from: Origin,
+}
+
+/// Where a planned tensor's values come from.
+enum Origin {
+    /// One tensor of the model, by its name there.
+    Tensor(String),
+    /// The experts of a layer's projection, stacked, in expert order.
+    Experts(Vec<ExpertTensor>),
 }
 
 // ── MLX safetensors path ──────────────────────────────────────────────────────
@@ -1735,5 +1816,259 @@ mod tests {
             content.get_metadata("general.file_type"),
             Some(MetadataValue::Uint32(15))
         ));
+    }
+
+    // ── streaming quantization, end to end on a tiny model ───────────────────
+
+    /// A float in `[-1, 1]` that depends on where it is: tensors whose values
+    /// differ, so a tensor written in the wrong slot or the wrong row shows.
+    fn pattern(seed: usize, n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| (((i * 37 + seed * 11) % 101) as f32 - 50.0) / 50.0)
+            .collect()
+    }
+
+    /// `bf16` rounding of `values`, as stored in the checkpoint.
+    fn as_stored(values: &[f32]) -> Vec<f32> {
+        values
+            .iter()
+            .map(|v| half::bf16::from_f32(*v).to_f32())
+            .collect()
+    }
+
+    /// A checkpoint of bf16 tensors in two shards, with a config.
+    fn write_tiny_model(dir: &Path, experts: bool) -> Vec<(String, Vec<usize>, Vec<f32>)> {
+        use safetensors::tensor::{Dtype as StDtype, TensorView, serialize};
+        let mut tensors: Vec<(String, Vec<usize>, Vec<f32>)> = Vec::new();
+        let mut add = |name: &str, shape: &[usize]| {
+            let n: usize = shape.iter().product();
+            let seed = tensors.len();
+            tensors.push((
+                name.to_string(),
+                shape.to_vec(),
+                as_stored(&pattern(seed, n)),
+            ));
+        };
+        add("model.embed_tokens.weight", &[32, 64]);
+        add("model.norm.weight", &[64]);
+        add("lm_head.weight", &[32, 64]);
+        add("model.layers.0.input_layernorm.weight", &[64]);
+        add("model.layers.0.self_attn.q_proj.weight", &[64, 64]);
+        add("model.layers.0.self_attn.k_proj.weight", &[32, 64]);
+        add("model.layers.0.self_attn.v_proj.weight", &[32, 64]);
+        add("model.layers.0.self_attn.o_proj.weight", &[64, 64]);
+        if experts {
+            for e in 0..3 {
+                for (proj, shape) in [
+                    ("gate_proj", [16, 64]),
+                    ("up_proj", [16, 64]),
+                    ("down_proj", [64, 16]),
+                ] {
+                    add(
+                        &format!("model.layers.0.mlp.experts.{e}.{proj}.weight"),
+                        &shape,
+                    );
+                }
+            }
+        } else {
+            add("model.layers.0.mlp.gate_proj.weight", &[128, 64]);
+            add("model.layers.0.mlp.up_proj.weight", &[128, 64]);
+            add("model.layers.0.mlp.down_proj.weight", &[64, 128]);
+        }
+
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"architectures":["LlamaForCausalLM"],"hidden_size":64,"num_hidden_layers":1,
+               "num_attention_heads":4,"num_key_value_heads":2,"intermediate_size":128,
+               "vocab_size":32,"max_position_embeddings":128}"#,
+        )
+        .unwrap();
+        // Two shards with an index, the layout of a real download.
+        let (first, second) = tensors.split_at(tensors.len() / 2);
+        let mut weight_map = serde_json::Map::new();
+        for (file, part) in [
+            ("model-00001-of-00002.safetensors", first),
+            ("model-00002-of-00002.safetensors", second),
+        ] {
+            let bytes: Vec<(String, Vec<usize>, Vec<u8>)> = part
+                .iter()
+                .map(|(name, shape, values)| {
+                    let data = values
+                        .iter()
+                        .flat_map(|v| half::bf16::from_f32(*v).to_le_bytes())
+                        .collect();
+                    (name.clone(), shape.clone(), data)
+                })
+                .collect();
+            let views: Vec<(String, TensorView<'_>)> = bytes
+                .iter()
+                .map(|(name, shape, data)| {
+                    weight_map.insert(name.clone(), serde_json::json!(file));
+                    (
+                        name.clone(),
+                        TensorView::new(StDtype::BF16, shape.clone(), data).unwrap(),
+                    )
+                })
+                .collect();
+            std::fs::write(dir.join(file), serialize(views, None).unwrap()).unwrap();
+        }
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::json!({"weight_map": weight_map}).to_string(),
+        )
+        .unwrap();
+        tensors
+    }
+
+    fn dequantized(model: &pmetal_gguf::GgufModel, name: &str) -> (Vec<f32>, Vec<u64>, GgmlType) {
+        let info = model
+            .tensor_info(name)
+            .unwrap_or_else(|| panic!("no tensor {name}"));
+        let shape: Vec<i32> = info.dimensions.iter().map(|&d| d as i32).collect();
+        let values =
+            pmetal_gguf::dequant::dequantize(model.tensor_data(name).unwrap(), info.dtype, &shape)
+                .unwrap();
+        (values, info.dimensions.clone(), info.dtype)
+    }
+
+    fn worst_difference(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max)
+    }
+
+    async fn quantize_dir(
+        dir: &Path,
+        out: &Path,
+        method: crate::cli::quantize::QuantizeMethod,
+        kl: bool,
+        bpw: Option<f32>,
+    ) -> anyhow::Result<()> {
+        run_quantization(
+            dir.to_str().unwrap(),
+            out.to_str().unwrap(),
+            None,
+            method,
+            kl,
+            bpw,
+            0.01,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_model_is_quantized_tensor_by_tensor_into_a_valid_gguf() {
+        let dir = tempfile::tempdir().unwrap();
+        let tensors = write_tiny_model(dir.path(), false);
+        let out = dir.path().join("out").join("model.gguf");
+        quantize_dir(
+            dir.path(),
+            &out,
+            crate::cli::quantize::QuantizeMethod::Q8_0,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Only the finished file is there: no temporary left beside it.
+        let entries: Vec<_> = std::fs::read_dir(out.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, ["model.gguf"]);
+
+        let model = pmetal_gguf::GgufModel::open(&out).unwrap();
+        assert_eq!(model.num_tensors(), tensors.len());
+        for (hf_name, shape, values) in &tensors {
+            let gguf_name = pmetal_models::weight_format::WeightLoader::hf_to_gguf_name(hf_name);
+            let (got, dims, dtype) = dequantized(&model, &gguf_name);
+            let want_dims: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
+            assert_eq!(dims, want_dims, "{gguf_name}");
+            let worst = worst_difference(&got, values);
+            if shape.len() == 2 {
+                assert_eq!(dtype, GgmlType::Q8_0, "{gguf_name}");
+                assert!(worst < 0.01, "{gguf_name}: q8_0 differs by {worst}");
+            } else {
+                // A norm weight stays dense.
+                assert!(
+                    matches!(dtype, GgmlType::F32 | GgmlType::F16),
+                    "{gguf_name}: {dtype:?}"
+                );
+                assert!(worst < 1e-3, "{gguf_name}: differs by {worst}");
+            }
+        }
+    }
+
+    /// The experts of a layer's projection are one stacked tensor
+    /// `[experts, out, in]` in expert order, however the checkpoint lists them.
+    #[tokio::test]
+    async fn per_expert_tensors_are_stacked_in_expert_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let tensors = write_tiny_model(dir.path(), true);
+        let out = dir.path().join("moe.gguf");
+        quantize_dir(
+            dir.path(),
+            &out,
+            crate::cli::quantize::QuantizeMethod::Q8_0,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let model = pmetal_gguf::GgufModel::open(&out).unwrap();
+        let (stack, dims, _) = dequantized(&model, "blk.0.ffn_up_exps.weight");
+        assert_eq!(dims, [3, 16, 64]);
+        let mut want = Vec::new();
+        for e in 0..3 {
+            let name = format!("model.layers.0.mlp.experts.{e}.up_proj.weight");
+            want.extend(&tensors.iter().find(|(n, ..)| *n == name).unwrap().2);
+        }
+        let worst = worst_difference(&stack, &want);
+        assert!(worst < 0.01, "the stacked experts differ by {worst}");
+        // No per-expert tensor is left beside the stack.
+        assert!(model.tensor_names().all(|n| !n.contains("experts.0")));
+    }
+
+    #[tokio::test]
+    async fn kl_calibration_streams_too_and_picks_types_within_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tiny_model(dir.path(), false);
+        let out = dir.path().join("kl.gguf");
+        quantize_dir(
+            dir.path(),
+            &out,
+            crate::cli::quantize::QuantizeMethod::Dynamic,
+            true,
+            Some(5.0),
+        )
+        .await
+        .unwrap();
+        let model = pmetal_gguf::GgufModel::open(&out).unwrap();
+        assert!(model.num_tensors() > 0);
+        let (_, _, dtype) = dequantized(&model, "blk.0.ffn_up.weight");
+        assert_ne!(dtype, GgmlType::F32);
+    }
+
+    /// A shard cut short is an error, and the destination is not touched.
+    #[tokio::test]
+    async fn a_damaged_shard_fails_without_leaving_an_output() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tiny_model(dir.path(), false);
+        let shard = dir.path().join("model-00002-of-00002.safetensors");
+        let bytes = std::fs::read(&shard).unwrap();
+        std::fs::write(&shard, &bytes[..bytes.len() - 64]).unwrap();
+        let out = dir.path().join("bad.gguf");
+        let result = quantize_dir(
+            dir.path(),
+            &out,
+            crate::cli::quantize::QuantizeMethod::Q8_0,
+            false,
+            None,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!out.exists());
     }
 }

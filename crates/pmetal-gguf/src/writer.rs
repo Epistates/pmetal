@@ -237,6 +237,19 @@ impl GgufBuilder {
         file.finish()
     }
 
+    /// A streaming, atomic writer for a file with this builder's metadata and
+    /// alignment and the tensors `tensors` declares, which replaces the
+    /// builder's own tensors (a model too large to hold in memory declares
+    /// each tensor's type and shape up front and hands over its data one tensor
+    /// at a time, in declaration order: [`GgufFileWriter::write_tensor`]).
+    pub fn file_writer(
+        &self,
+        path: impl AsRef<Path>,
+        tensors: Vec<TensorInfo>,
+    ) -> Result<GgufFileWriter> {
+        GgufFileWriter::create(path, &self.metadata, tensors, self.alignment)
+    }
+
     /// Build to a byte vector.
     pub fn build_to_bytes(&self) -> Result<Vec<u8>> {
         let mut buffer = Vec::new();
