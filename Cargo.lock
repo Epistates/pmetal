@@ -5438,9 +5438,9 @@ version = "0.6.0"
 dependencies = [
  "criterion",
  "half",
- "hf-hub",
  "memmap2",
  "ndarray",
+ "pmetal-hub",
  "pmetal-runtime",
  "rand 0.10.3",
  "regex",
@@ -5450,6 +5450,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+ "tokio",
  "tracing",
  "zerocopy",
 ]
@@ -5626,13 +5627,14 @@ version = "0.6.0"
 dependencies = [
  "criterion",
  "half",
- "hf-hub",
  "pmetal-hub",
  "pmetal-runtime",
  "safetensors",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]
