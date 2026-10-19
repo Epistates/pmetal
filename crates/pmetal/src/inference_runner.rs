@@ -6,7 +6,6 @@
 
 use std::{
     collections::HashSet,
-    ffi::OsStr,
     path::{Path, PathBuf},
 };
 
@@ -466,8 +465,7 @@ impl InferenceRunner {
             } else {
                 prompt
             };
-            let ids = tokenizer
-                .encode(&expand_media(prompt_text)?)
+            let ids = encode_plain_prompt(&tokenizer, &expand_media(prompt_text)?)
                 .map_err(|e| Exception::custom(e.to_string()))?;
             (ids, None, false)
         };
@@ -1809,21 +1807,22 @@ pub const MIN_DEFAULT_CONTEXT: usize = 4096;
 /// request's cache grows with its sequence, so a long window costs memory
 /// only when a request fills it.
 ///
-/// The KV estimate counts every layer that keeps one (full and sliding
-/// attention alike, so a sliding window is overestimated); recurrent layers
-/// keep none.
+/// The KV estimate is the hub's: a sliding layer stops growing at its window
+/// and recurrent layers keep none.
 pub fn default_serve_context_len(model_path: &Path, sequences: usize) -> DefaultContextLength {
     let context_window = pmetal_data::inference_config::context_window(model_path);
     let working_set = pmetal_metal::context::MetalContext::global()
         .ok()
         .map(|ctx| ctx.properties().recommended_working_set_size);
-    let kv_per_token = kv_bytes_per_token(model_path);
     let weights = sum_model_weight_file_bytes(model_path).unwrap_or(0);
-    let memory_cap = match (working_set, kv_per_token) {
-        (Some(ws), Some(per_token)) if per_token > 0 => {
+    let memory_cap = match (working_set, kv_shape(model_path)) {
+        (Some(ws), Some(kv)) => {
             let budget = ((ws as f64) * 0.70) as u64;
-            let free = budget.saturating_sub(weights);
-            Some((free / (per_token * sequences.max(1) as u64)) as usize)
+            Some(context_that_fits(
+                &kv,
+                budget.saturating_sub(weights),
+                sequences,
+            ))
         }
         _ => None,
     };
@@ -1841,33 +1840,30 @@ pub fn default_serve_context_len(model_path: &Path, sequences: usize) -> Default
     }
 }
 
-/// fp16 KV-cache bytes one token costs, from `config.json` (its
-/// `text_config` for a multimodal wrapper).
-fn kv_bytes_per_token(model_path: &Path) -> Option<u64> {
-    let config: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(model_path.join("config.json")).ok()?)
-            .ok()?;
-    let text = config
-        .get("text_config")
-        .filter(|t| t.is_object())
-        .unwrap_or(&config);
-    let int = |key: &str| text.get(key).and_then(serde_json::Value::as_u64);
-    let layers = int("num_hidden_layers")?;
-    let heads = int("num_attention_heads")?;
-    let kv_heads = int("num_key_value_heads").unwrap_or(heads);
-    let head_dim = int("head_dim").unwrap_or(int("hidden_size")? / heads.max(1));
-    let kv_layers = match text.get("layer_types").and_then(|t| t.as_array()) {
-        Some(types) => types
-            .iter()
-            .filter_map(|t| t.as_str())
-            .filter(|t| t.contains("attention") && !t.contains("linear"))
-            .count() as u64,
-        None => match int("full_attention_interval") {
-            Some(interval) if interval > 0 => layers / interval,
-            _ => layers,
-        },
-    };
-    Some(kv_layers * kv_heads * head_dim * 2 * 2)
+/// How the model's KV cache grows with context, from its `config.json`
+/// ([`pmetal_hub::fit::model_spec_from_dir`], the one definition of it:
+/// latent attention, hybrid layer patterns and sliding windows included).
+fn kv_shape(model_path: &Path) -> Option<pmetal_hub::fit::KvShape> {
+    pmetal_hub::fit::model_spec_from_dir(model_path)?.kv
+}
+
+/// The longest context whose fp16 KV caches, one per sequence, fit in `free`
+/// bytes.
+fn context_that_fits(kv: &pmetal_hub::fit::KvShape, free: u64, sequences: usize) -> usize {
+    // Contexts past a million tokens are not modelled (the hub clamps there).
+    const LONGEST: usize = 1 << 20;
+    let sequences = sequences.max(1) as f64;
+    let fits = |context: usize| kv.bytes(context as u32, 2.0) * sequences <= free as f64;
+    let (mut low, mut high) = (0usize, LONGEST);
+    while low < high {
+        let middle = (low + high).div_ceil(2);
+        if fits(middle) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    low
 }
 
 fn estimate_local_model_weight_bytes(
@@ -1925,75 +1921,25 @@ fn json_quantization_config_is_fp8(value: Option<&serde_json::Value>) -> bool {
         .is_some_and(|method| method.eq_ignore_ascii_case("fp8"))
 }
 
+/// Bytes of weights `model_path` holds: the file itself for a GGUF path, else
+/// the one set of weights the directory loads
+/// ([`pmetal_hub::verify_model_dir`], which follows the Hub cache's symlinks
+/// and never counts two formats of the same model twice).
 fn sum_model_weight_file_bytes(model_path: &Path) -> Option<u64> {
-    let mut total = 0u64;
-    let mut visited_dirs = HashSet::new();
-    let mut counted_files = HashSet::new();
-    accumulate_model_weight_file_bytes(
-        model_path,
-        &mut visited_dirs,
-        &mut counted_files,
-        &mut total,
-    );
-    (total > 0).then_some(total)
-}
-
-fn accumulate_model_weight_file_bytes(
-    path: &Path,
-    visited_dirs: &mut HashSet<PathBuf>,
-    counted_files: &mut HashSet<PathBuf>,
-    total: &mut u64,
-) {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return;
+    let bytes = if model_path.is_file() {
+        std::fs::metadata(model_path).ok()?.len()
+    } else {
+        // Two names for one blob are one file's bytes.
+        let mut seen = HashSet::new();
+        pmetal_hub::verify_model_dir(model_path)
+            .weight_files
+            .iter()
+            .filter(|file| seen.insert(file.canonicalize().unwrap_or_else(|_| (*file).clone())))
+            .filter_map(|file| std::fs::metadata(file).ok())
+            .map(|meta| meta.len())
+            .sum()
     };
-
-    if metadata.is_dir() {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        if !visited_dirs.insert(canonical) {
-            return;
-        }
-
-        let Ok(entries) = std::fs::read_dir(path) else {
-            return;
-        };
-
-        for entry in entries.flatten() {
-            accumulate_model_weight_file_bytes(&entry.path(), visited_dirs, counted_files, total);
-        }
-        return;
-    }
-
-    if !metadata.is_file() || !is_supported_model_weight_file(path) {
-        return;
-    }
-
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if counted_files.insert(canonical) {
-        *total = total.saturating_add(metadata.len());
-    }
-}
-
-fn is_supported_model_weight_file(path: &Path) -> bool {
-    let extension = path
-        .extension()
-        .and_then(OsStr::to_str)
-        .map(|ext| ext.to_ascii_lowercase());
-    let file_name = path
-        .file_name()
-        .and_then(OsStr::to_str)
-        .map(|name| name.to_ascii_lowercase())
-        .unwrap_or_default();
-
-    match extension.as_deref() {
-        Some("safetensors") | Some("gguf") => true,
-        Some("bin") | Some("pt") | Some("pth") => {
-            file_name.contains("model")
-                || file_name.contains("pytorch")
-                || file_name.contains("consolidated")
-        }
-        _ => false,
-    }
+    (bytes > 0).then_some(bytes)
 }
 
 fn estimate_fp16_kv_cache_bytes(base_cache_config: &KVCacheConfig) -> u64 {
@@ -2130,6 +2076,18 @@ fn attach_media(messages: &mut Vec<Message>, prompt: &str, images: usize, videos
     *last = Message::with_parts("user", parts);
 }
 
+/// A prompt no chat template rendered, as token ids: the tokenizer's own
+/// post-processor adds the BOS (and EOS) the model was trained to start from.
+///
+/// Text a chat template rendered already carries its BOS and goes through
+/// [`Tokenizer::encode`] instead; here nothing has written one, and a base
+/// model given a prompt without it answers a different, usually worse,
+/// distribution than the one it was trained on. A prompt that opens with the
+/// BOS token itself is not given a second one.
+fn encode_plain_prompt(tokenizer: &Tokenizer, text: &str) -> pmetal_core::Result<Vec<u32>> {
+    tokenizer.encode_with_special_tokens(text)
+}
+
 fn build_plain_conversation_prompt(
     history: Option<&Vec<Message>>,
     system_message: Option<&str>,
@@ -2162,6 +2120,29 @@ mod tests {
 
     fn qwen3_cache_config(max_seq_len: usize) -> KVCacheConfig {
         KVCacheConfig::new(28, max_seq_len, 8, 128)
+    }
+
+    /// A base model's raw prompt starts with the BOS its tokenizer adds; a
+    /// rendered chat, which carries its own, does not get a second one.
+    #[test]
+    fn a_plain_prompt_starts_with_the_bos_and_a_rendered_one_does_not_double_it() {
+        let tokenizer = pmetal_data::tokenizer::testing::byte_level_bpe(&[], &["<s>"], Some("<s>"));
+        let bos = tokenizer
+            .inner()
+            .token_to_id("<s>")
+            .expect("<s> is a token");
+
+        let plain = encode_plain_prompt(&tokenizer, "hi").unwrap();
+        assert_eq!(
+            plain[0], bos,
+            "a plain prompt opens with the BOS: {plain:?}"
+        );
+        assert_eq!(plain.len(), 3, "BOS and two bytes: {plain:?}");
+
+        let rendered = tokenizer.encode("<s>hi").unwrap();
+        assert_eq!(rendered.iter().filter(|&&id| id == bos).count(), 1);
+        let plain_with_bos = encode_plain_prompt(&tokenizer, "<s>hi").unwrap();
+        assert_eq!(plain_with_bos, rendered, "no second BOS");
     }
 
     #[test]
@@ -2488,6 +2469,51 @@ mod tests {
         .unwrap();
 
         assert_eq!(estimate_weight_bytes(dir.path(), 0, false), 4301);
+    }
+
+    /// How many tokens of context `config.json`'s model fits in `free` bytes
+    /// (one sequence).
+    fn context_for(config: &str, free: u64) -> Option<usize> {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), config).unwrap();
+        Some(context_that_fits(&kv_shape(dir.path())?, free, 1))
+    }
+
+    /// The KV cost a token adds is the hub's one definition of it: latent
+    /// attention caches a compressed vector (not every head's keys and
+    /// values), a hybrid keeps a cache only in its attention layers, and a
+    /// sliding layer stops growing at its window.
+    #[test]
+    fn the_context_that_fits_follows_the_models_attention_layout() {
+        let gib = 1u64 << 30;
+        // DeepSeek-V3: 61 layers, each caching kv_lora_rank + qk_rope_head_dim
+        // = 576 values (fp16: 2 bytes) per token.
+        let mla = r#"{"num_hidden_layers": 61, "num_attention_heads": 128, "hidden_size": 7168,
+                "num_key_value_heads": 128, "kv_lora_rank": 512, "qk_rope_head_dim": 64}"#;
+        assert_eq!(context_for(mla, gib), Some((gib / (61 * 576 * 2)) as usize));
+
+        // Nemotron-H: only the `*` layers of the pattern attend.
+        let hybrid = r#"{"num_hidden_layers": 8, "num_attention_heads": 8, "hidden_size": 512,
+                "num_key_value_heads": 2, "head_dim": 64, "hybrid_override_pattern": "M-M*M-M*"}"#;
+        assert_eq!(
+            context_for(hybrid, gib),
+            Some((gib / (2 * (2 * 2 * 64) * 2)) as usize)
+        );
+
+        // Plain grouped-query attention: every layer, keys and values.
+        let gqa = r#"{"num_hidden_layers": 4, "num_attention_heads": 8, "hidden_size": 512,
+                "num_key_value_heads": 2}"#;
+        assert_eq!(
+            context_for(gqa, gib),
+            Some((gib / (4 * (2 * 2 * 64) * 2)) as usize)
+        );
+
+        // Sliding layers stop growing at their window, so a model of them
+        // fits far more than one that caches everything.
+        let sliding = r#"{"num_hidden_layers": 4, "num_attention_heads": 8, "hidden_size": 512,
+                "num_key_value_heads": 2, "sliding_window": 128}"#;
+        assert!(context_for(sliding, gib) > context_for(gqa, gib));
+        assert_eq!(context_for("{}", gib), None);
     }
 
     #[test]
