@@ -469,8 +469,7 @@ impl TrainingLoop {
         let Some(dist) = &self.distributed else {
             return Ok(stats);
         };
-        let loss = tokio::runtime::Handle::current()
-            .block_on(async { dist.sync_loss(stats.loss).await })?;
+        let loss = crate::distributed_bridge::block_on(dist.sync_loss(stats.loss))?;
         Ok(StepStats { loss, ..stats })
     }
 

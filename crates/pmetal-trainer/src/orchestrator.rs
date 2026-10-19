@@ -716,7 +716,20 @@ pub async fn run_training(
         let sync = crate::distributed_bridge::DistributedGradientSync::new(ctx, distributed_config);
         Some(sync)
     } else {
-        None
+        // A process MLX launched into a distributed group trains data-parallel
+        // over MLX's collectives, with no peers to name.
+        let sync = crate::distributed_bridge::DistributedGradientSync::from_mlx_group(
+            &pmetal_core::DistributedTrainingConfig::default(),
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to join the MLX distributed group: {e}"))?;
+        if let Some(sync) = &sync {
+            tracing::info!(
+                "Distributed training over MLX collectives: rank={}/{}",
+                sync.rank(),
+                sync.world_size()
+            );
+        }
+        sync
     };
 
     #[cfg(not(feature = "distributed"))]

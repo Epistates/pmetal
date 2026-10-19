@@ -126,7 +126,7 @@ impl TrainingLoop {
                 dist.rank(),
                 dist.world_size()
             );
-            tokio::runtime::Handle::current().block_on(async { dist.barrier().await })?;
+            crate::distributed_bridge::block_on(dist.barrier())?;
         }
 
         let first_epoch = self.epoch;
@@ -137,7 +137,7 @@ impl TrainingLoop {
             #[cfg(feature = "distributed")]
             if epoch > first_epoch {
                 if let Some(ref dist) = self.distributed {
-                    tokio::runtime::Handle::current().block_on(async { dist.barrier().await })?;
+                    crate::distributed_bridge::block_on(dist.barrier())?;
                 }
             }
 
@@ -373,8 +373,7 @@ impl TrainingLoop {
         // Data parallelism: every rank steps on the mean gradient.
         #[cfg(feature = "distributed")]
         if let Some(ref mut dist) = self.distributed {
-            tokio::runtime::Handle::current()
-                .block_on(async { dist.sync_gradients(&mut grads).await })?;
+            crate::distributed_bridge::block_on(dist.sync_gradients(&mut grads))?;
         }
 
         optimizer
