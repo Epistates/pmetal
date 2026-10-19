@@ -127,6 +127,9 @@ export interface TrainSpec {
   output_dir?: string;
   learning_rate?: number;
   embedding_lr?: number | null;
+  label_smoothing?: number;
+  z_loss?: number;
+  neftune_alpha?: number | null;
   batch_size?: number;
   epochs?: number;
   max_seq_len?: number;

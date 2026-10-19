@@ -142,6 +142,23 @@ pub struct TrainArgs {
     #[arg(long = "seed", default_value = "42")]
     pub seed: u64,
 
+    /// Label smoothing of the training loss, in [0, 1): the target is
+    /// 1 - epsilon on the label and epsilon spread over the vocabulary.
+    /// Evaluation reports the plain loss.
+    #[arg(long = "label-smoothing", default_value = "0.0")]
+    pub label_smoothing: f64,
+
+    /// Weight of the z-loss added to each token's loss, `weight * lse^2`
+    /// (PaLM; 1e-4 is the paper's value). 0 turns it off.
+    #[arg(long = "z-loss", default_value = "0.0")]
+    pub z_loss: f64,
+
+    /// NEFTune noise alpha: uniform noise of magnitude
+    /// `alpha / sqrt(seq_len * hidden)` on the token embeddings of every
+    /// training forward pass (5 for small models, 15 for larger ones).
+    #[arg(long = "neftune-alpha")]
+    pub neftune_alpha: Option<f64>,
+
     /// Use cut cross-entropy: the loss from fused Metal kernels that never
     /// hold the logits, with the backward's gradient filtering set to keep
     /// the gradient as precise as the full logits' (the library's

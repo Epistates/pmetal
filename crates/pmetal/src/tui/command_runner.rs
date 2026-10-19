@@ -662,6 +662,10 @@ async fn run_training_direct(
             seed: parse_arg(&spec.args, "--seed", 42u64)?,
             embedding_learning_rate: optional_arg(&spec.args, "--embedding-lr")
                 .and_then(|s| s.parse::<f64>().ok()),
+            label_smoothing: parse_arg(&spec.args, "--label-smoothing", 0.0f64)?,
+            z_loss: parse_arg(&spec.args, "--z-loss", 0.0f64)?,
+            neftune_noise_alpha: optional_arg(&spec.args, "--neftune-alpha")
+                .and_then(|s| s.parse::<f64>().ok()),
             lr_scheduler: parse_arg(
                 &spec.args,
                 "--lr-schedule",

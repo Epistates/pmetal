@@ -43,6 +43,10 @@ class TrainingConfig:
         max_grad_norm: float = 1.0,
         use_packing: bool = True,
         output_dir: str = "./output",
+        optimizer: str = "adamw",
+        label_smoothing: float = 0.0,
+        z_loss: float = 0.0,
+        neftune_noise_alpha: float | None = None,
     ) -> None: ...
     @property
     def learning_rate(self) -> float: ...
@@ -157,6 +161,9 @@ class OptimizerType:
     Sgd: ClassVar[OptimizerType]
     Adafactor: ClassVar[OptimizerType]
     Lion: ClassVar[OptimizerType]
+    Muon: ClassVar[OptimizerType]
+    AdamWScheduleFree: ClassVar[OptimizerType]
+    AdamW8bit: ClassVar[OptimizerType]
 
 
 class DatasetFormat:

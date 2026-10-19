@@ -219,7 +219,7 @@ def test_lr_scheduler_type_enum():
 
 
 def test_optimizer_type_enum():
-    for name in ("AdamW", "Sgd", "Adafactor", "Lion"):
+    for name in ("AdamW", "Sgd", "Adafactor", "Lion", "Muon", "AdamWScheduleFree", "AdamW8bit"):
         assert hasattr(pmetal.OptimizerType, name), f"OptimizerType.{name} missing"
 
 

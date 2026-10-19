@@ -60,6 +60,9 @@ pmetal train --config training.yaml
 | `--double-quant` | `false` | Pack `nf4`'s absmax values to 8 bits as well |
 | `--gradient-accumulation-steps` | `4` | Gradient accumulation steps |
 | `--embedding-lr` | None | Separate LR for embeddings |
+| `--label-smoothing` | `0.0` | Label smoothing of the training loss, in [0, 1); evaluation reports the plain loss |
+| `--z-loss` | `0.0` | Weight of the z-loss `weight * lse^2` added to each token's loss (PaLM; 1e-4 is the paper's value) |
+| `--neftune-alpha` | None | NEFTune noise alpha on the token embeddings of every training forward pass (5 for small models, 15 for larger) |
 | `--lr-schedule` | `cosine` | `constant`, `linear`, `cosine`, `cosine_with_restarts`, `polynomial`, `wsd` |
 | `--no-gradient-checkpointing` | `false` | Disable gradient checkpointing |
 | `--gradient-checkpointing-layers` | `4` | Layers per checkpoint block |

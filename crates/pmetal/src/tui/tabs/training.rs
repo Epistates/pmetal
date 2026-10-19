@@ -367,6 +367,17 @@ impl TrainingTab {
                 .parse()
                 .unwrap_or(TrainSpec::default().learning_rate),
             embedding_lr: self.form.value("Embedding LR").parse().ok(),
+            label_smoothing: self
+                .form
+                .value("Label Smoothing")
+                .parse()
+                .unwrap_or(TrainSpec::default().label_smoothing),
+            z_loss: self
+                .form
+                .value("Z-Loss")
+                .parse()
+                .unwrap_or(TrainSpec::default().z_loss),
+            neftune_alpha: self.form.value("NEFTune Alpha").parse().ok(),
             batch_size: self
                 .form
                 .value("Batch Size")

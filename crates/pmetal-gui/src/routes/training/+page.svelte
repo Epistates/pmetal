@@ -64,6 +64,9 @@
   let gradientCheckpointingLayers = $state(4);
   let sequencePacking = $state(true);
   let embeddingLr = $state(0.0);
+  let labelSmoothing = $state(0.0);
+  let zLoss = $state(0.0);
+  let neftuneAlpha = $state(0.0);
   let cutCrossEntropy = $state(false);
   let noAdaptiveLr = $state(false);
   let packMaxSeqLen = $state('');
@@ -268,6 +271,9 @@
           ? selectedTextColumns[0]
           : selectedTextColumns.length === 0 ? textColumn || undefined : undefined,
         embedding_lr: embeddingLr > 0 ? embeddingLr : undefined,
+        label_smoothing: labelSmoothing,
+        z_loss: zLoss,
+        neftune_alpha: neftuneAlpha > 0 ? neftuneAlpha : undefined,
         no_gradient_checkpointing: !gradientCheckpointing,
         gradient_checkpointing_layers: gradientCheckpointingLayers,
         cut_cross_entropy: cutCrossEntropy,
@@ -997,6 +1003,21 @@
                 <div>
                   <label class="label" for="embedding-lr">Embedding LR (0 = same as base)</label>
                   <input id="embedding-lr" type="number" class="input" step="0.00001" min="0" bind:value={embeddingLr} />
+                </div>
+                <div>
+                  <label class="label" for="label-smoothing">Label Smoothing</label>
+                  <input id="label-smoothing" type="number" class="input" step="0.01" min="0" max="0.99" bind:value={labelSmoothing} />
+                  <p class="text-xs text-surface-400 mt-0.5">0 = plain cross-entropy. Evaluation reports the plain loss.</p>
+                </div>
+                <div>
+                  <label class="label" for="z-loss">Z-Loss</label>
+                  <input id="z-loss" type="number" class="input" step="0.00001" min="0" max="1" bind:value={zLoss} />
+                  <p class="text-xs text-surface-400 mt-0.5">Keeps the softmax normalizer near 1. 1e-4 is PaLM's value.</p>
+                </div>
+                <div>
+                  <label class="label" for="neftune-alpha">NEFTune Alpha (0 = off)</label>
+                  <input id="neftune-alpha" type="number" class="input" step="0.5" min="0" max="100" bind:value={neftuneAlpha} />
+                  <p class="text-xs text-surface-400 mt-0.5">Embedding noise: 5 for small models, 15 for larger.</p>
                 </div>
                 <div>
                   <label class="label" for="ckpt-layers">Checkpoint Layers</label>

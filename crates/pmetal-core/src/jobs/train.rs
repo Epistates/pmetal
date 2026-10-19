@@ -78,6 +78,38 @@ pub struct TrainSpec {
     pub embedding_lr: Option<f64>,
 
     #[job(
+        label = "Label Smoothing",
+        group = "Loss",
+        argv = "--label-smoothing",
+        min = 0.0,
+        max = 0.99,
+        default_float = 0.0
+    )]
+    #[serde(default)]
+    pub label_smoothing: f64,
+
+    #[job(
+        label = "Z-Loss",
+        group = "Loss",
+        argv = "--z-loss",
+        min = 0.0,
+        max = 1.0,
+        default_float = 0.0
+    )]
+    #[serde(default)]
+    pub z_loss: f64,
+
+    #[job(
+        label = "NEFTune Alpha",
+        group = "Loss",
+        argv = "--neftune-alpha",
+        min = 0.1,
+        max = 100.0
+    )]
+    #[serde(default)]
+    pub neftune_alpha: Option<f64>,
+
+    #[job(
         label = "Batch Size",
         group = "Training",
         argv = "--batch-size",
@@ -420,6 +452,9 @@ impl Default for TrainSpec {
             output_dir: default_train_output_dir(),
             learning_rate: default_lr(),
             embedding_lr: None,
+            label_smoothing: 0.0,
+            z_loss: 0.0,
+            neftune_alpha: None,
             batch_size: default_batch_size(),
             epochs: default_epochs(),
             max_seq_len: 0,
@@ -487,6 +522,9 @@ impl TrainSpec {
         Ok(TrainingConfig {
             learning_rate: self.learning_rate,
             embedding_learning_rate: self.embedding_lr,
+            label_smoothing: self.label_smoothing,
+            z_loss: self.z_loss,
+            neftune_noise_alpha: self.neftune_alpha,
             batch_size: self.batch_size,
             gradient_accumulation_steps: self.gradient_accumulation_steps,
             num_epochs: self.epochs,
@@ -741,6 +779,33 @@ mod tests {
         assert_eq!(distributed.peers, ["a:1", "b:2"]);
         assert_eq!(distributed.compression, DistributedCompression::TopK);
         assert!(TrainSpec::default().distributed_config().unwrap().is_none());
+    }
+
+    /// The loss options reach the training config and the command line the
+    /// spec spells, and a value the trainer would refuse is caught by the
+    /// config's own validation.
+    #[test]
+    fn the_loss_options_reach_the_config_and_the_command_line() {
+        let spec = TrainSpec {
+            label_smoothing: 0.1,
+            z_loss: 1e-4,
+            neftune_alpha: Some(5.0),
+            ..Default::default()
+        };
+        let training = spec.training_config().unwrap();
+        assert_eq!(training.label_smoothing, 0.1);
+        assert_eq!(training.z_loss, 1e-4);
+        assert_eq!(training.neftune_noise_alpha, Some(5.0));
+        let argv = spec.to_argv().join(" ");
+        assert!(argv.contains("--label-smoothing 0.1"), "{argv}");
+        assert!(argv.contains("--z-loss 0.0001"), "{argv}");
+        assert!(argv.contains("--neftune-alpha 5"), "{argv}");
+
+        let too_smooth = TrainSpec {
+            label_smoothing: 1.5,
+            ..Default::default()
+        };
+        assert!(crate::ConfigValidator::validate(&too_smooth.training_config().unwrap()).is_err());
     }
 
     #[test]
