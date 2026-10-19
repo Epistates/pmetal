@@ -579,20 +579,11 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
 
         #[cfg(feature = "lora")]
         Commands::Fuse(args) => {
-            let crate::cli::fuse::FuseArgs {
-                model,
-                lora,
-                output,
-                alpha,
-                rank,
-                accurate,
-                low_memory,
-            } = args;
-            if accurate {
-                commands::fuse::run_fuse_accurate(&model, &lora, &output, low_memory).await?;
-            } else {
-                commands::fuse::run_fuse(&model, &lora, &output, alpha, rank).await?;
-            }
+            use pmetal_core::jobs::FuseSpec;
+            let mut spec = FuseSpec::from(args);
+            spec.normalize()
+                .map_err(|errors| commands::invalid_spec::<FuseSpec>(&errors))?;
+            commands::fuse::run_fuse(spec).await?;
         }
 
         Commands::Quantize(args) => {
@@ -626,7 +617,13 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 if let Some(lora_path) = &lora {
                     // Fuse LoRA first, then quantize the fused model
                     let fused_dir = format!("{output}.fused_tmp");
-                    commands::fuse::run_fuse(&model, lora_path, &fused_dir, None, None).await?;
+                    commands::fuse::run_fuse(pmetal_core::jobs::FuseSpec {
+                        model: model.clone(),
+                        lora: lora_path.clone(),
+                        output: fused_dir.clone(),
+                        ..Default::default()
+                    })
+                    .await?;
                     commands::quantize::run_quantization(
                         &fused_dir,
                         &output,

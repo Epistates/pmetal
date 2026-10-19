@@ -655,41 +655,6 @@ async fn run_grpo_direct(
     .await
 }
 
-fn optional_arg(args: &[String], flag: &str) -> Option<String> {
-    args.windows(2)
-        .find(|window| window[0] == flag)
-        .map(|window| window[1].clone())
-}
-
-fn required_arg(args: &[String], flag: &str) -> Result<String, anyhow::Error> {
-    optional_arg(args, flag).ok_or_else(|| anyhow::anyhow!("Missing required argument: {flag}"))
-}
-
-fn has_flag(args: &[String], flag: &str) -> bool {
-    args.iter().any(|arg| arg == flag)
-}
-
-/// Parse an optional typed argument — returns `None` when the flag is absent.
-fn parse_opt_arg<T>(args: &[String], flag: &str) -> Option<T>
-where
-    T: std::str::FromStr,
-{
-    optional_arg(args, flag).and_then(|v| v.parse::<T>().ok())
-}
-
-fn parse_arg<T>(args: &[String], flag: &str, default: T) -> Result<T, anyhow::Error>
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
-{
-    match optional_arg(args, flag) {
-        Some(value) => value
-            .parse::<T>()
-            .map_err(|e| anyhow::anyhow!("Invalid value for {flag}: {e}")),
-        None => Ok(default),
-    }
-}
-
 /// Parse inference stats from a line like "Generated 42 tokens in 1.23s (34.1 tok/s)"
 fn parse_inference_stats(line: &str) -> (usize, f64) {
     let mut total_tokens = 0usize;
