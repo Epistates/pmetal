@@ -112,6 +112,21 @@ pub trait SpecTool: Send + Sync {
 /// value that the spec itself cannot know (what a server may expose, say).
 pub type SpecCheck = fn(&Map<String, Value>) -> Result<(), String>;
 
+/// The spec field that names the file step metrics are written to.
+const LOG_METRICS: &str = "log_metrics";
+
+/// Docs for the spec fields that several specs have and no descriptor shows.
+fn shared_doc(field: &str) -> Option<&'static str> {
+    match field {
+        "resume" => Some("Resume from the latest checkpoint in the output directory"),
+        LOG_METRICS => Some(
+            "Write per-step metrics as JSONL to this file (default: metrics.jsonl in the output \
+             directory)",
+        ),
+        _ => None,
+    }
+}
+
 /// What distinguishes one generated tool from another.
 pub struct SpecToolConfig {
     pub name: &'static str,
@@ -126,9 +141,6 @@ pub struct SpecToolConfig {
     /// of strings, with comma-separated entries.
     pub extra_path_fields: &'static [&'static str],
     pub check: Option<SpecCheck>,
-    /// The command writes step metrics to `--log-metrics <file>` but its spec
-    /// does not model the flag, so the server adds it.
-    pub adds_log_metrics: bool,
 }
 
 impl SpecToolConfig {
@@ -146,7 +158,6 @@ impl SpecToolConfig {
             extra_docs: &[],
             extra_path_fields: &[],
             check: None,
-            adds_log_metrics: false,
         }
     }
 
@@ -165,12 +176,6 @@ impl SpecToolConfig {
     #[must_use]
     pub const fn check(mut self, check: SpecCheck) -> Self {
         self.check = Some(check);
-        self
-    }
-
-    #[must_use]
-    pub const fn log_metrics(mut self) -> Self {
-        self.adds_log_metrics = true;
         self
     }
 }
@@ -198,6 +203,10 @@ impl<S: Spec> SpecEntry<S> {
 
     /// Whether a field names a model, a dataset or a path.
     fn path_role(&self, name: &str) -> Option<PathRole> {
+        // The metrics file a training spec may name.
+        if name == LOG_METRICS {
+            return Some(PathRole::Path);
+        }
         if let Some(d) = S::field_descriptors().iter().find(|d| d.name == name) {
             match d.kind {
                 FieldKind::Path => return Some(PathRole::Path),
@@ -270,12 +279,15 @@ impl<S: Spec> SpecEntry<S> {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
+        let metrics_field = Self::descriptor_for_flag("--log-metrics")
+            .map(|d| d.name)
+            .or_else(|| fields.contains_key(LOG_METRICS).then_some(LOG_METRICS));
         let mut metrics_file = None;
-        if let (Some(d), Some(dir)) = (Self::descriptor_for_flag("--log-metrics"), &output) {
-            match fields.get(d.name).and_then(Value::as_str) {
+        if let (Some(name), Some(dir)) = (metrics_field, &output) {
+            match fields.get(name).and_then(Value::as_str) {
                 None | Some("") => {
                     let file = dir.join("metrics.jsonl");
-                    fields.insert(d.name.into(), Value::String(file.display().to_string()));
+                    fields.insert(name.into(), Value::String(file.display().to_string()));
                     metrics_file = Some(file);
                 }
                 Some(given) => metrics_file = Some(PathBuf::from(given)),
@@ -289,15 +301,7 @@ impl<S: Spec> SpecEntry<S> {
         let mut spec: S = serde_json::from_value(value.clone())
             .map_err(|e| McpError::internal(format!("a spec did not round-trip: {e}")))?;
         spec.normalize_spec().map_err(field_errors)?;
-        let mut argv = spec.to_argv();
-        if self.config.adds_log_metrics && metrics_file.is_none() {
-            if let Some(dir) = &output {
-                let file = dir.join("metrics.jsonl");
-                argv.push("--log-metrics".into());
-                argv.push(file.display().to_string());
-                metrics_file = Some(file);
-            }
-        }
+        let argv = spec.to_argv();
         Ok(Prepared {
             subcommand: S::subcommand(),
             argv,
@@ -327,7 +331,8 @@ impl<S: Spec> SpecEntry<S> {
                 .extra_docs
                 .iter()
                 .find(|(field, _)| field == name)
-                .map(|(_, doc)| *doc);
+                .map(|(_, doc)| *doc)
+                .or_else(|| shared_doc(name));
             let mut schema = match default {
                 Value::Bool(_) => json!({"type": "boolean"}),
                 Value::Number(_) => json!({"type": "number"}),

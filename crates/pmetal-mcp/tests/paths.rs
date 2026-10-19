@@ -23,6 +23,30 @@ async fn an_output_directory_outside_the_roots_is_refused_before_anything_runs()
     assert!(!h.dir.join("ran").exists(), "a job was started anyway");
 }
 
+/// The metrics file is a path the client names, so it is held to the roots as
+/// the output directory is.
+#[tokio::test]
+async fn a_metrics_file_outside_the_roots_is_refused_before_anything_runs() {
+    let h = Harness::new("touch \"$(dirname \"$0\")/ran\"");
+    let mut train = train_args(&h);
+    train["log_metrics"] = json!("/etc/pmetal-metrics.jsonl");
+    let distill = json!({
+        "teacher": "Qwen/Qwen3-4B",
+        "student": "Qwen/Qwen3-0.6B",
+        "dataset": h.path("d.jsonl"),
+        "output_dir": h.path("out"),
+        "log_metrics": "/etc/pmetal-metrics.jsonl",
+    });
+    for (tool, args) in [("train", train), ("distill", distill)] {
+        let message = h.call_err(tool, args).await;
+        assert!(
+            message.contains("log_metrics") && message.contains("outside the directories"),
+            "{tool}: {message}"
+        );
+    }
+    assert!(!h.dir.join("ran").exists(), "a job was started anyway");
+}
+
 #[tokio::test]
 async fn a_dataset_or_adapter_outside_the_roots_is_refused() {
     let h = Harness::new("exit 0");

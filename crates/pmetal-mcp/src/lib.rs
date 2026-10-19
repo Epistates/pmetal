@@ -102,7 +102,6 @@ macro_rules! spec_tool {
             extra_docs: $docs,
             extra_path_fields: $paths,
             check: $check,
-            adds_log_metrics: false,
         })) as Box<dyn SpecTool>
     };
 }
@@ -149,8 +148,7 @@ pub fn spec_tool_list() -> Vec<Box<dyn SpecTool>> {
                 ("config_path", "YAML config file to load defaults from"),
                 ("resume", "Resume from the latest checkpoint in the output directory"),
             ])
-            .paths(&["config_path"])
-            .log_metrics(),
+            .paths(&["config_path"]),
         )) as Box<dyn SpecTool>,
         spec_tool!(
             PretrainSpec, "pretrain",
