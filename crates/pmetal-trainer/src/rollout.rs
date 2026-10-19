@@ -3,7 +3,7 @@
 //!
 //! The completions of a prompt are decoded together as one batch with the
 //! prompt prefilled once (see
-//! [`BatchedRlGenerator`](pmetal_models::rl_generation::BatchedRlGenerator)),
+//! [`BatchedRlGenerator`]),
 //! on the model's KV cache, through the runtime's one decode sampler.
 
 use pmetal_lora::TrainableModel;
