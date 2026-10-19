@@ -306,6 +306,14 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             commands::download::run_upload(args).await?;
         }
 
+        Commands::Verify(args) => {
+            commands::verify::run_verify(args)?;
+        }
+
+        Commands::Completions(args) => {
+            commands::completions::run_completions(args.shell);
+        }
+
         Commands::PackExperts(args) => {
             let crate::cli::pack_experts::PackExpertsArgs {
                 model,

@@ -158,3 +158,28 @@ pub struct SearchArgs {
     #[arg(long, value_enum, default_value_t = SortArg::Downloads)]
     pub sort: SortArg,
 }
+
+/// Check that a model directory is complete: every weight file there and as
+/// long as its header says, a readable config. Exits with status 1 when it is
+/// not.
+#[derive(Args, Debug, Clone)]
+pub struct VerifyArgs {
+    /// A model directory, or a Hub model ID with a copy in the Hub cache
+    pub model: String,
+
+    /// Output the report as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Print the shell completion script for pmetal.
+///
+/// Install it where your shell reads completions, for example
+/// `pmetal completions zsh > ~/.zfunc/_pmetal` or
+/// `pmetal completions bash > /usr/local/etc/bash_completion.d/pmetal`.
+#[derive(Args, Debug, Clone)]
+pub struct CompletionsArgs {
+    /// The shell to generate for
+    #[arg(value_enum)]
+    pub shell: clap_complete::Shell,
+}

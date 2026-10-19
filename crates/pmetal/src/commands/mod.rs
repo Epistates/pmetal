@@ -2,6 +2,7 @@
 pub(crate) mod bench;
 #[cfg(feature = "distributed")]
 pub(crate) mod cluster;
+pub(crate) mod completions;
 pub(crate) mod dataset;
 pub(crate) mod decide;
 pub(crate) mod dflash;
@@ -40,6 +41,7 @@ pub(crate) mod train_diffusion;
 pub(crate) mod train_draft;
 #[cfg(feature = "trainer")]
 pub(crate) mod train_mtp;
+pub(crate) mod verify;
 #[cfg(feature = "vocoder")]
 pub(crate) mod vocode;
 

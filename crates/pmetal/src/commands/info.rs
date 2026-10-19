@@ -21,6 +21,7 @@ pub(crate) async fn run_info(json_output: bool) -> anyhow::Result<()> {
             "metallib_sha256": crate::EMBEDDED_METALLIB_SHA256
                 .or(pmetal_runtime::metallib::BUILT_SHA256),
         });
+        obj["environment"] = environment_json();
         println!("{}", serde_json::to_string_pretty(&obj)?);
     } else {
         println!("PMetal Device Information");
@@ -42,8 +43,65 @@ pub(crate) async fn run_info(json_output: bool) -> anyhow::Result<()> {
             "MLX Metallib:   {}",
             metallib_in_use().unwrap_or_else(|| "MLX's default search".to_string())
         );
+        for line in environment_lines() {
+            println!("{line}");
+        }
     }
     Ok(())
+}
+
+/// Where this build keeps and finds things, and what it was built with: what
+/// a bug report needs besides the device.
+struct Environment {
+    hub_cache: std::path::PathBuf,
+    hub_offline: bool,
+    log_dir: std::path::PathBuf,
+    features: Vec<&'static str>,
+}
+
+fn environment() -> Environment {
+    let mut features = Vec::new();
+    for (name, on) in [
+        ("ane", cfg!(feature = "ane")),
+        ("distributed", cfg!(feature = "distributed")),
+        ("vocoder", cfg!(feature = "vocoder")),
+        ("serve", cfg!(feature = "serve")),
+        ("mcp", cfg!(feature = "mcp")),
+        ("dashboard", cfg!(feature = "dashboard")),
+    ] {
+        if on {
+            features.push(name);
+        }
+    }
+    Environment {
+        hub_cache: pmetal_hub::cache_dir(),
+        hub_offline: pmetal_hub::HubOptions::default().is_offline(),
+        log_dir: crate::pmetal_log_dir(),
+        features,
+    }
+}
+
+fn environment_json() -> serde_json::Value {
+    let env = environment();
+    serde_json::json!({
+        "hub_cache": env.hub_cache.display().to_string(),
+        "hub_offline": env.hub_offline,
+        "log_dir": env.log_dir.display().to_string(),
+        "features": env.features,
+    })
+}
+
+fn environment_lines() -> Vec<String> {
+    let env = environment();
+    vec![
+        format!("Hub Cache:      {}", env.hub_cache.display()),
+        format!(
+            "Hub Offline:    {}",
+            if env.hub_offline { "yes" } else { "no" }
+        ),
+        format!("Logs:           {}", env.log_dir.display()),
+        format!("Features:       {}", env.features.join(", ")),
+    ]
 }
 
 /// The `mlx.metallib` MLX loads its kernels from (`main` chose it).
@@ -216,6 +274,21 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn the_environment_names_the_cache_the_logs_and_the_build() {
+        let lines = environment_lines();
+        for label in ["Hub Cache:", "Hub Offline:", "Logs:", "Features:"] {
+            assert!(
+                lines.iter().any(|l| l.starts_with(label)),
+                "no {label}: {lines:?}"
+            );
+        }
+        let json = environment_json();
+        assert!(json["hub_cache"].as_str().is_some_and(|p| !p.is_empty()));
+        assert!(json["hub_offline"].is_boolean());
+        assert!(json["features"].is_array());
+    }
 
     fn test_properties() -> DeviceProperties {
         DeviceProperties {

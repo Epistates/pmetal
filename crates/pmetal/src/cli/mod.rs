@@ -99,6 +99,12 @@ pub enum Commands {
     /// Publish a model directory to HuggingFace (creates the repo if needed)
     Upload(hub::UploadArgs),
 
+    /// Check that a model directory is complete and undamaged
+    Verify(hub::VerifyArgs),
+
+    /// Print the shell completion script (bash, zsh, fish, elvish, powershell)
+    Completions(hub::CompletionsArgs),
+
     /// Search HuggingFace Hub for models and show device fit
     Search(hub::SearchArgs),
 
@@ -393,6 +399,8 @@ impl Commands {
             Commands::Init { .. } => false,
             Commands::Download(_)
             | Commands::Upload(_)
+            | Commands::Verify(_)
+            | Commands::Completions(_)
             | Commands::Search(_)
             | Commands::Dataset { .. }
             | Commands::Tokenize(_) => false,
