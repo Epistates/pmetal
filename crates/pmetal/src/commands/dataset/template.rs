@@ -307,7 +307,7 @@ pub(super) async fn prepare(
     let mut train_out = JsonlWriter::create(&train_path, "dataset prepare output")?;
     let mut val_out = JsonlWriter::create(&val_path, "dataset prepare output")?;
 
-    println!("[1/4] Loading the tokenizer and chat template...");
+    println!("[1/4] Tokenizer and chat template");
     let model_text = ModelText::load(&model).await?;
     let TemplateChoice { template, label } = choose_template(name, Some(&model_text))?;
     println!("  Template: {label}");
