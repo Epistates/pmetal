@@ -127,6 +127,16 @@ impl AdamW {
         self.inner.lr()
     }
 
+    /// The f32 master copies of the half-precision parameters that have taken
+    /// a step, by parameter name. A checkpoint that resumes such a run exactly
+    /// needs them: the parameters hold only the rounded weights.
+    pub fn master_weights(&self) -> impl Iterator<Item = (&str, &Array)> {
+        self.inner
+            .states
+            .iter()
+            .filter_map(|(key, state)| state.master.value().map(|m| (key.as_str(), m)))
+    }
+
     /// Restore optimizer state from a checkpoint.
     ///
     /// Sets the step counter and populates both the public `state` map and

@@ -22,7 +22,7 @@ pub struct GrpoArgs {
     pub num_generations: usize,
 
     /// KL penalty coefficient (beta)
-    #[arg(long = "beta", default_value = "0.001")]
+    #[arg(long = "beta", default_value = "0.0")]
     pub beta: f64,
 
     /// Learning rate

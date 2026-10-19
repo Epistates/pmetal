@@ -21,8 +21,10 @@ pub struct EmbedTrainArgs {
     #[arg(long = "loss", default_value = "info_nce")]
     pub loss: String,
 
-    /// Pooling strategy for sentence embeddings.
-    #[arg(long = "pooling", default_value = "mean")]
+    /// Pooling strategy for sentence embeddings; `auto` reads the pooling the
+    /// model was trained with (its sentence-transformers configuration), mean
+    /// without one.
+    #[arg(long = "pooling", default_value = "auto")]
     pub pooling: String,
 
     /// Temperature for InfoNCE, and 1/scale for CoSENT (0.05 is CoSENT's
@@ -46,7 +48,8 @@ pub struct EmbedTrainArgs {
     #[arg(long = "epochs", default_value = "3")]
     pub epochs: usize,
 
-    /// Maximum input sequence length.
+    /// Maximum input sequence length (capped at the model's own
+    /// `max_seq_length` when it declares one).
     #[arg(long = "max-seq-len", default_value = "512")]
     pub max_seq_len: usize,
 
@@ -65,4 +68,17 @@ pub struct EmbedTrainArgs {
     /// Random seed for dataset shuffling.
     #[arg(long = "seed", default_value = "42")]
     pub seed: u64,
+
+    /// Train LoRA adapters on every linear layer and save them as an adapter,
+    /// instead of fine-tuning the whole encoder.
+    #[arg(long = "lora")]
+    pub lora: bool,
+
+    /// LoRA rank (with --lora).
+    #[arg(long = "lora-r", default_value = "16")]
+    pub lora_r: usize,
+
+    /// LoRA alpha (with --lora).
+    #[arg(long = "lora-alpha", default_value = "32.0")]
+    pub lora_alpha: f32,
 }

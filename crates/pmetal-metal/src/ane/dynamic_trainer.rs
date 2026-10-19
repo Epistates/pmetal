@@ -332,6 +332,9 @@ struct LayerWeights {
     w3_t: Vec<f32>,
 }
 
+/// A weight's checkpoint name, its two Adam moments and its shape.
+type AdamEntry<'a> = (String, &'a mut Vec<f32>, &'a mut Vec<f32>, Vec<usize>);
+
 /// Adam state for a single parameter.
 struct AdamParam {
     m: Vec<f32>,
@@ -504,6 +507,10 @@ pub struct DynamicAneTrainer {
     rms_final_grad: Vec<f32>,
     rms_final_adam: AdamParam,
     adam_t: usize,
+    /// The learning rate the last optimizer step used.
+    last_lr: f32,
+    /// Positions that counted in the last batch's loss.
+    last_batch_tokens: usize,
     compile_count: usize,
     /// GPU dW GEMM dispatcher (None if dim < GPU_DW_MIN_DIM or Metal init fails).
     gpu_dw: Option<DwGemm>,
@@ -750,6 +757,8 @@ impl DynamicAneTrainer {
             rms_final_grad: vec![0.0; d],
             rms_final_adam: AdamParam::new(d),
             adam_t: 0,
+            last_lr: 0.0,
+            last_batch_tokens: 0,
             compile_count: 0,
             gpu_dw,
             dw_scratch,
@@ -781,6 +790,25 @@ impl DynamicAneTrainer {
     /// Current Adam step count.
     pub fn adam_t(&self) -> usize {
         self.adam_t
+    }
+
+    /// The learning rate the last optimizer step used, from the schedule
+    /// (warmup, cosine decay) rather than the configured peak; 0 before the
+    /// first step.
+    pub fn last_learning_rate(&self) -> f32 {
+        self.last_lr
+    }
+
+    /// The learning rate the next optimizer step will use in a run of
+    /// `max_steps`.
+    pub fn next_learning_rate(&self, max_steps: usize) -> f32 {
+        self.get_lr(self.adam_t + 1, max_steps)
+    }
+
+    /// How many positions counted in the last batch's loss (its targets that
+    /// were not [`IGNORE_TARGET`]).
+    pub fn last_batch_tokens(&self) -> usize {
+        self.last_batch_tokens
     }
 
     /// Number of ANE compilations performed (should be 9+ after compile_kernels).
@@ -2132,6 +2160,22 @@ impl DynamicAneTrainer {
         target_tokens: &[u16],
         batch: &mut Option<BatchedCommandBuffer>,
     ) -> Result<f32> {
+        self.train_step_weighted(input_tokens, target_tokens, batch, 1.0)
+            .map(|(loss, _)| loss)
+    }
+
+    /// [`Self::train_step`] with the sequence's gradient weighted by `weight`:
+    /// the loss is the sequence's own mean, so `train_batch` weights each
+    /// sequence by its share of the batch's counted tokens to make the update
+    /// the gradient of the mean over *tokens*, not over sequences. Returns the
+    /// sequence's mean loss and how many positions counted.
+    fn train_step_weighted(
+        &mut self,
+        input_tokens: &[u16],
+        target_tokens: &[u16],
+        batch: &mut Option<BatchedCommandBuffer>,
+        weight: f32,
+    ) -> Result<(f32, usize)> {
         let d = self.config.dim;
         let s = self.config.seq_len;
 
@@ -2176,7 +2220,7 @@ impl DynamicAneTrainer {
         // installed (always, from the CLI), which isn't the cross-entropy the
         // model is trained on: the loss read far too low, and the logits of
         // every token absent from the data went unpenalized.
-        let (loss, mut dx) = {
+        let (loss, tokens, mut dx) = {
             let v = self.config.vocab_size;
 
             let mut logits = vec![0.0f32; v * s];
@@ -2194,13 +2238,16 @@ impl DynamicAneTrainer {
             );
 
             let mut dlogits = vec![0.0f32; v * s];
-            let grad_scale = self.grad_scale();
-            let loss = self
-                .loss_fn
-                .as_mut()
-                .unwrap()
-                .compute(&logits, &targets, v, s, grad_scale, &mut dlogits)
-                .loss;
+            let grad_scale = self.grad_scale() * weight;
+            let output = self.loss_fn.as_mut().unwrap().compute(
+                &logits,
+                &targets,
+                v,
+                s,
+                grad_scale,
+                &mut dlogits,
+            );
+            let (loss, tokens) = (output.loss, output.tokens);
 
             let mut dx = vec![0.0f32; d * s];
             accelerate::gemm(
@@ -2230,7 +2277,7 @@ impl DynamicAneTrainer {
                 true,
             );
 
-            (loss, dx)
+            (loss, tokens, dx)
         };
 
         // Final RMSNorm backward
@@ -2257,7 +2304,7 @@ impl DynamicAneTrainer {
         // Embedding backward (scatter: stays CPU, sparse op)
         accelerate::embed_backward(&mut self.embed_grad, &dx, &inputs, d, s);
 
-        Ok(loss)
+        Ok((loss, tokens))
     }
 
     /// The factor the gradient carries through the backward pass, undone on
@@ -2303,9 +2350,19 @@ impl DynamicAneTrainer {
 
         // Accumulate gradients
         let steps = data.len().min(self.config.accum_steps);
-        let mut total_loss = 0.0f32;
+        // The loss and the gradient are means over the batch's *tokens*: each
+        // sequence carries its own mean, so it is weighted by its share of the
+        // counted positions (a sequence padded with ignored targets counts for
+        // less), not averaged equally with the rest.
+        let counted: Vec<usize> = data
+            .iter()
+            .take(steps)
+            .map(|(_, target)| target.iter().filter(|&&t| t != IGNORE_TARGET).count())
+            .collect();
+        let batch_tokens: usize = counted.iter().sum();
+        let mut weighted_loss = 0.0f64;
 
-        for (input, target) in data.iter().take(steps) {
+        for ((input, target), &tokens) in data.iter().take(steps).zip(&counted) {
             // The previous step's batch has executed (or was dropped unrun), so
             // the operands staged for it are free to be overwritten.
             if let Some(scratch) = &self.dw_scratch {
@@ -2320,8 +2377,15 @@ impl DynamicAneTrainer {
                 None
             };
 
-            let loss = self.train_step(input, target, &mut batch)?;
-            total_loss += loss;
+            // The accumulated gradient is divided by `steps` below, so a
+            // weight of `steps · n_i / N` makes it Σ (n_i / N) · g_i.
+            let weight = if batch_tokens == 0 {
+                1.0
+            } else {
+                steps as f32 * tokens as f32 / batch_tokens as f32
+            };
+            let (loss, _) = self.train_step_weighted(input, target, &mut batch, weight)?;
+            weighted_loss += f64::from(loss) * tokens as f64;
 
             // Execute all encoded dW GEMMs for this step (single GPU-CPU sync)
             if let Some(b) = batch {
@@ -2390,6 +2454,7 @@ impl DynamicAneTrainer {
         self.adam_t += 1;
         let t = self.adam_t;
         let lr = self.get_lr(t, max_steps);
+        self.last_lr = lr;
         // Embedding uses a separate LR if configured (prevents divergence
         // from sparse token updates and magnitude drift through many layers)
         let embed_lr = self.config.embedding_lr.unwrap_or(lr);
@@ -2473,7 +2538,12 @@ impl DynamicAneTrainer {
         // Record total step time
         self.last_timings.total_us = step_start.elapsed().as_micros() as u64;
 
-        Ok(total_loss / steps as f32)
+        self.last_batch_tokens = batch_tokens;
+        Ok(if batch_tokens == 0 {
+            0.0
+        } else {
+            (weighted_loss / batch_tokens as f64) as f32
+        })
     }
 
     /// Load weights from flat f32 arrays (llama2.c format).
@@ -2524,8 +2594,6 @@ impl DynamicAneTrainer {
     /// learning rates this trainer uses are below bf16's precision for
     /// weights of typical size, so a bf16 file would round most of them away.
     pub fn save_safetensors(&self, path: &std::path::Path) -> Result<()> {
-        use safetensors::{Dtype, tensor::TensorView};
-
         let (d, h) = (self.config.dim, self.config.hidden_dim);
         let (qd, kvd) = (self.kernel_config.q_dim(), self.kernel_config.kv_dim());
         let v = self.config.vocab_size;
@@ -2553,30 +2621,109 @@ impl DynamicAneTrainer {
             }
         }
 
-        let views = tensors
-            .iter()
-            .map(|(name, data, shape)| {
-                let bytes: &[u8] = zerocopy::IntoBytes::as_bytes(*data);
-                TensorView::new(Dtype::F32, shape.clone(), bytes)
-                    .map(|view| (name.as_str(), view))
-                    .map_err(|e| MetalError::InvalidConfig(format!("tensor {name}: {e}")))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let metadata = std::collections::HashMap::from([("format".to_string(), "pt".to_string())]);
-        // Written beside the destination and renamed over it, so a run killed
-        // mid-write (or a full disk) leaves the previous checkpoint intact.
-        let name = path.file_name().map_or_else(
-            || "checkpoint".into(),
-            |name| name.to_string_lossy().into_owned(),
+        write_f32_safetensors(&tensors, path)
+    }
+
+    /// The Adam moments of every weight, under the weight's checkpoint name,
+    /// with its shape: the order [`Self::save_safetensors`] writes weights in.
+    fn adam_tensors_mut(&mut self) -> Vec<AdamEntry<'_>> {
+        fn push<'a>(
+            out: &mut Vec<AdamEntry<'a>>,
+            name: String,
+            p: &'a mut AdamParam,
+            shape: Vec<usize>,
+        ) {
+            let AdamParam { m, v } = p;
+            out.push((name, m, v, shape));
+        }
+        let (d, h) = (self.config.dim, self.config.hidden_dim);
+        let (qd, kvd) = (self.kernel_config.q_dim(), self.kernel_config.kv_dim());
+        let v = self.config.vocab_size;
+        let mut out: Vec<AdamEntry<'_>> = Vec::new();
+        push(
+            &mut out,
+            "model.embed_tokens.weight".into(),
+            &mut self.embed_adam,
+            vec![v, d],
         );
-        let partial = path.with_file_name(format!(".{name}.partial"));
-        let written = safetensors::serialize_to_file(views, Some(metadata), &partial)
-            .map_err(|e| e.to_string())
-            .and_then(|()| std::fs::rename(&partial, path).map_err(|e| e.to_string()));
-        written.map_err(|e| {
-            let _ = std::fs::remove_file(&partial);
-            MetalError::InvalidConfig(format!("Failed to write {}: {e}", path.display()))
-        })
+        push(
+            &mut out,
+            "model.norm.weight".into(),
+            &mut self.rms_final_adam,
+            vec![d],
+        );
+        for (l, la) in self.layer_adam.iter_mut().enumerate() {
+            for (name, param, shape) in [
+                ("self_attn.q_proj.weight", &mut la.wq, vec![qd, d]),
+                ("self_attn.k_proj.weight", &mut la.wk, vec![kvd, d]),
+                ("self_attn.v_proj.weight", &mut la.wv, vec![kvd, d]),
+                ("self_attn.o_proj.weight", &mut la.wo, vec![d, qd]),
+                ("mlp.gate_proj.weight", &mut la.w1, vec![h, d]),
+                ("mlp.down_proj.weight", &mut la.w2, vec![d, h]),
+                ("mlp.up_proj.weight", &mut la.w3, vec![h, d]),
+                ("input_layernorm.weight", &mut la.rms_att, vec![d]),
+                ("post_attention_layernorm.weight", &mut la.rms_ffn, vec![d]),
+            ] {
+                push(&mut out, format!("model.layers.{l}.{name}"), param, shape);
+            }
+        }
+        out
+    }
+
+    /// Write the optimizer's state to `dir`: `optimizer.safetensors` (each
+    /// weight's first and second moments as `<name>.__m` and `<name>.__v`)
+    /// and `optimizer.json` (the Adam step count, which sets the bias
+    /// correction and the learning-rate schedule's position). With the
+    /// weights this is what a resumed run needs to continue as the
+    /// uninterrupted one would; resumed from the weights alone, Adam restarts
+    /// cold.
+    pub fn save_optimizer_state(&mut self, dir: &std::path::Path) -> Result<()> {
+        let adam_t = self.adam_t;
+        let tensors = self.adam_tensors_mut();
+        let named: Vec<(String, &[f32], Vec<usize>)> = tensors
+            .iter()
+            .flat_map(|(name, m, v, shape)| {
+                [
+                    (format!("{name}.__m"), m.as_slice(), shape.clone()),
+                    (format!("{name}.__v"), v.as_slice(), shape.clone()),
+                ]
+            })
+            .collect();
+        write_f32_safetensors(&named, &dir.join("optimizer.safetensors"))?;
+        std::fs::write(
+            dir.join("optimizer.json"),
+            serde_json::json!({ "adam_t": adam_t }).to_string(),
+        )
+        .map_err(|e| MetalError::InvalidConfig(format!("Failed to write optimizer.json: {e}")))
+    }
+
+    /// Restore the state [`Self::save_optimizer_state`] wrote to `dir`. A file
+    /// that is missing, or a tensor that is missing or the wrong size, is an
+    /// error naming it: Adam moments of zeros would silently restart the run.
+    pub fn load_optimizer_state(&mut self, dir: &std::path::Path) -> Result<()> {
+        let state_path = dir.join("optimizer.json");
+        let state: serde_json::Value = std::fs::read_to_string(&state_path)
+            .map_err(|e| format!("{}: {e}", state_path.display()))
+            .and_then(|text| serde_json::from_str(&text).map_err(|e| e.to_string()))
+            .map_err(|e| MetalError::InvalidConfig(format!("optimizer state: {e}")))?;
+        let adam_t = state["adam_t"].as_u64().ok_or_else(|| {
+            MetalError::InvalidConfig("optimizer.json has no `adam_t` step count".into())
+        })? as usize;
+
+        let ckpt = Checkpoint::open(&dir.join("optimizer.safetensors"))?;
+        let mut tensors = self.adam_tensors_mut();
+        ckpt.require(
+            tensors
+                .iter()
+                .flat_map(|(name, ..)| [format!("{name}.__m"), format!("{name}.__v")]),
+        )?;
+        for (name, m, v, _) in &mut tensors {
+            let (m_len, v_len) = (m.len(), v.len());
+            m.copy_from_slice(&ckpt.f32(&format!("{name}.__m"), m_len)?);
+            v.copy_from_slice(&ckpt.f32(&format!("{name}.__v"), v_len)?);
+        }
+        self.adam_t = adam_t;
+        Ok(())
     }
 
     /// The current weights, in [`Self::load_weights_flat`]'s layout.
@@ -2640,6 +2787,40 @@ impl DynamicAneTrainer {
         self.refresh_transposed_weights();
         Ok(())
     }
+}
+
+/// Write f32 `tensors` (name, data, shape) to `path` as one safetensors file.
+///
+/// Written beside the destination and renamed over it, so a run killed
+/// mid-write (or a full disk) leaves the previous checkpoint intact.
+fn write_f32_safetensors(
+    tensors: &[(String, &[f32], Vec<usize>)],
+    path: &std::path::Path,
+) -> Result<()> {
+    use safetensors::{Dtype, tensor::TensorView};
+
+    let views = tensors
+        .iter()
+        .map(|(name, data, shape)| {
+            let bytes: &[u8] = zerocopy::IntoBytes::as_bytes(*data);
+            TensorView::new(Dtype::F32, shape.clone(), bytes)
+                .map(|view| (name.as_str(), view))
+                .map_err(|e| MetalError::InvalidConfig(format!("tensor {name}: {e}")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let metadata = std::collections::HashMap::from([("format".to_string(), "pt".to_string())]);
+    let name = path.file_name().map_or_else(
+        || "checkpoint".into(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let partial = path.with_file_name(format!(".{name}.partial"));
+    let written = safetensors::serialize_to_file(views, Some(metadata), &partial)
+        .map_err(|e| e.to_string())
+        .and_then(|()| std::fs::rename(&partial, path).map_err(|e| e.to_string()));
+    written.map_err(|e| {
+        let _ = std::fs::remove_file(&partial);
+        MetalError::InvalidConfig(format!("Failed to write {}: {e}", path.display()))
+    })
 }
 
 /// Transpose a [rows, cols] row-major matrix to [cols, rows].
@@ -2736,6 +2917,57 @@ mod tests {
         };
         let trainer = DynamicAneTrainer::new(config);
         assert_eq!(trainer.compile_count(), 0);
+    }
+
+    /// On the Neural Engine: a batch's loss is the mean over its *tokens*, so
+    /// a sequence padded with ignored targets weighs in proportion to the
+    /// positions that count, and the learning rate a step reports is the
+    /// schedule's, not the peak.
+    #[test]
+    #[ignore = "needs the Neural Engine"]
+    fn a_batch_loss_is_the_token_weighted_mean_and_the_reported_rate_follows_the_schedule() {
+        let config = DynamicAneTrainerConfig {
+            dim: 64,
+            hidden_dim: 128,
+            n_heads: 4,
+            n_kv_heads: 4,
+            n_layers: 2,
+            vocab_size: 100,
+            seq_len: 16,
+            accum_steps: 2,
+            // No update moves a weight, so every batch below is scored by the
+            // same model.
+            learning_rate: 0.0,
+            ..Default::default()
+        };
+        let mut trainer = DynamicAneTrainer::new(config.clone());
+        let n = trainer.export_weights_flat().len();
+        let weights: Vec<f32> = (0..n).map(|i| (i % 89) as f32 * 0.002 - 0.08).collect();
+        trainer.load_weights_flat(&weights);
+        trainer.compile_kernels().expect("the ANE compiles");
+
+        let seq = |offset: u16, ignored: usize| {
+            let input: Vec<u16> = (0..16).map(|i| (i * 3 + offset) % 100).collect();
+            let mut target: Vec<u16> = (0..16).map(|i| (i * 3 + offset + 1) % 100).collect();
+            for t in target.iter_mut().take(ignored) {
+                *t = IGNORE_TARGET;
+            }
+            (input, target)
+        };
+        // All 16 positions count, against 4.
+        let (a, b) = (seq(1, 0), seq(7, 12));
+        let loss_a = trainer.train_batch(std::slice::from_ref(&a), 10).unwrap();
+        assert_eq!(trainer.last_batch_tokens(), 16);
+        let loss_b = trainer.train_batch(std::slice::from_ref(&b), 10).unwrap();
+        assert_eq!(trainer.last_batch_tokens(), 4);
+        let loss_ab = trainer.train_batch(&[a, b], 10).unwrap();
+        assert_eq!(trainer.last_batch_tokens(), 20);
+        let want = (16.0 * loss_a + 4.0 * loss_b) / 20.0;
+        assert!(
+            (loss_ab - want).abs() < 1e-3 * want.abs().max(1.0),
+            "batch loss {loss_ab}, token-weighted {want}, plain mean {}",
+            (loss_a + loss_b) / 2.0
+        );
     }
 
     // ======== GPU dW Tests ========
@@ -2875,6 +3107,49 @@ mod tests {
         let mut reloaded = DynamicAneTrainer::new(config);
         reloaded.load_weights_safetensors(&path).unwrap();
         assert_eq!(reloaded.export_weights_flat(), weights);
+    }
+
+    /// A resumed run continues its optimizer: the moments and the step count
+    /// come back as they were saved, so the first update after a resume is
+    /// the one the uninterrupted run would have taken. (A resume from weights
+    /// alone restarts Adam cold, with its bias correction at step 1.)
+    #[test]
+    fn the_optimizer_state_resumes_exactly() {
+        let (config, mut trainer, _) = small_trainer_with_weights();
+        // A trained-looking state: distinct moments in every tensor.
+        let mut fill = 0.0f32;
+        for (_, m, v, _) in trainer.adam_tensors_mut() {
+            for (i, (m, v)) in m.iter_mut().zip(v.iter_mut()).enumerate() {
+                fill += 1.0;
+                *m = (fill + i as f32) * 1e-4;
+                *v = (fill + i as f32) * 1e-6;
+            }
+        }
+        trainer.adam_t = 37;
+
+        let dir = tempfile::tempdir().unwrap();
+        trainer.save_optimizer_state(dir.path()).unwrap();
+
+        let mut resumed = DynamicAneTrainer::new(config);
+        assert_eq!(resumed.adam_t(), 0);
+        resumed.load_optimizer_state(dir.path()).unwrap();
+        assert_eq!(resumed.adam_t(), 37);
+        let saved: Vec<(String, Vec<f32>, Vec<f32>)> = trainer
+            .adam_tensors_mut()
+            .into_iter()
+            .map(|(n, m, v, _)| (n, m.clone(), v.clone()))
+            .collect();
+        let loaded: Vec<(String, Vec<f32>, Vec<f32>)> = resumed
+            .adam_tensors_mut()
+            .into_iter()
+            .map(|(n, m, v, _)| (n, m.clone(), v.clone()))
+            .collect();
+        assert_eq!(saved, loaded);
+        assert!(saved.len() > 10 && saved.iter().all(|(_, m, _)| m.iter().any(|&x| x != 0.0)));
+
+        // A missing or misshapen state is refused, not zero-filled.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(resumed.load_optimizer_state(empty.path()).is_err());
     }
 
     fn small_trainer_with_weights() -> (DynamicAneTrainerConfig, DynamicAneTrainer, Vec<f32>) {

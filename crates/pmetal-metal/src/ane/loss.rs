@@ -16,6 +16,10 @@ pub struct LossOutput {
     /// Scalar loss value: mean NLL over the counted tokens (not scaled by
     /// `loss_scale`).
     pub loss: f32,
+    /// How many positions counted (those whose target is not
+    /// [`IGNORE_INDEX`]): the weight of `loss` in a mean over several
+    /// sequences.
+    pub tokens: usize,
 }
 
 /// Trait for loss functions compatible with ANE training.
@@ -85,7 +89,10 @@ impl AneTrainingLoss for CrossEntropyLoss {
             crate::accelerate::scale_inplace(dlogits, loss_scale);
         }
 
-        LossOutput { loss }
+        LossOutput {
+            loss,
+            tokens: crate::accelerate::counted_targets(targets).0,
+        }
     }
 }
 

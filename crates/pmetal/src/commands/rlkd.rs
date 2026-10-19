@@ -1,5 +1,5 @@
 use pmetal_core::TrainingConfig;
-use pmetal_data::{DatasetFormat, Tokenizer, TrainingDataset};
+use pmetal_data::Tokenizer;
 use pmetal_trainer::{GrpoConfig, RlkdConfig, RlkdTrainer};
 use std::path::PathBuf;
 
@@ -42,13 +42,14 @@ pub(crate) async fn run_rlkd_cli(
 
     pmetal_runtime::compat::random::seed(seed);
 
-    let column_cfg = crate::commands::build_column_config(
-        text_column,
-        text_columns,
-        column_separator,
-        prompt_column,
-        response_column,
-    );
+    // RLKD reads a prompt and, optionally, a reference answer from a row: the
+    // prompt and response columns name them; the text-column options describe
+    // supervised text, which RLKD does not train on.
+    let _ = (text_column, text_columns, column_separator);
+    let prompt_columns = pmetal_trainer::grpo::PromptColumns {
+        prompt: prompt_column,
+        reference: response_column,
+    };
 
     if emit_console_output {
         println!("========================================");
@@ -83,30 +84,16 @@ pub(crate) async fn run_rlkd_cli(
 
     let chat_template = pmetal_data::chat_templates::detect_chat_template(&model_path, model_id);
 
-    // 4. Load dataset
+    // 4. Load the prompts: each row's conversation up to where the model
+    // writes, with its answer kept aside as the accuracy reward's reference.
     tracing::info!("Loading dataset: {}", dataset_path);
-    let dataset = TrainingDataset::from_jsonl_tokenized(
+    let prompts = pmetal_trainer::grpo::load_prompts_with(
         dataset_path,
         &tokenizer,
-        DatasetFormat::Auto,
+        &chat_template,
         max_seq_len,
-        Some(&chat_template),
-        column_cfg.as_ref(),
+        &prompt_columns,
     )?;
-    tracing::info!("RLKD dataset loaded: {} samples", dataset.len());
-    {
-        let stats = dataset.compute_statistics(max_seq_len);
-        tracing::info!(
-            "Dataset: lengths mean={:.0}, p95={}, p99={}, truncated={:.1}%",
-            stats.mean_length,
-            stats.p95_length,
-            stats.p99_length,
-            stats.truncated_pct,
-        );
-        for w in &dataset.validate_seq_len(max_seq_len) {
-            tracing::warn!("{}", w);
-        }
-    }
 
     // 5. Load policy model with LoRA
     tracing::info!("Loading policy model with LoRA...");
@@ -127,6 +114,13 @@ pub(crate) async fn run_rlkd_cli(
     grpo_config.max_completion_length = max_completion_length;
     grpo_config.max_prompt_length = max_seq_len;
     grpo_config.seed = Some(seed);
+    // A completion ends where the model would stop: every end-of-turn and
+    // end-of-text token it declares, not only the tokenizer's EOS.
+    grpo_config.stop_tokens = pmetal_data::inference_config::collect_all_stop_tokens(
+        std::path::Path::new(&model_path),
+        &tokenizer,
+        Some(chat_template.template_type),
+    );
 
     // 8. Setup RLKD config
     let training_config = TrainingConfig {
@@ -143,89 +137,53 @@ pub(crate) async fn run_rlkd_cli(
         training: training_config,
         distill_alpha,
         distill_temperature,
+        reverse_kl: false,
         anneal_alpha,
         final_alpha,
-        log_every: 10,
-        adaptive_lr: true,
     };
 
-    // 9. Setup reward functions
-    let mut rewards = pmetal_trainer::CombinedReward::new();
-
-    if reasoning_rewards {
-        struct FormatReward;
-        impl pmetal_trainer::RewardFunction for FormatReward {
-            fn compute(
-                &self,
-                _prompts: &[String],
-                completions: &[String],
-                _images: Option<&[Vec<pmetal_runtime::compat::Array>]>,
-            ) -> pmetal_trainer::GrpoResult<Vec<f64>> {
-                Ok(completions
-                    .iter()
-                    .map(|c| {
-                        if c.contains("<thinking>") && c.contains("</thinking>") {
-                            1.0
-                        } else if c.contains("<thinking>") {
-                            0.5
-                        } else {
-                            0.0
-                        }
-                    })
-                    .collect())
-            }
-            fn name(&self) -> &str {
-                "format_reward"
-            }
-        }
-
-        struct LengthReward(usize);
-        impl pmetal_trainer::RewardFunction for LengthReward {
-            fn compute(
-                &self,
-                _prompts: &[String],
-                completions: &[String],
-                _images: Option<&[Vec<pmetal_runtime::compat::Array>]>,
-            ) -> pmetal_trainer::GrpoResult<Vec<f64>> {
-                Ok(completions
-                    .iter()
-                    .map(|c| {
-                        let len = c.len();
-                        if len > self.0 {
-                            -0.1
-                        } else if len < 10 {
-                            -0.5
-                        } else {
-                            0.1
-                        }
-                    })
-                    .collect())
-            }
-            fn name(&self) -> &str {
-                "length_reward"
-            }
-        }
-
-        rewards = rewards
-            .add(Box::new(FormatReward), 1.0)
-            .add(Box::new(LengthReward(max_seq_len * 2)), 0.2);
+    // 9. Rewards: the reasoning rewards, which add the accuracy of the final
+    // answer when every prompt has a reference answer; or the accuracy alone.
+    // With neither, every completion scores alike and the RL term has no
+    // advantage to push: the run is on-policy distillation from the teacher.
+    let with_references = prompts.iter().all(|p| p.reference.is_some());
+    let rewards = if reasoning_rewards {
+        pmetal_trainer::CombinedReward::reasoning(max_seq_len * 2, with_references)
+    } else if with_references {
+        pmetal_trainer::CombinedReward::new()
+            .add(Box::new(pmetal_trainer::AccuracyReward::new()), 1.0)
     } else {
-        struct DummyReward;
-        impl pmetal_trainer::RewardFunction for DummyReward {
+        tracing::warn!(
+            "no reward configured (--reasoning-rewards, or an `answer` on every row): RLKD will \
+             only distill from the teacher"
+        );
+        struct NoReward;
+        impl pmetal_trainer::RewardFunction for NoReward {
             fn compute(
                 &self,
-                _p: &[String],
+                _: &[String],
                 completions: &[String],
-                _i: Option<&[Vec<pmetal_runtime::compat::Array>]>,
+                _: Option<&[Vec<pmetal_runtime::compat::Array>]>,
             ) -> pmetal_trainer::GrpoResult<Vec<f64>> {
-                Ok(vec![0.1; completions.len()])
+                Ok(vec![0.0; completions.len()])
             }
             fn name(&self) -> &str {
-                "dummy"
+                "none"
             }
         }
-        rewards = rewards.add(Box::new(DummyReward), 1.0);
-    }
+        pmetal_trainer::CombinedReward::new().add(Box::new(NoReward), 1.0)
+    };
+
+    // The reference model (frozen) is only the KL penalty's, so it is loaded
+    // only when the penalty is on.
+    let mut ref_model = if beta > 0.0 {
+        Some(
+            DynamicModel::load(&model_path)
+                .map_err(|e| anyhow::anyhow!("Failed to load reference model: {}", e))?,
+        )
+    } else {
+        None
+    };
 
     // 10. Build trainer
     let mut trainer = RlkdTrainer::new(rlkd_config)?;
@@ -266,8 +224,9 @@ pub(crate) async fn run_rlkd_cli(
         .run(
             &mut policy_model,
             &mut teacher_model,
+            ref_model.as_mut(),
             &tokenizer,
-            &dataset,
+            &prompts,
             &rewards,
             &mut optimizer,
             |opt, lr| opt.set_lr(lr),

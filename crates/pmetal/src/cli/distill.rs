@@ -69,6 +69,16 @@ pub struct DistillArgs {
     #[arg(long = "rationale-weight", default_value = "1.0")]
     pub rationale_weight: f32,
 
+    /// Share of batches whose responses the student samples itself and the
+    /// teacher scores (on-policy distillation, 0.0 to 1.0); online and
+    /// progressive runs only
+    #[arg(long = "on-policy", default_value = "0.0")]
+    pub on_policy: f32,
+
+    /// Longest response the student samples for an on-policy batch
+    #[arg(long = "on-policy-max-tokens", default_value_t = 256)]
+    pub on_policy_max_tokens: usize,
+
     /// LoRA rank for student
     #[arg(long = "lora-r", default_value = "16")]
     pub lora_r: usize,

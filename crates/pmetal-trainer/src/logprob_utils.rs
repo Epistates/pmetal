@@ -1,18 +1,16 @@
 //! Selective log softmax utilities for RL/preference trainers.
 //!
 //! Computes per-token log probabilities without materializing the full
-//! `[batch, seq, vocab]` log_softmax tensor. Uses the identity:
-//!
-//! ```text
-//! log_softmax(x)[i] = x[i] - logsumexp(x)
-//! ```
-//!
-//! to gather the logit at the target index first, then subtract the scalar
-//! logsumexp — saving ~4 GB VRAM for 128K-vocab models at typical batch sizes.
-//!
-//! This is the technique used by DeepSeek V3/R1.
+//! `[batch, seq, vocab]` log_softmax tensor. The log-prob of a token is
+//! `logit[target] - logsumexp(logits)`, which the runtime's cross-entropy
+//! kernels return from each row's statistics, evaluated in f32 whatever the
+//! logits' dtype: a bf16 `logsumexp` rounds the normalizer to 8 mantissa
+//! bits, which on a large vocabulary moves a token's log-prob by up to
+//! ~0.1 nats, and an RL ratio or a preference margin is a *difference* of
+//! two such log-probs.
 
 use pmetal_runtime::compat::{Array, Dtype, Exception, ops};
+use pmetal_runtime::training::CrossEntropy;
 
 /// Selective log softmax: compute log probabilities only at target indices.
 ///
@@ -48,44 +46,20 @@ pub fn selective_log_softmax_with_temperature(
     labels: &Array,
     temperature: Option<f32>,
 ) -> Result<(Array, Array), Exception> {
-    // Apply temperature scaling if requested
+    // Scaled in f32: a bf16 logit divided in bf16 would be rounded a second time.
     let logits = match temperature {
-        Some(t) if (t - 1.0).abs() > 1e-8 && t > 0.0 => logits.divide(&Array::from_f32(t)),
+        Some(t) if (t - 1.0).abs() > 1e-8 && t > 0.0 => logits
+            .as_dtype(Dtype::Float32.as_i32())
+            .divide(&Array::from_f32(t)),
         _ => logits.clone(),
     };
-    let logits = &logits;
-    // Match label dtype for comparisons (labels may be Int32 or Int64)
-    let labels_dtype = labels.dtype_raw();
-    let zero = Array::from_int(0).as_dtype(labels_dtype);
-    let ignore_val = Array::from_int(-100).as_dtype(labels_dtype);
-
-    // Replace -100 with 0 so gather doesn't go out-of-bounds
-    let gather_labels = ops::maximum(labels, &zero);
-
-    // [B, S] -> [B, S, 1] for take_along_axis
-    let gather_indices = gather_labels.expand_dims(-1i32);
-
-    // Gather the single logit at each target position: [B, S, 1]
-    // MLX >= 0.32: label indices must not enter the grad trace
-    let gather_indices = gather_indices.stop_gradient();
-    let selected_logits = logits.take_along_axis(&gather_indices, -1);
-
-    // logsumexp over vocab dim, keepdims for broadcast: [B, S, 1]
-    let lse = logits.logsumexp(-1, true);
-
-    // log_softmax(x)[i] = x[i] - logsumexp(x)  =>  [B, S, 1]
-    let log_probs = selected_logits.subtract(&lse);
-
-    // Squeeze back to [B, S]
-    let log_probs = log_probs.squeeze(-1);
-
-    // Build valid mask: 1.0 where label != -100, 0.0 otherwise
-    let valid_mask = labels.ne(&ignore_val).as_dtype(Dtype::Float32 as i32);
-
-    // Zero out ignored positions so downstream sums are correct
-    let log_probs = log_probs.multiply(&valid_mask);
-
-    Ok((log_probs, valid_mask))
+    // `-100` positions come back as 0 in both outputs; labels of any integer
+    // dtype are fine.
+    let (nll, valid) = CrossEntropy::new()
+        .with_ignore_index(-100)
+        .per_token(&logits, labels);
+    let shape = labels.shape();
+    Ok((nll.negative().reshape(shape), valid.reshape(shape)))
 }
 
 /// Shift-then-selective-log-softmax primitive shared by DPO / KTO / ORPO /
@@ -162,7 +136,9 @@ pub fn compute_log_probs_with_avg(
 /// # Returns
 /// Per-position entropy with the last dimension reduced: `[...]`
 pub fn efficient_entropy(logits: &Array) -> Result<Array, Exception> {
-    // H = logsumexp(x) - sum(softmax(x) * x, axis=-1)
+    // H = logsumexp(x) - sum(softmax(x) * x, axis=-1), in f32 whatever the
+    // logits' dtype (a bf16 normalizer and softmax are off by whole percents).
+    let logits = &logits.as_dtype(Dtype::Float32.as_i32());
     let lse = logits.logsumexp(-1, false); // [...] (no keepdims)
     let probs = ops::softmax_axis(logits, -1); // [..., V]
     let weighted = probs.multiply(logits); // [..., V]
@@ -677,5 +653,89 @@ mod tests {
             "extreme entropy must be finite"
         );
         assert!(ent_ext_vals[0] >= 0.0, "entropy must be non-negative");
+    }
+
+    /// The f64 log-softmax of `row` at `label`, after dividing by `temperature`.
+    fn log_softmax_at(row: &[f32], label: usize, temperature: f64) -> f64 {
+        let z: Vec<f64> = row.iter().map(|&x| x as f64 / temperature).collect();
+        let max = z.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let lse = max + z.iter().map(|x| (x - max).exp()).sum::<f64>().ln();
+        z[label] - lse
+    }
+
+    /// Half-precision logits over a large vocabulary: a bf16 `logsumexp`
+    /// rounds the normalizer to 8 mantissa bits, so each token's log-prob was
+    /// off by up to ~0.1 nats, and the two sides of a ratio (policy and
+    /// reference, or policy and its generation-time self) carried independent
+    /// errors. The log-prob of bf16 logits is the log-prob of the values they
+    /// hold.
+    #[test]
+    fn half_precision_logits_lose_nothing_in_the_log_prob() {
+        use pmetal_runtime::compat::random;
+        random::seed(7);
+        let (b, s, v) = (2usize, 5usize, 50_000usize);
+        let logits = random::normal(&[b as i32, s as i32, v as i32], Dtype::Float32)
+            .multiply(&Array::from_f32(3.0))
+            .as_dtype(Dtype::Bfloat16.as_i32());
+        let labels: Vec<i32> = (0..(b * s) as i32)
+            .map(|i| (i * 4871 + 11) % v as i32)
+            .collect();
+        let labels_arr = Array::from_slice(&labels, &[b as i32, s as i32]);
+        let values = logits.as_dtype(Dtype::Float32.as_i32());
+        values.eval();
+        let rows: &[f32] = values.as_slice();
+
+        for temperature in [None, Some(0.7f32)] {
+            let (lp, mask) =
+                selective_log_softmax_with_temperature(&logits, &labels_arr, temperature).unwrap();
+            lp.eval();
+            pmetal_runtime::check_unobserved_error().unwrap();
+            assert_eq!(lp.dtype_raw(), Dtype::Float32.as_i32());
+            assert_eq!(mask.dtype_raw(), Dtype::Float32.as_i32());
+            let got: &[f32] = lp.as_slice();
+            for t in 0..b * s {
+                let want = log_softmax_at(
+                    &rows[t * v..(t + 1) * v],
+                    labels[t] as usize,
+                    temperature.unwrap_or(1.0) as f64,
+                );
+                assert!(
+                    (got[t] as f64 - want).abs() < 2e-3,
+                    "T={temperature:?} token {t}: {} vs {want}",
+                    got[t]
+                );
+            }
+        }
+    }
+
+    /// The entropy of bf16 logits is the entropy of the values they hold.
+    #[test]
+    fn half_precision_logits_lose_nothing_in_the_entropy() {
+        use pmetal_runtime::compat::random;
+        random::seed(8);
+        let (n, v) = (6usize, 40_000usize);
+        let logits = random::normal(&[n as i32, v as i32], Dtype::Float32)
+            .multiply(&Array::from_f32(3.0))
+            .as_dtype(Dtype::Bfloat16.as_i32());
+        let ent = efficient_entropy(&logits).unwrap();
+        ent.eval();
+        pmetal_runtime::check_unobserved_error().unwrap();
+        assert_eq!(ent.dtype_raw(), Dtype::Float32.as_i32());
+        let values = logits.as_dtype(Dtype::Float32.as_i32());
+        values.eval();
+        let rows: &[f32] = values.as_slice();
+        let got: &[f32] = ent.as_slice();
+        for t in 0..n {
+            let z: Vec<f64> = rows[t * v..(t + 1) * v].iter().map(|&x| x as f64).collect();
+            let max = z.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let sum: f64 = z.iter().map(|x| (x - max).exp()).sum();
+            let lse = max + sum.ln();
+            let want = lse - z.iter().map(|x| (x - max).exp() / sum * x).sum::<f64>();
+            assert!(
+                (got[t] as f64 - want).abs() < 2e-3,
+                "row {t}: {} vs {want}",
+                got[t]
+            );
+        }
     }
 }

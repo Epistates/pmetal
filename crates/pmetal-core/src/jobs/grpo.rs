@@ -55,7 +55,7 @@ pub struct GrpoSpec {
         argv = "--beta",
         min = 0.0,
         max = 1.0,
-        default_float = 0.001
+        default_float = 0.0
     )]
     #[serde(default = "default_beta")]
     pub beta: f64,
@@ -360,7 +360,7 @@ fn default_num_generations() -> usize {
     8
 }
 fn default_beta() -> f64 {
-    0.001
+    0.0
 }
 fn default_lr() -> f64 {
     5e-6

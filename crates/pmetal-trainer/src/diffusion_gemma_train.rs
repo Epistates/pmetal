@@ -2,8 +2,8 @@
 //!
 //! DiffusionGemma is a *block-autoregressive discrete-diffusion* model: a causal
 //! encoder commits a prompt to a read-only KV cache, and a bidirectional decoder
-//! denoises a fixed-length canvas conditioned on that cache. transformers ships
-//! the modeling + generation code but **no training loop** (the top-level
+//! denoises a fixed-length canvas conditioned on that cache. The released
+//! modeling and generation code has **no training loop** (the top-level
 //! `forward` returns logits, never a loss), so the objective here is derived
 //! from the architecture, mirroring how the generation sampler was.
 //!
@@ -20,7 +20,7 @@
 //! The objective is the decoder **denoising cross-entropy** (predict the clean
 //! canvas from its corrupted version), optionally restricted to corrupted
 //! positions, plus an optional **encoder autoregressive** next-token loss (the
-//! encoder is causal; transformers exposes its hidden states "to compute an
+//! encoder is causal, and its hidden states are exposed "to compute an
 //! autoregressive loss on the encoder during training"). The full training step
 //! (t-schedule sampling, self-conditioning dropout, optimiser) lives in the
 //! training loop that consumes these primitives.
@@ -175,6 +175,60 @@ impl Default for DiffusionGemmaTrainConfig {
     }
 }
 
+impl DiffusionGemmaTrainConfig {
+    /// Check the hyperparameters for a model of vocabulary size `vocab`,
+    /// naming every one that cannot work.
+    pub fn validate(&self, vocab: i32) -> Result<(), Exception> {
+        let mut problems = Vec::new();
+        if vocab < 2 {
+            problems.push(format!(
+                "the vocabulary must have at least 2 tokens, got {vocab}"
+            ));
+        }
+        if !(self.learning_rate.is_finite() && self.learning_rate > 0.0) {
+            problems.push(format!(
+                "learning_rate must be positive, got {}",
+                self.learning_rate
+            ));
+        }
+        for (name, beta) in [("beta1", self.beta1), ("beta2", self.beta2)] {
+            if !(0.0..1.0).contains(&beta) {
+                problems.push(format!("{name} must be in [0, 1), got {beta}"));
+            }
+        }
+        if !(self.eps.is_finite() && self.eps > 0.0) {
+            problems.push(format!("eps must be positive, got {}", self.eps));
+        }
+        if !(self.weight_decay.is_finite() && self.weight_decay >= 0.0) {
+            problems.push(format!(
+                "weight_decay must not be negative, got {}",
+                self.weight_decay
+            ));
+        }
+        // t ~ U(min, 1]: the lowest noise level must leave a range.
+        if !(0.0..1.0).contains(&self.min_noise_level) {
+            problems.push(format!(
+                "min_noise_level must be in [0, 1), got {}",
+                self.min_noise_level
+            ));
+        }
+        if !(self.max_grad_norm.is_finite() && self.max_grad_norm >= 0.0) {
+            problems.push(format!(
+                "max_grad_norm must not be negative, got {}",
+                self.max_grad_norm
+            ));
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(Exception::custom(format!(
+                "invalid DiffusionGemma training configuration: {}",
+                problems.join("; ")
+            )))
+        }
+    }
+}
+
 /// Statistics for a single DiffusionGemma LoRA training step.
 #[derive(Debug, Clone)]
 pub struct DiffusionGemmaStepStats {
@@ -232,18 +286,20 @@ pub struct DiffusionGemmaTrainer {
 }
 
 impl DiffusionGemmaTrainer {
-    /// Create a trainer for a model whose vocabulary size is `vocab`.
-    pub fn new(config: DiffusionGemmaTrainConfig, vocab: i32) -> Self {
+    /// Create a trainer for a model whose vocabulary size is `vocab`; the
+    /// configuration is validated.
+    pub fn new(config: DiffusionGemmaTrainConfig, vocab: i32) -> Result<Self, Exception> {
+        config.validate(vocab)?;
         let optimizer = AdamW::new(config.learning_rate, config.weight_decay)
             .with_betas(config.beta1, config.beta2)
             .with_eps(config.eps)
             .with_classifier(|_| ParamClass::Regular);
-        Self {
+        Ok(Self {
             config,
             vocab,
             optimizer,
             step: 0,
-        }
+        })
     }
 
     /// Completed optimiser steps.
@@ -403,6 +459,32 @@ mod tests {
     }
 
     #[test]
+    fn the_training_configuration_is_validated_at_construction() {
+        assert!(DiffusionGemmaTrainer::new(DiffusionGemmaTrainConfig::default(), 32).is_ok());
+        for bad in [
+            DiffusionGemmaTrainConfig {
+                learning_rate: 0.0,
+                ..Default::default()
+            },
+            DiffusionGemmaTrainConfig {
+                beta2: 1.0,
+                ..Default::default()
+            },
+            DiffusionGemmaTrainConfig {
+                min_noise_level: 1.0,
+                ..Default::default()
+            },
+            DiffusionGemmaTrainConfig {
+                max_grad_norm: f32::NAN,
+                ..Default::default()
+            },
+        ] {
+            assert!(DiffusionGemmaTrainer::new(bad, 32).is_err());
+        }
+        assert!(DiffusionGemmaTrainer::new(DiffusionGemmaTrainConfig::default(), 1).is_err());
+    }
+
+    #[test]
     #[serial]
     fn noise_rate_matches_keep_prob() {
         random::seed(7);
@@ -493,8 +575,8 @@ mod tests {
             seed: 7,
             ..Default::default()
         };
-        let mut a = DiffusionGemmaTrainer::new(config.clone(), vocab);
-        let mut b = DiffusionGemmaTrainer::new(config.clone(), vocab);
+        let mut a = DiffusionGemmaTrainer::new(config.clone(), vocab).unwrap();
+        let mut b = DiffusionGemmaTrainer::new(config.clone(), vocab).unwrap();
 
         random::seed(1);
         let a0 = noise(&a);
@@ -509,7 +591,8 @@ mod tests {
         assert_ne!(a0, a1, "steps 0 and 1 drew the same noise");
 
         let other =
-            DiffusionGemmaTrainer::new(DiffusionGemmaTrainConfig { seed: 8, ..config }, vocab);
+            DiffusionGemmaTrainer::new(DiffusionGemmaTrainConfig { seed: 8, ..config }, vocab)
+                .unwrap();
         assert_ne!(noise(&other), a0, "seeds 7 and 8 drew the same noise");
         pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
     }
@@ -640,7 +723,7 @@ mod tests {
             corrupted_only: false, // full-canvas loss ⇒ deterministic, monotone signal
             ..Default::default()
         };
-        let mut trainer = DiffusionGemmaTrainer::new(config, vocab);
+        let mut trainer = DiffusionGemmaTrainer::new(config, vocab).unwrap();
         let mut first = f32::NAN;
         let mut last = f32::NAN;
         for i in 0..steps {

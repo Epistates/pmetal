@@ -73,8 +73,9 @@ fn parse_compression_method(
         "top_k" | "top-k" => Ok(CompressionMethod::TopK),
         "int8" => Ok(CompressionMethod::Int8),
         "int4" => Ok(CompressionMethod::Int4),
+        "sampled" => Ok(CompressionMethod::Sampled),
         other => anyhow::bail!(
-            "Unknown offline compression '{}'. Valid options: none, top_k, int8, int4",
+            "Unknown offline compression '{}'. Valid options: none, top_k, int8, int4, sampled",
             other
         ),
     }
@@ -188,6 +189,8 @@ pub(crate) async fn run_distillation_cli(
     alpha: f32,
     rationale: bool,
     rationale_weight: f32,
+    on_policy: f32,
+    on_policy_max_tokens: usize,
     lora_r: usize,
     lora_alpha: f32,
     learning_rate: f32,
@@ -354,6 +357,8 @@ pub(crate) async fn run_distillation_cli(
             batch_size,
             num_epochs: epochs,
             max_seq_len,
+            // One optimizer step per batch.
+            gradient_accumulation_steps: 1,
             output_dir: validated_distill_output.display().to_string(),
             ..Default::default()
         },
@@ -387,7 +392,30 @@ pub(crate) async fn run_distillation_cli(
         ..Default::default()
     };
 
-    let mut trainer = DistillationTrainer::new(distiller, training_loop_config);
+    let mut trainer = DistillationTrainer::new(distiller, training_loop_config)?;
+    if on_policy > 0.0 {
+        if method == pmetal_distill::DistillMethod::Offline {
+            anyhow::bail!(
+                "--on-policy needs the live teacher to score the student's samples; it cannot \
+                 run with --offline"
+            );
+        }
+        trainer = trainer.with_on_policy(pmetal_trainer::OnPolicyConfig {
+            probability: on_policy,
+            max_new_tokens: on_policy_max_tokens,
+            temperature: 1.0,
+            stop_tokens: pmetal_data::inference_config::collect_all_stop_tokens(
+                &student_path,
+                &tokenizer,
+                Some(chat_template.template_type),
+            ),
+        })?;
+        tracing::info!(
+            "On-policy distillation: {:.0}% of batches are the student's own samples (up to {} tokens)",
+            on_policy * 100.0,
+            on_policy_max_tokens
+        );
+    }
 
     {
         let adaptive_config = pmetal_trainer::AdaptiveLrConfig::for_distillation();
@@ -452,11 +480,14 @@ pub(crate) async fn run_distillation_cli(
             let mut cache = if metadata_path.exists() {
                 LogitCache::load(&offline_cfg.logits_path)?
             } else {
+                // A sampled cache's draws are taken at the loss's temperature,
+                // which the loss then has to use.
                 LogitCache::new(
                     &offline_cfg.logits_path,
                     offline_cfg.compression.clone(),
                     offline_cfg.top_k,
                 )?
+                .with_sampling_temperature(temperature)
             };
 
             let cache_complete = metadata_path.exists()
