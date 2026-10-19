@@ -3194,6 +3194,8 @@ async fn run_distillation_in_process(
             batch_size: spec.batch_size,
             num_epochs: spec.epochs,
             max_seq_len,
+            // One optimizer step per batch.
+            gradient_accumulation_steps: 1,
             output_dir: spec.output_dir.clone(),
             ..Default::default()
         },
@@ -3222,7 +3224,8 @@ async fn run_distillation_in_process(
         ..Default::default()
     };
 
-    let mut trainer = pmetal::trainer::DistillationTrainer::new(distiller, training_loop_config);
+    let mut trainer = pmetal::trainer::DistillationTrainer::new(distiller, training_loop_config)
+        .map_err(|e| AppError(e.to_string()))?;
     let adaptive_config = pmetal::trainer::AdaptiveLrConfig::for_distillation();
     let control_file = PathBuf::from(&spec.output_dir).join(".lr_control.json");
     trainer.enable_adaptive_lr_with_control(adaptive_config, control_file);

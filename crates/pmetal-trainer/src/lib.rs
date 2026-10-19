@@ -49,6 +49,7 @@ pub mod preference;
 pub mod pretrain;
 pub mod reward_model;
 pub mod rlkd;
+pub mod rollout;
 pub mod scheduler;
 pub mod sft;
 pub mod step_check;

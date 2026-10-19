@@ -41,7 +41,6 @@ pub use rewards::*;
 
 use pmetal_core::{ConfigValidator, TrainingConfig};
 use pmetal_lora::TrainableModel;
-use pmetal_models::rl_generation::{BatchedRlConfig, BatchedRlGenerator};
 use pmetal_runtime::compat::{
     Array, Exception,
     module::{Module, ModuleParameters},
@@ -1026,42 +1025,23 @@ impl GrpoTrainer {
             .seed
             .map(|seed| pmetal_runtime::decode::draw_bits(seed, self.rollouts));
         self.rollouts += 1;
-        let rl_config = BatchedRlConfig {
-            num_generations: self.config.num_generations,
-            max_new_tokens: self.config.max_completion_length,
-            temperature: self.config.temperature as f32,
-            top_p: self.config.top_p as f32,
-            top_k: self.config.top_k,
-            stop_tokens,
-            seed,
-            use_prefix_cache: true,
-            min_p: self.config.min_p as f32,
-        };
-
-        let max_len = self.config.max_prompt_length + self.config.max_completion_length;
-        let cache = if let Some(bits) = self.config.kv_cache_bits {
-            let mode = pmetal_cache::kv_cache::CacheMode::Quantized {
-                bits,
-                group_size: 64,
-            };
-            model.create_cache_with_mode(max_len, mode)
-        } else {
-            model.create_cache(max_len)
-        }
-        .ok_or_else(|| GrpoError::Generation("Model does not support KV cache".into()))?;
-        let kv_config = cache.config();
-
-        let mut generator = BatchedRlGenerator::new(rl_config, kv_config.clone());
-        generator
-            .generate(
-                |input, cache| {
-                    model
-                        .forward_with_cache_last(input, None, Some(cache))
-                        .map_err(|e| Exception::custom(e.to_string()))
-                },
-                prompt_tokens,
-            )
-            .map_err(|e| GrpoError::Generation(e.to_string()))
+        crate::rollout::sample_completions(
+            model,
+            prompt_tokens,
+            &crate::rollout::RolloutConfig {
+                num_generations: self.config.num_generations,
+                max_new_tokens: self.config.max_completion_length,
+                temperature: self.config.temperature as f32,
+                top_p: self.config.top_p as f32,
+                top_k: self.config.top_k,
+                min_p: self.config.min_p as f32,
+                stop_tokens,
+                seed,
+                max_len: self.config.max_prompt_length + self.config.max_completion_length,
+                kv_cache_bits: self.config.kv_cache_bits,
+            },
+        )
+        .map_err(|e| GrpoError::Generation(e.to_string()))
     }
 
     /// Run the full GRPO training loop: every prompt in turn, for the
@@ -2111,9 +2091,7 @@ mod tests {
         // Three steps a batch: 3, 6, 9, 12, 15, 18.
         for batch in 1..=6 {
             trainer.step = 3 * batch;
-            trainer
-                .maybe_save_checkpoint(&model, 1.0, false)
-                .unwrap();
+            trainer.maybe_save_checkpoint(&model, 1.0, false).unwrap();
         }
         let saved: Vec<usize> = trainer
             .checkpoint_manager
