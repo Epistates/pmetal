@@ -33,7 +33,7 @@ use std::sync::Arc;
 use pmetal_core::jobs::{
     DflashSpec, DistillSpec, EmbedTrainSpec, EvalSpec, FuseSpec, GrpoSpec, InferSpec, MergeSpec,
     PackExpertsSpec, PreferenceSpec, PretrainSpec, QuantizeSpec, RlkdSpec, ServeSpec, TokenizeSpec,
-    TrainDiffusionSpec, TrainDraftSpec, TrainMtpSpec, TrainSpec,
+    TrainDiffusionSpec, TrainDraftSpec, TrainMtpSpec, TrainSpec, VocodeSpec,
 };
 use serde_json::Value;
 use turbomcp::prelude::*;
@@ -242,6 +242,11 @@ pub fn spec_tool_list() -> Vec<Box<dyn SpecTool>> {
             InferSpec, "generate",
             "Generate text with a model and return it (pmetal infer). Blocks until generation completes; best for short outputs. For longer sessions use start_serve and chat.",
             NOW, Hints::CREATE.idempotent(false)
+        ),
+        spec_tool!(
+            VocodeSpec, "vocode",
+            "Synthesize a waveform from a mel spectrogram or a WAV file with a BigVGAN neural vocoder, writing a 16-bit WAV (pmetal vocode). Blocks until done.",
+            NOW, Hints::OVERWRITE
         ),
         spec_tool!(
             EvalSpec, "eval_perplexity",

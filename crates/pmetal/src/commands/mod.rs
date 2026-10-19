@@ -40,6 +40,8 @@ pub(crate) mod train_diffusion;
 pub(crate) mod train_draft;
 #[cfg(feature = "trainer")]
 pub(crate) mod train_mtp;
+#[cfg(feature = "vocoder")]
+pub(crate) mod vocode;
 
 /// The error for a spec that failed its own validation: every problem, with
 /// the flag each belongs to, so the message can be acted on without reading

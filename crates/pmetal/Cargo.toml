@@ -19,7 +19,7 @@ required-features = ["cli"]
 # `pmetal cluster` subcommand and the trainer's `--distributed-auto` flag.
 # Library consumers who don't want libp2p in their dependency tree can
 # opt out via `pmetal = { version = "x", default-features = false, features = [...] }`.
-default = ["cli", "dashboard", "trainer", "lora", "merge", "ane", "distributed"]
+default = ["cli", "dashboard", "trainer", "lora", "merge", "vocoder", "ane", "distributed"]
 
 # Foundation crates (no MLX dependency)
 core = ["dep:pmetal-core"]

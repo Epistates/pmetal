@@ -1,6 +1,7 @@
 //! Clap argument struct for `pmetal decide`.
 
 use clap::Args;
+use pmetal_core::jobs::DecideSpec;
 
 /// Thin clap argument struct for `pmetal decide`.
 #[derive(Args, Debug)]
@@ -22,4 +23,15 @@ pub struct DecideArgs {
     /// Print the response on one line instead of indented
     #[arg(long = "compact")]
     pub compact: bool,
+}
+
+impl From<DecideArgs> for DecideSpec {
+    fn from(a: DecideArgs) -> Self {
+        DecideSpec {
+            model: a.model,
+            request: a.request,
+            max_length: a.max_length,
+            compact: a.compact,
+        }
+    }
 }

@@ -1,6 +1,7 @@
 //! Clap argument struct for `pmetal tokenize`.
 
 use clap::Args;
+use pmetal_core::jobs::TokenizeSpec;
 
 /// Thin clap argument struct for `pmetal tokenize`.
 #[derive(Args, Debug)]
@@ -24,4 +25,16 @@ pub struct TokenizeArgs {
     /// Maximum documents per shard (default: 10000)
     #[arg(long = "docs-per-shard", default_value = "10000")]
     pub docs_per_shard: usize,
+}
+
+impl From<TokenizeArgs> for TokenizeSpec {
+    fn from(a: TokenizeArgs) -> Self {
+        TokenizeSpec {
+            input: a.input,
+            output: a.output,
+            tokenizer: a.tokenizer,
+            text_column: a.text_column,
+            docs_per_shard: a.docs_per_shard,
+        }
+    }
 }

@@ -23,7 +23,12 @@ use crate::Cli;
 /// Flags the command line has and the spec does not, with why. A flag listed
 /// here is one the spec cannot drive; it is for a surface that is not a job
 /// (a path to print to, a mode that never runs a job).
-const CLI_ONLY: &[(&str, &str, &str)] = &[];
+const CLI_ONLY: &[(&str, &str, &str)] = &[(
+    "serve",
+    "--api-key",
+    "a secret: a spec becomes a command line, and a key on one shows in every process list; \
+     the server also reads PMETAL_API_KEY",
+)];
 
 /// Flags the spec spells and the parser does not take. There should be none.
 const SPEC_ONLY: &[(&str, &str, &str)] = &[];
@@ -185,3 +190,4 @@ parity!(tokenize, TokenizeSpec);
 parity!(fuse, FuseSpec, feature = "lora");
 parity!(eval, EvalSpec, all(feature = "lora", feature = "trainer"));
 parity!(merge, MergeSpec, feature = "merge");
+parity!(vocode, VocodeSpec, feature = "vocoder");

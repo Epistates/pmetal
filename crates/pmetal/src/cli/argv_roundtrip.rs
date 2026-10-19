@@ -929,3 +929,308 @@ fn infer_spec_round_trips_every_field() {
         assert_eq!(json(&parsed), json(&spec));
     }
 }
+
+/// Spec -> argv -> parser -> spec for a command whose `From<Args>` is plain.
+fn round_trips<S, A>(subcommand: &str, specs: [S; 2], args: impl Fn(Commands) -> Option<A>)
+where
+    S: JobFields + serde::Serialize + From<A>,
+{
+    for spec in specs {
+        let parsed = try_parse(subcommand, spec.to_argv())
+            .unwrap_or_else(|e| panic!("`{subcommand}` argv failed to parse: {e}"));
+        let args =
+            args(parsed).unwrap_or_else(|| panic!("`{subcommand}` parsed as another command"));
+        assert_eq!(json(&S::from(args)), json(&spec), "{subcommand}");
+    }
+}
+
+#[test]
+fn model_commands_round_trip_every_field() {
+    use pmetal_core::jobs::VocodeSpec;
+    round_trips(
+        "merge",
+        [
+            MergeSpec {
+                model_a: "a".into(),
+                model_b: "b".into(),
+                output: "out".into(),
+                ..Default::default()
+            },
+            MergeSpec {
+                model_a: "a".into(),
+                model_b: "b".into(),
+                output: "out".into(),
+                method: "ties".into(),
+                base: Some("base".into()),
+                t: 0.3,
+                weight_a: 0.6,
+                weight_b: 0.4,
+                density: 0.7,
+                dtype: "float16".into(),
+            },
+        ],
+        |c| match c {
+            Commands::Merge(a) => Some(a),
+            _ => None,
+        },
+    );
+    round_trips(
+        "quantize",
+        [
+            QuantizeSpec {
+                model: "m".into(),
+                output: "o.gguf".into(),
+                ..Default::default()
+            },
+            QuantizeSpec {
+                model: "m".into(),
+                output: "o".into(),
+                imatrix: Some("im.dat".into()),
+                method: "q5_k_m".into(),
+                lora: Some("adapter".into()),
+                kl_calibrate: true,
+                target_bpw: Some(4.5),
+                kl_threshold: 0.02,
+                format: "mlx".into(),
+                bits: 8,
+                group_size: 32,
+            },
+        ],
+        |c| match c {
+            Commands::Quantize(a) => Some(a),
+            _ => None,
+        },
+    );
+    round_trips(
+        "fuse",
+        [
+            FuseSpec {
+                model: "m".into(),
+                lora: "l".into(),
+                output: "o".into(),
+                ..Default::default()
+            },
+            FuseSpec {
+                model: "m".into(),
+                lora: "l".into(),
+                output: "o".into(),
+                alpha: Some(8.0),
+                rank: Some(4),
+                low_memory: true,
+            },
+        ],
+        |c| match c {
+            Commands::Fuse(a) => Some(a),
+            _ => None,
+        },
+    );
+    round_trips(
+        "vocode",
+        [
+            VocodeSpec {
+                model: "m".into(),
+                input: "i.wav".into(),
+                output: "o.wav".into(),
+                ..Default::default()
+            },
+            VocodeSpec {
+                model: "m".into(),
+                input: "i.wav".into(),
+                output: "o.wav".into(),
+                chunk_frames: 64,
+            },
+        ],
+        |c| match c {
+            Commands::Vocode(a) => Some(a),
+            _ => None,
+        },
+    );
+}
+
+#[test]
+fn data_and_tool_commands_round_trip_every_field() {
+    round_trips(
+        "tokenize",
+        [
+            TokenizeSpec {
+                input: "i".into(),
+                output: "o".into(),
+                tokenizer: "t".into(),
+                ..Default::default()
+            },
+            TokenizeSpec {
+                input: "i".into(),
+                output: "o".into(),
+                tokenizer: "t".into(),
+                text_column: "body".into(),
+                docs_per_shard: 50,
+            },
+        ],
+        |c| match c {
+            Commands::Tokenize(a) => Some(a),
+            _ => None,
+        },
+    );
+    round_trips(
+        "pack-experts",
+        [
+            PackExpertsSpec {
+                model: "m".into(),
+                ..Default::default()
+            },
+            PackExpertsSpec {
+                model: "m".into(),
+                output: "packed".into(),
+                bits: Some(4),
+            },
+        ],
+        |c| match c {
+            Commands::PackExperts(a) => Some(a),
+            _ => None,
+        },
+    );
+    round_trips(
+        "decide",
+        [
+            DecideSpec {
+                model: "m".into(),
+                request: "r.json".into(),
+                ..Default::default()
+            },
+            DecideSpec {
+                model: "m".into(),
+                request: "r.json".into(),
+                max_length: 2048,
+                compact: true,
+            },
+        ],
+        |c| match c {
+            Commands::Decide(a) => Some(a),
+            _ => None,
+        },
+    );
+    round_trips(
+        "dflash",
+        [
+            DflashSpec {
+                target: "t".into(),
+                draft: "d".into(),
+                prompt: "p".into(),
+                ..Default::default()
+            },
+            DflashSpec {
+                target: "t".into(),
+                draft: "d".into(),
+                prompt: "p".into(),
+                max_new_tokens: 64,
+                temperature: 0.7,
+                speculative_tokens: Some(8),
+                draft_fp8: true,
+                json: true,
+                no_chat: true,
+                tree_budget: 4,
+                compare_greedy: true,
+            },
+        ],
+        |c| match c {
+            Commands::Dflash(a) => Some(a),
+            _ => None,
+        },
+    );
+    round_trips(
+        "bench",
+        [
+            BenchSpec::default(),
+            BenchSpec {
+                model: "m".into(),
+                batch_size: 4,
+                seq_len: 1024,
+            },
+        ],
+        |c| match c {
+            Commands::Bench(a) => Some(a),
+            _ => None,
+        },
+    );
+}
+
+#[cfg(feature = "trainer")]
+#[test]
+fn eval_spec_round_trips_every_field() {
+    round_trips(
+        "eval",
+        [
+            EvalSpec {
+                model: "m".into(),
+                dataset: "d".into(),
+                ..Default::default()
+            },
+            EvalSpec {
+                model: "m".into(),
+                dataset: "d".into(),
+                lora: Some("adapter".into()),
+                max_seq_len: 512,
+                num_samples: 20,
+                json: true,
+            },
+        ],
+        |c| match c {
+            Commands::Eval(a) => Some(a),
+            _ => None,
+        },
+    );
+}
+
+/// The server's API keys are not a spec field: they stay on the command line
+/// the operator typed (or in the environment), never in an argv built from a
+/// spec.
+#[cfg(feature = "serve")]
+#[test]
+fn serve_spec_round_trips_every_field_but_the_keys() {
+    let busy = ServeSpec {
+        model: "m".into(),
+        host: "0.0.0.0".into(),
+        port: 9000,
+        cors_origin: vec!["https://a.example".into(), "*".into()],
+        request_timeout: 60,
+        max_seq_len: Some(8192),
+        experts_dir: Some("experts".into()),
+        fp8: true,
+        kv_quant: Some(4),
+        no_kv_quant: true,
+        kv_group_size: 32,
+        kv_turboquant: true,
+        kv_turboquant_preset: Some("q2_5".into()),
+        ane: true,
+        ane_max_seq_len: 2048,
+        draft_model: Some("draft".into()),
+        continuous_batch: true,
+        cb_max_slots: 4,
+        cb_max_queue_depth: 16,
+        cb_block_size: 16,
+        cb_max_blocks: 100,
+        cb_exact: true,
+    };
+    let plain = ServeSpec {
+        model: "m".into(),
+        ..Default::default()
+    };
+    for spec in [plain, busy] {
+        let Ok(Commands::Serve(args)) = try_parse("serve", spec.to_argv()) else {
+            panic!("serve argv failed to parse")
+        };
+        let (parsed, keys) = args.into_spec();
+        assert_eq!(json(&parsed), json(&spec));
+        assert!(keys.is_empty());
+    }
+    assert!(!ServeSpec::argv_flags().contains(&"--api-key"));
+    let Ok(Commands::Serve(args)) = try_parse(
+        "serve",
+        ["--model", "m", "--api-key", "k1", "--api-key", "k2"]
+            .map(String::from)
+            .to_vec(),
+    ) else {
+        panic!("--api-key is a serve flag")
+    };
+    assert_eq!(args.into_spec().1, ["k1", "k2"]);
+}

@@ -1,6 +1,7 @@
 //! Clap argument struct for `pmetal quantize`.
 
 use clap::{Args, ValueEnum};
+use pmetal_core::jobs::QuantizeSpec;
 
 /// Thin clap argument struct for `pmetal quantize`.
 #[derive(Args, Debug)]
@@ -194,6 +195,24 @@ impl QuantizeMethod {
             Self::Bf16 => Some(GgmlType::Bf16),
             Self::F16 => Some(GgmlType::F16),
             Self::F32 => Some(GgmlType::F32),
+        }
+    }
+}
+
+impl From<QuantizeArgs> for QuantizeSpec {
+    fn from(a: QuantizeArgs) -> Self {
+        QuantizeSpec {
+            model: a.model,
+            output: a.output,
+            imatrix: a.imatrix,
+            method: a.method.as_str().to_string(),
+            lora: a.lora,
+            kl_calibrate: a.kl_calibrate,
+            target_bpw: a.target_bpw,
+            kl_threshold: a.kl_threshold,
+            format: a.format,
+            bits: a.bits,
+            group_size: a.group_size,
         }
     }
 }

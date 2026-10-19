@@ -41,6 +41,8 @@ pub mod train_diffusion;
 pub mod train_draft;
 #[cfg(feature = "trainer")]
 pub mod train_mtp;
+#[cfg(feature = "vocoder")]
+pub mod vocode;
 
 #[derive(Parser)]
 #[command(name = "pmetal")]
@@ -350,8 +352,12 @@ pub enum Commands {
     #[cfg(feature = "merge")]
     Merge(crate::cli::merge::MergeArgs),
 
+    /// Synthesize a waveform from a mel spectrogram with a neural vocoder (BigVGAN)
+    #[cfg(feature = "vocoder")]
+    Vocode(crate::cli::vocode::VocodeArgs),
+
+    /// Evaluate a model's perplexity on a dataset
     #[cfg(all(feature = "lora", feature = "trainer"))]
-    #[cfg(feature = "lora")]
     Eval(crate::cli::eval::EvalArgs),
 
     /// Train a sentence embedding model (BERT / encoder-only) with contrastive losses.

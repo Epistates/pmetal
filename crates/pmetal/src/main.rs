@@ -272,76 +272,11 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
 
         #[cfg(feature = "serve")]
         Commands::Serve(args) => {
-            let crate::cli::serve::ServeArgs {
-                model,
-                port,
-                host,
-                api_key,
-                cors_origin,
-                request_timeout,
-                max_seq_len,
-                experts_dir,
-                fp8,
-                kv_quant,
-                no_kv_quant,
-                kv_group_size,
-                kv_turboquant,
-                kv_turboquant_preset,
-                #[cfg(feature = "ane")]
-                ane,
-                #[cfg(feature = "ane")]
-                ane_max_seq_len,
-                #[cfg(feature = "ane")]
-                draft_model,
-                continuous_batch,
-                cb_max_slots,
-                cb_max_queue_depth,
-                cb_block_size,
-                cb_max_blocks,
-                cb_exact,
-            } = args;
-            #[cfg(feature = "ane")]
-            let ane_enabled = ane;
-            #[cfg(not(feature = "ane"))]
-            let ane_enabled = false;
-
-            #[cfg(feature = "ane")]
-            let serve_ane_max_seq_len = ane_max_seq_len;
-            #[cfg(not(feature = "ane"))]
-            let serve_ane_max_seq_len = 4096;
-            #[cfg(feature = "ane")]
-            let serve_draft_model = draft_model;
-            #[cfg(not(feature = "ane"))]
-            let serve_draft_model = None;
-
-            commands::serve::run_serve(
-                model,
-                port,
-                host,
-                commands::serve::Access {
-                    api_keys: api_key,
-                    cors_origins: cors_origin,
-                    request_timeout_secs: request_timeout,
-                },
-                max_seq_len,
-                experts_dir,
-                fp8,
-                kv_quant,
-                no_kv_quant,
-                kv_group_size,
-                kv_turboquant,
-                kv_turboquant_preset,
-                ane_enabled,
-                serve_ane_max_seq_len,
-                serve_draft_model,
-                continuous_batch,
-                cb_max_slots,
-                cb_max_queue_depth,
-                cb_block_size,
-                cb_max_blocks,
-                cb_exact,
-            )
-            .await?;
+            use pmetal_core::jobs::ServeSpec;
+            let (mut spec, api_keys) = args.into_spec();
+            spec.normalize()
+                .map_err(|errors| commands::invalid_spec::<ServeSpec>(&errors))?;
+            commands::serve::run_serve(spec, api_keys).await?;
         }
 
         Commands::Decide(args) => {
@@ -575,6 +510,15 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
 
         Commands::Ollama { action } => {
             commands::ollama::run_ollama_command(action).await?;
+        }
+
+        #[cfg(feature = "vocoder")]
+        Commands::Vocode(args) => {
+            use pmetal_core::jobs::VocodeSpec;
+            let mut spec = VocodeSpec::from(args);
+            spec.normalize()
+                .map_err(|errors| commands::invalid_spec::<VocodeSpec>(&errors))?;
+            commands::vocode::run_vocode(spec).await?;
         }
 
         #[cfg(feature = "lora")]

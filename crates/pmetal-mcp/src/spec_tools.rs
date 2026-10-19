@@ -65,6 +65,7 @@ impl_spec!(
     pmetal_core::jobs::TrainDiffusionSpec,
     pmetal_core::jobs::TrainDraftSpec,
     pmetal_core::jobs::TrainMtpSpec,
+    pmetal_core::jobs::VocodeSpec,
 );
 
 /// How a tool runs its command.

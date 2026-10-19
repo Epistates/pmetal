@@ -1,6 +1,7 @@
 //! Clap argument struct for `pmetal bench`.
 
 use clap::{Args, ValueEnum};
+use pmetal_core::jobs::BenchSpec;
 
 /// Thin clap argument struct for `pmetal bench`.
 #[derive(Args, Debug)]
@@ -60,4 +61,14 @@ pub enum WorkloadBenchmarkPreset {
     /// Nemotron-H sparse/hybrid inference regression workload
     #[value(name = "moe-nemotronh")]
     MoeNemotronH,
+}
+
+impl From<BenchArgs> for BenchSpec {
+    fn from(a: BenchArgs) -> Self {
+        BenchSpec {
+            model: a.model,
+            batch_size: a.batch_size,
+            seq_len: a.seq_len,
+        }
+    }
 }

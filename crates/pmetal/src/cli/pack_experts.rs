@@ -1,6 +1,7 @@
 //! Clap argument struct for `pmetal pack-experts`.
 
 use clap::Args;
+use pmetal_core::jobs::PackExpertsSpec;
 
 /// Thin clap argument struct for `pmetal pack-experts`.
 #[derive(Args, Debug)]
@@ -16,4 +17,14 @@ pub struct PackExpertsArgs {
     /// Quantization bit width (4 or 2)
     #[arg(short, long = "bits")]
     pub bits: Option<u8>,
+}
+
+impl From<PackExpertsArgs> for PackExpertsSpec {
+    fn from(a: PackExpertsArgs) -> Self {
+        PackExpertsSpec {
+            model: a.model,
+            output: a.output,
+            bits: a.bits,
+        }
+    }
 }
