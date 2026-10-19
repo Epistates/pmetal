@@ -144,6 +144,12 @@ pub trait JobFields: Sized {
     /// - CLI's own round-trip tests (parse → spec → argv → parse → equals).
     fn to_argv(&self) -> Vec<String>;
 
+    /// Every command-line flag [`to_argv`](Self::to_argv) can emit, including
+    /// the CLI-only fields that have no descriptor. A CLI that accepts a flag
+    /// outside this list has a control the spec cannot drive; a flag in it that
+    /// the CLI rejects is a spec that cannot start its job.
+    fn argv_flags() -> &'static [&'static str];
+
     /// Run descriptor-driven validation: range checks, required-field checks,
     /// enum-option checks. Spec-specific cross-field rules live in each
     /// spec's hand-written `normalize`.
