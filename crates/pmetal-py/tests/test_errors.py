@@ -83,6 +83,11 @@ def test_an_error_message_names_what_went_wrong(tmp_path):
     assert "org/never-cached" in str(caught.value)
 
 
+def test_the_build_unwinds_on_a_panic():
+    """A `--release` build aborts the interpreter on a panic; the wheel profile does not."""
+    assert pmetal.UNWINDS_ON_PANIC is True
+
+
 # -- panics -------------------------------------------------------------------------------------------
 
 needs_hooks = pytest.mark.skipif(not hasattr(native, "_panic"), reason="built without the test-hooks feature")

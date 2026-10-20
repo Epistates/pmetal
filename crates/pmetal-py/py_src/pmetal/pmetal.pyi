@@ -11,6 +11,14 @@ from typing import Any, ClassVar, Literal, Self, TypedDict, Unpack, final, type_
 
 __version__: str
 
+UNWINDS_ON_PANIC: bool
+"""Whether a Rust panic unwinds into a ``PanicException`` in this build.
+
+False for a build made with the workspace's ``release`` profile (``maturin build
+--release``), which aborts the interpreter instead; build with ``maturin build``,
+which uses the ``wheel`` profile.
+"""
+
 def configure_metallib(package_dir: str | os.PathLike[str]) -> str | None:
     """Point MLX at the ``mlx.metallib`` built with it and return its path.
 

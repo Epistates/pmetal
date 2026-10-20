@@ -155,7 +155,7 @@ def test_every_public_symbol_has_a_stub_docstring():
 
 def test_the_package_re_exports_every_public_name_of_the_module():
     """Nothing the module defines is unreachable from ``pmetal`` (except internals)."""
-    internal = {"configure_metallib", "INFER_COMMAND_LINE_ONLY"}
+    internal = {"configure_metallib"}
     for name, _ in public_members():
         if name in internal:
             continue

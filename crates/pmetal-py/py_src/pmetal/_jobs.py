@@ -146,11 +146,19 @@ def _bundled_cli() -> Path:
 _checked: set[Path] = set()
 
 
+def _fallback_directories() -> list[Path]:
+    """Where ``pmetal`` is installed to that a program with a short ``PATH`` does not look."""
+    return [Path.home() / ".cargo" / "bin", Path("/opt/homebrew/bin"), Path("/usr/local/bin")]
+
+
 def find_cli(cli: str | os.PathLike[str] | None = None) -> Path:
     """The ``pmetal`` command line to run jobs with.
 
     In order: the ``cli`` argument; the ``PMETAL_CLI`` environment variable; the
-    command line shipped inside this package; ``pmetal`` on ``PATH``.
+    command line shipped inside this package; ``pmetal`` on ``PATH``; then
+    ``~/.cargo/bin``, ``/opt/homebrew/bin`` and ``/usr/local/bin``, which a program
+    started from an IDE or Finder (with launchd's short ``PATH``) does not search.
+    The first of the arguments or the variable that is set is the only one tried.
 
     Raises:
         CliNotFoundError: None of them exists.
@@ -164,6 +172,9 @@ def find_cli(cli: str | os.PathLike[str] | None = None) -> Path:
         candidates.append(_bundled_cli())
         if on_path := shutil.which("pmetal"):
             candidates.append(Path(on_path))
+        for directory in _fallback_directories():
+            if (fallback := directory / "pmetal") not in candidates:
+                candidates.append(fallback)
     for candidate in candidates:
         if candidate.is_file() and os.access(candidate, os.X_OK):
             _warn_on_version_mismatch(candidate)

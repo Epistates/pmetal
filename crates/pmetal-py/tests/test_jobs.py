@@ -6,6 +6,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 import warnings
@@ -114,6 +115,7 @@ def test_an_interrupted_command_is_cancelled_not_failed(fake_cli):
 def test_a_missing_command_line_says_where_it_looked(tmp_path, monkeypatch):
     monkeypatch.delenv("PMETAL_CLI", raising=False)
     monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr(_jobs, "_fallback_directories", list)
     with pytest.raises(pmetal.CliNotFoundError, match="PMETAL_CLI") as caught:
         pmetal.run(SPEC, cli=tmp_path / "nope")
     assert isinstance(caught.value, FileNotFoundError) and isinstance(caught.value, pmetal.JobError)
@@ -274,3 +276,28 @@ def test_job_spec_protocol_is_every_spec():
         if name.endswith("Spec") and name != "JobSpec":
             assert isinstance(getattr(pmetal, name)(), pmetal.JobSpec), name
     assert not isinstance(object(), pmetal.JobSpec)
+
+
+def test_python_dash_m_pmetal_runs_the_command_line(fake_cli, monkeypatch):
+    cli = fake_cli('print("args:", " ".join(sys.argv[1:]))')
+    monkeypatch.setenv("PMETAL_CLI", str(cli))
+    result = subprocess.run(
+        [sys.executable, "-m", "pmetal", "info", "--json"], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0 and result.stdout.strip() == "args: info --json", result.stderr
+    monkeypatch.setenv("PMETAL_CLI", "/nonexistent/pmetal")
+    missing = subprocess.run([sys.executable, "-m", "pmetal"], capture_output=True, text=True, check=False)
+    assert missing.returncode != 0 and "no pmetal command line" in missing.stderr
+
+
+def test_the_places_a_gui_launched_program_would_miss_are_searched(tmp_path, monkeypatch):
+    monkeypatch.delenv("PMETAL_CLI", raising=False)
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    cargo_bin = tmp_path / ".cargo" / "bin"
+    cargo_bin.mkdir(parents=True)
+    cli = cargo_bin / "pmetal"
+    cli.write_text(f"#!{sys.executable}\nprint('pmetal {pmetal.__version__}')\n")
+    cli.chmod(0o755)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(_jobs, "_fallback_directories", lambda: [tmp_path / ".cargo" / "bin"])
+    assert pmetal.find_cli() == cli

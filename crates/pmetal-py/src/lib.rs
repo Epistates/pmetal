@@ -40,6 +40,7 @@ mod trainer;
 #[pymodule(gil_used = false)]
 fn pmetal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    m.add("UNWINDS_ON_PANIC", cfg!(panic = "unwind"))?;
 
     m.add_function(wrap_pyfunction!(metallib::configure_metallib, m)?)?;
     error::register(m)?;

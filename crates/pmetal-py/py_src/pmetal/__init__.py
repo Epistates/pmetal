@@ -16,6 +16,7 @@ checks as the command's flags. A spec is data. Run it:
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -31,6 +32,8 @@ from ._jobs import (
     start as start,
 )
 from .pmetal import (
+    INFER_COMMAND_LINE_ONLY as INFER_COMMAND_LINE_ONLY,
+    UNWINDS_ON_PANIC as UNWINDS_ON_PANIC,
     BackendError as BackendError,
     BenchSpec as BenchSpec,
     CancelledError as CancelledError,
@@ -98,6 +101,15 @@ from .pmetal import (
 # MLX loads its Metal kernels from the metallib built with it: point it at the
 # one this package carries before anything touches the GPU.
 _configure_metallib(Path(__file__).resolve().parent)
+
+if not UNWINDS_ON_PANIC:
+    warnings.warn(
+        "this pmetal build aborts the whole process on a Rust panic instead of raising an exception "
+        "(it was built with the release profile; `maturin build` and `maturin develop --profile wheel` "
+        "build the unwinding one)",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 if TYPE_CHECKING:
     from typing import Unpack
