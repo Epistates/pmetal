@@ -1,0 +1,4 @@
+# Differences between the stub and the runtime that are deliberate.
+
+# The module defines no __all__; the package re-exports by name.
+pmetal.pmetal.__all__
