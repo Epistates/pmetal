@@ -1,128 +1,175 @@
-# pmetal-py
+# pmetal (Python)
 
-Python bindings for PMetal via PyO3.
+Fine-tuning and inference for Apple Silicon, from Python. The extension module
+wraps the same code `pmetal` the command line runs; a job you can do there, you
+can do here with the same fields, defaults and checks.
 
-## Overview
+- macOS 14 or later, Apple Silicon (arm64) only. Python 3.11 or later.
+- One abi3 wheel covers CPython 3.11 and later.
+- Fully typed (`py.typed`, stubs checked with mypy and pyright in strict mode).
+- Long calls (training, generation, downloads) release the GIL, stop cleanly on
+  Ctrl-C, and report failures as typed exceptions.
 
-This crate provides the `pmetal` Python extension module for model loading,
-inference, LoRA fine-tuning, MTP assistant training, DFlash draft training, and
-HuggingFace Hub model management on Apple Silicon.
+## Install
 
-## Installation
+```bash
+pip install pmetal
+```
+
+From a checkout, with [maturin](https://www.maturin.rs):
 
 ```bash
 cd crates/pmetal-py
 pip install maturin
-maturin develop --release
+maturin develop --profile wheel
 ```
 
-## Quick Start
+## The job specs
 
-### Easy API
+Every `pmetal` subcommand has a spec class: `TrainSpec`, `GrpoSpec`,
+`PreferenceSpec`, `DistillSpec`, `RlkdSpec`, `EmbedTrainSpec`, `PretrainSpec`,
+`QuantizeSpec`, `MergeSpec`, `FuseSpec`, `ServeSpec`, `InferSpec`, `EvalSpec`,
+`DflashSpec`, `TrainMtpSpec`, `TrainDraftSpec`, `TrainDiffusionSpec`, `DecideSpec`,
+`TokenizeSpec`, `VocodeSpec`, `PackExpertsSpec` and `BenchSpec`. They wrap the
+job specs of `pmetal-core`, which define every field, default, bound and check
+for the command line, the TUI, the GUI, the MCP server and Python alike: there
+is no second list of options here to drift.
 
 ```python
 import pmetal
 
-result = pmetal.finetune(
-    "Qwen/Qwen3-0.6B",
-    "train.jsonl",
-    lora_r=16,
-    learning_rate=2e-4,
-    epochs=3,
-)
-print(result["final_loss"], result["total_steps"])
+spec = pmetal.TrainSpec(model="Qwen/Qwen3-0.6B", dataset="train.jsonl", epochs=2, lora_r=16)
+spec.learning_rate = 1e-4
+spec.optimizer = "muon"  # a name outside the spec's options fails type checking
 
-text = pmetal.infer(
-    "Qwen/Qwen3-0.6B",
-    "What is 2+2?",
-    max_tokens=64,
-    temperature=0.0,
-)
-print(text)
-
-run = pmetal.infer_with_metrics(
-    "Qwen/Qwen3.6-Coder-30B-A3B-Instruct",
-    "Write a short Rust function.",
-    mtp=True,
-    mtp_draft_tokens=3,
-)
-print(run["text"])
-print(run["speculative"])
+spec.validation_errors()  # [] when valid, else [(field, message), ...]
+spec.normalize()  # raises SpecValidationError listing every problem
+spec.to_argv()  # the arguments of `pmetal train`
+pmetal.TrainSpec.fields()  # every field: type, default, bounds, flag, help
+spec.copy(epochs=3)  # a changed copy
 ```
 
-### Full Control
+A spec is a mutable value: it compares by fields, round-trips through `to_dict`
+and `to_json`, copies and pickles.
+
+## Training
+
+`Trainer` runs a `TrainSpec` in this process, the run `pmetal train` makes:
 
 ```python
-import pmetal
-
-lora_config = pmetal.LoraConfig(r=16, alpha=32.0)
-training_config = pmetal.TrainingConfig(
-    learning_rate=2e-4,
-    num_epochs=3,
-    batch_size=4,
-    max_seq_len=2048,
-)
-
-trainer = pmetal.Trainer(
-    model_id="Qwen/Qwen3-0.6B",
-    lora_config=lora_config,
-    training_config=training_config,
-    dataset_path="train.jsonl",
-)
-trainer.add_callback(pmetal.ProgressCallback(100))
-trainer.add_callback(pmetal.LoggingCallback(log_every=10))
-result = trainer.train()
-
-model = pmetal.Model.load("Qwen/Qwen3-0.6B")
-print(model.generate("Hello world", temperature=0.7))
+trainer = pmetal.Trainer(spec, callbacks=[pmetal.LoggingCallback(10)])
+result = trainer.train()  # releases the GIL; Ctrl-C stops after the step
+print(result.final_loss, result.weights_path)
 ```
 
-## API Reference
+`pmetal.finetune("Qwen/Qwen3-0.6B", "train.jsonl", epochs=1)` is the one-line
+form. Callbacks are any object with some of these methods:
 
-### Module-Level Functions
+| Method | Called |
+|---|---|
+| `on_train_start()` | when the model and data are ready |
+| `on_step_end(step, loss)`, `on_step_metrics(metrics)` | after each optimizer step the run logs: the first, then every `logging_steps` |
+| `on_train_end()` | when the run is over, however it ended |
+| `should_stop() -> bool` | after every optimizer step; true ends the run cleanly |
 
-| Function | Description |
-|----------|-------------|
-| `finetune(model_id, dataset_path, ...)` | LoRA fine-tuning with sensible defaults |
-| `infer(model_id, prompt, ...)` | Shared-runner inference with LoRA, FP8, MTP, KV cache, chat, and sampling options |
-| `infer_with_metrics(model_id, prompt, ...)` | Inference plus generation and speculative decoding metrics |
-| `train_mtp(model, shards, ...)` | Train Qwen3Next/Qwen3.6 MTP predictors or Gemma 4 assistants from tokenized shards |
-| `train_draft(target, shards, ...)` | Train a DFlash draft model for a Qwen3 target |
-| `download_model(model_id, revision=None)` | Download a HuggingFace model repository |
-| `download_file(model_id, filename, revision=None)` | Download one file from a HuggingFace model repository |
+An exception in a callback, like Ctrl-C, ends the run after the current step
+with the weights saved, and is raised from `train()`.
 
-### Classes
+## Every other command
 
-| Class | Description |
-|-------|-------------|
-| `Model` | Model loading and inference (`Model.load()`, `model.generate()`) |
-| `DFlashGenerator` | DFlash block-diffusion speculative decoder |
-| `Trainer` | Training orchestration (`Trainer(...)`, `trainer.train()`) |
-| `Tokenizer` | Tokenization (`Tokenizer.from_file()`, `Tokenizer.from_pretrained()`) |
-| `LoraConfig` | LoRA configuration (`r`, `alpha`, `dropout`, `use_rslora`, `use_dora`) |
-| `TrainingConfig` | Training hyperparameters (`learning_rate`, `batch_size`, `num_epochs`, ...) |
-| `GenerationConfig` | Generation parameters (`max_tokens`, `temperature`, `top_k`, `top_p`, `min_p`, ...) |
-| `DataLoaderConfig` | Data loading parameters (`batch_size`, `max_seq_len`, `shuffle`, ...) |
-| `ProgressCallback` | Progress bar callback requiring `total_steps` |
-| `LoggingCallback` | Periodic logging callback |
-| `MetricsJsonCallback` | JSONL metrics callback |
+`run` and `start` run the `pmetal` command a spec stands for, as a subprocess:
+the command line's own behaviour, with a process of its own to fail in.
 
-### Enums
+```python
+pmetal.run(pmetal.MergeSpec(model_a="a", model_b="b", output="merged"))
 
-| Enum | Values |
-|------|--------|
-| `Dtype` | Float32, Float16, BFloat16, Float8E4M3, Float8E5M2, Int32, Int64, UInt8, Bool |
-| `Quantization` | None, NF4, FP4, Int8, FP8 |
-| `LoraBias` | None, All, LoraOnly |
-| `LrSchedulerType` | Constant, Linear, Cosine, CosineWithRestarts, Polynomial, Wsd |
-| `OptimizerType` | AdamW, Sgd, Adafactor, Lion, Muon, AdamWScheduleFree, AdamW8bit; a `TrainingConfig` takes the optimizer by name (`optimizer="muon"`) |
-| `DatasetFormat` | Simple, Alpaca, ShareGpt, OpenAi, Auto |
-| `ModelArchitecture` | Llama, Llama4, Qwen2, Qwen3, Qwen3MoE, Gemma, Mistral, Phi, Phi4, DeepSeek, Cohere, Granite, NemotronH, Qwen3Next, GptOss, Gemma4, Bert, Flux |
+job = pmetal.start(
+    pmetal.GrpoSpec(model="Qwen/Qwen3-0.6B", dataset="prompts.jsonl"), on_event=lambda e: print(e["event"])
+)
+for event in job:  # events as the job writes them
+    ...
+job.wait()  # or job.cancel()
+```
 
-## Typing
+The command line is found from `cli=`, `PMETAL_CLI`, the one shipped in the
+package, then `PATH`. Failures are `JobFailedError`.
 
-The package ships `py.typed` and `__init__.pyi`, so type checkers can see the
-public API exposed by the compiled extension.
+## Inference
+
+```python
+model = pmetal.Model.load("Qwen/Qwen3-0.6B")  # lives on its own thread; share it freely
+model.generate("The capital of France is", max_tokens=16, temperature=0.0)
+for piece in model.stream("Once upon a time", max_tokens=64):
+    print(piece, end="", flush=True)
+
+pmetal.infer("Qwen/Qwen3-0.6B", "What is 2+2?", chat=True, no_thinking=True)  # InferSpec fields
+gen = pmetal.DFlashGenerator("mlx-community/Qwen3-4B-bf16", "z-lab/Qwen3-4B-DFlash-b16")
+tokens, metrics = gen.generate(prompt_ids, max_new_tokens=128, temperature=0.7, seed=1)
+```
+
+Sampling starts from the model's own `generation_config.json`; what you pass
+overrides it. Temperature 0 or less is greedy.
+
+## The Hub
+
+`download_model` (revision, token, GGUF quantization, verification, offline mode,
+progress), `download_file`, `plan_download`, `verify_model`, `search_models`
+(with how each result fits this Mac), `estimate_fit` and `upload_model`.
+
+```python
+path = pmetal.download_model("Qwen/Qwen3-0.6B", revision="main", progress=print)
+pmetal.estimate_fit(path, context_length=8192, kv_cache_bits=8)
+```
+
+## Errors
+
+Everything pmetal raises is a `pmetal.PMetalError`: `ConfigError` (a
+`ValueError`), `SpecValidationError`, `HubError`, `ModelLoadError`,
+`TokenizerError`, `TrainingError`, `QuantizationError`, `BackendError`,
+`OutOfMemoryError` (a `MemoryError`), `CancelledError`, and `JobError`
+(`JobFailedError`, `CliNotFoundError`). I/O failures are the matching `OSError`
+subclass. A Rust panic is `pyo3_runtime.PanicException`, not a crash.
+
+## Threads
+
+The module declares itself safe without the GIL. `Model` and `DFlashGenerator`
+keep their weights on a thread of their own, so any Python thread may call them
+(one generation runs at a time). Callbacks run on the thread that called
+`train()`.
+
+## Development
+
+```bash
+python stub.py            # regenerate py_src/pmetal/pmetal.pyi after a spec changes
+python -m pytest tests    # about 30 seconds; no download needed
+```
+
+The suite writes a tiny random checkpoint for generation and training tests and
+serves a fake Hub on localhost. Tests that need a real model or the network are
+skipped unless `PMETAL_TEST_MODEL_DIR` (a local model directory) or
+`PMETAL_TEST_HUB=1` is set. `python -m pytest tests/test_stubs.py` runs mypy,
+pyright and `mypy.stubtest` against the stubs.
+
+The `test-hooks` cargo feature adds functions that panic on purpose, for the
+tests that check a panic is an exception; it is never in a published wheel.
+
+### Building a wheel
+
+```bash
+just build-wheel       # what CI runs; the wheel lands in target/wheels
+```
+
+or, by hand, `PMETAL_MLX_STATIC=1 MACOSX_DEPLOYMENT_TARGET=14.0 maturin build`.
+
+Do not pass `--release` to maturin, here or to `maturin develop`: it overrides
+the `wheel` profile in `pyproject.toml` with the workspace's `release` one, which
+aborts the interpreter on a Rust panic instead of raising `PanicException`
+(`import pmetal` warns, and `pmetal.UNWINDS_ON_PANIC` says which you have). The
+`wheel` profile is release optimization with `panic = "unwind"`. MLX is linked
+statically (`PMETAL_MLX_STATIC=1`) so the wheel runs where it was not built, the
+deployment target gives the wheel its `macosx_14_0` tag, and the `mlx.metallib`
+built with that MLX and the `pmetal` command line go in `py_src/pmetal/` before
+the build, which `just build-wheel` does.
 
 ## License
 

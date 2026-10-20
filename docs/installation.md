@@ -116,12 +116,12 @@ just build-gui-bundle
 
 ## Python SDK
 
-The Python SDK is built with maturin and PyO3:
+The Python SDK is a wheel (`pip install pmetal`), built with maturin and PyO3:
 
 ```bash
 cd crates/pmetal-py
 pip install maturin
-maturin develop --release
+maturin develop --profile wheel
 ```
 
 Then in Python:
