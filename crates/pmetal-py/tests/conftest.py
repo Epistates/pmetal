@@ -157,6 +157,64 @@ def make_tiny_model(directory: Path, seed: int = 0) -> Path:
     return directory
 
 
+def make_tiny_dflash_draft(directory: Path, seed: int = 1, block_size: int = 4) -> Path:
+    """Write a tiny DFlash draft for the tiny model into ``directory`` and return it."""
+    directory.mkdir(parents=True, exist_ok=True)
+    rng = random.Random(seed)
+    vocab = len(VOCAB)
+    taps = [0, LAYERS - 1]
+    config = {
+        "architectures": ["DFlashDraftModel"],
+        "model_type": "dflash_qwen3",
+        "hidden_size": HIDDEN,
+        "num_hidden_layers": 2,
+        "intermediate_size": INTERMEDIATE,
+        "num_attention_heads": HEADS,
+        "num_key_value_heads": KV_HEADS,
+        "head_dim": HEAD_DIM,
+        "rms_norm_eps": 1e-6,
+        "vocab_size": vocab,
+        "max_position_embeddings": 256,
+        "rope_theta": 10000.0,
+        "tie_word_embeddings": True,
+        "block_size": block_size,
+        "dflash_config": {"target_layer_ids": taps, "mask_token_id": VOCAB[UNK]},
+    }
+    (directory / "config.json").write_text(json.dumps(config))
+    tensors: dict[str, tuple[tuple[int, ...], bytes]] = {
+        "fc.weight": ((HIDDEN, len(taps) * HIDDEN), _tensor(rng, (HIDDEN, len(taps) * HIDDEN))),
+        "hidden_norm.weight": ((HIDDEN,), _ones((HIDDEN,))),
+        "norm.weight": ((HIDDEN,), _ones((HIDDEN,))),
+    }
+    for i in range(2):
+        p = f"layers.{i}"
+        for name, shape in {
+            f"{p}.self_attn.q_proj.weight": (HEADS * HEAD_DIM, HIDDEN),
+            f"{p}.self_attn.k_proj.weight": (KV_HEADS * HEAD_DIM, HIDDEN),
+            f"{p}.self_attn.v_proj.weight": (KV_HEADS * HEAD_DIM, HIDDEN),
+            f"{p}.self_attn.o_proj.weight": (HIDDEN, HEADS * HEAD_DIM),
+            f"{p}.mlp.gate_proj.weight": (INTERMEDIATE, HIDDEN),
+            f"{p}.mlp.up_proj.weight": (INTERMEDIATE, HIDDEN),
+            f"{p}.mlp.down_proj.weight": (HIDDEN, INTERMEDIATE),
+        }.items():
+            tensors[name] = (shape, _tensor(rng, shape))
+        for name, shape in {
+            f"{p}.self_attn.q_norm.weight": (HEAD_DIM,),
+            f"{p}.self_attn.k_norm.weight": (HEAD_DIM,),
+            f"{p}.input_layernorm.weight": (HIDDEN,),
+            f"{p}.post_attention_layernorm.weight": (HIDDEN,),
+        }.items():
+            tensors[name] = (shape, _ones(shape))
+    write_safetensors(directory / "model.safetensors", tensors)
+    return directory
+
+
+@pytest.fixture(scope="session")
+def tiny_draft(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A tiny random DFlash draft for ``tiny_model`` (block of four)."""
+    return make_tiny_dflash_draft(tmp_path_factory.mktemp("tiny-draft") / "draft")
+
+
 @pytest.fixture(scope="session")
 def tiny_model(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """A tiny random Qwen3 checkpoint (see the module docstring)."""
