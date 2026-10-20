@@ -244,6 +244,48 @@ pub fn find_cached_model_in(
     })
 }
 
+/// A model repository in the local cache, and the snapshot to use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedModel {
+    /// The repository id (`owner/name`).
+    pub repo_id: String,
+    /// The snapshot directory: what `refs/main` points at, else the newest.
+    pub snapshot: PathBuf,
+}
+
+/// Every model repository in the local cache that has a finished snapshot,
+/// ordered by repository id.
+///
+/// Local-only and cheap: it reads directory listings and refs, not weights, so
+/// a repository whose download left a snapshot the loader will reject is still
+/// listed (use [`find_cached_model`] to ask whether one can be loaded). A
+/// snapshot a download has not finished is skipped.
+pub fn list_cached_models() -> Vec<CachedModel> {
+    list_cached_models_in(&cache_dir())
+}
+
+/// [`list_cached_models`] in a given cache directory.
+pub fn list_cached_models_in(cache_root: &Path) -> Vec<CachedModel> {
+    let Ok(entries) = std::fs::read_dir(cache_root) else {
+        return Vec::new();
+    };
+    let mut models: Vec<CachedModel> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let folder = entry.file_name().into_string().ok()?;
+            let encoded = folder.strip_prefix("models--")?;
+            // The folder name is the repository id with `/` written `--`.
+            let repo_id = encoded.replace("--", "/");
+            let snapshot = find_snapshot(cache_root, RepoKind::Model, &repo_id, None, |s| {
+                std::fs::read_dir(s).is_ok_and(|mut files| files.next().is_some())
+            })?;
+            Some(CachedModel { repo_id, snapshot })
+        })
+        .collect();
+    models.sort_by(|a, b| a.repo_id.cmp(&b.repo_id));
+    models
+}
+
 /// Check if a dataset is already cached locally and return its path.
 ///
 /// Same as [`find_cached_model`] but for datasets, whose snapshots count as
@@ -403,6 +445,44 @@ mod tests {
         )
         .unwrap();
         assert!(find_cached_model_in(root.path(), "o/m", None).is_none());
+    }
+
+    #[test]
+    fn the_cached_models_are_listed_by_repository_with_the_snapshot_main_points_at() {
+        let root = tempfile::tempdir().unwrap();
+        // `o/m`: two snapshots, `main` on the older.
+        let wanted = put_model(root.path(), SHA_A, true);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        put_model(root.path(), SHA_B, true);
+        write_ref(root.path(), "models--o--m", "main", SHA_A).unwrap();
+        // A repository whose download is still going, one with nothing in it,
+        // a dataset, and a file that is not a repository.
+        let busy = snapshot_dir(root.path(), "models--a--busy", SHA_A);
+        std::fs::create_dir_all(&busy).unwrap();
+        std::fs::write(busy.join("config.json"), "{}").unwrap();
+        let _mark = InProgress::begin(&busy).unwrap();
+        std::fs::create_dir_all(snapshot_dir(root.path(), "models--a--empty", SHA_A)).unwrap();
+        std::fs::create_dir_all(root.path().join("datasets--d--x/snapshots")).unwrap();
+        std::fs::write(root.path().join("models--stray"), "x").unwrap();
+        // A repository without an owner, and a model with a late-sorting id.
+        let plain = snapshot_dir(root.path(), "models--gpt2", SHA_A);
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join("config.json"), "{}").unwrap();
+
+        assert_eq!(
+            list_cached_models_in(root.path()),
+            [
+                CachedModel {
+                    repo_id: "gpt2".into(),
+                    snapshot: plain
+                },
+                CachedModel {
+                    repo_id: "o/m".into(),
+                    snapshot: wanted
+                },
+            ]
+        );
+        assert!(list_cached_models_in(&root.path().join("missing")).is_empty());
     }
 
     #[test]
