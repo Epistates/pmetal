@@ -875,6 +875,13 @@ fn emit_descriptor(field: &ParsedField) -> syn::Result<TokenStream2> {
     let default_tokens = emit_default_value(field);
     let argv_optional = field.ty.is_option() || attrs.flag.is_some();
     let required = attrs.required.is_some();
+    let shape = if field.ty == FieldType::VecString {
+        quote! { ::pmetal_core::FieldShape::List }
+    } else if field.ty.is_option() {
+        quote! { ::pmetal_core::FieldShape::Optional }
+    } else {
+        quote! { ::pmetal_core::FieldShape::Scalar }
+    };
 
     Ok(quote! {
         ::pmetal_core::FieldDescriptor {
@@ -887,6 +894,7 @@ fn emit_descriptor(field: &ParsedField) -> syn::Result<TokenStream2> {
             required: #required,
             argv: #argv_lit,
             argv_optional: #argv_optional,
+            shape: #shape,
         }
     })
 }

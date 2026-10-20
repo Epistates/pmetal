@@ -230,6 +230,30 @@ fn argv_follows_flag_csv_option_and_skip_rules() {
     assert_eq!(s.to_argv(), ["--e", "0", "--v", "true"]);
 }
 
+/// A descriptor says whether a field holds one value, one that may be absent,
+/// or a list: a form needs it to know what an empty entry means.
+#[test]
+fn a_descriptor_knows_the_shape_of_its_field() {
+    use pmetal_core::FieldShape;
+    let shapes: Vec<(&str, FieldShape)> = Argv::field_descriptors()
+        .iter()
+        .map(|d| (d.name, d.shape))
+        .collect();
+    assert_eq!(
+        shapes,
+        [
+            ("a", FieldShape::Scalar),
+            ("b", FieldShape::Scalar),
+            ("c", FieldShape::List),
+            ("d", FieldShape::Optional),
+            ("e", FieldShape::Scalar),
+            ("f", FieldShape::Scalar),
+            ("h", FieldShape::Scalar),
+            ("v", FieldShape::Scalar),
+        ]
+    );
+}
+
 /// `argv_flags` lists every flag `to_argv` can spell, the CLI-only ones
 /// included and the form-only and `skip_argv` fields not.
 #[test]
