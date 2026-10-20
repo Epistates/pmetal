@@ -216,6 +216,7 @@ impl PyProgressCallback {
         Self { total_steps }
     }
 
+    /// The number of steps the bar counts to.
     #[getter]
     fn total_steps(&self) -> usize {
         self.total_steps
@@ -240,6 +241,7 @@ impl PyLoggingCallback {
         Self { log_every }
     }
 
+    /// Steps between log lines.
     #[getter]
     fn log_every(&self) -> usize {
         self.log_every
@@ -265,6 +267,7 @@ impl PyMetricsJsonCallback {
         }
     }
 
+    /// The file the metrics are written to.
     #[getter]
     fn path(&self) -> &str {
         &self.path

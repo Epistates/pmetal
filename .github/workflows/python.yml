@@ -87,3 +87,46 @@ jobs:
       - name: Test
         working-directory: crates/pmetal-py
         run: python -m pytest tests -v
+
+  # A free-threaded CPython cannot load an abi3 wheel (that needs Python 3.15's
+  # abi3t), so 3.14t gets a wheel of its own, built from its interpreter and
+  # tested with the GIL off.
+  wheel-free-threaded:
+    name: Wheel and tests (macOS aarch64, Python 3.14t)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14t"
+
+      - name: Install maturin
+        run: pip install "maturin>=1.15,<2.0"
+
+      - name: Build the wheel
+        run: just build-wheel
+
+      - name: Check it is the free-threaded wheel
+        run: ls target/wheels | grep -q 'cp314-cp314t-macosx_14_0_arm64.whl$'
+
+      - name: Install the wheel and the test tools
+        run: |
+          pip install target/wheels/*.whl
+          pip install pytest mypy pyright
+
+      # PYTHON_GIL=0, so a module that does not declare itself safe cannot
+      # quietly turn the GIL back on for the run.
+      - name: Test without the GIL
+        working-directory: crates/pmetal-py
+        env:
+          PYTHON_GIL: "0"
+        run: python -m pytest tests -v

@@ -7,8 +7,8 @@ from Python with the command line's own behaviour, defaults and validation, and
 with process isolation: a job that exhausts memory or crashes the GPU driver
 does not take the interpreter with it.
 
-Training commands report their progress as a stream of events (a loss per step,
-phases, a completion summary); ``on_event`` receives them as dicts.
+Training commands report their progress as a stream of events (a loss and
+learning rate per step); ``on_event`` receives them as dicts.
 """
 
 from __future__ import annotations
