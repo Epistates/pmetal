@@ -571,8 +571,14 @@ mod tests {
     #[test]
     fn a_near_miss_is_suggested_and_a_far_one_is_not() {
         let known = ["epochs".to_string(), "batch_size".to_string()];
-        assert_eq!(suggestion("epochz", known.iter()), " Did you mean 'epochs'?");
-        assert_eq!(suggestion("batch_siez", known.iter()), " Did you mean 'batch_size'?");
+        assert_eq!(
+            suggestion("epochz", known.iter()),
+            " Did you mean 'epochs'?"
+        );
+        assert_eq!(
+            suggestion("batch_siez", known.iter()),
+            " Did you mean 'batch_size'?"
+        );
         assert_eq!(suggestion("xylophone", known.iter()), "");
     }
 
@@ -595,7 +601,10 @@ mod tests {
         assert_eq!(annotation(&Value::Null, min_lr), "float | None");
         let style = descriptors.iter().find(|d| d.name == "wsd_decay_style");
         let text = annotation(&Value::Null, style);
-        assert!(text.starts_with("Literal['") && text.ends_with("| None"), "{text}");
+        assert!(
+            text.starts_with("Literal['") && text.ends_with("| None"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -607,7 +616,10 @@ mod tests {
         let object = object_of_for_test(&spec);
         assert_eq!(object["lora_dropout"], json!(0.05));
         // `to_value` is what widened it.
-        assert_ne!(serde_json::to_value(&spec).unwrap()["lora_dropout"], json!(0.05));
+        assert_ne!(
+            serde_json::to_value(&spec).unwrap()["lora_dropout"],
+            json!(0.05)
+        );
     }
 
     fn object_of_for_test(spec: &TrainSpec) -> Map<String, Value> {
