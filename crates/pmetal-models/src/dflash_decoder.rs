@@ -46,6 +46,9 @@
 //! earlier ones in its own cache, so each draft sees the whole context:
 //! the accepted positions of every round, not only the last.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use pmetal_runtime::compat::{Array, Dtype, Exception, Module, ops};
 use pmetal_runtime::decode::DecodeSampler;
 
@@ -249,6 +252,10 @@ pub struct DFlashConfig {
     /// shrinks its tree while the draft keeps winning. It never grows past
     /// the budget it is given.
     pub adaptive_tree_budget: bool,
+    /// Set from another thread to end the generation after the step in
+    /// flight: the output holds the tokens decided so far. How a caller
+    /// stops a long run (Ctrl-C in the Python bindings).
+    pub cancel: Option<Arc<AtomicBool>>,
 }
 
 impl DFlashConfig {
@@ -258,6 +265,7 @@ impl DFlashConfig {
             generation,
             speculative_tokens: None,
             adaptive_tree_budget: true,
+            cancel: None,
         }
     }
 }
@@ -337,11 +345,13 @@ struct Run {
     finished: bool,
     /// Where the last step's tokens start, to count only those kept.
     last_step_from: usize,
+    /// [`DFlashConfig::cancel`].
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Run {
-    /// Append drawn tokens, stopping at a stop token (which is dropped) or
-    /// the length limit.
+    /// Append drawn tokens, stopping at a stop token (which is dropped), the
+    /// length limit, or a cancellation.
     fn emit(&mut self, drawn: &[u32], config: &GenerationConfig) {
         self.last_step_from = self.tokens.len();
         for &token in drawn {
@@ -351,7 +361,11 @@ impl Run {
             }
             self.tokens.push(token);
         }
-        self.finished = self.tokens.len() >= self.total_max;
+        self.finished = self.tokens.len() >= self.total_max
+            || self
+                .cancel
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::SeqCst));
     }
 
     fn finish(mut self) -> DFlashOutput {
@@ -485,6 +499,7 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
             total_max,
             finished: config.generation.max_new_tokens == 0,
             last_step_from: prompt.len(),
+            cancel: config.cancel.clone(),
         };
         if !run.finished {
             run.emit(&[first], &config.generation);
@@ -1470,5 +1485,38 @@ mod tests {
         };
         let out = decoder.generate(&[1, 2], &one).unwrap();
         assert_eq!(out.metrics.num_generated, 6);
+    }
+
+    /// A cancellation ends the run after the step in flight, with the tokens
+    /// decided so far, instead of running to the length limit.
+    #[test]
+    #[serial]
+    fn cancel_ends_the_run_early() {
+        let mut decoder = DFlashDecoder::new(tiny_target(), tiny_draft(4));
+        let cancelled = Arc::new(AtomicBool::new(true));
+        for speculative_tokens in [Some(1), None] {
+            let config = DFlashConfig {
+                speculative_tokens,
+                cancel: Some(cancelled.clone()),
+                ..config(GenerationConfig::greedy(64))
+            };
+            let out = decoder.generate(&[1, 2], &config).unwrap();
+            // The first token comes with the prefill; the step after it is
+            // the one that was in flight, so a block's worth at most.
+            assert!(
+                (1..=4).contains(&out.metrics.num_generated),
+                "{speculative_tokens:?}: generated {} of 64 after a cancel",
+                out.metrics.num_generated
+            );
+        }
+        // Uncancelled, the same request runs to its length.
+        let free = DFlashConfig {
+            cancel: Some(Arc::new(AtomicBool::new(false))),
+            ..config(GenerationConfig::greedy(64))
+        };
+        assert_eq!(
+            decoder.generate(&[1, 2], &free).unwrap().metrics.num_generated,
+            64
+        );
     }
 }
