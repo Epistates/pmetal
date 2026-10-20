@@ -17,9 +17,8 @@
 use std::marker::PhantomData;
 use std::path::PathBuf;
 
-use pmetal_core::{FieldDescriptor, FieldError, FieldKind, JobFields};
+use pmetal_core::{FieldDescriptor, FieldError, FieldKind};
 use serde::Serialize;
-use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use turbomcp::ToolOutputSchema;
 use turbomcp::prelude::*;
@@ -28,45 +27,8 @@ use crate::policy::PathPolicy;
 use crate::schema_check;
 use crate::tooldef::Hints;
 
-/// A job spec the server can build a tool from.
-pub trait Spec: JobFields + Default + Serialize + DeserializeOwned + Send + Sync + 'static {
-    /// The spec's cross-field validation, which also runs the descriptor checks.
-    fn normalize_spec(&mut self) -> Result<(), Vec<FieldError>>;
-}
-
-macro_rules! impl_spec {
-    ($($ty:ty),+ $(,)?) => {$(
-        impl Spec for $ty {
-            fn normalize_spec(&mut self) -> Result<(), Vec<FieldError>> {
-                self.normalize()
-            }
-        }
-    )+};
-}
-
-impl_spec!(
-    pmetal_core::jobs::TrainSpec,
-    pmetal_core::jobs::PretrainSpec,
-    pmetal_core::jobs::DistillSpec,
-    pmetal_core::jobs::GrpoSpec,
-    pmetal_core::jobs::RlkdSpec,
-    pmetal_core::jobs::PreferenceSpec,
-    pmetal_core::jobs::EmbedTrainSpec,
-    pmetal_core::jobs::QuantizeSpec,
-    pmetal_core::jobs::FuseSpec,
-    pmetal_core::jobs::MergeSpec,
-    pmetal_core::jobs::PackExpertsSpec,
-    pmetal_core::jobs::ServeSpec,
-    pmetal_core::jobs::TokenizeSpec,
-    pmetal_core::jobs::DflashSpec,
-    pmetal_core::jobs::InferSpec,
-    pmetal_core::jobs::EvalSpec,
-    pmetal_core::jobs::BenchSpec,
-    pmetal_core::jobs::TrainDiffusionSpec,
-    pmetal_core::jobs::TrainDraftSpec,
-    pmetal_core::jobs::TrainMtpSpec,
-    pmetal_core::jobs::VocodeSpec,
-);
+/// A job spec the server can build a tool from: every spec in `pmetal-core`.
+pub use pmetal_core::jobs::Spec;
 
 /// How a tool runs its command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
