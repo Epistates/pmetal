@@ -2,7 +2,6 @@
 
 pub mod cli;
 mod commands;
-mod dashboard;
 #[cfg(any(feature = "models", feature = "native-only"))]
 pub mod native_inference;
 mod pack_experts;
@@ -146,7 +145,10 @@ fn run() -> anyhow::Result<()> {
 
     // The TUI owns the terminal, so it logs to the file only.
     #[cfg(feature = "dashboard")]
-    let is_tui = matches!(cli.command, Commands::Tui { .. });
+    let is_tui = matches!(
+        cli.command,
+        Commands::Tui { .. } | Commands::Dashboard { .. }
+    );
     #[cfg(not(feature = "dashboard"))]
     let is_tui = false;
     init_logging(if is_tui { "tui" } else { "cli" }, is_tui);
@@ -647,9 +649,17 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             .await?;
         }
 
+        #[cfg(feature = "dashboard")]
         Commands::Dashboard { metrics_file } => {
             let path = metrics_file.map(std::path::PathBuf::from);
-            dashboard::run_dashboard(path)?;
+            tui::run_dashboard(path).await?;
+        }
+
+        #[cfg(not(feature = "dashboard"))]
+        Commands::Dashboard { .. } => {
+            anyhow::bail!(
+                "The dashboard needs the 'dashboard' feature: cargo build --features dashboard"
+            );
         }
 
         #[cfg(feature = "dashboard")]

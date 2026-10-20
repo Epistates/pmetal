@@ -20,6 +20,7 @@ members = [
     "crates/pmetal-mhc",
     "crates/pmetal-serve",
     "crates/pmetal-mcp",
+    "crates/pmetal-supervisor",
     "crates/pmetal",
     "crates/pmetal-py",
 ]
@@ -53,6 +54,7 @@ pmetal-mhc = { path = "crates/pmetal-mhc", version = "0.6.0" }
 pmetal-distributed = { path = "crates/pmetal-distributed", version = "0.6.0" }
 pmetal-serve = { path = "crates/pmetal-serve", version = "0.6.0" }
 pmetal-mcp = { path = "crates/pmetal-mcp", version = "0.6.0" }
+pmetal-supervisor = { path = "crates/pmetal-supervisor", version = "0.6.0" }
 # The CLI crate, as a library. Renamed because pmetal-py's own lib is `pmetal`.
 pmetal-lib = { package = "pmetal", path = "crates/pmetal", version = "0.6.0", default-features = false }
 
@@ -180,6 +182,10 @@ image = { version = "0.25.10", default-features = false, features = [
 ] }
 flate2 = "1"
 libc = "0.2.190"
+# Signals a child's process group without `unsafe` (pmetal-supervisor)
+rustix = { version = "1.1", features = ["process"] }
+# Strips terminal escape sequences from a child's output (pmetal-supervisor)
+anstream = "1.0"
 parking_lot = "0.12.5"
 regex = "1.13"
 uuid = "1.27"

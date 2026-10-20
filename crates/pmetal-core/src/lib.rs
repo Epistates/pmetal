@@ -44,7 +44,10 @@ pub use events::{
     JobStatus, JsonlSink, LogLevel, MetricPayload, NullSink, ParseError, Phase, Progress,
     ServeRequestMetrics, TrainingCallbackToSink, parse_event, write_event,
 };
-pub use fields::{DefaultValue, FieldDescriptor, FieldError, FieldKind, JobFields};
+pub use fields::{
+    DefaultValue, FieldDescriptor, FieldError, FieldKind, FieldShape, JobFields, default_text,
+    spec_from_text,
+};
 pub use scheduler::{LearningRateScheduler, total_training_steps, warmup_steps_for};
 pub use secrets::SecretString;
 pub use traits::*;
@@ -60,7 +63,9 @@ pub mod prelude {
     pub use crate::config_file::{FullTrainingConfig, LoadedConfig};
     pub use crate::error::{PMetalError, Result};
     pub use crate::events::{JobEvent, JobEventSink, JobKind, JobStatus, MetricPayload, Phase};
-    pub use crate::fields::{DefaultValue, FieldDescriptor, FieldError, FieldKind, JobFields};
+    pub use crate::fields::{
+        DefaultValue, FieldDescriptor, FieldError, FieldKind, FieldShape, JobFields,
+    };
     pub use crate::scheduler::LearningRateScheduler;
     pub use crate::secrets::SecretString;
     pub use crate::traits::*;

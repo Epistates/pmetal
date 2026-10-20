@@ -1,48 +1,39 @@
 //! Tab definitions and implementations for the PMetal TUI.
 
 mod bench;
+mod custom_dirs;
 pub mod dashboard;
 mod datasets;
 mod device;
-mod dflash;
-mod distillation;
-mod embed_train;
-mod eval;
-mod grpo;
+mod infer_stream;
 mod inference;
 mod jobs;
-mod merge;
 mod models;
 mod ollama;
-mod preference;
-mod pretrain;
-mod quantize;
-mod rlkd;
+pub mod panel;
 mod serve;
-mod tokenize;
-mod training;
+mod status_panel;
+mod tools;
+mod trainers;
 
 pub use bench::BenchTab;
 pub use dashboard::DashboardTab;
-pub use datasets::DatasetsTab;
-pub use device::DeviceTab;
-pub use dflash::DflashTab;
-pub use distillation::DistillationTab;
-pub use embed_train::EmbedTrainTab;
-pub use eval::EvalTab;
-pub use grpo::GrpoTab;
+pub use datasets::scan as scan_datasets;
+pub use datasets::{DatasetEntry, DatasetPeek, DatasetsTab};
+#[cfg(test)]
+pub use datasets::{DatasetSource, Readiness as DatasetReadiness};
+pub use device::{DeviceInfo, DeviceTab, read_memory_in_use};
 pub use inference::{InferenceFocus, InferenceTab};
-pub use jobs::JobsTab;
-pub use merge::MergeTab;
-pub use models::{ModelSource, ModelsTab, write_training_info};
+pub use jobs::{JobEntry, JobsTab, Selection as JobSelection, history_roots, scan_history};
+pub use models::{
+    ModelEntry, ModelSource, ModelsTab, fit_style, is_lora_adapter, query_device_spec,
+    scan as scan_models, write_training_info,
+};
 pub use ollama::OllamaTab;
-pub use preference::PreferenceTab;
-pub use pretrain::PretrainTab;
-pub use quantize::QuantizeTab;
-pub use rlkd::RlkdTab;
+pub use panel::{Applied, FormTab, Pick, RunState};
 pub use serve::ServeTab;
-pub use tokenize::TokenizeTab;
-pub use training::{TrainingStatus, TrainingTab};
+pub use tools::ToolTab;
+pub use trainers::TrainerTab;
 
 /// Extract a short model name from a model ID.
 /// e.g. "Qwen/Qwen3-0.6B" → "Qwen3-0.6B", "trained/foo" → "foo"
@@ -51,7 +42,7 @@ pub fn model_short_name(model_id: &str) -> String {
 }
 
 /// All available tabs in the TUI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tab {
     Dashboard,
     Device,
@@ -151,6 +142,14 @@ impl Tab {
         let idx = all.iter().position(|t| *t == self).unwrap_or(0);
         all[(idx + all.len() - 1) % all.len()]
     }
+
+    /// Whether the tab runs a job from a form.
+    pub fn is_form(self) -> bool {
+        !matches!(
+            self,
+            Tab::Dashboard | Tab::Device | Tab::Models | Tab::Datasets | Tab::Inference | Tab::Jobs
+        )
+    }
 }
 
 impl std::fmt::Display for Tab {
@@ -177,6 +176,34 @@ impl std::fmt::Display for Tab {
             Tab::Eval => write!(f, "Eval"),
             Tab::Ollama => write!(f, "Modelfile"),
             Tab::Jobs => write!(f, "Jobs"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_tab_is_listed_once_and_cycling_visits_them_all() {
+        let mut seen = std::collections::HashSet::new();
+        let mut tab = Tab::ALL[0];
+        for _ in 0..Tab::ALL.len() {
+            assert!(seen.insert(tab), "{tab} twice");
+            tab = tab.next();
+        }
+        assert_eq!(tab, Tab::ALL[0]);
+        assert_eq!(seen.len(), Tab::ALL.len());
+        assert_eq!(Tab::ALL[0].prev(), *Tab::ALL.last().unwrap());
+    }
+
+    #[test]
+    fn icons_and_names_tell_the_tabs_apart() {
+        let mut icons = std::collections::HashSet::new();
+        let mut names = std::collections::HashSet::new();
+        for &tab in Tab::ALL {
+            assert!(icons.insert(tab.icon()), "icon of {tab}");
+            assert!(names.insert(tab.to_string()), "name of {tab}");
         }
     }
 }

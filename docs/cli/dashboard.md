@@ -2,7 +2,7 @@
 
 Real-time training metrics visualization.
 
-Display a real-time dashboard of training metrics. Shows live loss curves, learning rate schedules, throughput sparklines, and timing breakdowns.
+Opens the [TUI](/cli/tui/) on its Monitor tab, following a training run's metrics file. Shows live loss curves, learning rate schedules, throughput sparklines, and timing breakdowns. The other tabs are available from there, so a run can be started, steered and watched in one place.
 
 ## Usage
 
@@ -17,8 +17,9 @@ pmetal dashboard [OPTIONS]
 - Throughput sparklines (tokens/second)
 - Timing breakdown gauges (forward pass, backward pass, optimizer step)
 - Memory usage monitoring
+- Follows a run started from the Training tab (or any `--log-metrics` file) and reports when the loss diverges
 
 ## See Also
 
-- [pmetal tui](/cli/tui/) — Full TUI with Dashboard tab
-- [pmetal train](/cli/train/) — Training commands
+- [pmetal tui](/cli/tui/): The full TUI
+- [pmetal train](/cli/train/): Training commands
