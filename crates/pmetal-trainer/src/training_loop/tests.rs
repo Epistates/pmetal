@@ -1346,9 +1346,7 @@ struct StopWhenAsked {
 
 impl TrainingCallback for StopWhenAsked {
     fn should_stop(&self) -> bool {
-        self.asked
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            >= self.after
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= self.after
     }
 }
 

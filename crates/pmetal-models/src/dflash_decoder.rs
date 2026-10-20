@@ -1515,7 +1515,11 @@ mod tests {
             ..config(GenerationConfig::greedy(64))
         };
         assert_eq!(
-            decoder.generate(&[1, 2], &free).unwrap().metrics.num_generated,
+            decoder
+                .generate(&[1, 2], &free)
+                .unwrap()
+                .metrics
+                .num_generated,
             64
         );
     }
