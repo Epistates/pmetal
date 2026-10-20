@@ -1,6 +1,8 @@
 name: Python Bindings
 
-# Disabled until Python bindings are stabilized
+# Builds the wheel the way a release ships it and runs the test suite against
+# the installed wheel (not an editable install). Manual until the bindings are
+# published.
 on:
   workflow_dispatch:
 
@@ -11,69 +13,77 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  build:
-    name: Build Python wheel (macOS aarch64)
+  wheel:
+    name: Wheel and tests (macOS aarch64, Python ${{ matrix.python }})
     runs-on: macos-latest
-    env:
-      # A wheel runs far from this build tree, so MLX is linked into the
-      # extension module (.cargo/config.toml otherwise links it shared here).
-      # Job-wide, so the metallib step and maturin build the same MLX.
-      PMETAL_MLX_STATIC: '1'
+    strategy:
+      fail-fast: false
+      matrix:
+        # The abi3 wheel is built once, on the oldest Python it supports, and
+        # tested on the oldest and the newest.
+        python: ["3.11", "3.14"]
     steps:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Set up Python 3.11
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Set up Python
         uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python }}
 
       - name: Install maturin
         run: pip install "maturin>=1.15,<2.0"
 
-      # MLX loads its Metal kernels from an mlx.metallib next to the binary
-      # that links it, here the extension module, and only the one built with
-      # that MLX holds the kernels it asks for. Build the extension's
-      # dependencies as maturin will, take the metallib path and SHA-256 the
-      # bridge's build script publishes, and put the file in the package,
-      # where the wheel carries it beside the module.
-      - name: Bundle the metallib built with the linked MLX
+      # MLX linked statically, the `pmetal` command line and the metallib built
+      # with that MLX inside the package, and the unwinding `wheel` profile
+      # (see `just build-wheel`).
+      - name: Build the wheel
+        if: matrix.python == '3.11'
+        run: just build-wheel
+
+      - name: Check the wheel carries the metallib and the command line
+        if: matrix.python == '3.11'
         run: |
           set -euo pipefail
-          meta=$(
-            cargo build --release -p pmetal-py --message-format=json \
-              | jq -r 'select(.reason == "build-script-executed")
-                  | select(.package_id | test("pmetal-runtime"))
-                  | .env | map({(.[0]): .[1]}) | add
-                  | "\(.PMETAL_RUNTIME_MLX_METALLIB) \(.PMETAL_RUNTIME_MLX_METALLIB_SHA256)"' \
-              | tail -n 1)
-          read -r path sha <<< "$meta"
-          if [ ! -f "$path" ]; then
-            echo "::error::the bridge's build published no metallib ($meta)"
-            exit 1
-          fi
-          dest=crates/pmetal-py/py_src/pmetal/mlx.metallib
-          cp "$path" "$dest"
-          echo "$sha  $dest" | shasum -a 256 -c -
+          ls target/wheels
+          unzip -l target/wheels/*.whl | grep -q 'pmetal/mlx.metallib$'
+          unzip -l target/wheels/*.whl | grep -q 'pmetal/_bin/pmetal$'
+          unzip -l target/wheels/*.whl | grep -q 'pmetal/py.typed$'
+          unzip -l target/wheels/*.whl | grep -q 'pmetal/pmetal.pyi$'
 
-      - name: Build wheel
-        working-directory: crates/pmetal-py
-        run: maturin build --release --strip
-
-      - name: Check the wheel carries the metallib
-        run: unzip -l target/wheels/*.whl | grep -q 'pmetal/mlx.metallib$'
-
-      - name: Install wheel and run tests
-        run: |
-          pip install target/wheels/*.whl
-          pip install pytest
-          cd crates/pmetal-py
-          pytest tests/ -v
-
-      - name: Upload wheel artifact
+      - name: Upload the wheel
+        if: matrix.python == '3.11'
         uses: actions/upload-artifact@v7
         with:
           name: pmetal-wheel-macos-aarch64
           path: target/wheels/*.whl
+
+      - name: Fetch the wheel built on 3.11
+        if: matrix.python != '3.11'
+        uses: actions/download-artifact@v7
+        with:
+          name: pmetal-wheel-macos-aarch64
+          path: target/wheels
+
+      - name: Install the wheel and the test tools
+        run: |
+          pip install target/wheels/*.whl
+          pip install pytest mypy pyright ruff
+
+      # The package is imported from the installed wheel: the checkout keeps its
+      # sources in py_src, which is not on the import path.
+      - name: Lint
+        working-directory: crates/pmetal-py
+        run: |
+          python -m ruff check .
+          python -m ruff format --check .
+
+      - name: Test
+        working-directory: crates/pmetal-py
+        run: python -m pytest tests -v

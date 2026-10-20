@@ -35,9 +35,9 @@ fmt-check:
 
 # ─── Linting ────────────────────────────────────────────────────────
 
-# Clippy with default features, excluding pmetal-py (CI: check job)
+# Clippy with default features (CI: check job)
 lint:
-    cargo clippy --workspace --all-targets --exclude pmetal-py -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings
 
 # Clippy with ALL features enabled (catches cfg-gated field mismatches)
 lint-all-features:
@@ -69,7 +69,7 @@ build-debug:
 
 # Check compilation without building
 check:
-    cargo check --workspace --exclude pmetal-py
+    cargo check --workspace
 
 # Build CLI binary (mirrors release CI: feature set + self-contained MLX)
 build-cli:
@@ -118,6 +118,40 @@ stage-gui-sidecar: build-cli
     fi
     cp "$METALLIB" "$SIDECAR_DIR/mlx.metallib"
     echo "Staged sidecar for $TRIPLE"
+
+# Build the Python wheel the way CI ships it: MLX linked statically, the `pmetal`
+# command line (which `pmetal.run` runs) and the metallib built with the
+# extension's MLX inside the package, and the unwinding `wheel` profile
+# (pyproject.toml), so a Rust panic is a Python exception. Output: target/wheels.
+build-wheel:
+    #!/usr/bin/env zsh
+    set -euo pipefail
+    export PMETAL_MLX_STATIC=1 MACOSX_DEPLOYMENT_TARGET=14.0
+    PKG=crates/pmetal-py/py_src/pmetal
+    mkdir -p "$PKG/_bin"
+    cargo build --release -p pmetal --features serve,mcp
+    cp target/release/pmetal "$PKG/_bin/pmetal"
+    meta=$(
+      cargo build --profile wheel -p pmetal-py --message-format=json \
+        | jq -r 'select(.reason == "build-script-executed")
+            | select(.package_id | test("pmetal-runtime"))
+            | .env | map({(.[0]): .[1]}) | add
+            | "\(.PMETAL_RUNTIME_MLX_METALLIB) \(.PMETAL_RUNTIME_MLX_METALLIB_SHA256)"' \
+        | tail -n 1
+    )
+    read -r path sha <<< "$meta"
+    if [[ ! -f "$path" ]]; then
+        echo "FAIL: the bridge's build published no metallib ($meta)"
+        exit 1
+    fi
+    cp "$path" "$PKG/mlx.metallib"
+    echo "$sha  $PKG/mlx.metallib" | shasum -a 256 -c -
+    cd crates/pmetal-py && maturin build --strip --out ../../target/wheels
+
+# Python bindings: lint, then the pytest suite (stubs included) against the
+# extension installed by `maturin develop`.
+test-python:
+    cd crates/pmetal-py && python -m ruff check . && python -m ruff format --check . && python -m pytest tests
 
 # Build the release GUI bundle the way release CI does (sidecar included)
 build-gui-bundle: stage-gui-sidecar
