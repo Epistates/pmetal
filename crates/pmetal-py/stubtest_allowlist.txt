@@ -2,3 +2,8 @@
 
 # The module defines no __all__; the package re-exports by name.
 pmetal.pmetal.__all__
+
+# Hooks of the test-hooks feature, which the stub does not describe.
+pmetal.pmetal._panic
+pmetal.pmetal._panic_in_task
+pmetal.pmetal._panic_unwinds

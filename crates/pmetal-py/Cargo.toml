@@ -28,6 +28,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 
+[features]
+# Hooks that make the extension misbehave on purpose, for the tests that check
+# it fails the way it should (a Rust panic must be a Python exception). Never in
+# a published wheel.
+test-hooks = []
+
 [build-dependencies]
 pyo3-build-config = { workspace = true }
 

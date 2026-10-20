@@ -63,7 +63,7 @@ def test_pyright_strict_accepts_the_sample():
 @needs_mypy
 def test_stubtest_finds_no_disagreement_between_stub_and_module():
     result = run(sys.executable, "-m", "mypy.stubtest", "pmetal.pmetal",
-                 "--allowlist", str(CRATE / "stubtest_allowlist.txt"), cwd=CRATE.parent)
+                 "--allowlist", str(CRATE / "stubtest_allowlist.txt"), "--ignore-unused-allowlist", cwd=CRATE.parent)
     assert result.returncode == 0, result.stdout + result.stderr
 
 

@@ -19,6 +19,8 @@ mod callbacks;
 mod config;
 mod dflash;
 mod error;
+#[cfg(feature = "test-hooks")]
+mod hooks;
 mod hub;
 mod infer;
 mod json;
@@ -76,6 +78,13 @@ fn pmetal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hub::search_models, m)?)?;
     m.add_function(wrap_pyfunction!(hub::estimate_fit, m)?)?;
     m.add_function(wrap_pyfunction!(hub::upload_model, m)?)?;
+
+    #[cfg(feature = "test-hooks")]
+    {
+        m.add_function(wrap_pyfunction!(hooks::_panic, m)?)?;
+        m.add_function(wrap_pyfunction!(hooks::_panic_in_task, m)?)?;
+        m.add_function(wrap_pyfunction!(hooks::_panic_unwinds, m)?)?;
+    }
 
     Ok(())
 }
