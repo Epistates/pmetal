@@ -552,3 +552,68 @@ macro_rules! py_spec {
 }
 
 pub(crate) use py_spec;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pmetal_core::jobs::TrainSpec;
+    use serde_json::json;
+
+    #[test]
+    fn edit_distance_is_the_usual_one() {
+        assert_eq!(distance("epochs", "epochs"), 0);
+        assert_eq!(distance("epochz", "epochs"), 1);
+        assert_eq!(distance("modle", "model"), 2);
+        assert_eq!(distance("", "abc"), 3);
+        assert_eq!(distance("kitten", "sitting"), 3);
+    }
+
+    #[test]
+    fn a_near_miss_is_suggested_and_a_far_one_is_not() {
+        let known = ["epochs".to_string(), "batch_size".to_string()];
+        assert_eq!(suggestion("epochz", known.iter()), " Did you mean 'epochs'?");
+        assert_eq!(suggestion("batch_siez", known.iter()), " Did you mean 'batch_size'?");
+        assert_eq!(suggestion("xylophone", known.iter()), "");
+    }
+
+    #[test]
+    fn an_annotation_follows_the_default_and_the_descriptor() {
+        assert_eq!(annotation(&json!(true), None), "bool");
+        assert_eq!(annotation(&json!(3), None), "int");
+        assert_eq!(annotation(&json!(0.5), None), "float");
+        assert_eq!(annotation(&json!("x"), None), "str");
+        assert_eq!(annotation(&json!([]), None), "list[str]");
+        assert_eq!(annotation(&Value::Null, None), "str | None");
+        assert_eq!(literal(&["a", "b'c"]), "Literal['a', 'b\\'c']");
+    }
+
+    #[test]
+    fn every_trainspec_field_gets_an_annotation_from_its_descriptor_when_unset() {
+        // `Option` fields default to null, so their type can only come from the descriptor.
+        let descriptors = <TrainSpec as JobFields>::field_descriptors();
+        let min_lr = descriptors.iter().find(|d| d.name == "min_lr");
+        assert_eq!(annotation(&Value::Null, min_lr), "float | None");
+        let style = descriptors.iter().find(|d| d.name == "wsd_decay_style");
+        let text = annotation(&Value::Null, style);
+        assert!(text.starts_with("Literal['") && text.ends_with("| None"), "{text}");
+    }
+
+    #[test]
+    fn f32_fields_serialize_as_their_shortest_decimal() {
+        let spec = TrainSpec {
+            lora_dropout: 0.05,
+            ..TrainSpec::default()
+        };
+        let object = object_of_for_test(&spec);
+        assert_eq!(object["lora_dropout"], json!(0.05));
+        // `to_value` is what widened it.
+        assert_ne!(serde_json::to_value(&spec).unwrap()["lora_dropout"], json!(0.05));
+    }
+
+    fn object_of_for_test(spec: &TrainSpec) -> Map<String, Value> {
+        match value_of(spec).unwrap() {
+            Value::Object(map) => map,
+            other => panic!("{other}"),
+        }
+    }
+}
