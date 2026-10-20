@@ -1,490 +1,258 @@
-//! Python wrappers for PMetal configuration types.
+//! `GenerationConfig` and `ModelArchitecture`.
+//!
+//! Training and job settings are the job specs (see `spec.rs`); what is left
+//! here is generation, which a loaded `Model` takes per call.
 
+use std::collections::HashMap;
+
+use pmetal_models::GenerationConfig;
 use pyo3::prelude::*;
 
-// ---------------------------------------------------------------------------
-// LoRA Configuration
-// ---------------------------------------------------------------------------
-
-#[pyclass(from_py_object, name = "LoraConfig")]
-#[derive(Clone)]
-pub struct PyLoraConfig(pub(crate) pmetal_core::LoraConfig);
-
-#[pymethods]
-impl PyLoraConfig {
-    #[new]
-    #[pyo3(signature = (r=16, alpha=32.0, dropout=0.0, use_rslora=false, use_dora=false))]
-    fn new(r: usize, alpha: f32, dropout: f32, use_rslora: bool, use_dora: bool) -> Self {
-        Self(pmetal_core::LoraConfig {
-            r,
-            alpha,
-            dropout,
-            use_rslora,
-            use_dora,
-            ..Default::default()
-        })
-    }
-
-    #[getter]
-    fn r(&self) -> usize {
-        self.0.r
-    }
-    #[getter]
-    fn alpha(&self) -> f32 {
-        self.0.alpha
-    }
-    #[getter]
-    fn dropout(&self) -> f32 {
-        self.0.dropout
-    }
-    #[getter]
-    fn use_rslora(&self) -> bool {
-        self.0.use_rslora
-    }
-    #[getter]
-    fn use_dora(&self) -> bool {
-        self.0.use_dora
-    }
-    #[getter]
-    fn scaling(&self) -> f32 {
-        self.0.scaling()
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "LoraConfig(r={}, alpha={}, dropout={}, use_rslora={}, use_dora={}, scaling={:.4})",
-            self.0.r,
-            self.0.alpha,
-            self.0.dropout,
-            self.0.use_rslora,
-            self.0.use_dora,
-            self.0.scaling(),
-        )
-    }
-
-    fn to_json(&self) -> PyResult<String> {
-        serde_json::to_string_pretty(&self.0).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("Serialization error: {e}"))
-        })
-    }
-
-    #[staticmethod]
-    fn from_json(json: &str) -> PyResult<Self> {
-        let config: pmetal_core::LoraConfig = serde_json::from_str(json).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("Deserialization error: {e}"))
-        })?;
-        Ok(Self(config))
-    }
+/// Sampling settings for `Model.generate`.
+///
+/// Every field is optional, and a field left unset keeps the model's own
+/// default (its `generation_config.json`, else the library's): a config says
+/// only what the caller wants different. Temperature 0 or less is greedy.
+#[pyclass(name = "GenerationConfig", module = "pmetal", frozen, from_py_object)]
+#[derive(Clone, Default)]
+pub struct PyGenerationConfig {
+    max_tokens: Option<usize>,
+    temperature: Option<f32>,
+    top_k: Option<usize>,
+    top_p: Option<f32>,
+    min_p: Option<f32>,
+    repetition_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
+    seed: Option<u64>,
+    stop_tokens: Option<Vec<u32>>,
+    logit_bias: Option<Vec<(u32, f32)>>,
 }
 
-// ---------------------------------------------------------------------------
-// Training Configuration
-// ---------------------------------------------------------------------------
-
-#[pyclass(from_py_object, name = "TrainingConfig")]
-#[derive(Clone)]
-pub struct PyTrainingConfig(pub(crate) pmetal_core::TrainingConfig);
-
-#[pymethods]
-impl PyTrainingConfig {
-    #[new]
-    #[pyo3(signature = (
-        learning_rate=2e-4,
-        batch_size=4,
-        num_epochs=3,
-        max_seq_len=2048,
-        warmup_steps=100,
-        weight_decay=0.01,
-        max_grad_norm=1.0,
-        use_packing=true,
-        output_dir="./output",
-        optimizer="adamw",
-        label_smoothing=0.0,
-        z_loss=0.0,
-        neftune_noise_alpha=None,
-    ))]
+impl PyGenerationConfig {
+    /// `config` with any keyword that is given replacing its field.
     #[allow(clippy::too_many_arguments)]
-    fn new(
-        learning_rate: f64,
-        batch_size: usize,
-        num_epochs: usize,
-        max_seq_len: usize,
-        warmup_steps: usize,
-        weight_decay: f64,
-        max_grad_norm: f64,
-        use_packing: bool,
-        output_dir: &str,
-        optimizer: &str,
-        label_smoothing: f64,
-        z_loss: f64,
-        neftune_noise_alpha: Option<f64>,
-    ) -> PyResult<Self> {
-        let optimizer = optimizer
-            .parse::<pmetal_core::OptimizerType>()
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
-        let config = pmetal_core::TrainingConfig {
-            learning_rate,
-            batch_size,
-            num_epochs,
-            max_seq_len,
-            warmup_steps,
-            weight_decay,
-            max_grad_norm,
-            use_packing,
-            output_dir: output_dir.to_string(),
-            optimizer,
-            label_smoothing,
-            z_loss,
-            neftune_noise_alpha,
-            ..Default::default()
-        };
-        pmetal_core::ConfigValidator::validate(&config)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-        Ok(Self(config))
+    pub fn from_parts(
+        config: Option<&PyGenerationConfig>,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+        top_k: Option<usize>,
+        top_p: Option<f32>,
+        min_p: Option<f32>,
+        repetition_penalty: Option<f32>,
+        frequency_penalty: Option<f32>,
+        presence_penalty: Option<f32>,
+        seed: Option<u64>,
+        stop_tokens: Option<Vec<u32>>,
+        logit_bias: Option<HashMap<u32, f32>>,
+    ) -> Self {
+        let base = config.cloned().unwrap_or_default();
+        Self {
+            max_tokens: max_tokens.or(base.max_tokens),
+            temperature: temperature.or(base.temperature),
+            top_k: top_k.or(base.top_k),
+            top_p: top_p.or(base.top_p),
+            min_p: min_p.or(base.min_p),
+            repetition_penalty: repetition_penalty.or(base.repetition_penalty),
+            frequency_penalty: frequency_penalty.or(base.frequency_penalty),
+            presence_penalty: presence_penalty.or(base.presence_penalty),
+            seed: seed.or(base.seed),
+            stop_tokens: stop_tokens.or(base.stop_tokens),
+            logit_bias: logit_bias.map(sorted_bias).or(base.logit_bias),
+        }
     }
 
-    #[getter]
-    fn learning_rate(&self) -> f64 {
-        self.0.learning_rate
-    }
-    #[getter]
-    fn batch_size(&self) -> usize {
-        self.0.batch_size
-    }
-    #[getter]
-    fn num_epochs(&self) -> usize {
-        self.0.num_epochs
-    }
-    #[getter]
-    fn max_seq_len(&self) -> usize {
-        self.0.max_seq_len
-    }
-    #[getter]
-    fn warmup_steps(&self) -> usize {
-        self.0.warmup_steps
-    }
-    #[getter]
-    fn weight_decay(&self) -> f64 {
-        self.0.weight_decay
-    }
-    #[getter]
-    fn max_grad_norm(&self) -> f64 {
-        self.0.max_grad_norm
-    }
-    #[getter]
-    fn use_packing(&self) -> bool {
-        self.0.use_packing
-    }
-    #[getter]
-    fn output_dir(&self) -> &str {
-        &self.0.output_dir
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "TrainingConfig(lr={:.2e}, batch_size={}, epochs={}, max_seq_len={}, warmup={}, \
-             weight_decay={}, max_grad_norm={}, packing={}, output_dir='{}')",
-            self.0.learning_rate,
-            self.0.batch_size,
-            self.0.num_epochs,
-            self.0.max_seq_len,
-            self.0.warmup_steps,
-            self.0.weight_decay,
-            self.0.max_grad_norm,
-            self.0.use_packing,
-            self.0.output_dir,
-        )
-    }
-
-    fn to_json(&self) -> PyResult<String> {
-        serde_json::to_string_pretty(&self.0).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("Serialization error: {e}"))
-        })
-    }
-
-    #[staticmethod]
-    fn from_json(json: &str) -> PyResult<Self> {
-        let config: pmetal_core::TrainingConfig = serde_json::from_str(json).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("Deserialization error: {e}"))
-        })?;
-        Ok(Self(config))
+    /// `base` with every field this config sets applied over it.
+    pub fn resolve(&self, mut base: GenerationConfig) -> GenerationConfig {
+        if let Some(n) = self.max_tokens {
+            base.max_new_tokens = n;
+        }
+        if let Some(t) = self.temperature {
+            base.temperature = t;
+            // 0 or less is greedy, and a positive temperature samples even
+            // when the model's defaults say otherwise.
+            base.do_sample = t > 0.0;
+        }
+        if let Some(k) = self.top_k {
+            base.top_k = k;
+        }
+        if let Some(p) = self.top_p {
+            base.top_p = p;
+        }
+        if let Some(p) = self.min_p {
+            base.min_p = p;
+        }
+        if let Some(p) = self.repetition_penalty {
+            base.repetition_penalty = p;
+        }
+        if let Some(p) = self.frequency_penalty {
+            base.frequency_penalty = p;
+        }
+        if let Some(p) = self.presence_penalty {
+            base.presence_penalty = p;
+        }
+        if let Some(seed) = self.seed {
+            base.seed = Some(seed);
+        }
+        if let Some(stop) = &self.stop_tokens {
+            for token in stop {
+                if !base.stop_tokens.contains(token) {
+                    base.stop_tokens.push(*token);
+                }
+            }
+        }
+        if let Some(bias) = &self.logit_bias {
+            base.logit_bias.clone_from(bias);
+        }
+        base
     }
 }
 
-// ---------------------------------------------------------------------------
-// Generation Configuration
-// ---------------------------------------------------------------------------
-
-#[pyclass(from_py_object, name = "GenerationConfig")]
-#[derive(Clone)]
-pub struct PyGenerationConfig(pub(crate) pmetal_models::GenerationConfig);
+fn sorted_bias(bias: HashMap<u32, f32>) -> Vec<(u32, f32)> {
+    let mut pairs: Vec<_> = bias.into_iter().collect();
+    pairs.sort_by_key(|(token, _)| *token);
+    pairs
+}
 
 #[pymethods]
 impl PyGenerationConfig {
     #[new]
-    #[pyo3(signature = (max_tokens=256, temperature=0.7, top_k=50, top_p=0.9, min_p=0.05, seed=None))]
+    #[pyo3(signature = (*, max_tokens=None, temperature=None, top_k=None, top_p=None,
+        min_p=None, repetition_penalty=None, frequency_penalty=None, presence_penalty=None,
+        seed=None, stop_tokens=None, logit_bias=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
-        max_tokens: usize,
-        temperature: f32,
-        top_k: usize,
-        top_p: f32,
-        min_p: f32,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+        top_k: Option<usize>,
+        top_p: Option<f32>,
+        min_p: Option<f32>,
+        repetition_penalty: Option<f32>,
+        frequency_penalty: Option<f32>,
+        presence_penalty: Option<f32>,
         seed: Option<u64>,
+        stop_tokens: Option<Vec<u32>>,
+        logit_bias: Option<HashMap<u32, f32>>,
     ) -> Self {
-        let mut config = pmetal_models::GenerationConfig::sampling(max_tokens, temperature)
-            .with_top_k(top_k)
-            .with_top_p(top_p)
-            .with_min_p(min_p);
-        if let Some(s) = seed {
-            config = config.with_seed(s);
-        }
-        Self(config)
-    }
-
-    #[staticmethod]
-    fn greedy(max_tokens: usize) -> Self {
-        Self(pmetal_models::GenerationConfig::greedy(max_tokens))
-    }
-
-    #[staticmethod]
-    #[pyo3(signature = (max_tokens=256, temperature=0.7))]
-    fn sampling(max_tokens: usize, temperature: f32) -> Self {
-        Self(pmetal_models::GenerationConfig::sampling(
+        Self::from_parts(
+            None,
             max_tokens,
             temperature,
-        ))
+            top_k,
+            top_p,
+            min_p,
+            repetition_penalty,
+            frequency_penalty,
+            presence_penalty,
+            seed,
+            stop_tokens,
+            logit_bias,
+        )
     }
 
-    #[getter]
-    fn max_tokens(&self) -> usize {
-        self.0.max_new_tokens
+    /// Greedy decoding: the likeliest token every step.
+    #[staticmethod]
+    #[pyo3(signature = (max_tokens=None))]
+    fn greedy(max_tokens: Option<usize>) -> Self {
+        Self {
+            max_tokens,
+            temperature: Some(0.0),
+            ..Self::default()
+        }
     }
+
+    /// Maximum new tokens, or None for the model's default.
     #[getter]
-    fn temperature(&self) -> f32 {
-        self.0.temperature
+    fn max_tokens(&self) -> Option<usize> {
+        self.max_tokens
     }
+    /// Sampling temperature, or None for the model's default.
     #[getter]
-    fn top_k(&self) -> usize {
-        self.0.top_k
+    fn temperature(&self) -> Option<f32> {
+        self.temperature
     }
+    /// Top-k, or None for the model's default.
     #[getter]
-    fn top_p(&self) -> f32 {
-        self.0.top_p
+    fn top_k(&self) -> Option<usize> {
+        self.top_k
     }
+    /// Top-p, or None for the model's default.
     #[getter]
-    fn min_p(&self) -> f32 {
-        self.0.min_p
+    fn top_p(&self) -> Option<f32> {
+        self.top_p
     }
+    /// Min-p, or None for the model's default.
+    #[getter]
+    fn min_p(&self) -> Option<f32> {
+        self.min_p
+    }
+    /// Repetition penalty, or None for the model's default.
+    #[getter]
+    fn repetition_penalty(&self) -> Option<f32> {
+        self.repetition_penalty
+    }
+    /// Frequency penalty, or None for the model's default.
+    #[getter]
+    fn frequency_penalty(&self) -> Option<f32> {
+        self.frequency_penalty
+    }
+    /// Presence penalty, or None for the model's default.
+    #[getter]
+    fn presence_penalty(&self) -> Option<f32> {
+        self.presence_penalty
+    }
+    /// Seed, or None for a different draw every call.
     #[getter]
     fn seed(&self) -> Option<u64> {
-        self.0.seed
+        self.seed
+    }
+    /// Extra stop token ids.
+    #[getter]
+    fn stop_tokens(&self) -> Option<Vec<u32>> {
+        self.stop_tokens.clone()
+    }
+    /// Logit biases, `{token_id: bias}`.
+    #[getter]
+    fn logit_bias(&self) -> Option<HashMap<u32, f32>> {
+        self.logit_bias
+            .as_ref()
+            .map(|pairs| pairs.iter().copied().collect())
     }
 
     fn __repr__(&self) -> String {
-        format!(
-            "GenerationConfig(max_tokens={}, temp={}, top_k={}, top_p={}, min_p={})",
-            self.0.max_new_tokens, self.0.temperature, self.0.top_k, self.0.top_p, self.0.min_p,
-        )
-    }
-}
-
-// ---------------------------------------------------------------------------
-// DataLoader Configuration
-// ---------------------------------------------------------------------------
-
-#[pyclass(from_py_object, name = "DataLoaderConfig")]
-#[derive(Clone)]
-pub struct PyDataLoaderConfig(pub(crate) pmetal_data::DataLoaderConfig);
-
-#[pymethods]
-impl PyDataLoaderConfig {
-    #[new]
-    #[pyo3(signature = (batch_size=4, max_seq_len=2048, shuffle=true, seed=42, pad_token_id=0, drop_last=false))]
-    fn new(
-        batch_size: usize,
-        max_seq_len: usize,
-        shuffle: bool,
-        seed: u64,
-        pad_token_id: u32,
-        drop_last: bool,
-    ) -> Self {
-        Self(pmetal_data::DataLoaderConfig {
-            batch_size,
-            max_seq_len,
-            shuffle,
-            seed,
-            pad_token_id,
-            drop_last,
-            ..Default::default()
-        })
-    }
-
-    #[getter]
-    fn batch_size(&self) -> usize {
-        self.0.batch_size
-    }
-    #[getter]
-    fn max_seq_len(&self) -> usize {
-        self.0.max_seq_len
-    }
-    #[getter]
-    fn shuffle(&self) -> bool {
-        self.0.shuffle
-    }
-    #[getter]
-    fn seed(&self) -> u64 {
-        self.0.seed
-    }
-    #[getter]
-    fn pad_token_id(&self) -> u32 {
-        self.0.pad_token_id
-    }
-    #[getter]
-    fn drop_last(&self) -> bool {
-        self.0.drop_last
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "DataLoaderConfig(batch_size={}, max_seq_len={}, shuffle={}, pad_token_id={})",
-            self.0.batch_size, self.0.max_seq_len, self.0.shuffle, self.0.pad_token_id,
-        )
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Enum wrappers
-// ---------------------------------------------------------------------------
-
-#[pyclass(from_py_object, name = "Dtype", eq)]
-#[derive(Clone, PartialEq)]
-pub enum PyDtype {
-    Float32,
-    Float16,
-    BFloat16,
-    Float8E4M3,
-    Float8E5M2,
-    Int32,
-    Int64,
-    UInt8,
-    Bool,
-}
-
-impl From<PyDtype> for pmetal_core::Dtype {
-    fn from(d: PyDtype) -> Self {
-        match d {
-            PyDtype::Float32 => Self::Float32,
-            PyDtype::Float16 => Self::Float16,
-            PyDtype::BFloat16 => Self::BFloat16,
-            PyDtype::Float8E4M3 => Self::Float8E4M3,
-            PyDtype::Float8E5M2 => Self::Float8E5M2,
-            PyDtype::Int32 => Self::Int32,
-            PyDtype::Int64 => Self::Int64,
-            PyDtype::UInt8 => Self::UInt8,
-            PyDtype::Bool => Self::Bool,
+        let mut parts = Vec::new();
+        macro_rules! field {
+            ($name:ident) => {
+                if let Some(v) = &self.$name {
+                    parts.push(format!("{}={:?}", stringify!($name), v));
+                }
+            };
         }
+        field!(max_tokens);
+        field!(temperature);
+        field!(top_k);
+        field!(top_p);
+        field!(min_p);
+        field!(repetition_penalty);
+        field!(frequency_penalty);
+        field!(presence_penalty);
+        field!(seed);
+        field!(stop_tokens);
+        field!(logit_bias);
+        format!("GenerationConfig({})", parts.join(", "))
     }
 }
 
-impl From<pmetal_core::Dtype> for PyDtype {
-    fn from(d: pmetal_core::Dtype) -> Self {
-        match d {
-            pmetal_core::Dtype::Float32 => Self::Float32,
-            pmetal_core::Dtype::Float16 => Self::Float16,
-            pmetal_core::Dtype::BFloat16 => Self::BFloat16,
-            pmetal_core::Dtype::Float8E4M3 => Self::Float8E4M3,
-            pmetal_core::Dtype::Float8E5M2 => Self::Float8E5M2,
-            pmetal_core::Dtype::Int32 => Self::Int32,
-            pmetal_core::Dtype::Int64 => Self::Int64,
-            pmetal_core::Dtype::UInt8 => Self::UInt8,
-            pmetal_core::Dtype::Bool => Self::Bool,
-        }
-    }
-}
-
-#[pyclass(from_py_object, name = "Quantization", eq)]
-#[derive(Clone, PartialEq)]
-pub enum PyQuantization {
-    None,
-    NF4,
-    FP4,
-    Int8,
-    FP8,
-}
-
-impl From<PyQuantization> for pmetal_core::Quantization {
-    fn from(q: PyQuantization) -> Self {
-        match q {
-            PyQuantization::None => Self::None,
-            PyQuantization::NF4 => Self::NF4,
-            PyQuantization::FP4 => Self::FP4,
-            PyQuantization::Int8 => Self::Int8,
-            PyQuantization::FP8 => Self::FP8,
-        }
-    }
-}
-
-#[pyclass(from_py_object, name = "LoraBias", eq)]
-#[derive(Clone, PartialEq)]
-pub enum PyLoraBias {
-    None,
-    All,
-    LoraOnly,
-}
-
-#[pyclass(from_py_object, name = "LrSchedulerType", eq)]
-#[derive(Clone, PartialEq)]
-pub enum PyLrSchedulerType {
-    Constant,
-    Linear,
-    Cosine,
-    CosineWithRestarts,
-    Polynomial,
-    /// Warmup-Stable-Decay schedule (modern default for LLM training).
-    Wsd,
-}
-
-/// The optimizers a `TrainingConfig` can name (by string, as the CLI does).
-#[pyclass(from_py_object, name = "OptimizerType", eq)]
-#[derive(Clone, PartialEq)]
-pub enum PyOptimizerType {
-    AdamW,
-    Sgd,
-    Adafactor,
-    Lion,
-    Muon,
-    AdamWScheduleFree,
-    AdamW8bit,
-}
-
-#[pyclass(from_py_object, name = "DatasetFormat", eq)]
-#[derive(Clone, PartialEq)]
-pub enum PyDatasetFormat {
-    Simple,
-    Alpaca,
-    ShareGpt,
-    OpenAi,
-    Reasoning,
-    PromptCompletion,
-    Auto,
-}
-
-impl From<PyDatasetFormat> for pmetal_data::DatasetFormat {
-    fn from(f: PyDatasetFormat) -> Self {
-        match f {
-            PyDatasetFormat::Simple => Self::Simple,
-            PyDatasetFormat::Alpaca => Self::Alpaca,
-            PyDatasetFormat::ShareGpt => Self::ShareGpt,
-            PyDatasetFormat::OpenAi => Self::OpenAi,
-            PyDatasetFormat::Reasoning => Self::Reasoning,
-            PyDatasetFormat::PromptCompletion => Self::PromptCompletion,
-            PyDatasetFormat::Auto => Self::Auto,
-        }
-    }
-}
-
-#[pyclass(from_py_object, name = "ModelArchitecture", eq)]
-#[derive(Clone, PartialEq)]
+/// A model architecture pmetal implements.
+#[pyclass(
+    name = "ModelArchitecture",
+    module = "pmetal",
+    eq,
+    eq_int,
+    frozen,
+    from_py_object
+)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum PyModelArchitecture {
     Llama,
     Llama4,
@@ -511,28 +279,29 @@ pub enum PyModelArchitecture {
 
 impl From<pmetal_models::ModelArchitecture> for PyModelArchitecture {
     fn from(a: pmetal_models::ModelArchitecture) -> Self {
+        use pmetal_models::ModelArchitecture as A;
         match a {
-            pmetal_models::ModelArchitecture::Llama => Self::Llama,
-            pmetal_models::ModelArchitecture::Llama4 => Self::Llama4,
-            pmetal_models::ModelArchitecture::Qwen2 => Self::Qwen2,
-            pmetal_models::ModelArchitecture::Qwen3 => Self::Qwen3,
-            pmetal_models::ModelArchitecture::Qwen3MoE => Self::Qwen3MoE,
-            pmetal_models::ModelArchitecture::Gemma => Self::Gemma,
-            pmetal_models::ModelArchitecture::Mistral => Self::Mistral,
-            pmetal_models::ModelArchitecture::Phi => Self::Phi,
-            pmetal_models::ModelArchitecture::Phi4 => Self::Phi4,
-            pmetal_models::ModelArchitecture::DeepSeek => Self::DeepSeek,
-            pmetal_models::ModelArchitecture::Cohere => Self::Cohere,
-            pmetal_models::ModelArchitecture::Granite => Self::Granite,
-            pmetal_models::ModelArchitecture::NemotronH => Self::NemotronH,
-            pmetal_models::ModelArchitecture::Qwen3Next => Self::Qwen3Next,
-            pmetal_models::ModelArchitecture::GptOss => Self::GptOss,
-            pmetal_models::ModelArchitecture::Gemma4 => Self::Gemma4,
-            pmetal_models::ModelArchitecture::Bert => Self::Bert,
-            pmetal_models::ModelArchitecture::Flux => Self::Flux,
-            pmetal_models::ModelArchitecture::DiffusionGemma => Self::DiffusionGemma,
-            pmetal_models::ModelArchitecture::Mllama => Self::Mllama,
-            pmetal_models::ModelArchitecture::Qwen4Exp => Self::Qwen4Exp,
+            A::Llama => Self::Llama,
+            A::Llama4 => Self::Llama4,
+            A::Qwen2 => Self::Qwen2,
+            A::Qwen3 => Self::Qwen3,
+            A::Qwen3MoE => Self::Qwen3MoE,
+            A::Gemma => Self::Gemma,
+            A::Mistral => Self::Mistral,
+            A::Phi => Self::Phi,
+            A::Phi4 => Self::Phi4,
+            A::DeepSeek => Self::DeepSeek,
+            A::Cohere => Self::Cohere,
+            A::Granite => Self::Granite,
+            A::NemotronH => Self::NemotronH,
+            A::Qwen3Next => Self::Qwen3Next,
+            A::GptOss => Self::GptOss,
+            A::Gemma4 => Self::Gemma4,
+            A::Bert => Self::Bert,
+            A::Flux => Self::Flux,
+            A::DiffusionGemma => Self::DiffusionGemma,
+            A::Mllama => Self::Mllama,
+            A::Qwen4Exp => Self::Qwen4Exp,
         }
     }
 }

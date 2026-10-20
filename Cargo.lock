@@ -5531,16 +5531,19 @@ dependencies = [
 name = "pmetal-py"
 version = "0.6.0"
 dependencies = [
+ "anyhow",
  "pmetal",
  "pmetal-core",
  "pmetal-data",
  "pmetal-hub",
  "pmetal-lora",
+ "pmetal-metal",
  "pmetal-models",
  "pmetal-runtime",
  "pmetal-trainer",
  "pyo3",
  "pyo3-build-config",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

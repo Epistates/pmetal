@@ -1,340 +1,193 @@
-//! Python wrapper for the training loop.
+//! `Trainer`: a `TrainSpec` run in this process.
+//!
+//! This is the same run `pmetal train` does: the spec becomes a
+//! `TrainingJobConfig` (`TrainingJobConfig::from_spec`, the conversion the
+//! command line, the TUI and the GUI use) and `orchestrator::run_training`
+//! runs it. The bindings add only what a library caller needs: Python
+//! callbacks, Ctrl-C, and the GIL released for the whole run.
 
-use std::path::PathBuf;
-
+use pmetal_core::TrainingCallback;
+use pmetal_trainer::orchestrator::{self, TrainingJobConfig, TrainingResult};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use tracing::info_span;
 
 use crate::callbacks::{
-    PyLoggingCallback, PyMetricsJsonCallback, PyProgressCallback, PythonCallbackBridge,
+    PyLoggingCallback, PyMetricsJsonCallback, PyProgressCallback, PythonCallbackBridge, RunState,
 };
-use crate::config::{PyLoraConfig, PyTrainingConfig};
-use crate::error::pmetal_to_pyerr;
-use crate::hub::is_hf_model_id;
+use crate::error::{anyhow_to_pyerr, config_err};
+use crate::json::to_py;
+use crate::runtime::runtime;
+use crate::spec;
+use crate::specs::PyTrainSpec;
 
-/// Map any Display error to `PMetalError::Training`.
-fn training_err(e: impl std::fmt::Display) -> pmetal_core::PMetalError {
-    pmetal_core::PMetalError::Training(e.to_string())
+/// What a finished training run produced.
+#[pyclass(name = "TrainResult", module = "pmetal", frozen, skip_from_py_object)]
+pub struct PyTrainResult {
+    /// The loss of the last step.
+    #[pyo3(get)]
+    final_loss: f64,
+    /// Optimizer steps taken.
+    #[pyo3(get)]
+    total_steps: usize,
+    /// Tokens trained on.
+    #[pyo3(get)]
+    total_tokens: usize,
+    /// The run's output directory.
+    #[pyo3(get)]
+    output_dir: String,
+    /// The trained weights: the LoRA adapter, or for full-parameter Neural Engine training the model's own weights.
+    #[pyo3(get)]
+    weights_path: String,
 }
 
-/// Map any Display error to `PMetalError::ModelLoad`.
-fn model_err(e: impl std::fmt::Display) -> pmetal_core::PMetalError {
-    pmetal_core::PMetalError::ModelLoad(e.to_string())
-}
-
-fn build_training_callbacks(
-    py: Python<'_>,
-    py_callbacks: &[Py<PyAny>],
-) -> PyResult<Vec<Box<dyn pmetal_core::TrainingCallback>>> {
-    let mut rust_callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>> = Vec::new();
-    let mut bridged_callbacks = Vec::new();
-
-    for callback in py_callbacks {
-        let bound = callback.bind(py);
-
-        if let Ok(progress) = bound.extract::<PyRef<'_, PyProgressCallback>>() {
-            rust_callbacks.push(Box::new(pmetal_trainer::ProgressCallback::new(
-                progress.total_steps,
-            )));
-            continue;
+impl From<TrainingResult> for PyTrainResult {
+    fn from(r: TrainingResult) -> Self {
+        Self {
+            final_loss: r.final_loss,
+            total_steps: r.total_steps,
+            total_tokens: r.total_tokens,
+            output_dir: r.output_dir.to_string_lossy().into_owned(),
+            weights_path: r.lora_weights_path.to_string_lossy().into_owned(),
         }
-
-        if let Ok(logging) = bound.extract::<PyRef<'_, PyLoggingCallback>>() {
-            rust_callbacks.push(Box::new(pmetal_trainer::LoggingCallback::new(
-                logging.log_every,
-            )));
-            continue;
-        }
-
-        if let Ok(metrics) = bound.extract::<PyRef<'_, PyMetricsJsonCallback>>() {
-            let callback = pmetal_trainer::MetricsJsonCallback::new(&metrics.path)
-                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-            rust_callbacks.push(Box::new(callback));
-            continue;
-        }
-
-        bridged_callbacks.push(callback.clone_ref(py));
     }
-
-    if !bridged_callbacks.is_empty() {
-        rust_callbacks.push(Box::new(PythonCallbackBridge {
-            py_callbacks: bridged_callbacks,
-        }));
-    }
-
-    Ok(rust_callbacks)
-}
-
-#[pyclass(name = "Trainer")]
-pub struct PyTrainer {
-    model_id: String,
-    lora_config: pmetal_core::LoraConfig,
-    training_config: pmetal_core::TrainingConfig,
-    dataset_path: String,
-    eval_dataset_path: Option<String>,
-    sequence_packing: bool,
-    gradient_checkpointing: bool,
-    embedding_lr: Option<f32>,
-    py_callbacks: Vec<Py<PyAny>>,
 }
 
 #[pymethods]
-impl PyTrainer {
-    /// Create a new trainer.
-    ///
-    /// Args:
-    ///     model_id: HuggingFace model ID or local path
-    ///     lora_config: LoRA configuration
-    ///     training_config: Training hyperparameters
-    ///     dataset_path: Path to JSONL training dataset
-    ///     eval_dataset_path: Optional path to evaluation dataset
-    #[new]
-    #[pyo3(signature = (model_id, lora_config, training_config, dataset_path, eval_dataset_path=None))]
-    fn new(
-        model_id: &str,
-        lora_config: &PyLoraConfig,
-        training_config: &PyTrainingConfig,
-        dataset_path: &str,
-        eval_dataset_path: Option<&str>,
-    ) -> Self {
-        Self {
-            model_id: model_id.to_string(),
-            lora_config: lora_config.0.clone(),
-            training_config: training_config.0.clone(),
-            dataset_path: dataset_path.to_string(),
-            eval_dataset_path: eval_dataset_path.map(String::from),
-            sequence_packing: true,
-            gradient_checkpointing: false,
-            embedding_lr: None,
-            py_callbacks: Vec::new(),
-        }
-    }
-
-    /// Add a Python callback object.
-    ///
-    /// Built-in PMetal callback classes are mapped to their native Rust
-    /// implementations. Arbitrary Python objects are bridged through the
-    /// training callback interface if they implement callback methods.
-    fn add_callback(&mut self, callback: Py<PyAny>) {
-        self.py_callbacks.push(callback);
-    }
-
-    /// Enable or disable sequence packing.
-    fn set_sequence_packing(&mut self, enabled: bool) {
-        self.sequence_packing = enabled;
-    }
-
-    /// Enable or disable gradient checkpointing.
-    fn set_gradient_checkpointing(&mut self, enabled: bool) {
-        self.gradient_checkpointing = enabled;
-    }
-
-    /// Set separate embedding learning rate.
-    fn set_embedding_lr(&mut self, lr: f32) {
-        self.embedding_lr = Some(lr);
-    }
-
-    /// Run the training loop.
-    ///
-    /// Returns:
-    ///     dict with keys: final_loss, total_steps, total_tokens, output_dir, lora_weights_path
-    fn train<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let rust_callbacks = build_training_callbacks(py, &self.py_callbacks)?;
-
-        // Capture all settings before releasing the GIL
-        let model_id = self.model_id.clone();
-        let lora_config = self.lora_config.clone();
-        let training_config = self.training_config.clone();
-        let dataset_path = self.dataset_path.clone();
-        let eval_dataset_path = self.eval_dataset_path.clone();
-        let sequence_packing = self.sequence_packing;
-        let gradient_checkpointing = self.gradient_checkpointing;
-        let embedding_lr = self.embedding_lr;
-        let mut rust_callbacks = rust_callbacks;
-
-        // Use PMetalError as the intermediate error type to preserve exception fidelity
-        let result = py
-            .detach(move || {
-                crate::hub::shared_runtime().block_on(async {
-                    // Resolve model path
-                    let model_path = {
-                        let _span = info_span!("model_resolve", model_id = %model_id).entered();
-                        if is_hf_model_id(&model_id) {
-                            let path = pmetal_hub::download_model(&model_id, None, None).await?;
-                            let _ =
-                                pmetal_hub::download_file(&model_id, "tokenizer.json", None, None)
-                                    .await;
-                            let _ = pmetal_hub::download_file(
-                                &model_id,
-                                "tokenizer_config.json",
-                                None,
-                                None,
-                            )
-                            .await;
-                            path
-                        } else {
-                            PathBuf::from(&model_id)
-                        }
-                    };
-
-                    // Load tokenizer (with config-aware special token resolution)
-                    let tokenizer = {
-                        let _span =
-                            info_span!("load_tokenizer", path = %model_path.display()).entered();
-                        pmetal_data::Tokenizer::from_model_dir(&model_path)?
-                    };
-
-                    // Detect chat template
-                    let chat_template =
-                        pmetal_data::chat_templates::detect_chat_template(&model_path, &model_id);
-
-                    // Load dataset
-                    let (train_dataset, eval_dataset) = {
-                        let _span = info_span!(
-                            "load_dataset",
-                            path = %dataset_path,
-                            has_eval = eval_dataset_path.is_some(),
-                        )
-                        .entered();
-
-                        let train = pmetal_data::TrainingDataset::from_jsonl_tokenized(
-                            &dataset_path,
-                            &tokenizer,
-                            pmetal_data::DatasetFormat::Auto,
-                            training_config.max_seq_len,
-                            Some(&chat_template),
-                            None,
-                        )?;
-
-                        let eval = if let Some(ref eval_path) = eval_dataset_path {
-                            Some(pmetal_data::TrainingDataset::from_jsonl_tokenized(
-                                eval_path,
-                                &tokenizer,
-                                pmetal_data::DatasetFormat::Auto,
-                                training_config.max_seq_len,
-                                Some(&chat_template),
-                                None,
-                            )?)
-                        } else {
-                            None
-                        };
-
-                        (train, eval)
-                    };
-
-                    // Load model
-                    let model = {
-                        let _span =
-                            info_span!("load_model", path = %model_path.display()).entered();
-                        pmetal_lora::DynamicLoraModel::from_pretrained(
-                            &model_path,
-                            lora_config.clone(),
-                        )
-                        .map_err(model_err)?
-                    };
-
-                    // Set up checkpoint manager
-                    let output_dir = PathBuf::from(&training_config.output_dir);
-                    std::fs::create_dir_all(&output_dir)?;
-                    let checkpoint_dir = output_dir.join("checkpoints");
-                    let checkpoint_manager =
-                        pmetal_trainer::CheckpointManager::new(&checkpoint_dir)
-                            .map_err(training_err)?
-                            .with_max_checkpoints(3);
-
-                    // Build training loop config
-                    let dataloader_config = pmetal_data::DataLoaderConfig {
-                        batch_size: training_config.batch_size,
-                        max_seq_len: training_config.max_seq_len,
-                        shuffle: true,
-                        seed: training_config.seed,
-                        pad_token_id: tokenizer.pad_token_id().unwrap_or(0),
-                        drop_last: false,
-                        ..Default::default()
-                    };
-
-                    #[allow(clippy::needless_update)]
-                    let loop_config = pmetal_trainer::TrainingLoopConfig {
-                        training: training_config.clone(),
-                        dataloader: dataloader_config,
-                        log_every: 10,
-                        checkpoint_every: training_config.save_steps.unwrap_or(500),
-                        eval_every: if eval_dataset.is_some() { 100 } else { 0 },
-                        use_sequence_packing: sequence_packing,
-                        gradient_checkpointing,
-                        gradient_checkpointing_layers: 4,
-                        embedding_lr,
-                        loraplus_lr_ratio: None,
-                        use_cut_cross_entropy: false,
-                        ..Default::default()
-                    };
-
-                    let mut training_loop =
-                        pmetal_trainer::TrainingLoop::new(loop_config).map_err(training_err)?;
-                    for callback in rust_callbacks.drain(..) {
-                        training_loop.add_callback(callback);
-                    }
-
-                    // Run training
-                    let mut model = model;
-                    {
-                        let _span = info_span!(
-                            "training_loop",
-                            model = %model_path.display(),
-                            sequence_packing,
-                        )
-                        .entered();
-                        training_loop
-                            .run(
-                                &mut model,
-                                train_dataset,
-                                eval_dataset,
-                                Some(&checkpoint_manager),
-                            )
-                            .map_err(training_err)?;
-                    }
-
-                    // Save weights
-                    let weights_path = {
-                        let _span = info_span!("save_weights", output_dir = %output_dir.display())
-                            .entered();
-                        // A PEFT adapter directory: `adapter_model.safetensors`
-                        // and `adapter_config.json`.
-                        pmetal_trainer::orchestrator::save_adapter(
-                            &model,
-                            &output_dir,
-                            &lora_config,
-                            Some(&model_id),
-                        )
-                        .map_err(|e| training_err(e.to_string()))?
-                    };
-
-                    Ok::<_, pmetal_core::PMetalError>((
-                        training_loop.current_loss(),
-                        training_loop.current_step(),
-                        training_loop.total_tokens(),
-                        output_dir.to_string_lossy().to_string(),
-                        weights_path.to_string_lossy().to_string(),
-                    ))
-                })
-            })
-            .map_err(pmetal_to_pyerr)?;
-
-        // Build Python dict result
-        let dict = PyDict::new(py);
-        dict.set_item("final_loss", result.0)?;
-        dict.set_item("total_steps", result.1)?;
-        dict.set_item("total_tokens", result.2)?;
-        dict.set_item("output_dir", result.3)?;
-        dict.set_item("lora_weights_path", result.4)?;
-        Ok(dict)
+impl PyTrainResult {
+    /// The result as a dict.
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("final_loss", self.final_loss)?;
+        d.set_item("total_steps", self.total_steps)?;
+        d.set_item("total_tokens", self.total_tokens)?;
+        d.set_item("output_dir", &self.output_dir)?;
+        d.set_item("weights_path", &self.weights_path)?;
+        Ok(d)
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "Trainer(model='{}', dataset='{}', lora_r={}, epochs={})",
-            self.model_id, self.dataset_path, self.lora_config.r, self.training_config.num_epochs,
+            "TrainResult(final_loss={:.4}, total_steps={}, total_tokens={}, output_dir={:?}, weights_path={:?})",
+            self.final_loss,
+            self.total_steps,
+            self.total_tokens,
+            self.output_dir,
+            self.weights_path
         )
     }
+}
+
+/// The callbacks for a run: the built-in ones become the trainer's own, every
+/// other object goes through the bridge, which also watches for Ctrl-C.
+fn build_callbacks(
+    py: Python<'_>,
+    objects: &[Py<PyAny>],
+    state: std::sync::Arc<RunState>,
+) -> PyResult<Vec<Box<dyn TrainingCallback>>> {
+    let mut native: Vec<Box<dyn TrainingCallback>> = Vec::new();
+    let mut bridged = Vec::new();
+    for object in objects {
+        let bound = object.bind(py);
+        if let Ok(p) = bound.extract::<PyRef<'_, PyProgressCallback>>() {
+            native.push(Box::new(pmetal_trainer::ProgressCallback::new(
+                p.total_steps,
+            )));
+        } else if let Ok(l) = bound.extract::<PyRef<'_, PyLoggingCallback>>() {
+            native.push(Box::new(pmetal_trainer::LoggingCallback::new(l.log_every)));
+        } else if let Ok(m) = bound.extract::<PyRef<'_, PyMetricsJsonCallback>>() {
+            let callback = pmetal_trainer::MetricsJsonCallback::new(&m.path)
+                .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?;
+            native.push(Box::new(callback));
+        } else {
+            bridged.push(object.clone_ref(py));
+        }
+    }
+    native.push(Box::new(PythonCallbackBridge::new(bridged, state)));
+    Ok(native)
+}
+
+/// Run `job` to completion on this thread with the GIL released, then raise
+/// what a callback or Ctrl-C ended it with, in preference to its result.
+pub(crate) fn run_job(
+    py: Python<'_>,
+    job: TrainingJobConfig,
+    objects: &[Py<PyAny>],
+) -> PyResult<PyTrainResult> {
+    let state = RunState::new();
+    let callbacks = build_callbacks(py, objects, state.clone())?;
+    let rt = runtime()?;
+    let outcome = py.detach(move || rt.block_on(orchestrator::run_training(job, None, callbacks)));
+    if let Some(err) = state.take_error() {
+        return Err(err);
+    }
+    outcome.map(PyTrainResult::from).map_err(anyhow_to_pyerr)
+}
+
+/// Supervised fine-tuning of one `TrainSpec`, in this process.
+///
+/// `train()` runs `pmetal train` for the spec with the GIL released, so other
+/// Python threads keep running, and stops cleanly on Ctrl-C (the current step
+/// finishes, the weights are saved, and `KeyboardInterrupt` is raised).
+#[pyclass(name = "Trainer", module = "pmetal")]
+pub struct PyTrainer {
+    spec: pmetal_core::jobs::TrainSpec,
+    callbacks: Vec<Py<PyAny>>,
+}
+
+#[pymethods]
+impl PyTrainer {
+    /// Args:
+    ///     spec: What to train. Validated here: `SpecValidationError` lists every problem.
+    ///     callbacks: Objects with any of the callback methods (see `pmetal.ProgressCallback`).
+    #[new]
+    #[pyo3(signature = (spec, callbacks=None))]
+    fn new(spec: &PyTrainSpec, callbacks: Option<Vec<Py<PyAny>>>) -> PyResult<Self> {
+        let mut spec = spec.inner.clone();
+        spec::normalize(&mut spec)?;
+        // The conversion the run itself makes, so a name it rejects (an
+        // optimizer, a schedule, a quantization scheme) fails here.
+        TrainingJobConfig::from_spec(&spec).map_err(config_err)?;
+        Ok(Self {
+            spec,
+            callbacks: callbacks.unwrap_or_default(),
+        })
+    }
+
+    /// A copy of the spec the trainer runs.
+    #[getter]
+    fn spec(&self) -> PyTrainSpec {
+        PyTrainSpec {
+            inner: self.spec.clone(),
+        }
+    }
+
+    /// Add a callback object.
+    fn add_callback(&mut self, callback: Py<PyAny>) {
+        self.callbacks.push(callback);
+    }
+
+    /// Run the training. Raises `TrainingError` (or the error's own type) if it fails.
+    fn train(&self, py: Python<'_>) -> PyResult<PyTrainResult> {
+        let mut job = TrainingJobConfig::from_spec(&self.spec).map_err(config_err)?;
+        // A library call prints nothing the caller did not ask for.
+        job.emit_console_output = false;
+        run_job(py, job, &self.callbacks)
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!(
+            "Trainer({})",
+            spec::repr::<pmetal_core::jobs::TrainSpec>(py, &self.spec)?
+        ))
+    }
+}
+
+/// The fields of a `TrainSpec` as a Python dict, for the `TrainSpec.lora_config()`
+/// and `TrainSpec.training_config()` views.
+pub(crate) fn config_dict<'py, T: serde::Serialize>(
+    py: Python<'py>,
+    config: &T,
+) -> PyResult<Bound<'py, PyAny>> {
+    let value = crate::json::value_of(config).map_err(config_err)?;
+    to_py(py, &value)
 }

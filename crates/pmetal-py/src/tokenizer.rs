@@ -1,77 +1,102 @@
-//! Python wrapper for the PMetal tokenizer.
+//! `Tokenizer`.
 
+use std::sync::Arc;
+
+use pmetal_data::Tokenizer;
 use pyo3::prelude::*;
 
-use crate::error::IntoPyResult;
+use crate::error::tokenizer_err;
+use crate::hub::{HubArgs, resolve_model};
 
-#[pyclass(name = "Tokenizer")]
+/// A model's tokenizer.
+///
+/// Immutable and shareable between threads; encoding and decoding release the
+/// GIL.
+#[pyclass(name = "Tokenizer", module = "pmetal", frozen)]
 pub struct PyTokenizer {
-    pub(crate) inner: pmetal_data::Tokenizer,
+    pub(crate) inner: Arc<Tokenizer>,
 }
 
 #[pymethods]
 impl PyTokenizer {
-    /// Load a tokenizer from a local file path.
+    /// Load a tokenizer from a `tokenizer.json` file.
     #[staticmethod]
-    fn from_file(path: &str) -> PyResult<Self> {
-        let inner = pmetal_data::Tokenizer::from_file(path).into_pyresult()?;
-        Ok(Self { inner })
+    fn from_file(path: std::path::PathBuf) -> PyResult<Self> {
+        let inner = Tokenizer::from_file(path).map_err(tokenizer_err)?;
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
     }
 
-    /// Load a tokenizer from a HuggingFace model (downloads all config files).
+    /// Load the tokenizer of a model: a local directory, or a Hub id (its
+    /// files are downloaded, and Ctrl-C interrupts the download).
     ///
-    /// Releases the GIL during the network download.
+    /// Special tokens (beginning, end, padding) are read from the model's own
+    /// configuration, not guessed from their names.
     #[staticmethod]
-    fn from_pretrained(py: Python<'_>, model_id: &str) -> PyResult<Self> {
-        let id = model_id.to_string();
-        // Release GIL during download
-        let model_dir = py.detach(move || {
-            crate::hub::shared_runtime()
-                .block_on(pmetal_hub::download_model(&id, None, None))
-                .map_err(crate::error::runtime_err)
-        })?;
-        let inner = pmetal_data::Tokenizer::from_model_dir(&model_dir).into_pyresult()?;
-        Ok(Self { inner })
+    #[pyo3(signature = (model_id, *, revision=None, token=None))]
+    fn from_pretrained(
+        py: Python<'_>,
+        model_id: &str,
+        revision: Option<String>,
+        token: Option<String>,
+    ) -> PyResult<Self> {
+        let hub = HubArgs {
+            revision,
+            token,
+            ..HubArgs::default()
+        };
+        let dir = resolve_model(py, model_id, &hub)?;
+        let inner = Tokenizer::from_model_dir(&dir).map_err(tokenizer_err)?;
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
     }
 
-    /// Encode text to token IDs.
-    fn encode(&self, text: &str) -> PyResult<Vec<u32>> {
-        self.inner.encode(text).into_pyresult()
+    /// Token ids for `text`.
+    fn encode(&self, py: Python<'_>, text: &str) -> PyResult<Vec<u32>> {
+        let tokenizer = &self.inner;
+        py.detach(|| tokenizer.encode(text)).map_err(tokenizer_err)
     }
 
-    /// Decode token IDs to text.
-    fn decode(&self, ids: Vec<u32>) -> PyResult<String> {
-        self.inner.decode(&ids).into_pyresult()
+    /// The text for token ids.
+    fn decode(&self, py: Python<'_>, ids: Vec<u32>) -> PyResult<String> {
+        let tokenizer = &self.inner;
+        py.detach(|| tokenizer.decode(&ids)).map_err(tokenizer_err)
     }
 
-    /// Get the vocabulary size.
+    /// The vocabulary size.
     #[getter]
     fn vocab_size(&self) -> usize {
         self.inner.vocab_size()
     }
 
-    /// Get the pad token ID, if available.
+    /// The padding token's id, if the tokenizer has one.
     #[getter]
     fn pad_token_id(&self) -> Option<u32> {
         self.inner.pad_token_id()
     }
 
-    /// Get the EOS token ID, if available.
+    /// The end-of-sequence token's id, if the tokenizer has one.
     #[getter]
     fn eos_token_id(&self) -> Option<u32> {
         self.inner.eos_token_id()
     }
 
-    /// Get the BOS token ID, if available.
+    /// The beginning-of-sequence token's id, if the tokenizer has one.
     #[getter]
     fn bos_token_id(&self) -> Option<u32> {
         self.inner.bos_token_id()
     }
 
-    /// Get the UNK token ID, if available.
+    /// The unknown token's id, if the tokenizer has one.
     #[getter]
     fn unk_token_id(&self) -> Option<u32> {
         self.inner.unk_token_id()
+    }
+
+    fn __len__(&self) -> usize {
+        self.inner.vocab_size()
     }
 
     fn __repr__(&self) -> String {
