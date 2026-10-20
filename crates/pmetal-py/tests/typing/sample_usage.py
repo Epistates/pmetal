@@ -95,7 +95,9 @@ def hub() -> None:
     def show(progress: pmetal.pmetal.TransferProgress) -> None:
         print(progress["bytes_done"], progress["total_bytes"])
 
-    path: str = pmetal.download_model("org/name", revision="main", weights="gguf", gguf_quant="Q4_K_M", verify="sha256", progress=show)
+    path: str = pmetal.download_model(
+        "org/name", revision="main", weights="gguf", gguf_quant="Q4_K_M", verify="sha256", progress=show
+    )
     file: str = pmetal.download_file("org/name", "config.json", offline=True, cache_dir=Path("cache"))
     plan: pmetal.DownloadPlan = pmetal.plan_download("org/name")
     report: pmetal.ModelReport = pmetal.verify_model(path)

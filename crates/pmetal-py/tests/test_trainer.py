@@ -13,9 +13,8 @@ import threading
 import time
 from pathlib import Path
 
-import pytest
-
 import pmetal
+import pytest
 
 
 def spec_for(tiny_model: Path, dataset: Path, output: Path, **fields: object) -> pmetal.TrainSpec:
@@ -94,8 +93,15 @@ def test_builtin_callbacks_run_natively(tiny_model, tiny_dataset, tmp_path):
 
 def test_the_function_form_is_the_same_run(tiny_model, tiny_dataset, tmp_path):
     result = pmetal.finetune(
-        str(tiny_model), str(tiny_dataset), output_dir=str(tmp_path / "out"), max_steps=2, batch_size=2,
-        gradient_accumulation_steps=1, max_seq_len=32, lora_r=4, no_adaptive_lr=True,
+        str(tiny_model),
+        str(tiny_dataset),
+        output_dir=str(tmp_path / "out"),
+        max_steps=2,
+        batch_size=2,
+        gradient_accumulation_steps=1,
+        max_seq_len=32,
+        lora_r=4,
+        no_adaptive_lr=True,
     )
     assert result.total_steps == 2
 
@@ -163,7 +169,9 @@ def test_should_stop_ends_the_run_early_and_cleanly(tiny_model, tiny_dataset, tm
         def should_stop(self) -> bool:
             return self.steps >= 2
 
-    result = pmetal.Trainer(spec_for(tiny_model, tiny_dataset, tmp_path / "out", max_steps=50), [StopAfterTwo()]).train()
+    result = pmetal.Trainer(
+        spec_for(tiny_model, tiny_dataset, tmp_path / "out", max_steps=50), [StopAfterTwo()]
+    ).train()
     assert 2 <= result.total_steps < 50
     assert Path(result.weights_path).exists()
 
@@ -233,8 +241,15 @@ def test_callbacks_may_be_called_from_the_training_thread_only_with_the_gil(tiny
 def test_a_real_model_trains_two_steps(tmp_path, tiny_dataset):
     model = os.environ["PMETAL_TEST_MODEL_DIR"]
     result = pmetal.finetune(
-        model, str(tiny_dataset), output_dir=str(tmp_path / "out"), max_steps=2, batch_size=1,
-        gradient_accumulation_steps=1, max_seq_len=64, lora_r=8, no_adaptive_lr=True,
+        model,
+        str(tiny_dataset),
+        output_dir=str(tmp_path / "out"),
+        max_steps=2,
+        batch_size=1,
+        gradient_accumulation_steps=1,
+        max_seq_len=64,
+        lora_r=8,
+        no_adaptive_lr=True,
     )
     assert result.total_steps == 2 and result.final_loss > 0
     assert Path(result.weights_path).exists()

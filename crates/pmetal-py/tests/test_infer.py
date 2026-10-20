@@ -7,9 +7,8 @@ import signal
 import threading
 import time
 
-import pytest
-
 import pmetal
+import pytest
 from pmetal import pmetal as native
 
 
@@ -46,9 +45,20 @@ def test_options_are_the_specs_fields_with_its_validation(tiny_model):
         pmetal.infer(tiny_model, "p", mtp_model="m")  # --mtp-model needs --mtp
 
 
-@pytest.mark.parametrize("field,value", [("image", ["a.png"]), ("video", ["frames"]), ("ane", True), ("benchmark", True),
-                                         ("json", True), ("tools", "tools.json"), ("backend", "standard"),
-                                         ("profile_layers", True), ("hide_thinking", True)])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("image", ["a.png"]),
+        ("video", ["frames"]),
+        ("ane", True),
+        ("benchmark", True),
+        ("json", True),
+        ("tools", "tools.json"),
+        ("backend", "standard"),
+        ("profile_layers", True),
+        ("hide_thinking", True),
+    ],
+)
 def test_a_field_only_the_command_line_honours_is_refused_by_name(tiny_model, field, value):
     with pytest.raises(pmetal.ConfigError, match=field) as caught:
         pmetal.infer(tiny_model, "p", **{field: value})
@@ -89,6 +99,12 @@ def test_ctrl_c_stops_an_inference(tiny_model):
 
 @pytest.mark.real_model
 def test_a_real_model_answers_with_a_chat_template():
-    text = pmetal.infer(os.environ["PMETAL_TEST_MODEL_DIR"], "What is 2+2? Answer with one digit.",
-                        chat=True, no_thinking=True, max_tokens=24, temperature=0.0)
+    text = pmetal.infer(
+        os.environ["PMETAL_TEST_MODEL_DIR"],
+        "What is 2+2? Answer with one digit.",
+        chat=True,
+        no_thinking=True,
+        max_tokens=24,
+        temperature=0.0,
+    )
     assert "4" in text

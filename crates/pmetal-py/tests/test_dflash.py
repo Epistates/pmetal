@@ -12,9 +12,8 @@ import signal
 import threading
 import time
 
-import pytest
-
 import pmetal
+import pytest
 from conftest import make_tiny_dflash_draft
 
 
@@ -38,11 +37,17 @@ def test_greedy_speculative_decoding_is_the_targets_own_greedy_decoding(generato
     assert tokens[: len(prompt_ids)] == prompt_ids and len(tokens) == len(prompt_ids) + 24
     model = pmetal.Model.load(tiny_model)
     plain = model.generate("the cat", max_tokens=24, temperature=0.0)
-    assert model.tokenizer.decode(tokens[len(prompt_ids):]) == plain
+    assert model.tokenizer.decode(tokens[len(prompt_ids) :]) == plain
     assert metrics["num_generated"] == 24 and len(metrics["acceptance_lengths"]) >= 1
     assert 0.0 <= metrics["acceptance_rate"] <= 1.0
-    assert set(metrics) == {"num_generated", "total_drafted", "total_accepted", "avg_acceptance_length",
-                            "acceptance_rate", "acceptance_lengths"}
+    assert set(metrics) == {
+        "num_generated",
+        "total_drafted",
+        "total_accepted",
+        "avg_acceptance_length",
+        "acceptance_rate",
+        "acceptance_lengths",
+    }
 
 
 def test_a_seed_makes_a_sampled_run_repeatable(generator, prompt_ids):
@@ -75,7 +80,7 @@ def test_stop_tokens_end_the_generation_and_are_not_emitted(generator, prompt_id
     tokens, _ = generator.generate(prompt_ids, max_new_tokens=16)
     stop = tokens[len(prompt_ids) + 2]
     stopped, _ = generator.generate(prompt_ids, max_new_tokens=16, stop_tokens=[stop])
-    generated = stopped[len(prompt_ids):]
+    generated = stopped[len(prompt_ids) :]
     assert stop not in generated and len(generated) <= 2
 
 
@@ -108,8 +113,10 @@ def test_a_missing_draft_is_file_not_found(tiny_model, tmp_path):
 def test_it_is_shared_between_threads_and_releases_the_gil(generator, prompt_ids):
     expected, _ = generator.generate(prompt_ids, max_new_tokens=16)
     results: list[list[int]] = []
-    threads = [threading.Thread(target=lambda: results.append(generator.generate(prompt_ids, max_new_tokens=16)[0]))
-               for _ in range(4)]
+    threads = [
+        threading.Thread(target=lambda: results.append(generator.generate(prompt_ids, max_new_tokens=16)[0]))
+        for _ in range(4)
+    ]
     [t.start() for t in threads]
     [t.join() for t in threads]
     assert results == [expected] * 4

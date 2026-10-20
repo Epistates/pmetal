@@ -141,8 +141,24 @@ def make_tiny_model(directory: Path, seed: int = 0) -> Path:
         "truncation": None,
         "padding": None,
         "added_tokens": [
-            {"id": VOCAB[UNK], "content": UNK, "single_word": False, "lstrip": False, "rstrip": False, "normalized": False, "special": True},
-            {"id": VOCAB[EOS], "content": EOS, "single_word": False, "lstrip": False, "rstrip": False, "normalized": False, "special": True},
+            {
+                "id": VOCAB[UNK],
+                "content": UNK,
+                "single_word": False,
+                "lstrip": False,
+                "rstrip": False,
+                "normalized": False,
+                "special": True,
+            },
+            {
+                "id": VOCAB[EOS],
+                "content": EOS,
+                "single_word": False,
+                "lstrip": False,
+                "rstrip": False,
+                "normalized": False,
+                "special": True,
+            },
         ],
         "normalizer": None,
         "pre_tokenizer": {"type": "Split", "pattern": {"Regex": "."}, "behavior": "Isolated", "invert": False},
@@ -246,8 +262,7 @@ def fake_cli(tmp_path: Path):
         script = tmp_path / name
         script.write_text(
             f"#!{sys.executable}\nimport json, os, sys, time\n"
-            f"if sys.argv[1:] == ['--version']:\n    print('pmetal {version}'); sys.exit(0)\n"
-            + textwrap.dedent(body)
+            f"if sys.argv[1:] == ['--version']:\n    print('pmetal {version}'); sys.exit(0)\n" + textwrap.dedent(body)
         )
         script.chmod(script.stat().st_mode | stat.S_IXUSR)
         return script

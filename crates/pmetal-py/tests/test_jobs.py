@@ -10,9 +10,8 @@ import threading
 import time
 import warnings
 
-import pytest
-
 import pmetal
+import pytest
 from pmetal import _jobs
 
 SPEC = pmetal.TrainSpec(model="m", dataset="d", epochs=2)
@@ -46,8 +45,10 @@ def test_training_commands_get_an_event_log_and_others_do_not(fake_cli):
 
 def test_the_event_log_subcommands_are_the_specs_that_stream_events():
     # The command line's own list (main.rs: Distill, Grpo, Rlkd, Preference, and Train).
-    names = {cls.subcommand for cls in (pmetal.TrainSpec, pmetal.DistillSpec, pmetal.GrpoSpec,
-                                        pmetal.RlkdSpec, pmetal.PreferenceSpec)}
+    names = {
+        cls.subcommand
+        for cls in (pmetal.TrainSpec, pmetal.DistillSpec, pmetal.GrpoSpec, pmetal.RlkdSpec, pmetal.PreferenceSpec)
+    }
     assert names == set(_jobs.EVENT_LOG_SUBCOMMANDS)
 
 

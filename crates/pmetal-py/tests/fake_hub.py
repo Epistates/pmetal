@@ -69,7 +69,9 @@ class FakeHub:
             def log_message(self, *args: object) -> None:
                 pass
 
-            def _send(self, status: int, body: bytes = b"", headers: dict[str, str] | None = None, head: bool = False) -> None:
+            def _send(
+                self, status: int, body: bytes = b"", headers: dict[str, str] | None = None, head: bool = False
+            ) -> None:
                 self.send_response(status)
                 for key, value in (headers or {}).items():
                     self.send_header(key, value)
@@ -100,7 +102,16 @@ class FakeHub:
                         return
                     commit, directory = repo
                     files = [{"rfilename": str(p.relative_to(directory))} for p in files_of(directory)]
-                    return self._json(200, {"id": match["id"], "sha": commit, "siblings": files, "tags": [], "private": match["id"] in hub.private})
+                    return self._json(
+                        200,
+                        {
+                            "id": match["id"],
+                            "sha": commit,
+                            "siblings": files,
+                            "tags": [],
+                            "private": match["id"] in hub.private,
+                        },
+                    )
 
                 match = re.match(r"^/api/models/(?P<id>[^/]+/[^/]+)/tree/(?P<rev>[^/]+)(?:/(?P<sub>.*))?$", path)
                 if match:
@@ -118,7 +129,11 @@ class FakeHub:
                             "path": str(p.relative_to(directory)),
                         }
                         if p.suffix == ".safetensors":
-                            entry["lfs"] = {"oid": hashlib.sha256(data).hexdigest(), "size": len(data), "pointerSize": 134}
+                            entry["lfs"] = {
+                                "oid": hashlib.sha256(data).hexdigest(),
+                                "size": len(data),
+                                "pointerSize": 134,
+                            }
                         entries.append(entry)
                     return self._json(200, entries)
 

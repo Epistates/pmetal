@@ -4,15 +4,23 @@ from __future__ import annotations
 
 import pickle
 
-import pytest
-
 import pmetal
+import pytest
 from pmetal import pmetal as native
 
 LEAVES = [
-    "ConfigError", "SpecValidationError", "SerializationError", "HubError", "ModelLoadError",
-    "UnsupportedArchitectureError", "TokenizerError", "TrainingError", "QuantizationError",
-    "BackendError", "OutOfMemoryError", "CancelledError",
+    "ConfigError",
+    "SpecValidationError",
+    "SerializationError",
+    "HubError",
+    "ModelLoadError",
+    "UnsupportedArchitectureError",
+    "TokenizerError",
+    "TrainingError",
+    "QuantizationError",
+    "BackendError",
+    "OutOfMemoryError",
+    "CancelledError",
 ]
 
 

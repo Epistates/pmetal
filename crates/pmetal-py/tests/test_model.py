@@ -12,9 +12,8 @@ import signal
 import threading
 import time
 
-import pytest
-
 import pmetal
+import pytest
 from conftest import ALPHABET, UNK, VOCAB
 
 

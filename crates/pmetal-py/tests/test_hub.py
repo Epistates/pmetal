@@ -8,9 +8,8 @@ import threading
 import time
 from pathlib import Path
 
-import pytest
-
 import pmetal
+import pytest
 from conftest import make_tiny_model
 from fake_hub import FakeHub
 
@@ -18,8 +17,16 @@ from fake_hub import FakeHub
 @pytest.fixture(autouse=True)
 def isolated_hub_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """No test sends a real credential anywhere or touches the real cache."""
-    for name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HF_ENDPOINT", "HF_HUB_OFFLINE", "HF_HUB_CACHE",
-                 "HUGGINGFACE_HUB_CACHE", "HF_HOME", "HF_TOKEN_PATH"):
+    for name in (
+        "HF_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
+        "HF_ENDPOINT",
+        "HF_HUB_OFFLINE",
+        "HF_HUB_CACHE",
+        "HUGGINGFACE_HUB_CACHE",
+        "HF_HOME",
+        "HF_TOKEN_PATH",
+    ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("HF_HOME", str(tmp_path / "hf-home"))
 
@@ -57,8 +64,20 @@ def test_a_download_lands_a_complete_model_that_loads_and_generates(hub, cache):
 def test_progress_is_reported_as_dicts_and_ends_finished(hub, cache):
     seen: list[dict] = []
     download(hub, cache, progress=seen.append)
-    assert seen and all(set(p) == {"files_done", "total_files", "bytes_done", "total_bytes",
-                                   "bytes_per_sec", "eta_seconds", "current_file", "finished"} for p in seen)
+    assert seen and all(
+        set(p)
+        == {
+            "files_done",
+            "total_files",
+            "bytes_done",
+            "total_bytes",
+            "bytes_per_sec",
+            "eta_seconds",
+            "current_file",
+            "finished",
+        }
+        for p in seen
+    )
     assert seen[-1]["finished"] is True and seen[-1]["bytes_done"] == seen[-1]["total_bytes"] > 0
     assert seen[-1]["files_done"] == seen[-1]["total_files"] >= 4
     done = [p["bytes_done"] for p in seen]
@@ -175,7 +194,9 @@ def test_verify_model_finds_a_hub_id_in_the_cache_and_reports_damage(hub, cache,
     (broken / "model.safetensors").write_bytes(data[: len(data) // 2])
     report = pmetal.verify_model(broken)
     assert not report and not report.is_complete and report.problems
-    assert pmetal.verify_model(tmp_path / "empty-nowhere").problems, "a missing directory is a problem, not an exception"
+    assert pmetal.verify_model(tmp_path / "empty-nowhere").problems, (
+        "a missing directory is a problem, not an exception"
+    )
     empty = tmp_path / "empty"
     empty.mkdir()
     assert pmetal.verify_model(empty).format is None
@@ -183,9 +204,16 @@ def test_verify_model_finds_a_hub_id_in_the_cache_and_reports_damage(hub, cache,
 
 def test_search_results_carry_the_hubs_facts_and_a_fit(hub):
     hub.search_results = [
-        {"id": "org/tiny", "modelId": "org/tiny", "downloads": 12, "likes": 3, "tags": ["safetensors", "qwen3"],
-         "pipeline_tag": "text-generation", "lastModified": "2026-01-01T00:00:00.000Z",
-         "safetensors": {"parameters": {"F32": 20_000}, "total": 20_000}},
+        {
+            "id": "org/tiny",
+            "modelId": "org/tiny",
+            "downloads": 12,
+            "likes": 3,
+            "tags": ["safetensors", "qwen3"],
+            "pipeline_tag": "text-generation",
+            "lastModified": "2026-01-01T00:00:00.000Z",
+            "safetensors": {"parameters": {"F32": 20_000}, "total": 20_000},
+        },
     ]
     results = pmetal.search_models("tiny", endpoint=hub.endpoint, limit=3, tags=["qwen3"], sort="likes")
     assert [r["model_id"] for r in results] == ["org/tiny"]

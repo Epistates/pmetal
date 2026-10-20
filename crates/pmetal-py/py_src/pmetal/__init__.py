@@ -19,13 +19,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from . import pmetal as _native
-
-# MLX loads its Metal kernels from the metallib built with it: point it at the
-# one this package carries before anything touches the GPU.
-_native.configure_metallib(Path(__file__).resolve().parent)
-
-from ._jobs import (  # noqa: E402
+from ._jobs import (
     CliNotFoundError as CliNotFoundError,
     Job as Job,
     JobError as JobError,
@@ -36,7 +30,7 @@ from ._jobs import (  # noqa: E402
     run as run,
     start as start,
 )
-from .pmetal import (  # noqa: E402
+from .pmetal import (
     BackendError as BackendError,
     BenchSpec as BenchSpec,
     CancelledError as CancelledError,
@@ -76,8 +70,8 @@ from .pmetal import (  # noqa: E402
     SpecValidationError as SpecValidationError,
     TextStream as TextStream,
     Tokenizer as Tokenizer,
-    TokenizeSpec as TokenizeSpec,
     TokenizerError as TokenizerError,
+    TokenizeSpec as TokenizeSpec,
     TrainDiffusionSpec as TrainDiffusionSpec,
     TrainDraftSpec as TrainDraftSpec,
     Trainer as Trainer,
@@ -89,6 +83,7 @@ from .pmetal import (  # noqa: E402
     UploadReport as UploadReport,
     VocodeSpec as VocodeSpec,
     __version__ as __version__,
+    configure_metallib as _configure_metallib,
     download_file as download_file,
     download_model as download_model,
     estimate_fit as estimate_fit,
@@ -100,8 +95,12 @@ from .pmetal import (  # noqa: E402
     verify_model as verify_model,
 )
 
+# MLX loads its Metal kernels from the metallib built with it: point it at the
+# one this package carries before anything touches the GPU.
+_configure_metallib(Path(__file__).resolve().parent)
+
 if TYPE_CHECKING:
-    from typing_extensions import Unpack
+    from typing import Unpack
 
     from .pmetal import TrainCallOptions
 

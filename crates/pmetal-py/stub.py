@@ -107,7 +107,7 @@ def spec_stub(name: str, cls: type, only: set[str] | None = None) -> str:
     out.append(f"    def __new__(cls, **options: Unpack[{options}]) -> Self:\n")
     out.append(
         doc(
-            f"""\
+            """\
             Args:
                 **options: Any field of the spec; the rest keep their defaults.
 
@@ -131,9 +131,7 @@ def spec_stub(name: str, cls: type, only: set[str] | None = None) -> str:
 def call_options(name: str, cls: type, positional: tuple[str, ...], used_by: str) -> str:
     """A ``TypedDict`` of a spec's fields minus the ones a function takes positionally."""
     out = ["@type_check_only\n", f"class {name}(TypedDict, total=False):\n"]
-    out.append(
-        f'    """The fields of ``{cls.__name__}`` that ``{used_by}`` takes as keyword arguments."""\n\n'
-    )
+    out.append(f'    """The fields of ``{cls.__name__}`` that ``{used_by}`` takes as keyword arguments."""\n\n')
     for info in cls.fields():  # type: ignore[attr-defined]
         if info.name not in positional:
             out.append(f"    {info.name}: {info.annotation}\n")
@@ -143,12 +141,8 @@ def call_options(name: str, cls: type, positional: tuple[str, ...], used_by: str
 
 def infer_stub(spec_cls: type, unsupported: tuple[str, ...]) -> str:
     """``infer`` and ``infer_with_metrics``, typed by ``InferSpec``'s fields."""
-    out = [
-        call_options(
-            "InferCallOptions", spec_cls, ("model", "prompt", *unsupported), "infer"
-        )
-    ]
-    out.append(f"INFER_COMMAND_LINE_ONLY: tuple[str, ...]\n")
+    out = [call_options("InferCallOptions", spec_cls, ("model", "prompt", *unsupported), "infer")]
+    out.append("INFER_COMMAND_LINE_ONLY: tuple[str, ...]\n")
     out.append(
         doc(
             "The ``InferSpec`` fields only the command line honours: ``infer`` raises "
@@ -169,9 +163,7 @@ def infer_stub(spec_cls: type, unsupported: tuple[str, ...]) -> str:
     """
     )
     out.append("\n")
-    out.append(
-        "def infer(model: str | os.PathLike[str], prompt: str, **options: Unpack[InferCallOptions]) -> str:\n"
-    )
+    out.append("def infer(model: str | os.PathLike[str], prompt: str, **options: Unpack[InferCallOptions]) -> str:\n")
     out.append(doc("Generate text for one prompt and return it.\n\n" + common, "    "))
     out.append("\n")
     out.append(
@@ -180,8 +172,7 @@ def infer_stub(spec_cls: type, unsupported: tuple[str, ...]) -> str:
     out.append(
         doc(
             "Like ``infer``, with the generation's statistics: token counts, why it "
-            "stopped, its time, and the acceptance statistics of speculative decoding.\n\n"
-            + common,
+            "stopped, its time, and the acceptance statistics of speculative decoding.\n\n" + common,
             "    ",
         )
     )

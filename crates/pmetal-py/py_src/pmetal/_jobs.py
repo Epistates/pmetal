@@ -170,9 +170,7 @@ def find_cli(cli: str | os.PathLike[str] | None = None) -> Path:
             return candidate
     raise CliNotFoundError(
         "no pmetal command line to run the job with: pass cli=..., set PMETAL_CLI, "
-        "or install the `pmetal` command (looked for "
-        + ", ".join(str(c) for c in candidates)
-        + ")"
+        "or install the `pmetal` command (looked for " + ", ".join(str(c) for c in candidates) + ")"
     )
 
 
@@ -336,8 +334,7 @@ class Job:
                 raise CancelledError("the job was interrupted")
             reason = result.stderr.strip().splitlines()[-1:] or ["no error output"]
             raise JobFailedError(
-                f"`{' '.join(result.command[:2])}` exited with status {result.returncode}: "
-                f"{reason[0]}",
+                f"`{' '.join(result.command[:2])}` exited with status {result.returncode}: {reason[0]}",
                 returncode=result.returncode,
                 command=result.command,
                 stderr=result.stderr,

@@ -13,9 +13,8 @@ import json
 import pickle
 from typing import Any
 
-import pytest
-
 import pmetal
+import pytest
 
 SPEC_NAMES = sorted(n for n in dir(pmetal) if n.endswith("Spec") and n != "JobSpec")
 SPECS = [getattr(pmetal, n) for n in SPEC_NAMES]
@@ -63,8 +62,18 @@ def test_fields_are_the_specs_and_their_defaults_are_used(cls):
 def test_no_field_hides_a_method(cls):
     # Fields are read through __getattr__, so a field named like a method would be unreachable.
     for info in cls.fields():
-        assert info.name not in {"fields", "normalize", "to_argv", "to_dict", "from_dict", "to_json",
-                                 "from_json", "copy", "validation_errors", "subcommand"}
+        assert info.name not in {
+            "fields",
+            "normalize",
+            "to_argv",
+            "to_dict",
+            "from_dict",
+            "to_json",
+            "from_json",
+            "copy",
+            "validation_errors",
+            "subcommand",
+        }
 
 
 @pytest.mark.parametrize("cls", SPECS, ids=SPEC_NAMES)
@@ -105,7 +114,9 @@ def test_f32_fields_read_back_as_written():
     assert spec.lora_config()["alpha"] == 0.1
     assert json.loads(spec.to_json())["lora_dropout"] == 0.05
     # An f32 default reads back as its shortest decimal too.
-    assert pmetal.DistillSpec().to_dict()["learning_rate"] == json.loads(pmetal.DistillSpec().to_json())["learning_rate"]
+    assert (
+        pmetal.DistillSpec().to_dict()["learning_rate"] == json.loads(pmetal.DistillSpec().to_json())["learning_rate"]
+    )
 
 
 def test_a_spec_is_a_value_not_a_dict():
@@ -191,7 +202,9 @@ def test_field_info_describes_the_field():
     assert info["lora_targets"].annotation == "list[str]"
     assert info["model"].required and info["model"].kind == "model"
     assert info["resume"].flag == "--resume" or info["resume"].flag is None
-    assert info["wsd_decay_style"].annotation.startswith("Literal[") and info["wsd_decay_style"].annotation.endswith("| None")
+    assert info["wsd_decay_style"].annotation.startswith("Literal[") and info["wsd_decay_style"].annotation.endswith(
+        "| None"
+    )
     assert "label" in repr(info["learning_rate"]) or "learning_rate" in repr(info["learning_rate"])
 
 
@@ -200,11 +213,29 @@ def test_field_info_describes_the_field():
 
 def test_train_spec_builds_the_trainers_configs():
     spec = pmetal.TrainSpec(
-        model="m", dataset="d", learning_rate=1e-4, epochs=2, batch_size=3, lora_r=8,
-        lora_alpha=16.0, dora=True, rslora=True, lora_dropout=0.05, lora_targets=["q_proj", "v_proj"],
-        optimizer="muon", lr_schedule="wsd", wsd_decay_style="cosine", wsd_stable_ratio=0.6,
-        label_smoothing=0.1, z_loss=1e-4, neftune_alpha=5.0, warmup_ratio=0.1, min_lr=1e-6,
-        embedding_lr=5e-5, gradient_accumulation_steps=2, seed=7,
+        model="m",
+        dataset="d",
+        learning_rate=1e-4,
+        epochs=2,
+        batch_size=3,
+        lora_r=8,
+        lora_alpha=16.0,
+        dora=True,
+        rslora=True,
+        lora_dropout=0.05,
+        lora_targets=["q_proj", "v_proj"],
+        optimizer="muon",
+        lr_schedule="wsd",
+        wsd_decay_style="cosine",
+        wsd_stable_ratio=0.6,
+        label_smoothing=0.1,
+        z_loss=1e-4,
+        neftune_alpha=5.0,
+        warmup_ratio=0.1,
+        min_lr=1e-6,
+        embedding_lr=5e-5,
+        gradient_accumulation_steps=2,
+        seed=7,
     )
     training = spec.training_config()
     assert training["learning_rate"] == 1e-4
@@ -227,17 +258,23 @@ def test_train_spec_defaults_are_the_command_lines():
     """No default is restated in Python: the config a bare spec yields is the spec's."""
     spec = pmetal.TrainSpec(model="m", dataset="d")
     training = spec.training_config()
-    for name, key in [("learning_rate", "learning_rate"), ("batch_size", "batch_size"),
-                      ("epochs", "num_epochs"), ("weight_decay", "weight_decay"),
-                      ("max_grad_norm", "max_grad_norm"), ("warmup_steps", "warmup_steps"),
-                      ("gradient_accumulation_steps", "gradient_accumulation_steps")]:
+    for name, key in [
+        ("learning_rate", "learning_rate"),
+        ("batch_size", "batch_size"),
+        ("epochs", "num_epochs"),
+        ("weight_decay", "weight_decay"),
+        ("max_grad_norm", "max_grad_norm"),
+        ("warmup_steps", "warmup_steps"),
+        ("gradient_accumulation_steps", "gradient_accumulation_steps"),
+    ]:
         assert training[key] == getattr(spec, name), name
     lora = spec.lora_config()
     assert lora["r"] == spec.lora_r and lora["alpha"] == spec.lora_alpha
 
 
-@pytest.mark.parametrize("name,field", [("optimizer", "optimizer"), ("lr_schedule", "lr_schedule"),
-                                        ("wsd_decay_style", "wsd_decay_style")])
+@pytest.mark.parametrize(
+    "name,field", [("optimizer", "optimizer"), ("lr_schedule", "lr_schedule"), ("wsd_decay_style", "wsd_decay_style")]
+)
 def test_every_enum_option_of_the_spec_is_one_the_trainer_parses(name, field):
     info = next(f for f in pmetal.TrainSpec.fields() if f.name == name)
     assert info.options
@@ -279,6 +316,15 @@ def test_removed_options_are_gone():
 
 def test_python_exports_no_standalone_config_classes():
     """The old LoraConfig/TrainingConfig/DataLoaderConfig re-declared the specs' defaults."""
-    for name in ("LoraConfig", "TrainingConfig", "DataLoaderConfig", "Dtype", "Quantization",
-                 "LoraBias", "LrSchedulerType", "OptimizerType", "DatasetFormat"):
+    for name in (
+        "LoraConfig",
+        "TrainingConfig",
+        "DataLoaderConfig",
+        "Dtype",
+        "Quantization",
+        "LoraBias",
+        "LrSchedulerType",
+        "OptimizerType",
+        "DatasetFormat",
+    ):
         assert not hasattr(pmetal, name), name

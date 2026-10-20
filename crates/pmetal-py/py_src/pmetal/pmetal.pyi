@@ -6,10 +6,8 @@ job specs: edit the template or the Rust, never this file.
 
 import os
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import Any, ClassVar, Literal, TypedDict, final, type_check_only
 from types import TracebackType
-
-from typing_extensions import Self, Unpack
+from typing import Any, ClassVar, Literal, Self, TypedDict, Unpack, final, type_check_only
 
 __version__: str
 

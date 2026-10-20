@@ -17,9 +17,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 import pmetal
+import pytest
 from pmetal import pmetal as native
 
 CRATE = Path(__file__).resolve().parent.parent
@@ -41,16 +40,22 @@ def test_the_committed_stub_is_what_the_generator_writes():
 
 @needs_mypy
 def test_mypy_strict_accepts_the_sample_and_the_package():
-    result = run(sys.executable, "-m", "mypy", "--strict", "--warn-unused-ignores",
-                 str(TYPING / "sample_usage.py"), str(CRATE / "py_src" / "pmetal"))
+    result = run(
+        sys.executable,
+        "-m",
+        "mypy",
+        "--strict",
+        "--warn-unused-ignores",
+        str(TYPING / "sample_usage.py"),
+        str(CRATE / "py_src" / "pmetal"),
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 @needs_mypy
 def test_mypy_rejects_each_mistake_in_the_negative_sample():
     # --warn-unused-ignores: a mistake the stubs let through leaves its ignore unused.
-    result = run(sys.executable, "-m", "mypy", "--strict", "--warn-unused-ignores",
-                 str(TYPING / "negative_usage.py"))
+    result = run(sys.executable, "-m", "mypy", "--strict", "--warn-unused-ignores", str(TYPING / "negative_usage.py"))
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -62,8 +67,16 @@ def test_pyright_strict_accepts_the_sample():
 
 @needs_mypy
 def test_stubtest_finds_no_disagreement_between_stub_and_module():
-    result = run(sys.executable, "-m", "mypy.stubtest", "pmetal.pmetal",
-                 "--allowlist", str(CRATE / "stubtest_allowlist.txt"), "--ignore-unused-allowlist", cwd=CRATE.parent)
+    result = run(
+        sys.executable,
+        "-m",
+        "mypy.stubtest",
+        "pmetal.pmetal",
+        "--allowlist",
+        str(CRATE / "stubtest_allowlist.txt"),
+        "--ignore-unused-allowlist",
+        cwd=CRATE.parent,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -87,9 +100,14 @@ def test_every_public_symbol_has_a_runtime_docstring():
             for attr, member in vars(obj).items():
                 if attr.startswith("_") or attr in {"errors"}:
                     continue
-                if (inspect.isroutine(member) or isinstance(member, (property, staticmethod, classmethod))
-                        or type(member).__name__ in {"getset_descriptor", "method_descriptor"}):
-                    doc = getattr(member, "__doc__", None) or getattr(getattr(member, "__func__", None), "__doc__", None)
+                if (
+                    inspect.isroutine(member)
+                    or isinstance(member, (property, staticmethod, classmethod))
+                    or type(member).__name__ in {"getset_descriptor", "method_descriptor"}
+                ):
+                    doc = getattr(member, "__doc__", None) or getattr(
+                        getattr(member, "__func__", None), "__doc__", None
+                    )
                     if not (doc or "").strip():
                         missing.append(f"{name}.{attr}")
     # Enum members are documented by their class.
@@ -102,7 +120,12 @@ def test_every_public_symbol_has_a_stub_docstring():
     missing: list[str] = []
 
     def has_doc(body: list[ast.stmt]) -> bool:
-        return bool(body) and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str)
+        return (
+            bool(body)
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        )
 
     def visit(body: list[ast.stmt], prefix: str, in_class: bool) -> None:
         for i, node in enumerate(body):
