@@ -19,9 +19,12 @@ use pmetal_distributed::pipeline_harness::{PipelineHarness, PipelineHarnessConfi
 use pmetal_distributed::topology::NodeProfile;
 use std::net::{SocketAddr, TcpListener};
 
-fn grab_free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-    l.local_addr().expect("local_addr").port()
+/// `n` distinct free loopback ports: the probes stay open until all are chosen.
+fn grab_free_ports<const N: usize>() -> [u16; N] {
+    let probes: Vec<TcpListener> = (0..N)
+        .map(|_| TcpListener::bind("127.0.0.1:0").expect("bind port 0"))
+        .collect();
+    std::array::from_fn(|i| probes[i].local_addr().expect("local_addr").port())
 }
 
 const ENV_RANK: &str = "PMETAL_PHA_RANK";
@@ -174,9 +177,7 @@ fn pipeline_harness_two_process_smoke() {
     }
 
     let bin = std::env::current_exe().expect("current_exe");
-    let port_0 = grab_free_port();
-    let port_1 = grab_free_port();
-    let result_port = grab_free_port();
+    let [port_0, port_1, result_port] = grab_free_ports::<3>();
 
     eprintln!("parent: spawning ranks (act0={port_0}, act1={port_1}, result={result_port})");
 

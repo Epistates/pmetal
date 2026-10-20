@@ -17,18 +17,16 @@ use pmetal_distributed::{
 use std::net::{SocketAddr, TcpListener};
 use std::time::Instant;
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port()
-}
-
 async fn measure(ranks: usize, megabytes: usize, secure: bool) -> f64 {
-    let nodes: Vec<SocketAddr> = (0..ranks)
-        .map(|_| format!("127.0.0.1:{}", free_port()).parse().unwrap())
+    // The probes stay open until every port is chosen, so the ports differ.
+    let probes: Vec<TcpListener> = (0..ranks)
+        .map(|_| TcpListener::bind("127.0.0.1:0").expect("bind"))
         .collect();
+    let nodes: Vec<SocketAddr> = probes
+        .iter()
+        .map(|probe| probe.local_addr().expect("addr"))
+        .collect();
+    drop(probes);
     let secret = ClusterSecret::generate();
     let len = megabytes * 1024 * 1024 / 4;
     let iterations = 4;

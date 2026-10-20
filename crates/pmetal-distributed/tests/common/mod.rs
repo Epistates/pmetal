@@ -17,20 +17,24 @@ pub fn is_rank() -> bool {
     std::env::var("MLX_RANK").is_ok()
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port()
+/// `n` distinct free loopback ports: the probes stay open until all are chosen.
+fn free_ports(n: usize) -> Vec<u16> {
+    let probes: Vec<TcpListener> = (0..n)
+        .map(|_| TcpListener::bind("127.0.0.1:0").expect("bind"))
+        .collect();
+    probes
+        .iter()
+        .map(|probe| probe.local_addr().expect("addr").port())
+        .collect()
 }
 
 /// Spawn `ranks` copies of this test binary running the test `name`, and
 /// require every one to succeed within `timeout`.
 pub fn launch(ranks: usize, name: &str, timeout: Duration) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let hosts: Vec<Vec<String>> = (0..ranks)
-        .map(|_| vec![format!("127.0.0.1:{}", free_port())])
+    let hosts: Vec<Vec<String>> = free_ports(ranks)
+        .into_iter()
+        .map(|port| vec![format!("127.0.0.1:{port}")])
         .collect();
     let hostfile = dir.path().join("hosts.json");
     std::fs::write(&hostfile, serde_json::to_vec(&hosts).expect("json")).expect("hostfile");

@@ -11,19 +11,17 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-fn free_port() -> u16 {
-    StdListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port()
-}
-
+/// Two loopback addresses on free ports. The probe listeners stay open until
+/// both ports are chosen, so the two differ; the tests run one at a time
+/// (`#[serial]`) so none takes a port another has just let go of.
 fn addrs() -> Vec<SocketAddr> {
-    vec![
-        format!("127.0.0.1:{}", free_port()).parse().unwrap(),
-        format!("127.0.0.1:{}", free_port()).parse().unwrap(),
-    ]
+    let probes: Vec<StdListener> = (0..2)
+        .map(|_| StdListener::bind("127.0.0.1:0").expect("bind"))
+        .collect();
+    probes
+        .iter()
+        .map(|probe| probe.local_addr().expect("addr"))
+        .collect()
 }
 
 fn config(nodes: &[SocketAddr], rank: usize, secret: &ClusterSecret) -> DistributedConfig {
@@ -62,6 +60,7 @@ async fn honest_pair(nodes: &[SocketAddr], secret: &ClusterSecret) -> (Vec<f32>,
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
 async fn two_ranks_average_their_gradients() {
     let secret = ClusterSecret::generate();
     let (a, b) = honest_pair(&addrs(), &secret).await;
@@ -74,6 +73,7 @@ async fn two_ranks_average_their_gradients() {
 /// namespace key) must not be admitted as the previous rank of the ring,
 /// where it could feed its own numbers into every gradient average.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
 async fn a_lan_peer_knowing_only_the_public_namespace_cannot_join_the_ring() {
     let nodes = addrs();
     let secret = ClusterSecret::generate();
@@ -133,6 +133,7 @@ async fn a_lan_peer_knowing_only_the_public_namespace_cannot_join_the_ring() {
 /// the right answer for any placement of the bytes, not refuse the ones that
 /// happen to be misaligned.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
 async fn a_misaligned_byte_buffer_is_reduced_correctly() {
     let nodes = addrs();
     let secret = ClusterSecret::generate();
@@ -167,6 +168,7 @@ async fn a_misaligned_byte_buffer_is_reduced_correctly() {
 /// Peers whose node lists differ must be told so, not left to exchange
 /// gradients between what are really two different rings.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
 async fn ranks_with_different_node_lists_refuse_to_form_a_ring() {
     let nodes = addrs();
     // Rank 0 believes there is a third rank; rank 1 believes there are two.
@@ -194,6 +196,7 @@ async fn ranks_with_different_node_lists_refuse_to_form_a_ring() {
 /// One all-reduce chunk bigger than the old 512 MiB framing cap. Each rank
 /// holds 1 GiB and the test allocates several, so it is opt-in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
 #[ignore = "allocates several GiB"]
 async fn a_buffer_whose_chunks_exceed_half_a_gibibyte() {
     let nodes = addrs();
