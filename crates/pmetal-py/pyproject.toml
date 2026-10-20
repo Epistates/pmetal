@@ -27,6 +27,9 @@ Repository = "https://github.com/epistates/pmetal"
 python-source = "py_src"
 module-name = "pmetal.pmetal"
 bindings = "pyo3"
+# `release` aborts on a panic, which would kill the interpreter; `wheel` is
+# release with unwinding, so a Rust panic is a Python exception.
+profile = "wheel"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
