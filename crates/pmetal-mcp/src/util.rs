@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -30,69 +29,7 @@ pub fn get_system_memory() -> Option<u64> {
     mem_str.trim().parse().ok()
 }
 
-/// Resolve the path to the `pmetal` binary.
-///
-/// Search order:
-/// 1. `PMETAL_BIN` environment variable (explicit override)
-/// 2. Co-located binary (same directory as this executable)
-/// 3. `pmetal` on PATH (fallback)
-pub fn resolve_pmetal_binary() -> PathBuf {
-    if let Some(bin) = std::env::var_os("PMETAL_BIN") {
-        return PathBuf::from(bin);
-    }
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join("pmetal");
-            if candidate.exists() {
-                return candidate;
-            }
-        }
-    }
-
-    PathBuf::from("pmetal")
-}
-
-/// Hide anything in `text` that looks like a credential: Hugging Face tokens
-/// (`hf_…`) and bearer tokens. Output from a job or a failed command is shown
-/// to the model, and a token must not reach it.
-pub fn redact_secrets(text: &str) -> Cow<'_, str> {
-    if !text.contains("hf_") && !text.contains("Bearer ") && !text.contains("bearer ") {
-        return Cow::Borrowed(text);
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while !rest.is_empty() {
-        let hf = rest.find("hf_");
-        let bearer = rest.find("Bearer ").or_else(|| rest.find("bearer "));
-        let (at, prefix_len) = match (hf, bearer) {
-            (Some(h), Some(b)) if b < h => (b, 7),
-            (Some(h), _) => (h, 3),
-            (None, Some(b)) => (b, 7),
-            (None, None) => break,
-        };
-        let token_len = rest[at + prefix_len..]
-            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '=')))
-            .unwrap_or(rest.len() - at - prefix_len);
-        // `hf_` inside a word (`shelf_life`) is not a token, and a short tail is
-        // not a credential.
-        let preceded_by_word = rest[..at]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_ascii_alphanumeric());
-        let is_token = token_len >= 8 && !(prefix_len == 3 && preceded_by_word);
-        out.push_str(&rest[..at]);
-        if is_token {
-            out.push_str(&rest[at..at + prefix_len]);
-            out.push_str("[REDACTED]");
-        } else {
-            out.push_str(&rest[at..at + prefix_len + token_len]);
-        }
-        rest = &rest[at + prefix_len + token_len..];
-    }
-    out.push_str(rest);
-    Cow::Owned(out)
-}
+pub use pmetal_supervisor::{kill_group, redact_secrets, resolve_pmetal_binary};
 
 /// A `Command` for the `pmetal` binary `binary` with stdin closed, output piped, in its
 /// own process group, and killed if the handle is dropped.
@@ -180,7 +117,7 @@ pub async fn run_command(
 
     if !matches!(outcome, Outcome::Exited(_)) {
         if let Some(pid) = pid {
-            kill_group(pid).await;
+            kill_group(pid);
         }
         let _ = child.wait().await;
     }
@@ -277,17 +214,6 @@ fn tail_chars(text: &str, max: usize) -> Cow<'_, str> {
     Cow::Owned(format!("…{}", text.chars().skip(skip).collect::<String>()))
 }
 
-/// SIGKILL the process group led by `pid`.
-pub async fn kill_group(pid: u32) {
-    let _ = Command::new("kill")
-        .args(["-s", "KILL", "--", &format!("-{pid}")])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-}
-
 /// Build device info JSON by calling MetalContext directly.
 pub fn build_device_info_json() -> McpResult<serde_json::Value> {
     let ctx = pmetal_metal::context::MetalContext::global()
@@ -330,31 +256,6 @@ pub fn build_device_spec() -> McpResult<pmetal_hub::DeviceSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn hugging_face_tokens_and_bearer_tokens_are_hidden() {
-        let token = "hf_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
-        let text = format!("401 for {token}: header Authorization: Bearer abc.def-ghi_jkl123 done");
-        let out = redact_secrets(&text);
-        assert!(!out.contains(token), "{out}");
-        assert!(!out.contains("abc.def-ghi_jkl123"), "{out}");
-        assert!(out.contains("hf_[REDACTED]"), "{out}");
-        assert!(out.contains("Bearer [REDACTED]"), "{out}");
-        assert!(out.contains("done"), "{out}");
-    }
-
-    #[test]
-    fn ordinary_text_is_left_alone() {
-        for text in [
-            "loss 2.5 at step 10",
-            "shelf_life_days = 30",
-            "hf_ alone",
-            "the Bearer was here",
-            "path /models/hf_cache/x",
-        ] {
-            assert_eq!(redact_secrets(text), text);
-        }
-    }
 
     #[tokio::test]
     async fn capture_keeps_the_head_or_the_tail() {

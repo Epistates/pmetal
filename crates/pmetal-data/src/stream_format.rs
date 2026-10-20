@@ -48,6 +48,14 @@ const TURN_START_NAMES: &[&str] = &[
     "<｜Assistant｜>",
 ];
 
+/// The label [`StreamFormatter`] puts before the reasoning body, when it
+/// shows it. A reader of the stream (the terminal UI) splits on these.
+pub const THINKING_LABEL: &str = "[thinking]\n";
+
+/// The label [`StreamFormatter`] puts between the reasoning body and the
+/// answer.
+pub const ANSWER_LABEL: &str = "\n\n[answer]\n";
+
 /// Where a generated token belongs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
@@ -299,7 +307,7 @@ impl StreamFormatter {
                 if !self.is_at_start() {
                     out.push('\n');
                 }
-                out.push_str("[thinking]\n");
+                out.push_str(THINKING_LABEL);
                 self.thinking_label_printed = true;
             }
         }
@@ -308,7 +316,7 @@ impl StreamFormatter {
         if !now_thinking && self.in_thinking && route != Route::Reasoning {
             self.in_thinking = false;
             if self.show_thinking && !self.answer_label_printed {
-                out.push_str("\n\n[answer]\n");
+                out.push_str(ANSWER_LABEL);
                 self.answer_label_printed = true;
             } else if !self.answer_label_printed && self.streamed_bytes > 0 {
                 out.push('\n');

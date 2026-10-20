@@ -79,3 +79,50 @@ pub fn parse_optimizer(name: &str) -> Result<crate::OptimizerType, String> {
 pub fn parse_lr_scheduler(name: &str) -> Result<crate::LrSchedulerType, String> {
     name.parse()
 }
+
+/// A job spec a surface can build a job from: the CLI's own, a TUI form's, an
+/// MCP tool's. Everything that varies between specs is behind this trait
+/// (descriptors and argv through [`JobFields`](crate::JobFields), defaults
+/// through `Default`, the wire form through serde) except the cross-field
+/// rules, which each spec's `normalize` holds and this trait calls.
+pub trait Spec:
+    crate::JobFields + Default + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static
+{
+    /// The spec's cross-field validation, which also runs the descriptor checks.
+    fn normalize_spec(&mut self) -> Result<(), Vec<crate::FieldError>>;
+}
+
+macro_rules! impl_spec {
+    ($($ty:ty),+ $(,)?) => {$(
+        impl Spec for $ty {
+            fn normalize_spec(&mut self) -> Result<(), Vec<crate::FieldError>> {
+                self.normalize()
+            }
+        }
+    )+};
+}
+
+impl_spec!(
+    BenchSpec,
+    DecideSpec,
+    DflashSpec,
+    DistillSpec,
+    EmbedTrainSpec,
+    EvalSpec,
+    FuseSpec,
+    GrpoSpec,
+    InferSpec,
+    MergeSpec,
+    PackExpertsSpec,
+    PreferenceSpec,
+    PretrainSpec,
+    QuantizeSpec,
+    RlkdSpec,
+    ServeSpec,
+    TokenizeSpec,
+    TrainSpec,
+    TrainDiffusionSpec,
+    TrainDraftSpec,
+    TrainMtpSpec,
+    VocodeSpec,
+);

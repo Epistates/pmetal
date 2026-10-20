@@ -1,16 +1,26 @@
-//! Models tab — browse cached HuggingFace models and custom model directories.
+//! Models tab: browse cached Hugging Face models, trained outputs and custom
+//! model directories.
+//!
+//! The scan reads directories, config files and weight headers, so it runs off
+//! the interface's thread ([`scan`] is a plain function the app hands to a
+//! blocking task) and the tab shows "Scanning..." until it reports. Parameter
+//! counts and memory fit come from `pmetal_hub` (the model's own config and
+//! the weights' measured size against what the GPU reports it can address),
+//! never from guesses about system RAM.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Scrollbar, ScrollbarOrientation,
     ScrollbarState, StatefulWidget, Table, TableState, Widget, Wrap,
 };
 
+use crate::tui::tabs::custom_dirs::CustomDirs;
 use crate::tui::theme::THEME;
 
 /// A cached model entry.
@@ -52,6 +62,163 @@ impl ModelEntry {
             format!("{:.0} MB", mb)
         }
     }
+
+    /// Whether this is a LoRA adapter (not a full model).
+    pub fn is_adapter(&self) -> bool {
+        is_lora_adapter(&self.path)
+    }
+}
+
+/// Where a scan looks.
+#[derive(Debug, Clone)]
+pub struct ScanPlan {
+    /// The directory trained models are written under (`./output`).
+    pub output_root: PathBuf,
+    /// The Hugging Face hub cache.
+    pub hub_cache: PathBuf,
+    /// Directories the user added.
+    pub custom_dirs: Vec<PathBuf>,
+    /// What the GPU can address, for the fit estimate; `None` without a GPU.
+    pub device: Option<pmetal_hub::DeviceSpec>,
+}
+
+/// The device the fit estimate is made for, from the GPU's own report of how
+/// much it can address and how fast: never derived from the system's RAM.
+pub fn query_device_spec() -> Option<pmetal_hub::DeviceSpec> {
+    let ctx = pmetal_metal::context::MetalContext::global().ok()?;
+    let props = ctx.properties();
+    Some(pmetal_hub::DeviceSpec::from_device(
+        props.recommended_working_set_size,
+        props.memory_bandwidth_gbps,
+        props.has_unified_memory,
+    ))
+}
+
+/// Find every model the plan reaches: trained outputs first, then the hub
+/// cache, then the custom directories. Blocking.
+pub fn scan(plan: &ScanPlan) -> Vec<ModelEntry> {
+    let mut models: Vec<ModelEntry> = Vec::new();
+
+    // 1. Trained outputs
+    let mut seen: HashSet<String> = HashSet::new();
+    scan_trained_dir(&plan.output_root, &mut models, &mut seen, 0, 2);
+
+    // 2. The hub cache, with the snapshot each repository's `refs/main` names
+    for cached in pmetal_hub::list_cached_models_in(&plan.hub_cache) {
+        if let Some(entry) =
+            build_model_entry(&cached.repo_id, &cached.snapshot, ModelSource::HfCache)
+        {
+            models.push(entry);
+        }
+    }
+
+    // 3. Custom directories
+    for dir in &plan.custom_dirs {
+        scan_custom_dir(dir, &mut models);
+    }
+
+    // Trained models first, then alphabetically within each group
+    models.sort_by(|a, b| {
+        let a_trained = matches!(a.source, ModelSource::Trained);
+        let b_trained = matches!(b.source, ModelSource::Trained);
+        b_trained.cmp(&a_trained).then(a.id.cmp(&b.id))
+    });
+
+    if let Some(device) = &plan.device {
+        for model in &mut models {
+            // The config's architecture and the weights' measured size.
+            if let Some(spec) = pmetal_hub::model_spec_from_dir(&model.path) {
+                model.fit_estimate = Some(pmetal_hub::estimate_fit(&spec, device));
+            }
+        }
+    }
+    models
+}
+
+/// Scan a directory for trained/fine-tuned models, a couple of levels deep
+/// (`output/`, `output/distilled/`, ...).
+fn scan_trained_dir(
+    dir: &Path,
+    models: &mut Vec<ModelEntry>,
+    seen: &mut HashSet<String>,
+    depth: usize,
+    max_depth: usize,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let dir_name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        // Skip hidden dirs and checkpoints
+        if dir_name.starts_with('.') || dir_name == "checkpoints" {
+            continue;
+        }
+        if is_model_dir(&path) {
+            let model_id = format!("trained/{dir_name}");
+            if seen.insert(model_id.clone()) {
+                if let Some(mut entry) = build_model_entry(&model_id, &path, ModelSource::Trained) {
+                    if is_lora_adapter(&path) {
+                        entry.quantization = Some("LoRA Adapter".to_string());
+                    }
+                    models.push(entry);
+                }
+            }
+        } else if depth < max_depth {
+            scan_trained_dir(&path, models, seen, depth + 1, max_depth);
+        }
+    }
+}
+
+/// Scan a custom directory: the directory itself if it is a model, else the
+/// models directly inside it.
+fn scan_custom_dir(dir: &Path, models: &mut Vec<ModelEntry>) {
+    let candidates: Vec<PathBuf> = if is_model_dir(dir) {
+        vec![dir.to_path_buf()]
+    } else {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir() && is_model_dir(p))
+            .collect()
+    };
+    for path in candidates {
+        let adapter = is_lora_adapter(&path);
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let model_id = if adapter {
+            format!("trained/{name}")
+        } else {
+            name
+        };
+        if models.iter().any(|m| m.id == model_id) {
+            continue;
+        }
+        let source = if adapter {
+            ModelSource::Trained
+        } else {
+            ModelSource::Custom(dir.to_path_buf())
+        };
+        if let Some(mut entry) = build_model_entry(&model_id, &path, source) {
+            if adapter {
+                entry.quantization = Some("LoRA Adapter".to_string());
+            }
+            models.push(entry);
+        }
+    }
 }
 
 /// Models tab state.
@@ -59,311 +226,68 @@ pub struct ModelsTab {
     pub models: Vec<ModelEntry>,
     pub table_state: TableState,
     pub scrollbar_state: ScrollbarState,
+    /// A scan is running.
     pub loading: bool,
     pub search_query: String,
     pub searching: bool,
     /// User-configured custom directories to scan for models.
-    pub custom_dirs: Vec<PathBuf>,
-    /// Device spec for fit estimation (queried once at startup).
+    pub custom_dirs: CustomDirs,
+    /// What the GPU reports it can address (queried once at startup).
     pub device_spec: Option<pmetal_hub::DeviceSpec>,
 }
 
 impl ModelsTab {
     pub fn new() -> Self {
-        let custom_dirs = load_custom_model_dirs();
+        Self::with_device(query_device_spec())
+    }
 
-        // Query device spec for fit estimation
-        let device_spec = pmetal_metal::context::MetalContext::global()
-            .ok()
-            .map(|ctx| {
-                let props = ctx.properties();
-                pmetal_hub::DeviceSpec::from_device(
-                    props.recommended_working_set_size,
-                    props.memory_bandwidth_gbps,
-                    props.has_unified_memory,
-                )
-            });
-
-        let mut tab = Self {
+    /// A tab whose fit estimates are made for `device`.
+    pub fn with_device(device_spec: Option<pmetal_hub::DeviceSpec>) -> Self {
+        Self {
             models: Vec::new(),
             table_state: TableState::default(),
             scrollbar_state: ScrollbarState::default(),
             loading: true,
             search_query: String::new(),
             searching: false,
-            custom_dirs,
+            custom_dirs: CustomDirs::models(),
             device_spec,
-        };
-        tab.scan_models();
-        tab
-    }
-
-    /// Add a custom directory to scan for models.
-    pub fn add_custom_dir(&mut self, dir: PathBuf) {
-        if !self.custom_dirs.contains(&dir) {
-            self.custom_dirs.push(dir);
-            save_custom_model_dirs(&self.custom_dirs);
-            self.scan_models();
         }
     }
 
-    /// Remove a custom directory.
-    pub fn remove_custom_dir(&mut self, idx: usize) {
-        if idx < self.custom_dirs.len() {
-            self.custom_dirs.remove(idx);
-            save_custom_model_dirs(&self.custom_dirs);
-            self.scan_models();
+    /// What a scan should look at now.
+    pub fn scan_plan(&self) -> ScanPlan {
+        ScanPlan {
+            output_root: PathBuf::from("./output"),
+            hub_cache: pmetal_hub::cache_dir(),
+            custom_dirs: self.custom_dirs.dirs().to_vec(),
+            device: self.device_spec.clone(),
         }
     }
 
-    /// Scan HuggingFace cache, output directories, and custom directories for models.
-    pub fn scan_models(&mut self) {
+    /// A scan is about to run.
+    pub fn begin_scan(&mut self) {
         self.loading = true;
-        self.models.clear();
+    }
 
-        // 1. Scan trained/fine-tuned model output directories first
-        self.scan_trained_outputs();
-
-        // 2. Scan HuggingFace hub cache (cross-platform, respects HF_HOME/HF_HUB_CACHE)
-        let hf_cache = pmetal_hub::cache_dir();
-        self.scan_hf_cache(&hf_cache);
-
-        // 3. Scan custom user directories
-        let custom_dirs: Vec<PathBuf> = self.custom_dirs.clone();
-        for dir in &custom_dirs {
-            self.scan_custom_dir(dir);
-        }
-
-        // Sort: trained models first, then alphabetically within each group
-        self.models.sort_by(|a, b| {
-            let a_trained = matches!(a.source, ModelSource::Trained);
-            let b_trained = matches!(b.source, ModelSource::Trained);
-            b_trained.cmp(&a_trained).then(a.id.cmp(&b.id))
-        });
-
-        // Compute fit estimates for all models
-        self.compute_fit_estimates();
-
-        if !self.models.is_empty() {
-            self.table_state.select(Some(0));
-        }
-        self.scrollbar_state = ScrollbarState::new(self.models.len());
+    /// A scan finished. The selection stays on the same model if it is still
+    /// there.
+    pub fn set_models(&mut self, models: Vec<ModelEntry>) {
+        let selected = self.selected_model().map(|m| m.id.clone());
+        self.models = models;
         self.loading = false;
+        let shown = self.filtered_models();
+        let index = selected
+            .and_then(|id| shown.iter().position(|m| m.id == id))
+            .or(if shown.is_empty() { None } else { Some(0) });
+        let count = shown.len();
+        self.table_state.select(index);
+        self.scrollbar_state = ScrollbarState::new(count).position(index.unwrap_or(0));
     }
 
-    /// Compute fit estimates for all local models.
-    fn compute_fit_estimates(&mut self) {
-        let Some(device) = &self.device_spec else {
-            return;
-        };
-        for model in &mut self.models {
-            // The config's architecture and the weights' measured size.
-            let Some(model_spec) = pmetal_hub::model_spec_from_dir(&model.path) else {
-                continue;
-            };
-            model.fit_estimate = Some(pmetal_hub::estimate_fit(&model_spec, device));
-        }
-    }
-
-    /// Scan common output directories for trained/fine-tuned models.
-    /// Looks in ./output/ and all its subdirectories for lora_weights.safetensors,
-    /// adapter_config.json, or other model artifacts.
-    fn scan_trained_outputs(&mut self) {
-        let output_root = PathBuf::from("./output");
-        if !output_root.exists() {
-            return;
-        }
-
-        let mut seen: HashSet<String> = self.models.iter().map(|m| m.id.clone()).collect();
-
-        // Recursively scan output/ for model dirs (up to 2 levels deep)
-        self.scan_trained_dir_recursive(&output_root, &mut seen, 0, 2);
-    }
-
-    /// Recursively scan a directory for trained model outputs.
-    fn scan_trained_dir_recursive(
-        &mut self,
-        dir: &std::path::Path,
-        seen: &mut HashSet<String>,
-        depth: usize,
-        max_depth: usize,
-    ) {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-
-            let dir_name = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-
-            // Skip hidden dirs and checkpoints
-            if dir_name.starts_with('.') || dir_name == "checkpoints" {
-                continue;
-            }
-
-            if is_model_dir(&path) {
-                let model_id = format!("trained/{dir_name}");
-
-                if !seen.contains(&model_id) {
-                    if let Some(mut entry) =
-                        build_model_entry(&model_id, &path, ModelSource::Trained)
-                    {
-                        if is_trained_dir(&path) {
-                            entry.quantization = Some("LoRA Adapter".to_string());
-                        }
-                        seen.insert(model_id);
-                        self.models.push(entry);
-                    }
-                }
-            } else if depth < max_depth {
-                // Recurse into subdirectories (e.g., output/distilled/, output/grpo/)
-                self.scan_trained_dir_recursive(&path, seen, depth + 1, max_depth);
-            }
-        }
-    }
-
-    /// Scan the HuggingFace hub cache directory.
-    /// Structure: {cache}/models--{org}--{name}/snapshots/{hash}/
-    fn scan_hf_cache(&mut self, hub_dir: &std::path::Path) {
-        if !hub_dir.exists() {
-            return;
-        }
-
-        let entries = match std::fs::read_dir(hub_dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            if !name.starts_with("models--") {
-                continue;
-            }
-
-            // Parse model ID from directory name: models--org--name → org/name
-            let model_id = name
-                .strip_prefix("models--")
-                .unwrap_or(&name)
-                .replace("--", "/");
-
-            // Find the latest snapshot
-            let snapshots_dir = path.join("snapshots");
-            let snapshot_path = if snapshots_dir.exists() {
-                std::fs::read_dir(&snapshots_dir).ok().and_then(|entries| {
-                    entries
-                        .flatten()
-                        .filter(|e| e.path().is_dir())
-                        .max_by_key(|e| {
-                            e.metadata()
-                                .and_then(|m| m.modified())
-                                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-                        })
-                        .map(|e| e.path())
-                })
-            } else {
-                None
-            };
-
-            let snapshot = snapshot_path.unwrap_or_else(|| path.clone());
-            if let Some(entry) = build_model_entry(&model_id, &snapshot, ModelSource::HfCache) {
-                self.models.push(entry);
-            }
-        }
-    }
-
-    /// Scan a custom directory for model directories.
-    /// Looks for directories containing config.json or safetensors files.
-    /// Directories with adapter_config.json are treated as trained models.
-    fn scan_custom_dir(&mut self, dir: &std::path::Path) {
-        if !dir.exists() {
-            return;
-        }
-
-        let seen: HashSet<String> = self.models.iter().map(|m| m.id.clone()).collect();
-
-        // Check if the directory itself is a model
-        if is_model_dir(dir) {
-            let is_trained = is_trained_dir(dir);
-            let model_id = if is_trained {
-                format!(
-                    "trained/{}",
-                    dir.file_name().unwrap_or_default().to_string_lossy()
-                )
-            } else {
-                dir.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string()
-            };
-            if !seen.contains(&model_id) {
-                let source = if is_trained {
-                    ModelSource::Trained
-                } else {
-                    ModelSource::Custom(dir.to_path_buf())
-                };
-                if let Some(mut entry) = build_model_entry(&model_id, dir, source) {
-                    if is_trained {
-                        entry.quantization = Some("LoRA Adapter".to_string());
-                    }
-                    self.models.push(entry);
-                }
-            }
-            return;
-        }
-
-        // Otherwise scan subdirectories
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() || !is_model_dir(&path) {
-                continue;
-            }
-
-            let is_trained = is_trained_dir(&path);
-            let dir_name = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            let model_id = if is_trained {
-                format!("trained/{dir_name}")
-            } else {
-                dir_name
-            };
-
-            if seen.contains(&model_id) {
-                continue;
-            }
-
-            let source = if is_trained {
-                ModelSource::Trained
-            } else {
-                ModelSource::Custom(dir.to_path_buf())
-            };
-            if let Some(mut entry) = build_model_entry(&model_id, &path, source) {
-                if is_trained {
-                    entry.quantization = Some("LoRA Adapter".to_string());
-                }
-                self.models.push(entry);
-            }
-        }
+    /// Add a directory to scan. Returns whether it was new.
+    pub fn add_custom_dir(&mut self, dir: PathBuf) -> bool {
+        self.custom_dirs.add(dir)
     }
 
     pub fn filtered_models(&self) -> Vec<&ModelEntry> {
@@ -376,6 +300,14 @@ impl ModelsTab {
                 .filter(|m| m.id.to_lowercase().contains(&q))
                 .collect()
         }
+    }
+
+    /// The search text changed: keep the selection inside the shorter list.
+    pub fn search_changed(&mut self) {
+        let count = self.filtered_models().len();
+        self.table_state
+            .select(if count == 0 { None } else { Some(0) });
+        self.scrollbar_state = ScrollbarState::new(count);
     }
 
     pub fn next_row(&mut self) {
@@ -407,6 +339,25 @@ impl ModelsTab {
             .selected()
             .and_then(|i| filtered.get(i).copied())
     }
+
+    /// The model with this id, if the tab knows it.
+    pub fn find(&self, id: &str) -> Option<&ModelEntry> {
+        self.models.iter().find(|m| m.id == id)
+    }
+
+    /// The path a model id stands for: its directory if the tab knows it, else
+    /// the id itself (a Hugging Face id the trainer will resolve).
+    pub fn resolve_path(&self, id: &str) -> String {
+        self.find(id)
+            .map(|m| m.path.display().to_string())
+            .unwrap_or_else(|| id.to_string())
+    }
+}
+
+impl Default for ModelsTab {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Widget for &mut ModelsTab {
@@ -417,6 +368,16 @@ impl Widget for &mut ModelsTab {
 
         self.render_table(table_area, buf);
         self.render_detail(detail_area, buf);
+    }
+}
+
+/// How a fit level is drawn: green fits, yellow is tight, red is too large,
+/// and each is also spelled out.
+pub fn fit_style(level: pmetal_hub::FitLevel) -> Style {
+    match level {
+        pmetal_hub::FitLevel::Fits => THEME.text_success,
+        pmetal_hub::FitLevel::Tight => THEME.text_warning,
+        pmetal_hub::FitLevel::TooLarge => THEME.text_error,
     }
 }
 
@@ -433,8 +394,8 @@ impl ModelsTab {
             .borders(Borders::ALL)
             .border_style(THEME.block);
 
-        if self.loading {
-            Paragraph::new("\n  Scanning cache...")
+        if self.loading && self.models.is_empty() {
+            Paragraph::new("\n  Scanning the model directories...")
                 .style(THEME.text_muted)
                 .block(block)
                 .render(area, buf);
@@ -444,9 +405,9 @@ impl ModelsTab {
         let filtered = self.filtered_models();
         if filtered.is_empty() {
             Paragraph::new(if self.search_query.is_empty() {
-                "\n  No models found.\n\n  Download:  pmetal download <model-id>\n  Add dir:   press 'a' to add a custom model directory"
+                "\n  No models found.\n\n  Download:  d (or pmetal download <model-id>)\n  Add dir:   a"
             } else {
-                "\n  No models match search."
+                "\n  No models match the filter."
             })
             .style(THEME.text_muted)
             .block(block)
@@ -462,8 +423,6 @@ impl ModelsTab {
             .iter()
             .enumerate()
             .map(|(i, model)| {
-                use ratatui::style::{Color, Style};
-
                 let style = if i % 2 == 0 {
                     THEME.table_row
                 } else {
@@ -480,15 +439,14 @@ impl ModelsTab {
                     .map(String::from)
                     .or_else(|| model.base_model.as_ref().map(|b| format!("< {b}")))
                     .unwrap_or_else(|| "-".to_string());
-                let fit_cell = if let Some(fit) = &model.fit_estimate {
-                    let fit_style = match fit.fit_level {
-                        pmetal_hub::FitLevel::Fits => Style::default().fg(Color::Green),
-                        pmetal_hub::FitLevel::Tight => Style::default().fg(Color::Yellow),
-                        pmetal_hub::FitLevel::TooLarge => Style::default().fg(Color::Red),
-                    };
-                    Cell::new(format!("{:.1}GB", fit.total_required_gb)).style(fit_style)
-                } else {
-                    Cell::new("-")
+                let fit_cell = match &model.fit_estimate {
+                    Some(fit) => Cell::new(format!(
+                        "{:.1}GB {}",
+                        fit.total_required_gb,
+                        fit.fit_level.label()
+                    ))
+                    .style(fit_style(fit.fit_level)),
+                    None => Cell::new("-"),
                 };
                 Row::new(vec![
                     Cell::new(model.id.clone()),
@@ -507,7 +465,7 @@ impl ModelsTab {
                 Constraint::Fill(1),
                 Constraint::Length(10),
                 Constraint::Length(18),
-                Constraint::Length(9),
+                Constraint::Length(16),
                 Constraint::Length(10),
             ],
         )
@@ -518,7 +476,6 @@ impl ModelsTab {
 
         StatefulWidget::render(table, area, buf, &mut self.table_state);
 
-        // Scrollbar
         Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
             .end_symbol(None)
@@ -547,76 +504,40 @@ impl ModelsTab {
             ModelSource::Trained => "Trained (local)".to_string(),
         };
 
+        let kv = |key: &'static str, value: String, style: Style| {
+            Line::from(vec![
+                Span::styled(format!("{key:<9}"), THEME.kv_key),
+                Span::styled(value, style),
+            ])
+        };
         let mut lines = vec![
-            Line::from(vec![
-                Span::styled("ID:     ", THEME.kv_key),
-                Span::styled(&model.id, THEME.kv_value),
-            ]),
-            Line::from(vec![
-                Span::styled("Size:   ", THEME.kv_key),
-                Span::styled(model.size_display(), THEME.kv_value),
-            ]),
-            Line::from(vec![
-                Span::styled("Source: ", THEME.kv_key),
-                Span::styled(source_label, THEME.text_dim),
-            ]),
-            Line::from(vec![
-                Span::styled("Path:   ", THEME.kv_key),
-                Span::styled(model.path.display().to_string(), THEME.text_dim),
-            ]),
+            kv("ID:", model.id.clone(), THEME.kv_value),
+            kv("Size:", model.size_display(), THEME.kv_value),
+            kv("Source:", source_label, THEME.text_dim),
+            kv("Path:", model.path.display().to_string(), THEME.text_dim),
         ];
-
         if let Some(arch) = &model.architecture {
-            lines.push(Line::from(vec![
-                Span::styled("Arch:   ", THEME.kv_key),
-                Span::styled(arch, THEME.kv_value),
-            ]));
+            lines.push(kv("Arch:", arch.clone(), THEME.kv_value));
         }
-
         if let Some(params) = &model.params {
-            lines.push(Line::from(vec![
-                Span::styled("Params: ", THEME.kv_key),
-                Span::styled(params.as_str(), THEME.kv_value),
-            ]));
+            lines.push(kv("Params:", params.clone(), THEME.kv_value));
         }
-
         if let Some(quant) = &model.quantization {
-            lines.push(Line::from(vec![
-                Span::styled("Format: ", THEME.kv_key),
-                Span::styled(quant.as_str(), THEME.kv_value),
-            ]));
+            lines.push(kv("Format:", quant.clone(), THEME.kv_value));
         }
-
         if let Some(base) = &model.base_model {
-            lines.push(Line::from(vec![
-                Span::styled("Base:   ", THEME.kv_key),
-                Span::styled(base.as_str(), THEME.kv_value),
-            ]));
+            lines.push(kv("Base:", base.clone(), THEME.kv_value));
         }
-
         lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("Modified: ", THEME.kv_key),
-            Span::styled(&model.modified, THEME.text_dim),
-        ]));
+        lines.push(kv("Modified:", model.modified.clone(), THEME.text_dim));
 
         // Fit estimation section
         if let Some(fit) = &model.fit_estimate {
-            use ratatui::style::{Color, Style};
-
             lines.push(Line::from(""));
-            let fit_style = match fit.fit_level {
-                pmetal_hub::FitLevel::Fits => Style::default().fg(Color::Green),
-                pmetal_hub::FitLevel::Tight => Style::default().fg(Color::Yellow),
-                pmetal_hub::FitLevel::TooLarge => Style::default().fg(Color::Red),
-            };
-            lines.push(Line::from(vec![Span::styled(
-                "--- Memory Fit ---",
-                THEME.kv_key,
-            )]));
+            lines.push(Line::from(Span::styled("--- Memory Fit ---", THEME.kv_key)));
             lines.push(Line::from(vec![
-                Span::styled("Status: ", THEME.kv_key),
-                Span::styled(fit.fit_level.label(), fit_style),
+                Span::styled(format!("{:<9}", "Status:"), THEME.kv_key),
+                Span::styled(fit.fit_level.label(), fit_style(fit.fit_level)),
                 Span::styled(
                     format!(
                         " ({:.0}% of {:.0}GB)",
@@ -626,34 +547,40 @@ impl ModelsTab {
                 ),
             ]));
             lines.push(Line::from(vec![
-                Span::styled("Weights: ", THEME.kv_key),
+                Span::styled(format!("{:<9}", "Weights:"), THEME.kv_key),
                 Span::styled(format!("{:.1} GB", fit.weights_gb), THEME.kv_value),
                 Span::styled("  KV: ", THEME.kv_key),
                 Span::styled(format!("{:.1} GB", fit.kv_cache_gb), THEME.kv_value),
             ]));
+            lines.push(kv(
+                "Decode:",
+                format!("~{:.0} tok/s", fit.estimated_tps),
+                THEME.kv_value,
+            ));
             lines.push(Line::from(vec![
-                Span::styled("Decode:  ", THEME.kv_key),
-                Span::styled(format!("~{:.0} tok/s", fit.estimated_tps), THEME.kv_value),
-            ]));
-
-            // Training info
-            let train_style = match fit.training_fit {
-                pmetal_hub::FitLevel::Fits => Style::default().fg(Color::Green),
-                pmetal_hub::FitLevel::Tight => Style::default().fg(Color::Yellow),
-                pmetal_hub::FitLevel::TooLarge => Style::default().fg(Color::Red),
-            };
-            lines.push(Line::from(vec![
-                Span::styled("Train:   ", THEME.kv_key),
-                Span::styled(format!("{:.1} GB", fit.training_memory_gb), train_style),
+                Span::styled(format!("{:<9}", "Train:"), THEME.kv_key),
                 Span::styled(
-                    format!("  batch {}", fit.recommended_batch_size),
+                    format!("{:.1} GB", fit.training_memory_gb),
+                    fit_style(fit.training_fit),
+                ),
+                Span::styled(
+                    format!(
+                        "  {}  batch {}",
+                        fit.training_fit.label(),
+                        fit.recommended_batch_size
+                    ),
                     THEME.text_dim,
                 ),
             ]));
-
             for note in &fit.notes {
                 lines.push(Line::from(Span::styled(note.as_str(), THEME.text_muted)));
             }
+        } else if self.device_spec.is_none() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "No GPU was found, so memory fit is not estimated.",
+                THEME.text_muted,
+            )));
         }
 
         Paragraph::new(lines)
@@ -664,8 +591,8 @@ impl ModelsTab {
 
 // --- Helpers ---
 
-/// Check if a directory looks like a model directory.
-fn is_model_dir(path: &std::path::Path) -> bool {
+/// Whether a directory looks like a model directory.
+pub fn is_model_dir(path: &Path) -> bool {
     path.join("config.json").exists()
         || path.join("adapter_config.json").exists()
         || path.join("model.safetensors").exists()
@@ -675,8 +602,7 @@ fn is_model_dir(path: &std::path::Path) -> bool {
         || has_gguf_files(path)
 }
 
-/// Check if a directory contains any .gguf files.
-fn has_gguf_files(path: &std::path::Path) -> bool {
+fn has_gguf_files(path: &Path) -> bool {
     std::fs::read_dir(path)
         .ok()
         .map(|entries| {
@@ -687,27 +613,23 @@ fn has_gguf_files(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Check if a directory looks like a trained/fine-tuned output directory.
-fn is_trained_dir(path: &std::path::Path) -> bool {
+/// Whether a directory is a LoRA adapter (has adapter weights or config).
+pub fn is_lora_adapter(path: &Path) -> bool {
     path.join("adapter_config.json").exists()
         || path.join("adapter_model.safetensors").exists()
         || path.join("lora_weights.safetensors").exists()
 }
 
 /// Build a ModelEntry from a model directory path.
-fn build_model_entry(
-    model_id: &str,
-    path: &std::path::Path,
-    source: ModelSource,
-) -> Option<ModelEntry> {
+fn build_model_entry(model_id: &str, path: &Path, source: ModelSource) -> Option<ModelEntry> {
     let size = dir_size(path);
 
-    let config_path = path.join("config.json");
-    let (architecture, params) = if config_path.exists() {
-        read_model_config(&config_path)
-    } else {
-        (None, None)
-    };
+    // Architecture from the config; parameter count from the hub's own spec
+    // (the same one the fit estimate is made from).
+    let architecture = read_architecture(&path.join("config.json"));
+    let params = pmetal_hub::model_spec_from_dir(path)
+        .filter(|spec| spec.params_b > 0.0)
+        .map(|spec| pmetal_hub::format_params(spec.params_b));
 
     let quantization = if path.join("quantization_config.json").exists() {
         Some("Quantized".to_string())
@@ -719,10 +641,9 @@ fn build_model_entry(
         .and_then(|m| m.modified())
         .ok()
         .map(|t| {
-            let duration = t.elapsed().unwrap_or_default();
-            let hours = duration.as_secs() / 3600;
+            let hours = t.elapsed().unwrap_or_default().as_secs() / 3600;
             if hours < 24 {
-                format!("{}h ago", hours)
+                format!("{hours}h ago")
             } else {
                 format!("{}d ago", hours / 24)
             }
@@ -731,8 +652,10 @@ fn build_model_entry(
 
     // For trained models, read training_info.json or parse from dir name ({base}--{suffix})
     let base_model = read_training_info(path).or_else(|| {
+        if !is_lora_adapter(path) {
+            return None;
+        }
         let dir_name = path.file_name()?.to_string_lossy().to_string();
-        // Parse "{base}--{suffix}" convention
         dir_name.split_once("--").map(|(base, _)| base.to_string())
     });
 
@@ -746,12 +669,12 @@ fn build_model_entry(
         modified,
         source,
         base_model,
-        fit_estimate: None, // computed after scan in compute_fit_estimates()
+        fit_estimate: None,
     })
 }
 
-fn dir_size(path: &std::path::Path) -> u64 {
-    const MAX_ENTRIES: usize = 2000;
+fn dir_size(path: &Path) -> u64 {
+    const MAX_ENTRIES: usize = 4000;
     walkdir::WalkDir::new(path)
         .follow_links(true)
         .into_iter()
@@ -762,43 +685,16 @@ fn dir_size(path: &std::path::Path) -> u64 {
         .sum()
 }
 
-fn read_model_config(path: &std::path::Path) -> (Option<String>, Option<String>) {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return (None, None);
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return (None, None);
-    };
-
-    let arch = json["model_type"]
+fn read_architecture(config: &Path) -> Option<String> {
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(config).ok()?).ok()?;
+    json["model_type"]
         .as_str()
         .or_else(|| json["architectures"].as_array()?.first()?.as_str())
-        .map(String::from);
-
-    let params = estimate_params(&json);
-    (arch, params)
+        .map(String::from)
 }
 
-fn estimate_params(config: &serde_json::Value) -> Option<String> {
-    let hidden = config["hidden_size"].as_u64()?;
-    let layers = config["num_hidden_layers"].as_u64()?;
-    let vocab = config["vocab_size"].as_u64().unwrap_or(32000);
-    let intermediate = config["intermediate_size"].as_u64().unwrap_or(hidden * 4);
-
-    let embed = vocab * hidden;
-    let attn = 4 * hidden * hidden;
-    let mlp = 3 * hidden * intermediate;
-    let total = embed + layers * (attn + mlp);
-
-    let billions = total as f64 / 1e9;
-    if billions >= 1.0 {
-        Some(format!("{:.1}B", billions))
-    } else {
-        Some(format!("{:.0}M", billions * 1000.0))
-    }
-}
-
-fn detect_weight_format(path: &std::path::Path) -> Option<String> {
+fn detect_weight_format(path: &Path) -> Option<String> {
     if path.join("model.safetensors").exists() || path.join("model.safetensors.index.json").exists()
     {
         Some("SafeTensors".to_string())
@@ -810,10 +706,10 @@ fn detect_weight_format(path: &std::path::Path) -> Option<String> {
         if let Ok(entries) = std::fs::read_dir(path) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if name_str.ends_with(".safetensors") {
+                let name = name.to_string_lossy();
+                if name.ends_with(".safetensors") {
                     has_shards = true;
-                } else if name_str.ends_with(".gguf") {
+                } else if name.ends_with(".gguf") {
                     has_gguf = true;
                 }
             }
@@ -830,9 +726,8 @@ fn detect_weight_format(path: &std::path::Path) -> Option<String> {
 
 /// Read training metadata from a trained model output directory.
 /// Returns the base model ID/path if available.
-fn read_training_info(path: &std::path::Path) -> Option<String> {
-    let info_path = path.join("training_info.json");
-    let content = std::fs::read_to_string(&info_path).ok()?;
+fn read_training_info(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path.join("training_info.json")).ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
     json.get("base_model")
         .and_then(|v| v.as_str())
@@ -840,7 +735,7 @@ fn read_training_info(path: &std::path::Path) -> Option<String> {
 }
 
 /// Write training metadata to an output directory.
-pub fn write_training_info(output_dir: &std::path::Path, base_model: &str, base_model_path: &str) {
+pub fn write_training_info(output_dir: &Path, base_model: &str, base_model_path: &str) {
     let info = serde_json::json!({
         "base_model": base_model,
         "base_model_path": base_model_path,
@@ -853,30 +748,187 @@ pub fn write_training_info(output_dir: &std::path::Path, base_model: &str, base_
     );
 }
 
-/// Config file path for persisting custom model directories.
-fn custom_dirs_config_path() -> PathBuf {
-    pmetal_hub::pmetal_cache_dir().join("custom_model_dirs.json")
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Load custom model directories from config.
-fn load_custom_model_dirs() -> Vec<PathBuf> {
-    let path = custom_dirs_config_path();
-    if !path.exists() {
-        return Vec::new();
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
     }
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    serde_json::from_str::<Vec<PathBuf>>(&content).unwrap_or_default()
-}
 
-/// Persist custom model directories to config.
-fn save_custom_model_dirs(dirs: &[PathBuf]) {
-    let path = custom_dirs_config_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    const CONFIG: &str = r#"{"model_type":"llama","hidden_size":64,"num_hidden_layers":2,
+        "num_attention_heads":4,"num_key_value_heads":4,"intermediate_size":128,"vocab_size":1000}"#;
+
+    fn plan(root: &Path) -> ScanPlan {
+        ScanPlan {
+            output_root: root.join("output"),
+            hub_cache: root.join("hub"),
+            custom_dirs: vec![root.join("mine")],
+            device: Some(pmetal_hub::DeviceSpec::from_device(16 << 30, 200.0, true)),
+        }
     }
-    if let Ok(json) = serde_json::to_string_pretty(dirs) {
-        let _ = std::fs::write(&path, json);
+
+    #[test]
+    fn the_scan_finds_trained_cached_and_custom_models_in_that_order() {
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        // A trained adapter two levels down in the output directory.
+        write(&r.join("output/grpo/run--lora/adapter_config.json"), "{}");
+        write(
+            &r.join("output/grpo/run--lora/training_info.json"),
+            r#"{"base_model":"org/base"}"#,
+        );
+        // A cached model with two snapshots; main points at the older one.
+        let sha_a = "a".repeat(40);
+        let sha_b = "b".repeat(40);
+        write(
+            &r.join(format!(
+                "hub/models--org--base/snapshots/{sha_a}/config.json"
+            )),
+            CONFIG,
+        );
+        write(
+            &r.join(format!(
+                "hub/models--org--base/snapshots/{sha_b}/config.json"
+            )),
+            "{}",
+        );
+        write(&r.join("hub/models--org--base/refs/main"), &sha_a);
+        // A directory the user added, holding one model.
+        write(&r.join("mine/local-model/config.json"), CONFIG);
+
+        let models = scan(&plan(r));
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["trained/run--lora", "local-model", "org/base"]);
+
+        let trained = &models[0];
+        assert_eq!(trained.source, ModelSource::Trained);
+        assert_eq!(trained.base_model.as_deref(), Some("org/base"));
+        assert!(trained.is_adapter());
+        assert_eq!(trained.quantization.as_deref(), Some("LoRA Adapter"));
+
+        let cached = &models[2];
+        assert!(
+            cached.path.ends_with(&sha_a),
+            "the snapshot refs/main names, not the newest: {}",
+            cached.path.display()
+        );
+        assert_eq!(cached.architecture.as_deref(), Some("llama"));
+        // Parameters and fit come from the hub's own model spec, not a formula here.
+        assert!(cached.params.is_some());
+        assert!(cached.fit_estimate.is_some());
+    }
+
+    #[test]
+    fn without_a_device_the_models_are_listed_but_not_fitted() {
+        let root = tempfile::tempdir().unwrap();
+        write(&root.path().join("mine/m/config.json"), CONFIG);
+        let mut plan = plan(root.path());
+        plan.device = None;
+        let models = scan(&plan);
+        assert_eq!(models.len(), 1);
+        assert!(models[0].fit_estimate.is_none());
+    }
+
+    #[test]
+    fn a_rescan_keeps_the_selection_on_the_same_model() {
+        let entry = |id: &str| ModelEntry {
+            id: id.into(),
+            path: PathBuf::from(id),
+            size_bytes: 1 << 20,
+            architecture: None,
+            params: None,
+            quantization: None,
+            modified: "now".into(),
+            source: ModelSource::HfCache,
+            base_model: None,
+            fit_estimate: None,
+        };
+        let mut tab = ModelsTab::with_device(None);
+        tab.set_models(vec![entry("a"), entry("b"), entry("c")]);
+        tab.next_row();
+        tab.next_row();
+        assert_eq!(tab.selected_model().unwrap().id, "c");
+        // A new model sorts in front; the selection follows "c".
+        tab.begin_scan();
+        assert!(tab.loading);
+        tab.set_models(vec![entry("0"), entry("a"), entry("b"), entry("c")]);
+        assert_eq!(tab.selected_model().unwrap().id, "c");
+        assert!(!tab.loading);
+        // The model is gone: the selection falls back to the first.
+        tab.set_models(vec![entry("a")]);
+        assert_eq!(tab.selected_model().unwrap().id, "a");
+        tab.set_models(Vec::new());
+        assert!(tab.selected_model().is_none());
+    }
+
+    #[test]
+    fn filtering_narrows_the_list_and_resets_the_selection() {
+        let mut tab = ModelsTab::with_device(None);
+        let entry = |id: &str| ModelEntry {
+            id: id.into(),
+            path: PathBuf::from(id),
+            size_bytes: 0,
+            architecture: None,
+            params: None,
+            quantization: None,
+            modified: String::new(),
+            source: ModelSource::HfCache,
+            base_model: None,
+            fit_estimate: None,
+        };
+        tab.set_models(vec![entry("qwen/a"), entry("llama/b"), entry("qwen/c")]);
+        tab.next_row();
+        tab.search_query = "QWEN".into();
+        tab.search_changed();
+        assert_eq!(tab.filtered_models().len(), 2);
+        assert_eq!(tab.selected_model().unwrap().id, "qwen/a");
+        tab.search_query = "nothing".into();
+        tab.search_changed();
+        assert!(tab.selected_model().is_none());
+    }
+
+    #[test]
+    fn a_model_id_resolves_to_its_directory_or_stays_a_hub_id() {
+        let mut tab = ModelsTab::with_device(None);
+        tab.set_models(vec![ModelEntry {
+            id: "org/m".into(),
+            path: PathBuf::from("/cache/snap"),
+            size_bytes: 0,
+            architecture: None,
+            params: None,
+            quantization: None,
+            modified: String::new(),
+            source: ModelSource::HfCache,
+            base_model: None,
+            fit_estimate: None,
+        }]);
+        assert_eq!(tab.resolve_path("org/m"), "/cache/snap");
+        assert_eq!(tab.resolve_path("other/model"), "other/model");
+    }
+
+    #[test]
+    fn training_info_is_written_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        write_training_info(dir.path(), "org/base", "/cache/base");
+        assert_eq!(read_training_info(dir.path()).as_deref(), Some("org/base"));
+    }
+
+    #[test]
+    fn the_tab_draws_in_every_state_without_panicking() {
+        let mut tab = ModelsTab::with_device(None);
+        let sizes = [(0, 0), (1, 1), (20, 5), (60, 12), (120, 30)];
+        for &(w, h) in &sizes {
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(area);
+            (&mut tab).render(area, &mut buf);
+        }
+        tab.set_models(Vec::new());
+        for &(w, h) in &sizes {
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(area);
+            (&mut tab).render(area, &mut buf);
+        }
     }
 }

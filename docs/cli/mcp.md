@@ -122,8 +122,9 @@ lists no roots starts the server in `/`, set `PMETAL_MCP_ROOTS` in the server's 
 | `PMETAL_MCP_ALLOW_REMOTE_BIND` | Set to `1` to let `start_serve` bind to an address other than this machine's own |
 | `PMETAL_BIN` | The `pmetal` binary to run (default: the one next to the server, else on `PATH`) |
 
-Jobs run in their own process group. Stopping a job signals the group, and the server
-stops every job it started when it exits. A job's output is kept in a bounded buffer
+Jobs run in their own process group, under the same supervisor the TUI uses. Stopping a
+job signals the group and returns once the process has exited, and the server stops every
+job it started when it exits. A job's output is kept in a bounded buffer
 (10,000 lines, 4 MiB, long lines cut), and tokens that appear in output are redacted.
 `start_serve` binds to `127.0.0.1` by default, and `chat` and `decide` reach only a
 server on this machine, without following redirects.

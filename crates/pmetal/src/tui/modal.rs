@@ -80,7 +80,7 @@ pub enum Modal {
         table_state: TableState,
     },
     /// Contextual help overlay showing global + per-tab keybindings.
-    Help { tab: Tab },
+    Help { tab: Tab, scroll: usize },
     /// Jump-to-tab palette.
     ///
     /// `Alt+1-9` only reaches the first nine of twenty tabs, and cycling with
@@ -119,11 +119,21 @@ pub struct PickerEntry {
 impl Modal {
     // --- Constructors ---
 
+    /// A yes/no question whose Enter means yes.
     pub fn confirm(title: impl Into<String>, lines: Vec<String>) -> Self {
         Modal::Confirm {
             title: title.into(),
             lines,
             selected: true,
+        }
+    }
+
+    /// A yes/no question whose Enter means no: for what stops work.
+    pub fn confirm_no(title: impl Into<String>, lines: Vec<String>) -> Self {
+        Modal::Confirm {
+            title: title.into(),
+            lines,
+            selected: false,
         }
     }
 
@@ -163,7 +173,7 @@ impl Modal {
     }
 
     pub fn help(tab: Tab) -> Self {
-        Modal::Help { tab }
+        Modal::Help { tab, scroll: 0 }
     }
 
     pub fn tab_picker(current: Tab) -> Self {
@@ -510,12 +520,38 @@ impl Modal {
                 _ => None,
             },
 
-            Modal::Help { .. } => match key.code {
+            Modal::Help { scroll, .. } => match key.code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?') => {
                     Some(ModalAction::None)
                 }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *scroll = scroll.saturating_add(1);
+                    None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    *scroll = scroll.saturating_sub(1);
+                    None
+                }
+                KeyCode::PageDown => {
+                    *scroll = scroll.saturating_add(8);
+                    None
+                }
+                KeyCode::PageUp => {
+                    *scroll = scroll.saturating_sub(8);
+                    None
+                }
                 _ => None,
             },
+        }
+    }
+
+    /// Pasted text goes into a text input; no other dialog takes text.
+    pub fn paste(&mut self, text: &str) {
+        if let Modal::TextInput { value, cursor, .. } = self {
+            for c in text.chars().filter(|c| !c.is_control()) {
+                value.insert(*cursor, c);
+                *cursor += c.len_utf8();
+            }
         }
     }
 
@@ -562,7 +598,7 @@ impl Modal {
                 entries,
                 table_state,
             } => render_hf_search(popup_area, buf, entries, table_state),
-            Modal::Help { tab } => render_help(popup_area, buf, *tab),
+            Modal::Help { tab, scroll } => render_help(popup_area, buf, *tab, scroll),
             Modal::TabPicker { list_state, search } => {
                 render_tab_picker(popup_area, buf, list_state, search)
             }
@@ -647,7 +683,7 @@ fn render_text_input(
     title: &str,
     prompt: &str,
     value: &str,
-    _cursor: usize,
+    cursor: usize,
 ) {
     let block = Block::default()
         .title(format!(" {title} "))
@@ -669,12 +705,20 @@ fn render_text_input(
     let input_block = Block::default()
         .borders(Borders::ALL)
         .border_style(THEME.block_focused);
-    let display = if value.is_empty() { "..." } else { value };
-    let style = if value.is_empty() {
-        THEME.text_muted
+    let shown;
+    let display = if value.is_empty() {
+        "▏"
     } else {
-        THEME.text_bright
+        // The end of a long entry is where typing is.
+        let mut with_cursor = value.to_string();
+        with_cursor.insert(cursor.min(value.len()), '▏');
+        let width = input_area.width.saturating_sub(2) as usize;
+        let chars: Vec<char> = with_cursor.chars().collect();
+        let skip = chars.len().saturating_sub(width);
+        shown = chars[skip..].iter().collect::<String>();
+        shown.as_str()
     };
+    let style = THEME.text_bright;
     Paragraph::new(display)
         .style(style)
         .block(input_block)
@@ -927,8 +971,6 @@ fn render_hf_search(
     entries: &[HfSearchEntry],
     table_state: &mut TableState,
 ) {
-    use ratatui::style::{Color, Style};
-
     let block = Block::default()
         .title(" HuggingFace Hub Search ")
         .title_style(THEME.block_title_focused)
@@ -969,11 +1011,7 @@ fn render_hf_search(
             } else {
                 THEME.table_row_alt
             };
-            let fit_style = match entry.fit_level {
-                pmetal_hub::FitLevel::Fits => Style::default().fg(Color::Green),
-                pmetal_hub::FitLevel::Tight => Style::default().fg(Color::Yellow),
-                pmetal_hub::FitLevel::TooLarge => Style::default().fg(Color::Red),
-            };
+            let fit_style = crate::tui::tabs::fit_style(entry.fit_level);
             Row::new(vec![
                 Cell::new(entry.model_id.clone()),
                 Cell::new(entry.params.clone()),
@@ -1028,9 +1066,9 @@ fn filtered_models<'a>(models: &'a [PickerEntry], search: &str) -> Vec<&'a Picke
     }
 }
 
-/// Render the contextual help overlay — shows global keybindings
-/// alongside the bindings specific to `tab`.
-fn render_help(area: Rect, buf: &mut Buffer, tab: Tab) {
+/// Render the contextual help overlay: the global bindings and the active
+/// tab's, from the tables the footer reads too.
+fn render_help(area: Rect, buf: &mut Buffer, tab: Tab, scroll: &mut usize) {
     let block = Block::default()
         .title(format!(" Help — {tab} "))
         .title_style(THEME.block_title_focused)
@@ -1039,132 +1077,62 @@ fn render_help(area: Rect, buf: &mut Buffer, tab: Tab) {
     let inner = block.inner(area);
     block.render(area, buf);
 
-    let [global_area, tab_area, footer_area] = Layout::vertical([
-        Constraint::Length(12),
-        Constraint::Min(0),
-        Constraint::Length(2),
-    ])
-    .areas(inner);
+    let [body_area, footer_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
 
-    // ── Global bindings (same on every tab) ────────────────────────────
-    let global_lines = [
-        ("?", "Toggle this help overlay"),
-        ("Tab / Shift+Tab", "Switch tabs forward / backward"),
-        ("Alt+1..9", "Jump directly to tab 1..9"),
-        ("Ctrl+P", "Go to any tab (type to filter)"),
-        ("Ctrl+1..9", "Jump directly to tab 1..9 (alternative)"),
-        ("q / Ctrl+C", "Quit the TUI"),
-        ("F2", "Toggle mouse capture (text select/copy)"),
-        ("Esc", "Close modal / cancel edit"),
-    ];
     let mut lines: Vec<Line<'_>> = Vec::new();
-    lines.push(Line::from(Span::styled(" Global", THEME.kv_key)));
-    for (key, desc) in &global_lines {
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {key:<18}"), THEME.footer_key),
-            Span::styled(*desc, THEME.text),
-        ]));
-    }
-    Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .render(global_area, buf);
-
-    // ── Tab-specific bindings ──────────────────────────────────────────
-    let tab_bindings: &[(&str, &str)] = tab_help(tab);
-    let mut tab_lines: Vec<Line<'_>> = Vec::new();
-    tab_lines.push(Line::from(Span::styled(
-        format!(" {tab} tab"),
-        THEME.kv_key,
-    )));
-    if tab_bindings.is_empty() {
-        tab_lines.push(Line::from(Span::styled(
+    let section = |title: String| Line::from(Span::styled(title, THEME.kv_key));
+    let row = |b: &crate::tui::keys::Binding| {
+        Line::from(vec![
+            Span::styled(format!("  {:<18}", b.keys), THEME.footer_key),
+            Span::styled(b.help, THEME.text),
+        ])
+    };
+    lines.push(section(" Global".to_string()));
+    lines.extend(
+        crate::tui::keys::GLOBAL
+            .iter()
+            .filter(|b| !(tab == Tab::Inference && b.keys == "q"))
+            .map(row),
+    );
+    lines.push(Line::from(""));
+    lines.push(section(format!(" {tab} tab")));
+    let own = crate::tui::keys::tab_bindings(tab);
+    if own.is_empty() {
+        lines.push(Line::from(Span::styled(
             "  (no tab-specific bindings)",
             THEME.text_muted,
         )));
     } else {
-        for (key, desc) in tab_bindings {
-            tab_lines.push(Line::from(vec![
-                Span::styled(format!("  {key:<18}"), THEME.footer_key),
-                Span::styled(*desc, THEME.text),
-            ]));
-        }
+        lines.extend(own.iter().map(row));
     }
-    Paragraph::new(tab_lines)
-        .wrap(Wrap { trim: false })
-        .render(tab_area, buf);
-
-    Paragraph::new(Line::from(Span::styled(
-        " Press ? or Esc to close",
-        THEME.text_muted,
-    )))
-    .render(footer_area, buf);
-}
-
-/// Return the help text for a specific tab. Each row is `(key, description)`.
-fn tab_help(tab: Tab) -> &'static [(&'static str, &'static str)] {
-    match tab {
-        Tab::Dashboard => &[
-            ("p", "Pause / resume metric updates"),
-            ("r", "Reset metric buffers"),
-        ],
-        Tab::Device => &[],
-        Tab::Models => &[
-            ("j / k", "Navigate rows"),
-            ("/", "Filter model list"),
-            ("R", "Rescan model directories"),
-            ("d", "Download a model by HF id"),
-            ("a", "Add a custom model directory"),
-            ("S", "Search HuggingFace Hub"),
-            ("t", "Train with the selected model"),
-            ("s", "Distill with the selected model as student"),
-            ("i", "Infer with the selected model"),
-            ("f", "Fuse a LoRA adapter into its base"),
-        ],
-        Tab::Datasets => &[
-            ("j / k", "Navigate rows"),
-            ("c", "Convert to pmetal JSONL"),
-            ("a", "Add a custom dataset directory"),
-            ("R", "Rescan dataset directories"),
-        ],
-        Tab::Training | Tab::Pretrain | Tab::Distillation | Tab::Grpo => &[
-            ("j / k", "Navigate fields"),
-            ("Enter", "Edit / cycle / pick"),
-            ("S", "Start the job"),
-            ("x", "Stop the running job"),
-            ("L", "Override learning rate during training"),
-        ],
-        Tab::Inference => &[
-            ("Enter", "Send the prompt"),
-            ("Ctrl+P", "Pick a model"),
-            ("Ctrl+S", "Focus the settings sidebar"),
-            ("Ctrl+H", "Show / hide the settings sidebar"),
-            ("F2", "Enter browse mode to yank text"),
-            ("Esc", "Stop generation"),
-        ],
-        Tab::Jobs => &[
-            ("j / k", "Navigate jobs"),
-            ("J / K", "Scroll the selected job log"),
-            ("R", "Rescan job output directories"),
-        ],
-        Tab::Serve | Tab::Quantize | Tab::Merge | Tab::Bench | Tab::Eval | Tab::Dflash => &[
-            ("j / k", "Navigate fields"),
-            ("Enter", "Edit / cycle / pick"),
-            ("S", "Start the job"),
-            ("x", "Cancel the running job"),
-        ],
-        Tab::EmbedTrain | Tab::Rlkd | Tab::Preference | Tab::Tokenize => &[
-            ("j / k", "Navigate fields"),
-            ("Enter", "Edit / cycle / pick"),
-            ("S", "Start the job"),
-            ("x", "Cancel the running job"),
-        ],
-        Tab::Ollama => &[
-            ("j / k", "Navigate fields"),
-            ("Enter", "Edit field value"),
-            ("S", "Export the Modelfile"),
-            ("x", "Cancel running export"),
-        ],
+    if tab.is_form() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  While a field is being edited every key is typed into it: Enter applies,",
+            THEME.text_dim,
+        )));
+        lines.push(Line::from(Span::styled(
+            "  Esc cancels, Ctrl+U clears, and pasting works.",
+            THEME.text_dim,
+        )));
     }
+
+    let max_scroll = lines.len().saturating_sub(body_area.height as usize);
+    *scroll = (*scroll).min(max_scroll);
+    let visible: Vec<Line<'_>> = lines
+        .into_iter()
+        .skip(*scroll)
+        .take(body_area.height as usize)
+        .collect();
+    Paragraph::new(visible).render(body_area, buf);
+
+    let hint = if max_scroll > 0 {
+        " ? or Esc to close   j/k to scroll"
+    } else {
+        " ? or Esc to close"
+    };
+    Paragraph::new(Line::from(Span::styled(hint, THEME.text_muted))).render(footer_area, buf);
 }
 
 /// Compute a centered rectangle within `area` at the given percentage.

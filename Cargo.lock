@@ -5242,6 +5242,7 @@ dependencies = [
  "pmetal-models",
  "pmetal-runtime",
  "pmetal-serve",
+ "pmetal-supervisor",
  "pmetal-trainer",
  "pmetal-vocoder",
  "rand 0.10.3",
@@ -5424,10 +5425,10 @@ dependencies = [
 name = "pmetal-mcp"
 version = "0.6.0"
 dependencies = [
- "chrono",
  "pmetal-core",
  "pmetal-hub",
  "pmetal-metal",
+ "pmetal-supervisor",
  "reqwest",
  "schemars",
  "serde",
@@ -5592,6 +5593,24 @@ dependencies = [
  "tokio-stream",
  "tower",
  "tower-http 0.7.1",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "pmetal-supervisor"
+version = "0.6.0"
+dependencies = [
+ "anstream",
+ "chrono",
+ "pmetal-core",
+ "rustix",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
  "tracing",
  "uuid",
 ]

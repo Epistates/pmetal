@@ -329,7 +329,14 @@ pub struct DistillSpec {
     pub log_metrics: Option<String>,
 
     /// Resume from the latest checkpoint in the output directory.
-    #[job(skip_descriptor, argv = "--resume", flag, default_bool = false)]
+    #[job(
+        label = "Resume",
+        group = "Training",
+        argv = "--resume",
+        flag,
+        default_bool = false,
+        help = "Continue from the latest checkpoint in the output directory"
+    )]
     #[serde(default)]
     pub resume: bool,
 }

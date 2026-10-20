@@ -1,327 +1,254 @@
-//! Serve tab — HTTP inference server configuration and control.
+//! Serve tab: the OpenAI-compatible inference server.
 //!
-//! Mirrors the `pmetal serve` subcommand. Field navigation, inline edit,
-//! and log tailing are delegated to `FormTabState` + `JobLog` so this
-//! file only owns the tab-specific shape: the `ServeStatus` state machine
-//! and the status-panel rendering. Fields are driven by [`ServeSpec`].
+//! "Serving" means something answers on the address, not that the process
+//! started: the app connects to the address the server announces and tells the
+//! tab when it is reachable. A server that fails to bind (the port is taken)
+//! is therefore never shown as serving.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use pmetal_core::JobFields as _;
 use pmetal_core::jobs::ServeSpec;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 
+use crate::tui::jobs::LaunchPlan;
+use crate::tui::tabs::dashboard::Telemetry;
+use crate::tui::tabs::panel::{FormTab, JobPanel, RunState};
+use crate::tui::tabs::status_panel::render_standard;
 use crate::tui::theme::THEME;
-use crate::tui::widgets::{FormAction, FormTabState, JobLog, StatusTone, status_line};
+use crate::tui::widgets::{FormIssue, format_duration};
 
-/// Runtime status of the `pmetal serve` process.
-#[derive(Debug, Clone, Default)]
-pub enum ServeStatus {
-    #[default]
-    Idle,
-    Starting {
-        bind_url: String,
-    },
-    Running {
-        bind_url: String,
-        started_at: Instant,
-    },
-    Stopped {
-        reason: String,
-    },
-    Failed(String),
+/// The line the server logs once it has built its router and is about to
+/// bind (pmetal-serve, `run_server`).
+const ANNOUNCEMENT: &str = "OpenAI-compatible API available at http://";
+
+/// Whether a bind address is this machine only.
+fn is_loopback(host: &str) -> bool {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Serve tab state.
 pub struct ServeTab {
-    pub form: FormTabState,
-    pub status: ServeStatus,
-    pub log: JobLog,
+    panel: JobPanel,
+    /// The address the server announced, not yet checked.
+    announced: Option<String>,
+    /// The address, once something answers there.
+    serving: Option<(String, Instant)>,
 }
 
 impl ServeTab {
     pub fn new() -> Self {
         Self {
-            form: FormTabState::from_spec_default::<ServeSpec>(),
-            status: ServeStatus::Idle,
-            log: JobLog::with_default_cap(),
+            panel: JobPanel::new::<ServeSpec>("Serve"),
+            announced: None,
+            serving: None,
         }
     }
 
-    // ── Form delegation (all sections always visible) ──────────────────
-
-    pub fn is_editing(&self) -> bool {
-        self.form.is_editing()
-    }
-    pub fn handle_edit_key(&mut self, k: crossterm::event::KeyEvent) {
-        self.form.handle_edit_key(k);
-    }
-    pub fn confirm_edit(&mut self) {
-        self.form.confirm_edit();
-    }
-    pub fn cancel_edit(&mut self) {
-        self.form.cancel_edit();
-    }
-    pub fn next_param(&mut self) {
-        self.form.next_param(|_| true);
-    }
-    pub fn prev_param(&mut self) {
-        self.form.prev_param(|_| true);
-    }
-    pub fn handle_enter(&mut self) -> Option<FormAction> {
-        self.form.handle_enter()
+    /// Something answers on the server's address.
+    #[cfg(test)]
+    pub fn is_serving(&self) -> bool {
+        self.serving.is_some()
     }
 
-    // ── State transitions ──────────────────────────────────────────────
-
-    pub fn is_running(&self) -> bool {
-        matches!(
-            self.status,
-            ServeStatus::Starting { .. } | ServeStatus::Running { .. }
+    /// Where the form says the server will listen.
+    pub fn bind_url(&self) -> String {
+        format!(
+            "http://{}:{}",
+            self.panel.form.value("Host"),
+            self.panel.form.value("Port")
         )
     }
+}
 
-    pub fn mark_starting(&mut self, bind_url: String) {
-        self.log.clear();
-        self.status = ServeStatus::Starting { bind_url };
-    }
-
-    /// Append a stdout/stderr line. Triggers the Starting → Running
-    /// transition when we see the server's "listening"/"ready" banner.
-    pub fn append_log(&mut self, line: &str) {
-        if let ServeStatus::Starting { bind_url, .. } = &self.status {
-            let lower = line.to_lowercase();
-            if lower.contains("listening") || lower.contains("ready") {
-                let bind_url = bind_url.clone();
-                self.status = ServeStatus::Running {
-                    bind_url,
-                    started_at: Instant::now(),
-                };
-            }
-        }
-        self.log.push(line);
-    }
-
-    pub fn set_failed(&mut self, message: &str) {
-        self.status = ServeStatus::Failed(message.to_string());
-    }
-
-    pub fn set_stopped(&mut self, reason: &str) {
-        self.status = ServeStatus::Stopped {
-            reason: reason.to_string(),
-        };
-    }
-
-    pub fn set_model(&mut self, model_id: &str) {
-        self.form.set_value("Model", model_id);
-    }
-
-    // ── Config summary / CLI args ──────────────────────────────────────
-
-    pub fn validate_config(&self) -> Result<(), String> {
-        let model = self.form.value("Model");
-        if model.is_empty() || model == "(not selected)" {
-            return Err("Model is required.".into());
-        }
-        if self.form.value("Host").is_empty() {
-            return Err("Host is required (e.g. 127.0.0.1 or 0.0.0.0).".into());
-        }
-        Ok(())
-    }
-
-    pub fn bind_url(&self) -> String {
-        let host = self.form.value("Host");
-        let port = self.form.value("Port");
-        format!("http://{host}:{port}")
-    }
-
-    pub fn config_summary(&self) -> Vec<String> {
-        vec![
-            format!("Model:       {}", self.form.value("Model")),
-            format!("Bind:        {}", self.bind_url()),
-            format!("Max Seq Len: {}", self.form.value("Max Seq Len")),
-            format!("KV Cache Bits: {}", self.form.value("KV Cache Bits")),
-            format!("FP8:         {}", self.form.value("FP8 Weights")),
-            String::new(),
-            "Start server?".into(),
-        ]
-    }
-
-    /// Build CLI args from the form via [`ServeSpec::to_argv`].
-    pub fn build_cli_args(&self) -> Vec<String> {
-        let spec = self.spec_from_form();
-        let mut args = vec!["serve".to_string()];
-        args.extend(spec.to_argv());
-        args
-    }
-
-    fn spec_from_form(&self) -> ServeSpec {
-        let mut spec = ServeSpec::default();
-        spec.model = self.form.value("Model");
-        spec.host = {
-            let v = self.form.value("Host");
-            if v.is_empty() { spec.host } else { v }
-        };
-        spec.port = self.form.value("Port").parse().unwrap_or(spec.port);
-        // Empty: the model's context window, capped by device memory.
-        spec.max_seq_len = self.form.value("Max Seq Len").parse().ok();
-        spec.fp8 = self.form.value("FP8 Weights") == "Enabled";
-        spec.kv_quant = self.form.value("KV Cache Bits").parse().ok();
-        spec.no_kv_quant = self.form.value("Disable KV Quant") == "Enabled";
-        spec.kv_group_size = self
-            .form
-            .value("KV Group Size")
-            .parse()
-            .unwrap_or(spec.kv_group_size);
-        spec.kv_turboquant = self.form.value("TurboQuant KV") == "Enabled";
-        let preset = self.form.value("TurboQuant Preset");
-        spec.kv_turboquant_preset = if preset.is_empty() {
-            None
-        } else {
-            Some(preset)
-        };
-        spec.ane = self.form.value("Use ANE") == "Enabled";
-        spec.ane_max_seq_len = self
-            .form
-            .value("ANE Max Context")
-            .parse()
-            .unwrap_or(spec.ane_max_seq_len);
-        spec.continuous_batch = self.form.value("Continuous Batch") == "Enabled";
-        spec.cb_max_slots = self
-            .form
-            .value("CB Max Slots")
-            .parse()
-            .unwrap_or(spec.cb_max_slots);
-        spec.cb_max_queue_depth = self
-            .form
-            .value("CB Queue Depth")
-            .parse()
-            .unwrap_or(spec.cb_max_queue_depth);
-        spec.cb_block_size = self
-            .form
-            .value("CB Block Size")
-            .parse()
-            .unwrap_or(spec.cb_block_size);
-        spec.cb_max_blocks = self
-            .form
-            .value("CB Max Blocks")
-            .parse()
-            .unwrap_or(spec.cb_max_blocks);
-        let experts = self.form.value("Experts Dir");
-        spec.experts_dir = if experts.is_empty() {
-            None
-        } else {
-            Some(experts)
-        };
-        spec
+impl Default for ServeTab {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-// ── Rendering ──────────────────────────────────────────────────────────
-
-impl ServeTab {
-    pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
-        let [config_area, right_area] =
-            Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
-                .areas(area);
-
-        self.form
-            .render_list(config_area, buf, "Serve Configuration", |_| true);
-
-        let [status_area, log_area] =
-            Layout::vertical([Constraint::Length(8), Constraint::Min(0)]).areas(right_area);
-        self.render_status(status_area, buf);
-        self.log.render(log_area, buf, "Server Log");
+impl FormTab for ServeTab {
+    fn panel(&self) -> &JobPanel {
+        &self.panel
     }
 
-    fn render_status(&self, area: Rect, buf: &mut Buffer) {
-        let block = Block::default()
-            .title(" Status ")
-            .title_style(THEME.block_title)
-            .borders(Borders::ALL)
-            .border_style(THEME.block);
-        let inner = block.inner(area);
-        block.render(area, buf);
+    fn panel_mut(&mut self) -> &mut JobPanel {
+        &mut self.panel
+    }
 
-        let mut lines: Vec<Line<'_>> = Vec::new();
-        match &self.status {
-            ServeStatus::Idle => {
-                lines.push(status_line(StatusTone::Idle, "Idle", None));
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "  [S] Start  [x] Stop",
-                    THEME.text_muted,
+    fn plan(&self) -> Result<LaunchPlan, Vec<FormIssue>> {
+        self.panel.plan_for::<ServeSpec>(|_, _| {})
+    }
+
+    fn begin(&mut self) {
+        self.announced = None;
+        self.serving = None;
+    }
+
+    fn summary(&self) -> Vec<String> {
+        let mut lines = self.panel.form.summary();
+        if !is_loopback(&self.panel.form.value("Host")) {
+            lines.push(String::new());
+            lines.push("This listens on the network. Anyone who can reach the".to_string());
+            lines.push("port can use the model unless PMETAL_API_KEY is set.".to_string());
+        }
+        lines
+    }
+
+    fn on_line(&mut self, line: &str) {
+        if self.announced.is_none() && self.serving.is_none() {
+            if let Some(at) = line.find(ANNOUNCEMENT) {
+                let rest = &line[at + ANNOUNCEMENT.len()..];
+                let address = rest.split(['/', ' ']).next().unwrap_or("");
+                if !address.is_empty() {
+                    self.announced = Some(address.to_string());
+                }
+            }
+        }
+    }
+
+    fn take_announcement(&mut self) -> Option<String> {
+        self.announced.take()
+    }
+
+    fn on_reachable(&mut self) {
+        if self.panel.is_running() && self.serving.is_none() {
+            self.serving = Some((self.bind_url(), Instant::now()));
+        }
+    }
+
+    fn render(&mut self, area: Rect, buf: &mut Buffer, _: &Telemetry<'_>) {
+        let mut extras = Vec::new();
+        match (&self.panel.run, &self.serving) {
+            (RunState::Running { .. }, Some((url, since))) => {
+                extras.push(Line::from(vec![
+                    Span::styled("  ✓ Serving   ", THEME.status_success),
+                    Span::styled(url.clone(), THEME.kv_value),
+                ]));
+                extras.push(Line::from(vec![
+                    Span::styled("  Up for      ", THEME.kv_key),
+                    Span::styled(format_duration(since.elapsed()), THEME.kv_value),
+                ]));
+                extras.push(Line::from(Span::styled(
+                    "  API: /v1/chat/completions, /v1/completions, /v1/models",
+                    THEME.text_dim,
                 )));
             }
-            ServeStatus::Starting { bind_url, .. } => {
-                lines.push(status_line(StatusTone::Running, "Starting", Some(bind_url)));
+            (RunState::Running { .. }, None) => {
+                extras.push(Line::from(Span::styled(
+                    format!("  Waiting for {} to answer...", self.bind_url()),
+                    THEME.text_warning,
+                )));
             }
-            ServeStatus::Running {
-                bind_url,
-                started_at,
-            } => {
-                lines.push(status_line(StatusTone::Running, "Serving", Some(bind_url)));
-                lines.push(Line::from(vec![
-                    Span::styled("  Uptime  ", THEME.kv_key),
-                    Span::styled(format_duration(started_at.elapsed()), THEME.kv_value),
-                ]));
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled("  [x] Stop", THEME.text_muted)));
-            }
-            ServeStatus::Stopped { reason } => {
-                lines.push(status_line(StatusTone::Idle, "Stopped", Some(reason)));
-            }
-            ServeStatus::Failed(msg) => {
-                lines.push(status_line(StatusTone::Failed, "Failed", Some(msg)));
-            }
+            _ => {}
         }
-
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .render(inner, buf);
-    }
-}
-
-fn format_duration(d: Duration) -> String {
-    let secs = d.as_secs();
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m {}s", secs / 60, secs % 60)
-    } else {
-        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+        render_standard(&mut self.panel, area, buf, 9, extras, "Server Log");
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ServeTab;
+    use super::*;
+    use crate::tui::tabs::panel::Pick;
+
+    fn tab_with_model() -> ServeTab {
+        let mut tab = ServeTab::new();
+        tab.on_pick(
+            "Model",
+            Pick::Model {
+                id: "/models/m",
+                architecture: None,
+            },
+        );
+        tab
+    }
+
+    fn screen(tab: &mut ServeTab) -> String {
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        tab.render(area, &mut buf, &Telemetry::none());
+        (0..30)
+            .map(|y| (0..120).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     #[test]
-    fn serve_tab_defaults_to_loopback() {
+    fn the_server_defaults_to_this_machine_only() {
         let tab = ServeTab::new();
-        assert_eq!(tab.form.value("Host"), "127.0.0.1");
+        assert_eq!(tab.panel.form.value("Host"), "127.0.0.1");
+        assert_eq!(tab.bind_url(), "http://127.0.0.1:8080");
     }
 
     #[test]
-    /// `pmetal serve` has no `--lora`; the documented workflow is to `pmetal fuse`
-    /// the adapter first. Guards against the spec field coming back.
-    fn serve_tab_does_not_emit_removed_lora_flag() {
-        let mut tab = ServeTab::new();
-        tab.form.set_value("Model", "/tmp/model");
-        let args = tab.build_cli_args();
-        assert!(!args.iter().any(|arg| arg == "--lora"));
+    fn a_server_that_listens_on_the_network_says_so_before_it_starts() {
+        let mut tab = tab_with_model();
+        assert!(!tab.summary().join("\n").contains("network"));
+        tab.panel.form.set_value("Host", "0.0.0.0");
+        let text = tab.summary().join("\n");
+        assert!(
+            text.contains("listens on the network") && text.contains("PMETAL_API_KEY"),
+            "{text}"
+        );
+        for loopback in ["127.0.0.1", "localhost", "::1", "[::1]", "127.0.0.2"] {
+            tab.panel.form.set_value("Host", loopback);
+            assert!(!tab.summary().join("\n").contains("network"), "{loopback}");
+        }
     }
 
     #[test]
-    fn serve_tab_emits_model_flag() {
-        let mut tab = ServeTab::new();
-        tab.form.set_value("Model", "/tmp/model");
-        let args = tab.build_cli_args();
-        assert!(args.contains(&"--model".to_string()));
-        assert!(args.contains(&"/tmp/model".to_string()));
+    fn it_is_serving_when_something_answers_not_when_the_process_starts() {
+        let mut tab = tab_with_model();
+        tab.panel.begin("j".into(), "pmetal serve".into());
+        tab.begin();
+        assert!(screen(&mut tab).contains("Waiting for http://127.0.0.1:8080 to answer"));
+        assert!(!screen(&mut tab).contains("Serving"));
+        // The line pmetal-serve logs, as the tracing formatter writes it.
+        tab.on_line("2026-10-20T10:00:00Z  INFO pmetal_serve::server: OpenAI-compatible API available at http://127.0.0.1:8080/v1");
+        assert_eq!(tab.take_announcement().as_deref(), Some("127.0.0.1:8080"));
+        assert_eq!(tab.take_announcement(), None, "announced once");
+        assert!(!screen(&mut tab).contains("✓ Serving"));
+        tab.on_reachable();
+        let text = screen(&mut tab);
+        assert!(
+            text.contains("✓ Serving") && text.contains("http://127.0.0.1:8080"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_server_that_cannot_bind_never_looks_like_it_is_serving() {
+        let mut tab = tab_with_model();
+        tab.panel.begin("j".into(), "pmetal serve".into());
+        tab.on_line(
+            "INFO pmetal_serve: OpenAI-compatible API available at http://127.0.0.1:8080/v1",
+        );
+        tab.take_announcement();
+        // The bind fails and the process ends; nothing ever answered.
+        tab.panel.apply(&pmetal_supervisor::EventKind::Exited(
+            pmetal_supervisor::ProcessStatus::Failed {
+                exit_code: 1,
+                error: "Address already in use".into(),
+            },
+        ));
+        tab.on_reachable();
+        let text = screen(&mut tab);
+        assert!(!text.contains("✓ Serving"), "{text}");
+        assert!(text.contains("Address already in use"));
+    }
+
+    #[test]
+    fn a_new_run_forgets_the_last_servers_address() {
+        let mut tab = tab_with_model();
+        tab.panel.begin("j".into(), "c".into());
+        tab.on_reachable();
+        assert!(tab.serving.is_some());
+        tab.begin();
+        assert!(tab.serving.is_none());
     }
 }

@@ -35,6 +35,21 @@ pub struct FieldDescriptor {
     /// True if this field's argv emission is suppressed when the value equals
     /// the default (e.g. `Option::None`, `bool false` for `flag` fields).
     pub argv_optional: bool,
+    /// How many values the field holds: one, one that may be absent, or a list.
+    pub shape: FieldShape,
+}
+
+/// How many values a field holds. A form needs it to know what an empty entry
+/// means: unset for an optional field or an empty list, a missing value for a
+/// scalar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldShape {
+    /// Exactly one value (`String`, `usize`, `bool`, …).
+    Scalar,
+    /// One value or none (`Option<T>`); an empty entry is `None`.
+    Optional,
+    /// A list of strings (`Vec<String>`), entered comma-separated.
+    List,
 }
 
 /// Field render kind. Mirrors the TUI's `FieldKind` 1:1 so adapters can map
@@ -161,4 +176,149 @@ pub trait JobFields: Sized {
     /// Job classification — used by the surface to pick the right callback /
     /// router on the receiving side.
     fn job_kind() -> JobKind;
+}
+
+// ---------------------------------------------------------------------------
+// Forms: a typed spec from the text a person entered
+// ---------------------------------------------------------------------------
+
+/// The placeholder texts a picker shows for "nothing chosen".
+const UNSET_PLACEHOLDERS: &[&str] = &["(not selected)", "(none)", "(auto-detect)"];
+
+/// A boolean as a form shows it.
+fn parse_toggle(text: &str) -> Option<bool> {
+    match text.to_ascii_lowercase().as_str() {
+        "true" | "enabled" | "on" | "yes" => Some(true),
+        "false" | "disabled" | "off" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// The JSON a descriptor's field takes from the text entered for it, or why the
+/// text is not a value of that field. `None` is "leave it to the spec's own
+/// default".
+fn field_value(d: &FieldDescriptor, raw: &str) -> Result<Option<serde_json::Value>, FieldError> {
+    use serde_json::Value;
+
+    let text = raw.trim();
+    let text = if UNSET_PLACEHOLDERS.contains(&text) {
+        ""
+    } else {
+        text
+    };
+    let err = |message: String| FieldError::new(d.name, message);
+
+    if text.is_empty() {
+        return match (d.shape, d.kind) {
+            (FieldShape::Optional | FieldShape::List, _) => Ok(None),
+            (_, FieldKind::Number { .. } | FieldKind::Integer { .. } | FieldKind::Toggle) => {
+                Err(err("needs a value".to_string()))
+            }
+            _ => Ok(None),
+        };
+    }
+    let one = |text: &str| -> Result<Value, FieldError> {
+        match d.kind {
+            FieldKind::Number { .. } => {
+                let n: f64 = text
+                    .parse()
+                    .map_err(|_| err(format!("'{text}' is not a number")))?;
+                serde_json::Number::from_f64(n)
+                    .map(Value::Number)
+                    .ok_or_else(|| err("must be a finite number".to_string()))
+            }
+            FieldKind::Integer { .. } => text
+                .parse::<i64>()
+                .map(|n| Value::Number(n.into()))
+                .map_err(|_| err(format!("'{text}' is not a whole number"))),
+            FieldKind::Toggle => parse_toggle(text)
+                .map(Value::Bool)
+                .ok_or_else(|| err(format!("'{text}' is not on or off"))),
+            _ => Ok(Value::String(text.to_string())),
+        }
+    };
+    match d.shape {
+        FieldShape::List => {
+            let items = text
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(|item| Value::String(item.to_string()))
+                .collect::<Vec<_>>();
+            Ok(Some(Value::Array(items)))
+        }
+        FieldShape::Scalar | FieldShape::Optional => one(text).map(Some),
+    }
+}
+
+/// The text a form shows for each field of `S::default()`, as `(field name,
+/// text)` pairs in descriptor order.
+///
+/// It is read from the default spec itself, not from the descriptors'
+/// `default` attributes, so a form starts from exactly what the CLI would run
+/// with no flags. A list is joined with commas, an absent optional is empty.
+pub fn default_text<S>() -> Vec<(&'static str, String)>
+where
+    S: JobFields + Default + serde::Serialize,
+{
+    // Through text, not `to_value`: a `f32` field would otherwise show its
+    // widened `f64` ("0.00019999999494757503" for `2e-4`).
+    let value: serde_json::Value = serde_json::to_string(&S::default())
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(serde_json::Value::Null);
+    S::field_descriptors()
+        .iter()
+        .map(|d| {
+            let text = match value.get(d.name) {
+                None | Some(serde_json::Value::Null) => String::new(),
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(serde_json::Value::Array(items)) => items
+                    .iter()
+                    .map(|item| {
+                        item.as_str()
+                            .map_or_else(|| item.to_string(), str::to_string)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                Some(other) => other.to_string(),
+            };
+            (d.name, text)
+        })
+        .collect()
+}
+
+/// Build a spec from the text a person entered into its form.
+///
+/// `text_of` gives the text entered for a field, or `None` for a field the form
+/// does not show (it keeps the spec's own default). The result is the spec the
+/// CLI would build from the same values, so a form never carries defaults or
+/// flag names of its own. Every problem is reported, each naming the field by
+/// its Rust name ([`FieldError::field`]); a value outside its bounds is caught
+/// by the spec's own validation (`normalize`), not here.
+pub fn spec_from_text<S>(
+    mut text_of: impl FnMut(&FieldDescriptor) -> Option<String>,
+) -> Result<S, Vec<FieldError>>
+where
+    S: JobFields + serde::de::DeserializeOwned,
+{
+    let mut object = serde_json::Map::new();
+    let mut errors = Vec::new();
+    for d in S::field_descriptors() {
+        let Some(raw) = text_of(d) else { continue };
+        match field_value(d, &raw) {
+            Ok(Some(value)) => {
+                object.insert(d.name.to_string(), value);
+            }
+            Ok(None) => {}
+            Err(e) => errors.push(e),
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    serde_path_to_error::deserialize(serde_json::Value::Object(object)).map_err(|e| {
+        let field = e.path().to_string();
+        vec![FieldError::new(field, e.inner().to_string())]
+    })
 }

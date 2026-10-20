@@ -5,223 +5,147 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
+use crate::tui::keys::footer_items;
 use crate::tui::tabs::Tab;
 use crate::tui::theme::THEME;
 
-/// Footer widget showing context-sensitive keybindings.
+/// Footer widget showing the key bindings of the active tab.
 pub struct Footer {
     pub tab: Tab,
     /// Number of background jobs currently running (training, serve,
-    /// quantize, …). Surfaces a compact "N running" badge on the right
+    /// quantize, ...). Surfaces a compact "N running" badge on the right
     /// edge so the user never loses track of active work.
     pub active_jobs: usize,
+    /// A note to show in place of the hints (why a key did nothing).
+    pub notice: Option<String>,
 }
 
 impl Widget for Footer {
     fn render(self, area: Rect, buf: &mut Buffer) {
         buf.set_style(area, THEME.footer);
+        let width = area.width as usize;
 
-        let mut spans = vec![
-            Span::raw(" "),
-            Span::styled("?", THEME.footer_key),
-            Span::styled(" help  ", THEME.footer_desc),
-            Span::styled("Tab", THEME.footer_key),
-            Span::styled(" switch  ", THEME.footer_desc),
-        ];
+        // The badge is always shown; the key hints get what is left.
+        let badge = (self.active_jobs > 0).then(|| format!(" ● {} running ", self.active_jobs));
+        let badge_width = badge.as_ref().map_or(0, |b| b.chars().count());
+        let room = width.saturating_sub(badge_width);
 
-        // Tab-specific bindings
-        match self.tab {
-            Tab::Dashboard => {
-                spans.extend([
-                    Span::styled("r", THEME.footer_key),
-                    Span::styled(" reset  ", THEME.footer_desc),
-                    Span::styled("p", THEME.footer_key),
-                    Span::styled(" pause  ", THEME.footer_desc),
-                ]);
+        let mut spans: Vec<Span<'_>> = vec![Span::raw(" ")];
+        let mut used = 1;
+        if let Some(notice) = &self.notice {
+            let text: String = notice.chars().take(room.saturating_sub(2)).collect();
+            spans.push(Span::styled(text, THEME.text_warning));
+        } else {
+            for (key, label) in footer_items(self.tab) {
+                let need = key.chars().count() + label.chars().count() + 3;
+                if used + need > room {
+                    break;
+                }
+                used += need;
+                spans.push(Span::styled(key, THEME.footer_key));
+                spans.push(Span::styled(format!(" {label}  "), THEME.footer_desc));
             }
-            Tab::Models => {
-                spans.extend([
-                    Span::styled("jk", THEME.footer_key),
-                    Span::styled(" nav  ", THEME.footer_desc),
-                    Span::styled("t", THEME.footer_key),
-                    Span::styled(" train  ", THEME.footer_desc),
-                    Span::styled("s", THEME.footer_key),
-                    Span::styled(" distill  ", THEME.footer_desc),
-                    Span::styled("i", THEME.footer_key),
-                    Span::styled(" infer  ", THEME.footer_desc),
-                    Span::styled("f", THEME.footer_key),
-                    Span::styled(" fuse  ", THEME.footer_desc),
-                    Span::styled("d", THEME.footer_key),
-                    Span::styled(" download  ", THEME.footer_desc),
-                    Span::styled("S", THEME.footer_key),
-                    Span::styled(" search HF  ", THEME.footer_desc),
-                ]);
-            }
-            Tab::Datasets => {
-                spans.extend([
-                    Span::styled("jk", THEME.footer_key),
-                    Span::styled(" navigate  ", THEME.footer_desc),
-                    Span::styled("c", THEME.footer_key),
-                    Span::styled(" convert  ", THEME.footer_desc),
-                    Span::styled("a", THEME.footer_key),
-                    Span::styled(" add dir  ", THEME.footer_desc),
-                    Span::styled("R", THEME.footer_key),
-                    Span::styled(" refresh  ", THEME.footer_desc),
-                ]);
-            }
-            Tab::Training | Tab::Pretrain | Tab::Distillation | Tab::Grpo => {
-                spans.extend([
-                    Span::styled("jk", THEME.footer_key),
-                    Span::styled(" navigate  ", THEME.footer_desc),
-                    Span::styled("Enter", THEME.footer_key),
-                    Span::styled(" edit/pick  ", THEME.footer_desc),
-                    Span::styled("S", THEME.footer_key),
-                    Span::styled(" start  ", THEME.footer_desc),
-                    Span::styled("x", THEME.footer_key),
-                    Span::styled(" stop  ", THEME.footer_desc),
-                    Span::styled("L", THEME.footer_key),
-                    Span::styled(" set LR  ", THEME.footer_desc),
-                ]);
-            }
-            Tab::Inference => {
-                spans.extend([
-                    Span::styled("Enter", THEME.footer_key),
-                    Span::styled(" send  ", THEME.footer_desc),
-                    Span::styled("Ctrl+P", THEME.footer_key),
-                    Span::styled(" model  ", THEME.footer_desc),
-                    Span::styled("Ctrl+S", THEME.footer_key),
-                    Span::styled(" settings  ", THEME.footer_desc),
-                    Span::styled("Ctrl+H", THEME.footer_key),
-                    Span::styled(" sidebar  ", THEME.footer_desc),
-                    Span::styled("F2", THEME.footer_key),
-                    Span::styled(" browse/yank  ", THEME.footer_desc),
-                    Span::styled("Esc", THEME.footer_key),
-                    Span::styled(" stop  ", THEME.footer_desc),
-                    Span::styled("Ctrl+Q", THEME.footer_key),
-                    Span::styled(" quit  ", THEME.footer_desc),
-                ]);
-            }
-            Tab::Jobs => {
-                spans.extend([
-                    Span::styled("jk", THEME.footer_key),
-                    Span::styled(" navigate  ", THEME.footer_desc),
-                    Span::styled("JK", THEME.footer_key),
-                    Span::styled(" scroll log  ", THEME.footer_desc),
-                    Span::styled("R", THEME.footer_key),
-                    Span::styled(" refresh  ", THEME.footer_desc),
-                ]);
-            }
-            Tab::Device => {
-                // Device tab is read-only; no tab-specific bindings
-            }
-            Tab::Serve => {
-                spans.extend([
-                    Span::styled("jk", THEME.footer_key),
-                    Span::styled(" navigate  ", THEME.footer_desc),
-                    Span::styled("Enter", THEME.footer_key),
-                    Span::styled(" edit/pick  ", THEME.footer_desc),
-                    Span::styled("S", THEME.footer_key),
-                    Span::styled(" start  ", THEME.footer_desc),
-                    Span::styled("x", THEME.footer_key),
-                    Span::styled(" stop  ", THEME.footer_desc),
-                ]);
-            }
-            Tab::Quantize => {
-                spans.extend([
-                    Span::styled("jk", THEME.footer_key),
-                    Span::styled(" navigate  ", THEME.footer_desc),
-                    Span::styled("Enter", THEME.footer_key),
-                    Span::styled(" edit/pick  ", THEME.footer_desc),
-                    Span::styled("S", THEME.footer_key),
-                    Span::styled(" start  ", THEME.footer_desc),
-                    Span::styled("x", THEME.footer_key),
-                    Span::styled(" cancel  ", THEME.footer_desc),
-                ]);
-            }
-            Tab::Bench => {
-                spans.extend([
-                    Span::styled("jk", THEME.footer_key),
-                    Span::styled(" navigate  ", THEME.footer_desc),
-                    Span::styled("Enter", THEME.footer_key),
-                    Span::styled(" edit/pick  ", THEME.footer_desc),
-                    Span::styled("S", THEME.footer_key),
-                    Span::styled(" start  ", THEME.footer_desc),
-                    Span::styled("x", THEME.footer_key),
-                    Span::styled(" cancel  ", THEME.footer_desc),
-                ]);
-            }
-            Tab::Eval => {
-                spans.extend([
-                    Span::styled("jk", THEME.footer_key),
-                    Span::styled(" navigate  ", THEME.footer_desc),
-                    Span::styled("Enter", THEME.footer_key),
-                    Span::styled(" edit/pick  ", THEME.footer_desc),
-                    Span::styled("S", THEME.footer_key),
-                    Span::styled(" start  ", THEME.footer_desc),
-                    Span::styled("x", THEME.footer_key),
-                    Span::styled(" cancel  ", THEME.footer_desc),
-                ]);
-            }
-            Tab::Merge => {
-                spans.extend([
-                    Span::styled("jk", THEME.footer_key),
-                    Span::styled(" navigate  ", THEME.footer_desc),
-                    Span::styled("Enter", THEME.footer_key),
-                    Span::styled(" edit/pick  ", THEME.footer_desc),
-                    Span::styled("S", THEME.footer_key),
-                    Span::styled(" start  ", THEME.footer_desc),
-                    Span::styled("x", THEME.footer_key),
-                    Span::styled(" cancel  ", THEME.footer_desc),
-                ]);
-            }
-            Tab::EmbedTrain | Tab::Rlkd | Tab::Preference | Tab::Tokenize | Tab::Dflash => {
-                spans.extend([
-                    Span::styled("jk", THEME.footer_key),
-                    Span::styled(" navigate  ", THEME.footer_desc),
-                    Span::styled("Enter", THEME.footer_key),
-                    Span::styled(" edit/pick  ", THEME.footer_desc),
-                    Span::styled("S", THEME.footer_key),
-                    Span::styled(" start  ", THEME.footer_desc),
-                    Span::styled("x", THEME.footer_key),
-                    Span::styled(" cancel  ", THEME.footer_desc),
-                ]);
-            }
-            Tab::Ollama => {
-                spans.extend([
-                    Span::styled("jk", THEME.footer_key),
-                    Span::styled(" navigate  ", THEME.footer_desc),
-                    Span::styled("Enter", THEME.footer_key),
-                    Span::styled(" edit field  ", THEME.footer_desc),
-                    Span::styled("S", THEME.footer_key),
-                    Span::styled(" export  ", THEME.footer_desc),
-                    Span::styled("x", THEME.footer_key),
-                    Span::styled(" cancel  ", THEME.footer_desc),
-                ]);
-            }
-        }
-
-        // Global keybindings (not shown for Inference since it has its own quit)
-        if self.tab != Tab::Inference {
-            spans.extend([
-                Span::styled("q", THEME.footer_key),
-                Span::styled(" quit  ", THEME.footer_desc),
-            ]);
-        }
-        spans.extend([
-            Span::styled("F2", THEME.footer_key),
-            Span::styled(" mouse/select", THEME.footer_desc),
-        ]);
-
-        // Right-aligned "N running" badge when any background job is
-        // active. Gives the operator an always-on indicator so they
-        // never lose track of in-flight work.
-        if self.active_jobs > 0 {
-            spans.push(Span::styled(
-                format!("   ● {} running ", self.active_jobs),
-                THEME.status_running,
-            ));
         }
 
         Line::from(spans).render(area, buf);
+        if let Some(badge) = badge {
+            let x = area.right().saturating_sub(badge_width as u16);
+            if x >= area.x {
+                Line::from(Span::styled(badge, THEME.status_running))
+                    .render(Rect::new(x, area.y, badge_width as u16, 1), buf);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(footer: Footer, width: u16) -> String {
+        let area = Rect::new(0, 0, width, 1);
+        let mut buf = Buffer::empty(area);
+        footer.render(area, &mut buf);
+        (0..width).map(|x| buf[(x, 0)].symbol()).collect()
+    }
+
+    #[test]
+    fn the_footer_lists_the_tabs_bindings_that_fit() {
+        let wide = row(
+            Footer {
+                tab: Tab::Training,
+                active_jobs: 0,
+                notice: None,
+            },
+            200,
+        );
+        for hint in ["navigate", "start", "stop", "set LR", "help", "quit"] {
+            assert!(wide.contains(hint), "{hint} in {wide:?}");
+        }
+        let narrow = row(
+            Footer {
+                tab: Tab::Training,
+                active_jobs: 0,
+                notice: None,
+            },
+            40,
+        );
+        assert!(narrow.contains("navigate"));
+        assert!(!narrow.contains("quit"), "{narrow:?}");
+        assert_eq!(narrow.chars().count(), 40);
+    }
+
+    #[test]
+    fn the_running_badge_keeps_its_place_on_a_crowded_footer() {
+        let line = row(
+            Footer {
+                tab: Tab::Models,
+                active_jobs: 3,
+                notice: None,
+            },
+            60,
+        );
+        assert!(line.trim_end().ends_with("● 3 running"), "{line:?}");
+    }
+
+    #[test]
+    fn a_notice_replaces_the_hints() {
+        let line = row(
+            Footer {
+                tab: Tab::Serve,
+                active_jobs: 0,
+                notice: Some("Model is required".into()),
+            },
+            80,
+        );
+        assert!(line.contains("Model is required"));
+        assert!(!line.contains("navigate"));
+    }
+
+    #[test]
+    fn the_inference_tab_does_not_offer_q_to_quit() {
+        let line = row(
+            Footer {
+                tab: Tab::Inference,
+                active_jobs: 0,
+                notice: None,
+            },
+            200,
+        );
+        assert!(!line.contains(" quit"), "{line:?}");
+    }
+
+    #[test]
+    fn a_zero_width_footer_does_not_panic() {
+        for width in [0, 1, 2] {
+            row(
+                Footer {
+                    tab: Tab::Jobs,
+                    active_jobs: 1,
+                    notice: Some("x".into()),
+                },
+                width,
+            );
+        }
     }
 }
