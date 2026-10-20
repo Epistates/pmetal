@@ -18,6 +18,18 @@ pub struct PyTokenizer {
     pub(crate) inner: Arc<Tokenizer>,
 }
 
+/// The tokenizer of the model in `dir`, with its special tokens read from the
+/// model's own configuration.
+pub(crate) fn load_from_dir(dir: &std::path::Path) -> PyResult<Tokenizer> {
+    if !dir.join("tokenizer.json").is_file() {
+        return Err(pyo3::exceptions::PyFileNotFoundError::new_err(format!(
+            "{}: no tokenizer.json",
+            dir.display()
+        )));
+    }
+    Tokenizer::from_model_dir(dir).map_err(|e| tokenizer_err(format!("{}: {e}", dir.display())))
+}
+
 #[pymethods]
 impl PyTokenizer {
     /// Load a tokenizer from a `tokenizer.json` file.
@@ -54,7 +66,7 @@ impl PyTokenizer {
             ..HubArgs::default()
         };
         let dir = resolve_model(py, &model_id.to_string_lossy(), &hub)?;
-        let inner = Tokenizer::from_model_dir(&dir).map_err(tokenizer_err)?;
+        let inner = load_from_dir(&dir)?;
         Ok(Self {
             inner: Arc::new(inner),
         })

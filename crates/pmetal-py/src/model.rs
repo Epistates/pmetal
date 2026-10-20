@@ -171,9 +171,7 @@ impl PyModel {
             ..HubArgs::default()
         };
         let model_path = resolve_model(py, &path_or_id.to_string_lossy(), &hub)?;
-        let tokenizer = Arc::new(
-            Tokenizer::from_model_dir(&model_path).map_err(|e| tokenizer_err(e.to_string()))?,
-        );
+        let tokenizer = Arc::new(crate::tokenizer::load_from_dir(&model_path)?);
         let defaults = GenerationConfig::from_model_dir(&model_path);
 
         let path = model_path.clone();
