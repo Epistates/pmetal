@@ -253,6 +253,15 @@ pub struct CachedModel {
     pub snapshot: PathBuf,
 }
 
+/// A dataset repository in the local cache, and the snapshot to use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedDataset {
+    /// The repository id (`owner/name`).
+    pub repo_id: String,
+    /// The snapshot directory: what `refs/main` points at, else the newest.
+    pub snapshot: PathBuf,
+}
+
 /// Every model repository in the local cache that has a finished snapshot,
 /// ordered by repository id.
 ///
@@ -266,24 +275,47 @@ pub fn list_cached_models() -> Vec<CachedModel> {
 
 /// [`list_cached_models`] in a given cache directory.
 pub fn list_cached_models_in(cache_root: &Path) -> Vec<CachedModel> {
+    list_repos(cache_root, RepoKind::Model)
+        .into_iter()
+        .map(|(repo_id, snapshot)| CachedModel { repo_id, snapshot })
+        .collect()
+}
+
+/// Every dataset repository in the local cache that has a finished snapshot,
+/// ordered by repository id. See [`list_cached_models`].
+pub fn list_cached_datasets() -> Vec<CachedDataset> {
+    list_cached_datasets_in(&cache_dir())
+}
+
+/// [`list_cached_datasets`] in a given cache directory.
+pub fn list_cached_datasets_in(cache_root: &Path) -> Vec<CachedDataset> {
+    list_repos(cache_root, RepoKind::Dataset)
+        .into_iter()
+        .map(|(repo_id, snapshot)| CachedDataset { repo_id, snapshot })
+        .collect()
+}
+
+/// The `(repository id, snapshot)` of every finished repository of `kind`.
+fn list_repos(cache_root: &Path, kind: RepoKind) -> Vec<(String, PathBuf)> {
     let Ok(entries) = std::fs::read_dir(cache_root) else {
         return Vec::new();
     };
-    let mut models: Vec<CachedModel> = entries
+    let prefix = format!("{}--", kind.prefix());
+    let mut repos: Vec<(String, PathBuf)> = entries
         .flatten()
         .filter_map(|entry| {
             let folder = entry.file_name().into_string().ok()?;
-            let encoded = folder.strip_prefix("models--")?;
+            let encoded = folder.strip_prefix(&prefix)?;
             // The folder name is the repository id with `/` written `--`.
             let repo_id = encoded.replace("--", "/");
-            let snapshot = find_snapshot(cache_root, RepoKind::Model, &repo_id, None, |s| {
+            let snapshot = find_snapshot(cache_root, kind, &repo_id, None, |s| {
                 std::fs::read_dir(s).is_ok_and(|mut files| files.next().is_some())
             })?;
-            Some(CachedModel { repo_id, snapshot })
+            Some((repo_id, snapshot))
         })
         .collect();
-    models.sort_by(|a, b| a.repo_id.cmp(&b.repo_id));
-    models
+    repos.sort_by(|a, b| a.0.cmp(&b.0));
+    repos
 }
 
 /// Check if a dataset is already cached locally and return its path.
@@ -483,6 +515,23 @@ mod tests {
             ]
         );
         assert!(list_cached_models_in(&root.path().join("missing")).is_empty());
+    }
+
+    #[test]
+    fn the_cached_datasets_are_listed_apart_from_the_models() {
+        let root = tempfile::tempdir().unwrap();
+        put_model(root.path(), SHA_A, true);
+        let data = snapshot_dir(root.path(), "datasets--org--corpus", SHA_A);
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("train.jsonl"), "{}\n").unwrap();
+        assert_eq!(
+            list_cached_datasets_in(root.path()),
+            [CachedDataset {
+                repo_id: "org/corpus".into(),
+                snapshot: data
+            }]
+        );
+        assert_eq!(list_cached_models_in(root.path()).len(), 1);
     }
 
     #[test]
