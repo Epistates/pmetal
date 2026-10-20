@@ -1,5 +1,6 @@
 //! `Tokenizer`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use pmetal_data::Tokenizer;
@@ -22,6 +23,12 @@ impl PyTokenizer {
     /// Load a tokenizer from a `tokenizer.json` file.
     #[staticmethod]
     fn from_file(path: std::path::PathBuf) -> PyResult<Self> {
+        if !path.is_file() {
+            return Err(pyo3::exceptions::PyFileNotFoundError::new_err(format!(
+                "{}: no such tokenizer file",
+                path.display()
+            )));
+        }
         let inner = Tokenizer::from_file(path).map_err(tokenizer_err)?;
         Ok(Self {
             inner: Arc::new(inner),
@@ -37,7 +44,7 @@ impl PyTokenizer {
     #[pyo3(signature = (model_id, *, revision=None, token=None))]
     fn from_pretrained(
         py: Python<'_>,
-        model_id: &str,
+        model_id: PathBuf,
         revision: Option<String>,
         token: Option<String>,
     ) -> PyResult<Self> {
@@ -46,7 +53,7 @@ impl PyTokenizer {
             token,
             ..HubArgs::default()
         };
-        let dir = resolve_model(py, model_id, &hub)?;
+        let dir = resolve_model(py, &model_id.to_string_lossy(), &hub)?;
         let inner = Tokenizer::from_model_dir(&dir).map_err(tokenizer_err)?;
         Ok(Self {
             inner: Arc::new(inner),

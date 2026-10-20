@@ -2,18 +2,18 @@
 //!
 //! A callback is any object with some of these methods (all optional):
 //!
-//! - `on_train_start()`, `on_train_end()`
-//! - `on_epoch_start(epoch)`, `on_epoch_end(epoch, loss, perplexity)`
-//! - `on_step_start(step)`, `on_step_end(step, loss)`
-//! - `on_step_metrics(metrics: dict)`: the step's loss, learning rate, token
-//!   rate, gradient norm and timings
-//! - `on_save(path)`, `on_lr_event(event)`
-//! - `should_stop() -> bool`: return true to end the run cleanly after the
-//!   current step
+//! - `on_train_start()`: the model, data and optimizer are ready.
+//! - `on_step_end(step, loss)` and `on_step_metrics(metrics: dict)`: after an
+//!   optimizer step the run logs, which is every `logging_steps` steps and the
+//!   first (the trainer reports nothing between). `metrics` has the step's
+//!   loss, learning rate, token rate, gradient norm and timings.
+//! - `on_train_end()`: the run is over, however it ended.
+//! - `should_stop() -> bool`: asked after every optimizer step; return true to
+//!   end the run cleanly (the weights are saved).
 //!
-//! An exception in a callback ends the run the way `should_stop` does (the
-//! current step finishes and the best weights are kept) and is raised from
-//! `train()` once it has. So is Ctrl-C: it is looked for after every step.
+//! An exception in a callback ends the run the way `should_stop` does and is
+//! raised from `train()` once the weights are saved. So is Ctrl-C, which is
+//! looked for after every step.
 //!
 //! The built-in `ProgressCallback`, `LoggingCallback` and `MetricsJsonCallback`
 //! are the trainer's own Rust callbacks and take no part in this.
@@ -65,14 +65,24 @@ impl RunState {
 /// Calls the Python callbacks, watches for Ctrl-C, and asks the loop to stop
 /// when either says so. Always part of a run, even with no callbacks, for the
 /// interrupt.
+#[derive(Clone)]
 pub struct PythonCallbackBridge {
-    callbacks: Vec<Py<PyAny>>,
+    callbacks: Arc<Vec<Py<PyAny>>>,
     state: Arc<RunState>,
 }
 
 impl PythonCallbackBridge {
     pub fn new(callbacks: Vec<Py<PyAny>>, state: Arc<RunState>) -> Self {
-        Self { callbacks, state }
+        Self {
+            callbacks: Arc::new(callbacks),
+            state,
+        }
+    }
+
+    /// Tell the callbacks the run is over. The trainer says so to its own
+    /// metrics callback only, so the caller of the run does, after it.
+    pub fn train_end(&self) {
+        self.dispatch("on_train_end", |py| tuple(py, ()));
     }
 
     /// Call `name` on each callback that has it, with the GIL held for the
@@ -86,7 +96,7 @@ impl PythonCallbackBridge {
             return;
         }
         Python::attach(|py| {
-            for callback in &self.callbacks {
+            for callback in self.callbacks.iter() {
                 let result = (|| {
                     let method = match callback.bind(py).getattr(name) {
                         Ok(method) => method,
@@ -134,29 +144,9 @@ impl TrainingCallback for PythonCallbackBridge {
         self.dispatch("on_train_start", |py| tuple(py, ()));
     }
 
-    fn on_train_end(&mut self) {
-        self.dispatch("on_train_end", |py| tuple(py, ()));
-    }
-
-    fn on_epoch_start(&mut self, epoch: usize) {
-        self.dispatch("on_epoch_start", |py| tuple(py, (epoch,)));
-    }
-
-    fn on_epoch_end(&mut self, epoch: usize, metrics: &pmetal_core::EvalMetrics) {
-        let (loss, perplexity) = (metrics.loss, metrics.perplexity);
-        self.dispatch("on_epoch_end", |py| tuple(py, (epoch, loss, perplexity)));
-    }
-
-    fn on_step_start(&mut self, step: usize) {
-        self.dispatch("on_step_start", |py| tuple(py, (step,)));
-    }
-
-    fn on_step_end(&mut self, step: usize, loss: f64) {
-        self.dispatch("on_step_end", |py| tuple(py, (step, loss)));
-    }
-
     fn on_step_end_with_metrics(&mut self, metrics: &StepMetrics) {
-        self.on_step_end(metrics.step, metrics.loss);
+        let (step, loss) = (metrics.step, metrics.loss);
+        self.dispatch("on_step_end", |py| tuple(py, (step, loss)));
         if self.callbacks.is_empty() || self.state.failed() {
             return;
         }
@@ -165,7 +155,7 @@ impl TrainingCallback for PythonCallbackBridge {
                 Ok(d) => d,
                 Err(e) => return self.state.fail(e),
             };
-            for callback in &self.callbacks {
+            for callback in self.callbacks.iter() {
                 let bound = callback.bind(py);
                 let Ok(method) = bound.getattr("on_step_metrics") else {
                     continue;
@@ -175,16 +165,6 @@ impl TrainingCallback for PythonCallbackBridge {
                 }
             }
         });
-    }
-
-    fn on_save(&mut self, path: &std::path::Path) {
-        let path = path.to_string_lossy().into_owned();
-        self.dispatch("on_save", |py| tuple(py, (path.as_str(),)));
-    }
-
-    fn on_lr_event(&mut self, event: &str) {
-        let event = event.to_string();
-        self.dispatch("on_lr_event", |py| tuple(py, (event.as_str(),)));
     }
 
     fn should_stop(&self) -> bool {
@@ -197,7 +177,7 @@ impl TrainingCallback for PythonCallbackBridge {
                 self.state.fail(interrupt);
                 return true;
             }
-            for callback in &self.callbacks {
+            for callback in self.callbacks.iter() {
                 let bound = callback.bind(py);
                 let Ok(method) = bound.getattr("should_stop") else {
                     continue;

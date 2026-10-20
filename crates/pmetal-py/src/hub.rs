@@ -14,7 +14,7 @@ use pmetal_hub::{
     DeviceSpec, DownloadOptions, HubOptions, ProgressCallback, TransferProgress, UploadOptions,
     Verification, WeightFormat,
 };
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyFileNotFoundError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
@@ -55,12 +55,19 @@ impl HubArgs {
 /// A model reference as a local directory: a directory path is itself, a Hub
 /// id is downloaded (or served from the cache). Ctrl-C interrupts the wait.
 pub fn resolve_model(py: Python<'_>, reference: &str, hub: &HubArgs) -> PyResult<PathBuf> {
-    let reference = reference.to_string();
+    let id = reference.to_string();
     let options = hub.download_options();
-    block_on_interruptible(py, async move {
-        pmetal_hub::resolve_model_path_with(&reference, &options).await
+    let dir = block_on_interruptible(py, async move {
+        pmetal_hub::resolve_model_path_with(&id, &options).await
     })?
-    .map_err(pmetal_to_pyerr)
+    .map_err(pmetal_to_pyerr)?;
+    // A reference that is neither a Hub id nor a directory resolves to itself.
+    if !dir.is_dir() {
+        return Err(PyFileNotFoundError::new_err(format!(
+            "{reference}: not a model directory, and not a Hub id (org/name)"
+        )));
+    }
+    Ok(dir)
 }
 
 fn weight_format(name: &str) -> PyResult<WeightFormat> {
@@ -402,9 +409,11 @@ impl PyModelReport {
 #[pyo3(signature = (model, *, cache_dir=None))]
 pub fn verify_model(
     py: Python<'_>,
-    model: &str,
+    model: PathBuf,
     cache_dir: Option<PathBuf>,
 ) -> PyResult<PyModelReport> {
+    let model = model.to_string_lossy().into_owned();
+    let model = model.as_str();
     let dir = if std::path::Path::new(model).is_dir() || !pmetal_hub::is_hf_id(model) {
         PathBuf::from(model)
     } else {
@@ -556,12 +565,14 @@ pub fn search_models<'py>(
 #[pyo3(signature = (model, *, context_length=4096, kv_cache_bits=None, token=None, endpoint=None))]
 pub fn estimate_fit<'py>(
     py: Python<'py>,
-    model: &str,
+    model: PathBuf,
     context_length: u32,
     kv_cache_bits: Option<u8>,
     token: Option<String>,
     endpoint: Option<String>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    let model = model.to_string_lossy().into_owned();
+    let model = model.as_str();
     let device = require_device()?;
     let spec = if std::path::Path::new(model).is_dir() {
         let dir = PathBuf::from(model);

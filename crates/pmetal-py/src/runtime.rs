@@ -100,9 +100,10 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 /// a lock it can.
 pub struct Inbox<T>(Mutex<mpsc::Receiver<T>>);
 
-/// A channel whose receiving end can be waited on without the GIL.
-pub fn inbox<T>() -> (mpsc::Sender<T>, Inbox<T>) {
-    let (tx, rx) = mpsc::channel();
+/// A channel from a worker thread holding at most `bound` unread messages: the
+/// worker waits when the reader is behind, so it cannot run ahead of it.
+pub fn inbox<T>(bound: usize) -> (mpsc::SyncSender<T>, Inbox<T>) {
+    let (tx, rx) = mpsc::sync_channel(bound);
     (tx, Inbox(Mutex::new(rx)))
 }
 
@@ -117,9 +118,11 @@ impl<T> Inbox<T> {
 
 /// Wait for the next message from a worker thread with the GIL released.
 ///
-/// On Ctrl-C, `cancel` is set (the generation ends at its next token) and the
-/// wait goes on until the thread reports, so the model is idle again when this
-/// returns; the interrupt is then raised.
+/// Signals are looked for on every call, and every [`SIGNAL_POLL`] of a long
+/// wait: a worker that produces messages faster than they are read would
+/// otherwise never leave a wait that times out. On Ctrl-C `cancel` is set (the
+/// worker ends its job at the next token or step) and the next message, or the
+/// worker's end, is answered with the interrupt.
 pub fn recv_interruptible<T: Send>(
     py: Python<'_>,
     rx: &Inbox<T>,
@@ -127,6 +130,12 @@ pub fn recv_interruptible<T: Send>(
 ) -> PyResult<Option<T>> {
     let mut interrupt = None;
     loop {
+        if interrupt.is_none() {
+            if let Err(e) = py.check_signals() {
+                cancel.store(true, Ordering::SeqCst);
+                interrupt = Some(e);
+            }
+        }
         match py.detach(|| rx.recv_timeout(SIGNAL_POLL)) {
             Ok(message) => {
                 return match interrupt {
@@ -134,14 +143,7 @@ pub fn recv_interruptible<T: Send>(
                     None => Ok(Some(message)),
                 };
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if interrupt.is_none() {
-                    if let Err(e) = py.check_signals() {
-                        cancel.store(true, Ordering::SeqCst);
-                        interrupt = Some(e);
-                    }
-                }
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return match interrupt {
                     Some(e) => Err(e),

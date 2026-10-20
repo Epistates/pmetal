@@ -170,12 +170,12 @@ def infer_stub(spec_cls: type, unsupported: tuple[str, ...]) -> str:
     )
     out.append("\n")
     out.append(
-        "def infer(model: str, prompt: str, **options: Unpack[InferCallOptions]) -> str:\n"
+        "def infer(model: str | os.PathLike[str], prompt: str, **options: Unpack[InferCallOptions]) -> str:\n"
     )
     out.append(doc("Generate text for one prompt and return it.\n\n" + common, "    "))
     out.append("\n")
     out.append(
-        "def infer_with_metrics(\n    model: str, prompt: str, **options: Unpack[InferCallOptions]\n) -> InferResult:\n"
+        "def infer_with_metrics(\n    model: str | os.PathLike[str], prompt: str, **options: Unpack[InferCallOptions]\n) -> InferResult:\n"
     )
     out.append(
         doc(

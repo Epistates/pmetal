@@ -184,11 +184,12 @@ class Trainer:
     step finishes, the weights are saved, and ``KeyboardInterrupt`` is raised).
 
     A callback is any object with some of these methods, all optional:
-    ``on_train_start()``, ``on_train_end()``, ``on_epoch_start(epoch)``,
-    ``on_epoch_end(epoch, loss, perplexity)``, ``on_step_start(step)``,
-    ``on_step_end(step, loss)``, ``on_step_metrics(metrics)``, ``on_save(path)``,
-    ``on_lr_event(event)`` and ``should_stop() -> bool``. An exception in a
-    callback ends the run cleanly and is raised from ``train()``.
+    ``on_train_start()``; ``on_step_end(step, loss)`` and
+    ``on_step_metrics(metrics)``, after each optimizer step the run logs (the
+    first, then every ``logging_steps``); ``on_train_end()``; and
+    ``should_stop() -> bool``, asked after every step. An exception in a
+    callback, like Ctrl-C, ends the run after the current step with the weights
+    saved, and is raised from ``train()``.
     """
 
     def __new__(cls, spec: TrainSpec, callbacks: Sequence[object] | None = None) -> Self:
@@ -341,7 +342,7 @@ class Tokenizer:
         """Load a tokenizer from a ``tokenizer.json`` file."""
     @staticmethod
     def from_pretrained(
-        model_id: str, *, revision: str | None = None, token: str | None = None
+        model_id: str | os.PathLike[str], *, revision: str | None = None, token: str | None = None
     ) -> Tokenizer:
         """Load the tokenizer of a model: a local directory, or a Hub id.
 
@@ -399,7 +400,7 @@ class Model:
 
     @staticmethod
     def load(
-        path_or_id: str,
+        path_or_id: str | os.PathLike[str],
         fp8: bool = False,
         *,
         revision: str | None = None,
@@ -508,8 +509,8 @@ class DFlashGenerator:
 
     def __new__(
         cls,
-        target_model: str,
-        draft_model: str,
+        target_model: str | os.PathLike[str],
+        draft_model: str | os.PathLike[str],
         *,
         revision: str | None = None,
         token: str | None = None,
@@ -772,7 +773,7 @@ def plan_download(
 ) -> DownloadPlan:
     """The commit, the files and the size a ``download_model`` call would fetch, without fetching them."""
 
-def verify_model(model: str, *, cache_dir: str | os.PathLike[str] | None = None) -> ModelReport:
+def verify_model(model: str | os.PathLike[str], *, cache_dir: str | os.PathLike[str] | None = None) -> ModelReport:
     """Check that a model directory is complete and undamaged, reading headers only.
 
     Every weight file must be there and as long as its header says, a GGUF set
@@ -810,7 +811,7 @@ def search_models(
     """
 
 def estimate_fit(
-    model: str,
+    model: str | os.PathLike[str],
     *,
     context_length: int = 4096,
     kv_cache_bits: int | None = None,

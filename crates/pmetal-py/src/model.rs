@@ -30,9 +30,14 @@ use crate::tokenizer::PyTokenizer;
 
 /// What the model thread sends back from a generation.
 pub(crate) enum Event {
+    /// One token, as it is generated (streaming only).
     Token(u32),
-    Done(Result<(), String>),
+    /// The end, with all the tokens when they were not streamed.
+    Done(Result<Vec<u32>, String>),
 }
+
+/// Unread tokens a stream lets the model thread get ahead by.
+const STREAM_LEAD: usize = 64;
 
 fn thread_gone() -> PyErr {
     PanicException::new_err(
@@ -90,14 +95,26 @@ impl PyModel {
         ids: Vec<u32>,
         config: GenerationConfig,
         cancel: Arc<AtomicBool>,
+        stream: bool,
     ) -> PyResult<Inbox<Event>> {
-        let (tx, rx) = inbox();
+        let (tx, rx) = inbox(if stream { STREAM_LEAD } else { 1 });
         self.thread
             .submit(move |model: &mut DynamicModel| {
                 let sent = tx.clone();
+                let mut tokens = Vec::new();
                 let result = decode(model, &ids, config, |token| {
-                    sent.send(Event::Token(token)).is_ok() && !cancel.load(Ordering::SeqCst)
-                });
+                    if stream {
+                        // Blocks while the reader is `STREAM_LEAD` behind; fails
+                        // once it is gone.
+                        if sent.send(Event::Token(token)).is_err() {
+                            return false;
+                        }
+                    } else {
+                        tokens.push(token);
+                    }
+                    !cancel.load(Ordering::SeqCst)
+                })
+                .map(|()| tokens);
                 let _ = tx.send(Event::Done(result));
             })
             .map_err(|_| thread_gone())?;
@@ -143,7 +160,7 @@ impl PyModel {
     #[pyo3(signature = (path_or_id, fp8=false, *, revision=None, token=None))]
     fn load(
         py: Python<'_>,
-        path_or_id: &str,
+        path_or_id: PathBuf,
         fp8: bool,
         revision: Option<String>,
         token: Option<String>,
@@ -153,7 +170,7 @@ impl PyModel {
             token,
             ..HubArgs::default()
         };
-        let model_path = resolve_model(py, path_or_id, &hub)?;
+        let model_path = resolve_model(py, &path_or_id.to_string_lossy(), &hub)?;
         let tokenizer = Arc::new(
             Tokenizer::from_model_dir(&model_path).map_err(|e| tokenizer_err(e.to_string()))?,
         );
@@ -245,18 +262,17 @@ impl PyModel {
         );
         let (ids, resolved) = self.request(prompt, Some(&overrides))?;
         let cancel = Arc::new(AtomicBool::new(false));
-        let rx = self.start(ids, resolved, cancel.clone())?;
+        let rx = self.start(ids, resolved, cancel.clone(), false)?;
 
-        let mut generated = Vec::new();
-        loop {
-            match recv_interruptible(py, &rx, &cancel)? {
-                Some(Event::Token(token)) => generated.push(token),
-                Some(Event::Done(Ok(()))) => break,
-                Some(Event::Done(Err(message))) => return Err(backend_err(message)),
-                None => return Err(thread_gone()),
+        match recv_interruptible(py, &rx, &cancel)? {
+            Some(Event::Done(Ok(generated))) => {
+                let tokenizer = &self.tokenizer;
+                py.detach(|| tokenizer.decode(&generated))
+                    .map_err(tokenizer_err)
             }
+            Some(Event::Done(Err(message))) => Err(backend_err(message)),
+            Some(Event::Token(_)) | None => Err(thread_gone()),
         }
-        self.tokenizer.decode(&generated).map_err(tokenizer_err)
     }
 
     /// Like `generate`, but yields the text piece by piece as it is produced.
@@ -298,7 +314,7 @@ impl PyModel {
         );
         let (ids, resolved) = self.request(prompt, Some(&overrides))?;
         let cancel = Arc::new(AtomicBool::new(false));
-        let rx = self.start(ids, resolved, cancel.clone())?;
+        let rx = self.start(ids, resolved, cancel.clone(), true)?;
         Ok(PyTextStream {
             tokenizer: self.tokenizer.clone(),
             cancel,
@@ -398,7 +414,7 @@ impl PyTextStream {
                         return Ok(Some(piece));
                     }
                 }
-                Some(Event::Done(Ok(()))) => {
+                Some(Event::Done(Ok(_))) => {
                     let state = self.lock();
                     let text = self
                         .tokenizer

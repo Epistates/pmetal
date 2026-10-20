@@ -11,6 +11,7 @@
 //! one raises `ConfigError` naming it, rather than ignoring it; run the spec
 //! with `pmetal.run` to use them.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -132,7 +133,7 @@ impl PyInferResult {
 /// The spec for a call's `model`, `prompt` and keyword options, validated.
 fn spec_for(
     py: Python<'_>,
-    model: &str,
+    model: &Path,
     prompt: &str,
     options: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<InferSpec> {
@@ -140,7 +141,7 @@ fn spec_for(
         Some(options) => options.copy()?,
         None => PyDict::new(py),
     };
-    fields.set_item("model", model)?;
+    fields.set_item("model", model.to_string_lossy())?;
     fields.set_item("prompt", prompt)?;
     let mut spec = spec::new::<InferSpec>(Some(&fields))?;
 
@@ -344,11 +345,11 @@ fn run(py: Python<'_>, spec: &InferSpec) -> PyResult<PyInferResult> {
 #[pyo3(signature = (model, prompt, **options))]
 pub fn infer(
     py: Python<'_>,
-    model: &str,
+    model: PathBuf,
     prompt: &str,
     options: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<String> {
-    let spec = spec_for(py, model, prompt, options)?;
+    let spec = spec_for(py, &model, prompt, options)?;
     run(py, &spec).map(|r| r.text)
 }
 
@@ -358,11 +359,11 @@ pub fn infer(
 #[pyo3(signature = (model, prompt, **options))]
 pub fn infer_with_metrics(
     py: Python<'_>,
-    model: &str,
+    model: PathBuf,
     prompt: &str,
     options: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<PyInferResult> {
-    let spec = spec_for(py, model, prompt, options)?;
+    let spec = spec_for(py, &model, prompt, options)?;
     run(py, &spec)
 }
 

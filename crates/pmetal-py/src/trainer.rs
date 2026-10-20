@@ -83,7 +83,7 @@ fn build_callbacks(
     py: Python<'_>,
     objects: &[Py<PyAny>],
     state: std::sync::Arc<RunState>,
-) -> PyResult<Vec<Box<dyn TrainingCallback>>> {
+) -> PyResult<(Vec<Box<dyn TrainingCallback>>, PythonCallbackBridge)> {
     let mut native: Vec<Box<dyn TrainingCallback>> = Vec::new();
     let mut bridged = Vec::new();
     for object in objects {
@@ -102,8 +102,9 @@ fn build_callbacks(
             bridged.push(object.clone_ref(py));
         }
     }
-    native.push(Box::new(PythonCallbackBridge::new(bridged, state)));
-    Ok(native)
+    let bridge = PythonCallbackBridge::new(bridged, state);
+    native.push(Box::new(bridge.clone()));
+    Ok((native, bridge))
 }
 
 /// Run `job` to completion on this thread with the GIL released, then raise
@@ -114,9 +115,10 @@ pub(crate) fn run_job(
     objects: &[Py<PyAny>],
 ) -> PyResult<PyTrainResult> {
     let state = RunState::new();
-    let callbacks = build_callbacks(py, objects, state.clone())?;
+    let (callbacks, bridge) = build_callbacks(py, objects, state.clone())?;
     let rt = runtime()?;
     let outcome = py.detach(move || rt.block_on(orchestrator::run_training(job, None, callbacks)));
+    bridge.train_end();
     if let Some(err) = state.take_error() {
         return Err(err);
     }

@@ -30,7 +30,9 @@
 
 use pmetal_core::{FieldError, PMetalError};
 use pyo3::exceptions::{
-    PyException, PyMemoryError, PyNotImplementedError, PyOSError, PyValueError,
+    PyBrokenPipeError, PyException, PyFileExistsError, PyFileNotFoundError, PyInterruptedError,
+    PyMemoryError, PyNotImplementedError, PyOSError, PyPermissionError, PyTimeoutError,
+    PyValueError,
 };
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
@@ -220,10 +222,7 @@ pub fn pmetal_to_pyerr(err: PMetalError) -> PyErr {
             | PMetalError::Config(_)
             | PMetalError::ShapeMismatch { .. }
             | PMetalError::DtypeMismatch { .. } => raise(&e.config_error, message),
-            PMetalError::Io(io) => match io.raw_os_error() {
-                Some(errno) => PyOSError::new_err((errno, message)),
-                None => PyOSError::new_err(message),
-            },
+            PMetalError::Io(io) => io_to_pyerr(io, message),
             PMetalError::OutOfMemory { .. } => raise(&e.out_of_memory_error, message),
             PMetalError::NotImplemented(_) => PyNotImplementedError::new_err(message),
             PMetalError::ModelLoad(_) => raise(&e.model_load_error, message),
@@ -240,6 +239,25 @@ pub fn pmetal_to_pyerr(err: PMetalError) -> PyErr {
             _ => raise(&e.backend_error, message),
         }
     })
+}
+
+/// The `OSError` for an I/O error: the subclass its errno names
+/// (`FileNotFoundError`, `PermissionError`, ...), or when it carries none (a
+/// library's own message), the one its kind names.
+fn io_to_pyerr(io: &std::io::Error, message: String) -> PyErr {
+    use std::io::ErrorKind;
+    if let Some(errno) = io.raw_os_error() {
+        return PyOSError::new_err((errno, message));
+    }
+    match io.kind() {
+        ErrorKind::NotFound => PyFileNotFoundError::new_err(message),
+        ErrorKind::PermissionDenied => PyPermissionError::new_err(message),
+        ErrorKind::AlreadyExists => PyFileExistsError::new_err(message),
+        ErrorKind::TimedOut => PyTimeoutError::new_err(message),
+        ErrorKind::BrokenPipe => PyBrokenPipeError::new_err(message),
+        ErrorKind::Interrupted => PyInterruptedError::new_err(message),
+        _ => PyOSError::new_err(message),
+    }
 }
 
 /// The Python exception for an `anyhow::Error`: a `PMetalError` or an

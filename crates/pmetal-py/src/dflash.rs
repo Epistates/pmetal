@@ -66,8 +66,8 @@ impl PyDFlashGenerator {
     #[pyo3(signature = (target_model, draft_model, *, revision=None, token=None))]
     fn new(
         py: Python<'_>,
-        target_model: &str,
-        draft_model: &str,
+        target_model: PathBuf,
+        draft_model: PathBuf,
         revision: Option<String>,
         token: Option<String>,
     ) -> PyResult<Self> {
@@ -76,8 +76,8 @@ impl PyDFlashGenerator {
             token,
             ..HubArgs::default()
         };
-        let target_path = resolve_model(py, target_model, &hub)?;
-        let draft_path = resolve_model(py, draft_model, &hub)?;
+        let target_path = resolve_model(py, &target_model.to_string_lossy(), &hub)?;
+        let draft_path = resolve_model(py, &draft_model.to_string_lossy(), &hub)?;
 
         let (target, draft) = (target_path.clone(), draft_path.clone());
         let started = py.detach(move || {
@@ -185,7 +185,7 @@ impl PyDFlashGenerator {
             ..DFlashConfig::new(generation)
         };
 
-        let (tx, rx) = inbox();
+        let (tx, rx) = inbox(1);
         self.thread
             .submit(move |decoder| {
                 let output = decoder
