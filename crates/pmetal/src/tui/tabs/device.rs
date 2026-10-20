@@ -1,4 +1,9 @@
-//! Device information tab — GPU, ANE, and memory details.
+//! System tab: the GPU, the Neural Engine and memory.
+//!
+//! Everything here is read from the machine: the Metal device for the chip,
+//! its cores and the working set the GPU may address, the kernel's virtual
+//! memory statistics for how much memory is in use. Nothing is derived from
+//! the amount of RAM.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -9,6 +14,8 @@ use crate::tui::theme::{THEME, gauge_color};
 use crate::tui::widgets::KeyValueList;
 use crate::tui::widgets::key_value::KvPair;
 
+const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
 /// Cached device information (queried once at startup).
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
@@ -18,6 +25,7 @@ pub struct DeviceInfo {
     pub max_threads_per_threadgroup: u64,
     pub max_threadgroup_memory: u64,
     pub has_unified_memory: bool,
+    /// What the GPU may address, as the device reports it.
     pub recommended_working_set: u64,
     pub max_buffer_length: u64,
     pub has_dynamic_caching: bool,
@@ -64,41 +72,78 @@ impl DeviceInfo {
     }
 }
 
-/// Memory statistics snapshot.
-#[derive(Debug, Clone)]
+/// System memory at one moment.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MemorySnapshot {
-    pub total_gb: f64,
-    pub used_gb: f64,
-    pub peak_gb: f64,
-    pub available_gb: f64,
+    /// Installed memory, as the Metal device reports it (the GPU shares it).
+    pub total_bytes: u64,
+    /// Memory in use; `None` until the kernel has been asked.
+    pub used_bytes: Option<u64>,
 }
 
 impl MemorySnapshot {
-    pub fn query() -> Self {
-        let stats = pmetal_runtime::memory::get_memory_stats();
+    /// Installed memory only; the usage arrives when it has been read.
+    pub fn installed() -> Self {
         Self {
-            total_gb: stats.total_gb(),
-            used_gb: stats.used_gb(),
-            peak_gb: stats.peak_gb(),
-            available_gb: stats.available_gb(),
+            total_bytes: pmetal_runtime::memory::get_system_memory().unwrap_or(0),
+            used_bytes: None,
         }
     }
 
     pub fn used_ratio(&self) -> f64 {
-        if self.total_gb > 0.0 {
-            self.used_gb / self.total_gb
-        } else {
-            0.0
+        match (self.used_bytes, self.total_bytes) {
+            (Some(used), total) if total > 0 => (used as f64 / total as f64).clamp(0.0, 1.0),
+            _ => 0.0,
         }
     }
 
-    pub fn peak_ratio(&self) -> f64 {
-        if self.total_gb > 0.0 {
-            self.peak_gb / self.total_gb
-        } else {
-            0.0
-        }
+    fn total_gb(&self) -> f64 {
+        self.total_bytes as f64 / GIB
     }
+
+    fn used_gb(&self) -> Option<f64> {
+        self.used_bytes.map(|b| b as f64 / GIB)
+    }
+}
+
+/// Memory in use, from the text of `vm_stat`.
+///
+/// Available memory is what the system can hand out without paging: free,
+/// inactive and speculative pages (the file cache among them) plus purgeable
+/// ones. In use is what is left of the installed memory.
+pub fn memory_in_use(vm_stat: &str, installed_bytes: u64) -> Option<u64> {
+    let page_size: u64 = vm_stat
+        .lines()
+        .next()?
+        .split("page size of ")
+        .nth(1)?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    let pages = |label: &str| -> Option<u64> {
+        vm_stat.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            (name.trim().trim_matches('"') == label)
+                .then(|| value.trim().trim_end_matches('.').parse().ok())
+                .flatten()
+        })
+    };
+    let available_pages = pages("Pages free")?
+        + pages("Pages inactive").unwrap_or(0)
+        + pages("Pages speculative").unwrap_or(0)
+        + pages("Pages purgeable").unwrap_or(0);
+    Some(installed_bytes.saturating_sub(available_pages * page_size))
+}
+
+/// Ask the kernel how much memory is in use. Blocking (runs `vm_stat`).
+pub fn read_memory_in_use(installed_bytes: u64) -> Option<u64> {
+    let output = std::process::Command::new("vm_stat")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    memory_in_use(&String::from_utf8_lossy(&output.stdout), installed_bytes)
 }
 
 /// Device tab state.
@@ -111,13 +156,32 @@ impl DeviceTab {
     pub fn new() -> Self {
         Self {
             device: DeviceInfo::query(),
-            memory: MemorySnapshot::query(),
+            memory: MemorySnapshot::installed(),
         }
     }
 
-    /// Refresh memory stats (called on tick).
-    pub fn refresh_memory(&mut self) {
-        self.memory = MemorySnapshot::query();
+    /// A tab for a device that is not queried (tests).
+    pub fn with(device: Option<DeviceInfo>, total_bytes: u64) -> Self {
+        Self {
+            device,
+            memory: MemorySnapshot {
+                total_bytes,
+                used_bytes: None,
+            },
+        }
+    }
+
+    /// The kernel reported how much memory is in use.
+    pub fn set_used(&mut self, used_bytes: Option<u64>) {
+        if used_bytes.is_some() {
+            self.memory.used_bytes = used_bytes;
+        }
+    }
+}
+
+impl Default for DeviceTab {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -157,33 +221,14 @@ impl DeviceTab {
             return;
         };
 
-        let gpu_cores_str = if dev.gpu_core_count > 0 {
-            if dev.is_ultra_fusion {
-                format!(
-                    "{} ({}x{} dies)",
-                    dev.gpu_core_count,
-                    dev.gpu_core_count / dev.die_count,
-                    dev.die_count
-                )
+        let cores = |count: u32, unknown: &str| {
+            if count == 0 {
+                unknown.to_string()
+            } else if dev.is_ultra_fusion && dev.die_count > 0 {
+                format!("{count} ({}x{} dies)", count / dev.die_count, dev.die_count)
             } else {
-                format!("{}", dev.gpu_core_count)
+                count.to_string()
             }
-        } else {
-            "Unknown".to_string()
-        };
-        let ane_cores_str = if dev.ane_core_count > 0 {
-            if dev.is_ultra_fusion {
-                format!(
-                    "{} ({}x{} dies)",
-                    dev.ane_core_count,
-                    dev.ane_core_count / dev.die_count,
-                    dev.die_count
-                )
-            } else {
-                format!("{}", dev.ane_core_count)
-            }
-        } else {
-            "N/A".to_string()
         };
         let tier_str = if dev.is_ultra_fusion {
             format!("{} (UltraFusion)", dev.device_tier)
@@ -198,25 +243,19 @@ impl DeviceTab {
                 format!("{} (gen {})", dev.gpu_family, dev.architecture_gen),
             ),
             KvPair::new("Tier", &tier_str),
-            KvPair::new("GPU Cores", &gpu_cores_str),
-            KvPair::new("ANE Cores", &ane_cores_str),
+            KvPair::new("GPU Cores", cores(dev.gpu_core_count, "Unknown")),
+            KvPair::new("ANE Cores", cores(dev.ane_core_count, "N/A")),
             KvPair::new(
                 "Bandwidth",
                 format!("{:.0} GB/s", dev.memory_bandwidth_gbps),
             ),
             KvPair::new(
                 "Working Set",
-                format!(
-                    "{:.1} GB",
-                    dev.recommended_working_set as f64 / (1024.0 * 1024.0 * 1024.0)
-                ),
+                format!("{:.1} GB", dev.recommended_working_set as f64 / GIB),
             ),
             KvPair::new(
                 "Max Buffer",
-                format!(
-                    "{:.1} GB",
-                    dev.max_buffer_length as f64 / (1024.0 * 1024.0 * 1024.0)
-                ),
+                format!("{:.1} GB", dev.max_buffer_length as f64 / GIB),
             ),
         ];
 
@@ -236,14 +275,6 @@ impl DeviceTab {
             return;
         };
 
-        let check_style = |b: bool| {
-            if b {
-                THEME.text_success
-            } else {
-                THEME.text_muted
-            }
-        };
-
         let features = [
             ("Dynamic Caching", dev.has_dynamic_caching),
             ("Ray Tracing", dev.has_ray_tracing),
@@ -255,29 +286,31 @@ impl DeviceTab {
 
         for (i, (name, enabled)) in features.iter().enumerate() {
             let y = inner.y + i as u16;
-            if y >= inner.y + inner.height {
+            if y >= inner.bottom() {
                 break;
             }
-            let row = Rect::new(inner.x, y, inner.width, 1);
+            // Spelled out as well as colored.
             Line::from(vec![
-                Span::styled(format!("{:>18}: ", name), THEME.kv_key),
+                Span::styled(format!("{name:>18}: "), THEME.kv_key),
                 Span::styled(
-                    if *enabled { " YES " } else { " NO  " },
-                    check_style(*enabled),
+                    if *enabled { "yes" } else { "no" },
+                    if *enabled {
+                        THEME.text_success
+                    } else {
+                        THEME.text_muted
+                    },
                 ),
             ])
-            .render(row, buf);
+            .render(Rect::new(inner.x, y, inner.width, 1), buf);
         }
 
-        // Kernel tuning info
-        let y_offset = features.len() as u16 + 1;
-        if inner.y + y_offset < inner.y + inner.height {
-            let row = Rect::new(inner.x, inner.y + y_offset, inner.width, 1);
+        let y = inner.y + features.len() as u16 + 1;
+        if y < inner.bottom() {
             Line::from(vec![
                 Span::styled("Batch Multiplier: ", THEME.kv_key),
                 Span::styled(format!("{}x", dev.batch_size_multiplier), THEME.kv_value),
             ])
-            .render(row, buf);
+            .render(Rect::new(inner.x, y, inner.width, 1), buf);
         }
     }
 
@@ -291,44 +324,60 @@ impl DeviceTab {
         block.render(area, buf);
 
         let mem = &self.memory;
-
-        // Memory gauge
         let [gauge_area, stats_area] =
             Layout::vertical([Constraint::Length(3), Constraint::Fill(1)]).areas(inner);
 
-        // Used memory gauge
         let ratio = mem.used_ratio();
-        let gauge_label = format!(
-            "{:.1} / {:.1} GB ({:.0}%)",
-            mem.used_gb,
-            mem.total_gb,
-            ratio * 100.0
-        );
+        let label = match mem.used_gb() {
+            Some(used) => format!(
+                "{used:.1} / {:.1} GB ({:.0}%)",
+                mem.total_gb(),
+                ratio * 100.0
+            ),
+            None => format!("{:.1} GB installed", mem.total_gb()),
+        };
         Gauge::default()
             .block(
                 Block::default()
-                    .title("Used")
+                    .title("In use")
                     .title_style(THEME.gauge_label),
             )
             .gauge_style(gauge_color(ratio))
-            .ratio(ratio.clamp(0.0, 1.0))
-            .label(gauge_label)
+            .ratio(ratio)
+            .label(label)
             .render(gauge_area, buf);
 
-        // Stats
-        let pairs = [
-            KvPair::new("Total", format!("{:.2}", mem.total_gb)).with_unit("GB"),
-            KvPair::new("Used", format!("{:.2}", mem.used_gb)).with_unit("GB"),
-            KvPair::new("Available", format!("{:.2}", mem.available_gb)).with_unit("GB"),
-            KvPair::new("Peak", format!("{:.2}", mem.peak_gb)).with_unit("GB"),
-        ];
-        let stats_inner = Rect::new(
+        let mut pairs =
+            vec![KvPair::new("Installed", format!("{:.1}", mem.total_gb())).with_unit("GB")];
+        if let Some(used) = mem.used_gb() {
+            pairs.push(KvPair::new("In use", format!("{used:.1}")).with_unit("GB"));
+            pairs.push(
+                KvPair::new(
+                    "Available",
+                    format!("{:.1}", (mem.total_gb() - used).max(0.0)),
+                )
+                .with_unit("GB"),
+            );
+        }
+        if let Some(dev) = &self.device {
+            let share = if mem.total_bytes > 0 {
+                format!(
+                    "{:.1} ({:.0}% of installed)",
+                    dev.recommended_working_set as f64 / GIB,
+                    dev.recommended_working_set as f64 / mem.total_bytes as f64 * 100.0
+                )
+            } else {
+                format!("{:.1}", dev.recommended_working_set as f64 / GIB)
+            };
+            pairs.push(KvPair::new("GPU may use", share).with_unit("GB"));
+        }
+        let stats = Rect::new(
             stats_area.x,
             stats_area.y + 1,
             stats_area.width,
             stats_area.height.saturating_sub(1),
         );
-        KeyValueList::new(&pairs).render(stats_inner, buf);
+        KeyValueList::new(&pairs).render(stats, buf);
     }
 
     fn render_tuning(&self, area: Rect, buf: &mut Buffer) {
@@ -350,14 +399,114 @@ impl DeviceTab {
                 Span::styled("tensor runtime", THEME.kv_value),
             ]),
             Line::from(""),
-            Line::from(vec![Span::styled(
+            Line::from(Span::styled(
                 "Tuning is tier-based. See docs/hardware-support.md",
                 THEME.text_muted,
-            )]),
+            )),
         ];
 
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .render(inner, buf);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VM_STAT: &str = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
+Pages free:                               20000.\n\
+Pages active:                            500000.\n\
+Pages inactive:                          100000.\n\
+Pages speculative:                         5000.\n\
+Pages throttled:                              0.\n\
+Pages wired down:                        300000.\n\
+Pages purgeable:                          10000.\n\
+\"Translation faults\":                 123456789.\n";
+
+    fn device() -> DeviceInfo {
+        DeviceInfo {
+            name: "Apple M4 Max".into(),
+            gpu_family: "Apple9".into(),
+            device_tier: "Max".into(),
+            max_threads_per_threadgroup: 1024,
+            max_threadgroup_memory: 32768,
+            has_unified_memory: true,
+            recommended_working_set: 100 << 30,
+            max_buffer_length: 64 << 30,
+            has_dynamic_caching: true,
+            has_ray_tracing: true,
+            has_mesh_shaders: true,
+            has_nax: false,
+            supports_ane: true,
+            batch_size_multiplier: 4,
+            architecture_gen: 16,
+            memory_bandwidth_gbps: 546.0,
+            gpu_core_count: 40,
+            ane_core_count: 16,
+            is_ultra_fusion: false,
+            die_count: 1,
+        }
+    }
+
+    fn draw(tab: &DeviceTab, w: u16, h: u16) -> String {
+        let area = Rect::new(0, 0, w, h);
+        let mut buf = Buffer::empty(area);
+        tab.render(area, &mut buf);
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn memory_in_use_is_what_is_left_after_what_the_system_could_hand_out() {
+        let installed = 128u64 << 30;
+        let used = memory_in_use(VM_STAT, installed).unwrap();
+        let available = (20_000 + 100_000 + 5_000 + 10_000) * 16384u64;
+        assert_eq!(used, installed - available);
+        assert_eq!(memory_in_use("", installed), None);
+        assert_eq!(memory_in_use("garbage\nPages free: 1.", installed), None);
+    }
+
+    #[test]
+    fn a_machine_reporting_more_free_than_installed_is_not_negative() {
+        let used = memory_in_use(VM_STAT, 1 << 20).unwrap();
+        assert_eq!(used, 0);
+    }
+
+    #[test]
+    fn the_tab_shows_the_devices_own_report() {
+        let mut tab = DeviceTab::with(Some(device()), 128 << 30);
+        let screen = draw(&tab, 120, 36);
+        assert!(screen.contains("Apple M4 Max"), "{screen}");
+        assert!(screen.contains("546 GB/s"), "{screen}");
+        assert!(screen.contains("100.0 GB"), "the working set: {screen}");
+        assert!(screen.contains("GPU may use"), "{screen}");
+        assert!(screen.contains("128.0 GB installed"), "{screen}");
+        assert!(!screen.contains("Used"), "usage is not known yet: {screen}");
+
+        tab.set_used(Some(32 << 30));
+        let screen = draw(&tab, 120, 36);
+        assert!(screen.contains("32.0 / 128.0 GB (25%)"), "{screen}");
+        assert!(screen.contains("96.0"), "available: {screen}");
+        // A failed reading keeps the last good one.
+        tab.set_used(None);
+        assert_eq!(tab.memory.used_bytes, Some(32 << 30));
+    }
+
+    #[test]
+    fn a_machine_without_a_gpu_says_so() {
+        let tab = DeviceTab::with(None, 16 << 30);
+        assert!(draw(&tab, 100, 30).contains("No Metal device found"));
+    }
+
+    #[test]
+    fn the_tab_draws_at_any_size() {
+        let tab = DeviceTab::with(Some(device()), 128 << 30);
+        for &(w, h) in &[(0, 0), (1, 1), (10, 4), (40, 10), (100, 30), (200, 60)] {
+            draw(&tab, w, h);
+        }
     }
 }

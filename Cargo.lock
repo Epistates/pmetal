@@ -5242,6 +5242,7 @@ dependencies = [
  "pmetal-models",
  "pmetal-runtime",
  "pmetal-serve",
+ "pmetal-supervisor",
  "pmetal-trainer",
  "pmetal-vocoder",
  "rand 0.10.3",
@@ -5424,7 +5425,6 @@ dependencies = [
 name = "pmetal-mcp"
 version = "0.6.0"
 dependencies = [
- "chrono",
  "pmetal-core",
  "pmetal-hub",
  "pmetal-metal",

@@ -1,571 +1,497 @@
-//! Bench tab — inference / workload benchmark configuration and trial display.
+//! Bench tab: the training benchmark and the real-workload benchmark.
 //!
-//! Exposes the two most user-facing `pmetal` bench subcommands behind a
-//! Mode enum:
+//! Two modes:
 //!
-//! * **Basic** → `pmetal bench` (short model forward timing).
-//! * **Workload** → `pmetal bench-workload` (preset-driven, full inference
-//!   + LoRA training numbers, JSON export).
+//! * **basic** is `pmetal bench`, which [`BenchSpec`] describes: a short LoRA
+//!   training run of a fixed shape.
+//! * **workload** is `pmetal bench-workload`: inference and LoRA training over
+//!   a real cached dataset, with named presets and a JSON report. It has no job
+//!   spec, so its fields are listed here, but their defaults and the values the
+//!   presets and context sources take are read from the command's own
+//!   definition in the CLI, never copied.
 //!
-//! Trials are parsed out of stdout live into a compact table and an
-//! average summary line so the operator gets an "is this fast or slow?"
-//! read at a glance.
-//!
-//! Note: the form retains the tab-local field list because [`BenchSpec`]
-//! only covers the basic `pmetal bench` subcommand (3 fields). The
-//! workload mode fields are TUI-only until a `BenchWorkloadSpec` is
-//! added to pmetal-core.
+//! What the benchmark prints is shown as it prints it: the results block of the
+//! log, unparsed, so a change to the report cannot leave this tab wrong.
 
-use std::path::PathBuf;
-
+use clap::CommandFactory;
+use pmetal_core::jobs::BenchSpec;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Widget};
 
+use crate::cli::Cli;
+use crate::tui::jobs::LaunchPlan;
+use crate::tui::tabs::dashboard::Telemetry;
+use crate::tui::tabs::panel::{FormTab, JobPanel, RunState};
+use crate::tui::tabs::status_panel::render_standard;
 use crate::tui::theme::THEME;
-use crate::tui::widgets::{
-    FieldKind, FormAction, FormField, FormTabState, JobLog, StatusTone, status_line,
-};
+use crate::tui::widgets::{FieldKind, FormField, FormIssue, FormTabState, FormView};
 
-/// Status of the currently running bench job.
-#[derive(Debug, Clone, Default)]
-pub enum BenchStatus {
-    #[default]
-    Idle,
-    Running {
-        mode: String,
-    },
-    Completed,
-    Failed(String),
+/// The subcommand the workload mode runs.
+const WORKLOAD: &str = "bench-workload";
+/// The preset that means "no preset": the model and dataset fields rule.
+const CUSTOM: &str = "custom";
+
+/// What the CLI's definition of `bench-workload` says about one option.
+struct ClapArg {
+    default: String,
+    values: Vec<String>,
 }
 
-/// One measured trial row parsed from the bench subprocess stdout.
-#[derive(Debug, Clone, Default)]
-pub struct BenchTrial {
-    pub index: usize,
-    pub prompt_tps: f64,
-    pub generation_tps: f64,
-    pub peak_memory_gb: f64,
-}
-
-/// Bench tab state.
-pub struct BenchTab {
-    pub form: FormTabState,
-    pub status: BenchStatus,
-    pub log: JobLog,
-    pub trials: Vec<BenchTrial>,
-}
-
-impl BenchTab {
-    pub fn new() -> Self {
-        Self {
-            form: FormTabState::new(Self::default_fields()),
-            status: BenchStatus::Idle,
-            log: JobLog::with_default_cap(),
-            trials: Vec::new(),
-        }
-    }
-
-    fn default_fields() -> Vec<FormField> {
-        vec![
-            FormField::new(
-                "Mode",
-                "workload",
-                FieldKind::Enum {
-                    options: vec!["workload".into(), "basic".into()],
-                },
-                "Mode",
-            ),
-            FormField::new("Model", "(not selected)", FieldKind::ModelPicker, "Mode"),
-            FormField::new(
-                "Preset",
-                "dense-qwen3",
-                FieldKind::Enum {
-                    options: vec![
-                        "dense-qwen3".into(),
-                        "hybrid-qwen3next".into(),
-                        "hybrid-qwen35-steady".into(),
-                        "moe-nemotronh".into(),
-                        "custom".into(),
-                    ],
-                },
-                "Workload",
-            ),
-            FormField::new(
-                "Inference Context",
-                "auto",
-                FieldKind::Enum {
-                    options: vec!["auto".into(), "prompt".into(), "text-prefix".into()],
-                },
-                "Workload",
-            ),
-            FormField::new(
-                "Dataset",
-                "TeichAI/gemini-3-pro-preview-high-reasoning-250x",
-                FieldKind::DatasetPicker,
-                "Workload",
-            ),
-            FormField::new("Experts Dir", "", FieldKind::Path, "Workload"),
-            FormField::new(
-                "Prompt Samples",
-                "8",
-                FieldKind::Integer { min: 1, max: 128 },
-                "Workload",
-            ),
-            FormField::new(
-                "Max Prompt Tokens",
-                "0",
-                FieldKind::Integer {
-                    min: 0,
-                    max: 16_384,
-                },
-                "Workload",
-            ),
-            FormField::new(
-                "Decode Steps",
-                "32",
-                FieldKind::Integer { min: 1, max: 4096 },
-                "Workload",
-            ),
-            FormField::new(
-                "Inference Warmup",
-                "2",
-                FieldKind::Integer { min: 0, max: 32 },
-                "Workload",
-            ),
-            FormField::new(
-                "Inference Session Repeats",
-                "1",
-                FieldKind::Integer { min: 1, max: 64 },
-                "Workload",
-            ),
-            FormField::new(
-                "Inference Repeats",
-                "1",
-                FieldKind::Integer { min: 1, max: 64 },
-                "Workload",
-            ),
-            FormField::new(
-                "Train Samples",
-                "8",
-                FieldKind::Integer { min: 1, max: 4096 },
-                "Workload",
-            ),
-            FormField::new(
-                "Train Steps",
-                "4",
-                FieldKind::Integer { min: 1, max: 4096 },
-                "Workload",
-            ),
-            FormField::new(
-                "Train Batch Size",
-                "1",
-                FieldKind::Integer { min: 1, max: 128 },
-                "Workload",
-            ),
-            FormField::new(
-                "Train Max Seq Len",
-                "0",
-                FieldKind::Integer {
-                    min: 0,
-                    max: 32_768,
-                },
-                "Workload",
-            ),
-            FormField::new(
-                "Batch Size",
-                "1",
-                FieldKind::Integer { min: 1, max: 128 },
-                "Basic",
-            ),
-            FormField::new(
-                "Seq Len",
-                "512",
-                FieldKind::Integer {
-                    min: 32,
-                    max: 32_768,
-                },
-                "Basic",
-            ),
-            FormField::new("JSON Output", "", FieldKind::Text, "Output"),
-        ]
-    }
-
-    // ── Form delegation ─────────────────────────────────────────────────
-
-    pub fn is_editing(&self) -> bool {
-        self.form.is_editing()
-    }
-    pub fn handle_edit_key(&mut self, k: crossterm::event::KeyEvent) {
-        self.form.handle_edit_key(k);
-    }
-    pub fn confirm_edit(&mut self) {
-        self.form.confirm_edit();
-    }
-    pub fn cancel_edit(&mut self) {
-        self.form.cancel_edit();
-    }
-    pub fn handle_enter(&mut self) -> Option<FormAction> {
-        self.form.handle_enter()
-    }
-
-    pub fn next_param(&mut self) {
-        let mode = self.form.value("Mode");
-        self.form
-            .next_param(move |f| section_visible(&mode, &f.section));
-    }
-
-    pub fn prev_param(&mut self) {
-        let mode = self.form.value("Mode");
-        self.form
-            .prev_param(move |f| section_visible(&mode, &f.section));
-    }
-
-    pub fn set_model(&mut self, model_id: &str) {
-        self.form.set_value("Model", model_id);
-    }
-
-    pub fn is_running(&self) -> bool {
-        matches!(self.status, BenchStatus::Running { .. })
-    }
-
-    pub fn mark_running(&mut self) {
-        self.log.clear();
-        self.trials.clear();
-        self.status = BenchStatus::Running {
-            mode: self.form.value("Mode"),
-        };
-    }
-
-    pub fn append_log(&mut self, line: &str) {
-        if let Some(trial) = parse_trial_line(line) {
-            if let Some(existing) = self.trials.iter_mut().find(|t| t.index == trial.index) {
-                *existing = trial;
-            } else {
-                self.trials.push(trial);
-            }
-        }
-        self.log.push(line);
-    }
-
-    pub fn mark_completed(&mut self) {
-        self.status = BenchStatus::Completed;
-    }
-
-    pub fn mark_failed(&mut self, msg: &str) {
-        self.status = BenchStatus::Failed(msg.to_string());
-    }
-
-    // ── Config ──────────────────────────────────────────────────────────
-
-    pub fn validate_config(&self) -> Result<(), String> {
-        let mode = self.form.value("Mode");
-        let preset = self.form.value("Preset");
-        if (mode == "basic" || preset == "custom") && self.form.value("Model") == "(not selected)" {
-            return Err("Model is required.".into());
-        }
-        if mode == "workload" && preset == "custom" && self.form.value("Dataset").is_empty() {
-            return Err("Dataset is required for custom workload benchmarks.".into());
-        }
-        let json_out = self.form.value("JSON Output");
-        if !json_out.is_empty() && !json_out.ends_with(".json") {
-            return Err("JSON Output, if set, must end in .json".into());
-        }
-        Ok(())
-    }
-
-    pub fn config_summary(&self) -> Vec<String> {
-        let mode = self.form.value("Mode");
-        let mut summary = vec![format!("Mode:     {mode}")];
-        if mode == "workload" {
-            let preset = self.form.value("Preset");
-            summary.push(format!("Preset:   {preset}"));
-            if preset == "custom" {
-                summary.push(format!("Model:    {}", self.form.value("Model")));
-                summary.push(format!("Dataset:  {}", self.form.value("Dataset")));
-            }
-            summary.push(format!(
-                "Samples:  {} prompts x {} decode steps",
-                self.form.value("Prompt Samples"),
-                self.form.value("Decode Steps"),
-            ));
-        } else {
-            summary.push(format!("Model:    {}", self.form.value("Model")));
-            summary.push(format!(
-                "Shape:    batch={}, seq_len={}",
-                self.form.value("Batch Size"),
-                self.form.value("Seq Len"),
-            ));
-        }
-        let json_out = self.form.value("JSON Output");
-        if !json_out.is_empty() {
-            summary.push(format!("JSON:     {json_out}"));
-        }
-        summary.push(String::new());
-        summary.push("Run benchmark?".into());
-        summary
-    }
-
-    pub fn build_cli_args(&self) -> Vec<String> {
-        let mode = self.form.value("Mode");
-        let mut args = Vec::new();
-
-        if mode == "workload" {
-            args.push("bench-workload".into());
-            let preset = self.form.value("Preset");
-            if preset != "custom" {
-                args.extend(["--preset".into(), preset]);
-            } else {
-                args.extend(["--model".into(), self.form.value("Model")]);
-                args.extend(["--dataset".into(), self.form.value("Dataset")]);
-                args.extend([
-                    "--inference-context".into(),
-                    self.form.value("Inference Context"),
-                ]);
-                args.extend(["--prompt-samples".into(), self.form.value("Prompt Samples")]);
-                args.extend([
-                    "--max-prompt-tokens".into(),
-                    self.form.value("Max Prompt Tokens"),
-                ]);
-                args.extend(["--decode-steps".into(), self.form.value("Decode Steps")]);
-                args.extend([
-                    "--inference-repeats".into(),
-                    self.form.value("Inference Repeats"),
-                ]);
-                args.extend(["--train-samples".into(), self.form.value("Train Samples")]);
-                args.extend(["--train-steps".into(), self.form.value("Train Steps")]);
-                args.extend(["--batch-size".into(), self.form.value("Train Batch Size")]);
-                args.extend(["--max-seq-len".into(), self.form.value("Train Max Seq Len")]);
-            }
-            let experts_dir = self.form.value("Experts Dir");
-            if !experts_dir.is_empty() {
-                args.extend(["--experts-dir".into(), experts_dir]);
-            }
-            args.extend([
-                "--inference-warmup-passes".into(),
-                self.form.value("Inference Warmup"),
-            ]);
-            args.extend([
-                "--inference-session-repeats".into(),
-                self.form.value("Inference Session Repeats"),
-            ]);
-        } else {
-            args.push("bench".into());
-            args.extend(["--model".into(), self.form.value("Model")]);
-            args.extend(["--batch-size".into(), self.form.value("Batch Size")]);
-            args.extend(["--seq-len".into(), self.form.value("Seq Len")]);
-        }
-
-        let json_out = self.form.value("JSON Output");
-        if !json_out.is_empty() {
-            args.push("--json".into());
-            args.extend(["--output".into(), json_out]);
-        }
-
-        args
-    }
-
-    pub fn json_output_path(&self) -> Option<PathBuf> {
-        let v = self.form.value("JSON Output");
-        if v.is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(v))
-        }
-    }
-
-    fn avg_prompt_tps(&self) -> Option<f64> {
-        if self.trials.is_empty() {
-            return None;
-        }
-        let sum: f64 = self.trials.iter().map(|t| t.prompt_tps).sum();
-        Some(sum / self.trials.len() as f64)
-    }
-
-    fn avg_generation_tps(&self) -> Option<f64> {
-        if self.trials.is_empty() {
-            return None;
-        }
-        let sum: f64 = self.trials.iter().map(|t| t.generation_tps).sum();
-        Some(sum / self.trials.len() as f64)
-    }
-
-    fn peak_mem_gb(&self) -> Option<f64> {
-        self.trials
-            .iter()
-            .map(|t| t.peak_memory_gb)
-            .fold(None, |acc, x| Some(acc.map_or(x, |a: f64| a.max(x))))
+/// The default and the allowed values of `--<id>` of `bench-workload`.
+fn clap_arg(id: &str) -> ClapArg {
+    let command = Cli::command();
+    let arg = command
+        .find_subcommand(WORKLOAD)
+        .and_then(|sub| sub.get_arguments().find(|a| a.get_long() == Some(id)));
+    ClapArg {
+        default: arg
+            .and_then(|a| a.get_default_values().first())
+            .map(|v| v.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        values: arg
+            .map(|a| {
+                a.get_possible_values()
+                    .iter()
+                    .map(|v| v.get_name().to_string())
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
-/// Shared visibility rule for nav helpers and the renderer.
-fn section_visible(mode: &str, section: &str) -> bool {
-    match section {
-        "Workload" => mode == "workload",
-        "Basic" => mode == "basic",
+/// Workload options entered as a whole number: `(clap id, label, min, max)`.
+const WORKLOAD_COUNTS: &[(&str, &str, i64, i64)] = &[
+    ("prompt-samples", "Prompt Samples", 1, 128),
+    ("max-prompt-tokens", "Max Prompt Tokens", 0, 16_384),
+    ("decode-steps", "Decode Steps", 1, 4096),
+    ("inference-warmup-passes", "Inference Warmup", 0, 32),
+    (
+        "inference-session-repeats",
+        "Inference Session Repeats",
+        1,
+        64,
+    ),
+    ("inference-repeats", "Inference Repeats", 1, 64),
+    ("train-samples", "Train Samples", 1, 4096),
+    ("train-steps", "Train Steps", 1, 4096),
+    ("batch-size", "Train Batch Size", 1, 128),
+    ("max-seq-len", "Train Max Seq Len", 0, 32_768),
+];
+
+fn workload_fields() -> Vec<FormField> {
+    let preset = clap_arg("preset");
+    let mut preset_options = vec![CUSTOM.to_string()];
+    preset_options.extend(preset.values);
+    let context = clap_arg("inference-context");
+
+    let mut fields = vec![
+        FormField::new(
+            "Mode",
+            "workload",
+            FieldKind::Enum {
+                options: vec!["workload".into(), "basic".into()],
+            },
+            "Mode",
+        ),
+        FormField::new(
+            "Preset",
+            CUSTOM,
+            FieldKind::Enum {
+                options: preset_options,
+            },
+            "Workload",
+        ),
+        FormField::new(
+            "Dataset",
+            clap_arg("dataset").default,
+            FieldKind::DatasetPicker,
+            "Workload",
+        ),
+        FormField::new(
+            "Inference Context",
+            context.default,
+            FieldKind::Enum {
+                options: context.values,
+            },
+            "Workload",
+        ),
+        FormField::new("Experts Dir", "", FieldKind::Path, "Workload"),
+    ];
+    for &(id, label, min, max) in WORKLOAD_COUNTS {
+        fields.push(FormField::new(
+            label,
+            clap_arg(id).default,
+            FieldKind::Integer { min, max },
+            "Workload",
+        ));
+    }
+    let mut json = FormField::new("JSON Report", "", FieldKind::Path, "Output");
+    json.optional = true;
+    fields.push(json);
+    fields
+}
+
+/// Which fields a mode shows. The model is the workload's only with the
+/// custom preset (a preset names its own); the shape knobs are basic's alone.
+fn visibility(view: &FormView<'_>, field: &FormField) -> bool {
+    let workload = view.value("Mode") != "basic";
+    let custom = view.value("Preset") == CUSTOM;
+    match (field.section.as_str(), field.label.as_str()) {
+        ("Mode", _) => true,
+        (_, "Model") => !workload || custom,
+        ("Bench", _) => !workload,
+        ("Workload", "Preset") | ("Workload", "Experts Dir") => workload,
+        ("Workload", "Inference Warmup") | ("Workload", "Inference Session Repeats") => workload,
+        ("Workload", _) => workload && custom,
+        ("Output", _) => workload,
         _ => true,
     }
 }
 
-// ── Rendering ──────────────────────────────────────────────────────────
+/// The benchmark tab.
+pub struct BenchTab {
+    panel: JobPanel,
+}
 
 impl BenchTab {
-    pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
-        let [config_area, right_area] =
-            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .areas(area);
-
-        let mode = self.form.value("Mode");
-        self.form
-            .render_list(config_area, buf, "Bench Configuration", move |f| {
-                section_visible(&mode, &f.section)
-            });
-
-        let [trials_area, log_area] =
-            Layout::vertical([Constraint::Min(10), Constraint::Length(10)]).areas(right_area);
-        self.render_trials(trials_area, buf);
-        self.log.render(log_area, buf, "Bench Log");
+    pub fn new() -> Self {
+        let mut fields = FormTabState::for_spec::<BenchSpec>().fields;
+        let workload = workload_fields();
+        // Mode first, then the spec's model, then the rest of the workload's,
+        // then the spec's shape, then the report.
+        let mut ordered = Vec::new();
+        let mut workload = workload.into_iter();
+        ordered.extend(workload.next());
+        ordered.extend(fields.drain(..1));
+        ordered.extend(workload);
+        ordered.extend(fields);
+        let form = FormTabState::new(ordered).with_visibility(visibility);
+        Self {
+            panel: JobPanel::with_form("Bench", form),
+        }
     }
 
-    fn render_trials(&self, area: Rect, buf: &mut Buffer) {
-        let (tone, label, detail) = match &self.status {
-            BenchStatus::Idle => (StatusTone::Idle, "Idle", None),
-            BenchStatus::Running { mode } => (StatusTone::Running, "Running", Some(mode.as_str())),
-            BenchStatus::Completed => (StatusTone::Completed, "Completed", None),
-            BenchStatus::Failed(msg) => (StatusTone::Failed, "Failed", Some(msg.as_str())),
-        };
+    fn is_workload(&self) -> bool {
+        self.panel.form.value("Mode") != "basic"
+    }
 
-        let block = Block::default()
-            .title(" Trials ")
-            .title_style(THEME.block_title)
-            .borders(Borders::ALL)
-            .border_style(THEME.block);
-        let inner = block.inner(area);
-        block.render(area, buf);
+    /// The report file, if one was asked for.
+    pub fn report_path(&self) -> Option<String> {
+        let path = self.panel.form.value("JSON Report");
+        (self.is_workload() && !path.is_empty()).then_some(path)
+    }
 
-        // Reserve the first line for the status badge.
-        let [header_area, rest] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
-        Paragraph::new(status_line(tone, label, detail)).render(header_area, buf);
-
-        if self.trials.is_empty() {
-            let hint = match &self.status {
-                BenchStatus::Idle => "Press S to start a benchmark.",
-                BenchStatus::Running { .. } => "Waiting for first trial...",
-                BenchStatus::Completed => "No measured trials.",
-                BenchStatus::Failed(_) => "Run failed before any trial completed.",
-            };
-            Paragraph::new(Line::from(Span::styled(
-                format!("  {hint}"),
-                THEME.text_muted,
-            )))
-            .render(rest, buf);
-            return;
-        }
-
-        let header = Row::new(vec![
-            Cell::from("Trial").style(THEME.table_header),
-            Cell::from("Prompt tok/s").style(THEME.table_header),
-            Cell::from("Decode tok/s").style(THEME.table_header),
-            Cell::from("Peak GB").style(THEME.table_header),
-        ]);
-
-        let rows: Vec<Row<'_>> = self
-            .trials
-            .iter()
-            .map(|t| {
-                Row::new(vec![
-                    Cell::from(format!("{}", t.index)),
-                    Cell::from(format!("{:.1}", t.prompt_tps)),
-                    Cell::from(format!("{:.1}", t.generation_tps)),
-                    Cell::from(format!("{:.2}", t.peak_memory_gb)),
-                ])
-            })
-            .collect();
-
-        let widths = [
-            Constraint::Length(7),
-            Constraint::Length(14),
-            Constraint::Length(14),
-            Constraint::Length(10),
-        ];
-
-        // Reserve the last line for the averages summary.
-        let [table_area, summary_area] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(rest);
-
-        let table = Table::new(rows, widths).header(header).column_spacing(2);
-        Widget::render(table, table_area, buf);
-
-        if let (Some(pp), Some(gg)) = (self.avg_prompt_tps(), self.avg_generation_tps()) {
-            let mut spans = vec![
-                Span::styled("  Avg ", THEME.kv_key),
-                Span::styled(format!("prompt {pp:.1} "), THEME.kv_value),
-                Span::styled("| ", THEME.text_muted),
-                Span::styled(format!("decode {gg:.1} "), THEME.kv_value),
-            ];
-            if let Some(peak) = self.peak_mem_gb() {
-                spans.extend([
-                    Span::styled("| ", THEME.text_muted),
-                    Span::styled(format!("peak {peak:.2} GB"), THEME.kv_value),
-                ]);
+    fn workload_plan(&self) -> Result<LaunchPlan, Vec<FormIssue>> {
+        let form = &self.panel.form;
+        let mut issues = Vec::new();
+        let value_of = |label: &str| form.value(label);
+        let preset = value_of("Preset");
+        let mut argv: Vec<String> = Vec::new();
+        if preset != CUSTOM {
+            argv.extend(["--preset".to_string(), preset]);
+        } else {
+            let model = value_of("Model");
+            if model.is_empty() {
+                issues.push(FormIssue {
+                    field: "Model".into(),
+                    message: "required with the custom preset".into(),
+                });
             }
-            Paragraph::new(Line::from(spans)).render(summary_area, buf);
+            if value_of("Dataset").is_empty() {
+                issues.push(FormIssue {
+                    field: "Dataset".into(),
+                    message: "required with the custom preset".into(),
+                });
+            }
+            argv.extend(["--model".to_string(), model]);
+            argv.extend(["--dataset".to_string(), value_of("Dataset")]);
+            argv.extend([
+                "--inference-context".to_string(),
+                value_of("Inference Context"),
+            ]);
+            for &(id, label, _, _) in WORKLOAD_COUNTS {
+                // The warm-up and repeat counts also apply to a preset.
+                if matches!(id, "inference-warmup-passes" | "inference-session-repeats") {
+                    continue;
+                }
+                argv.extend([format!("--{id}"), value_of(label)]);
+            }
+        }
+        for &(id, label, _, _) in WORKLOAD_COUNTS {
+            if matches!(id, "inference-warmup-passes" | "inference-session-repeats") {
+                argv.extend([format!("--{id}"), value_of(label)]);
+            }
+        }
+        let experts = value_of("Experts Dir");
+        if !experts.is_empty() {
+            argv.extend(["--experts-dir".to_string(), experts]);
+        }
+        let report = value_of("JSON Report");
+        if !report.is_empty() {
+            if !report.ends_with(".json") {
+                issues.push(FormIssue {
+                    field: "JSON Report".into(),
+                    message: "must end in .json".into(),
+                });
+            }
+            argv.extend(["--json".to_string(), "--output".to_string(), report]);
+        }
+        if !issues.is_empty() {
+            return Err(issues);
+        }
+        Ok(LaunchPlan {
+            subcommand: WORKLOAD.to_string(),
+            argv,
+            ..LaunchPlan::default()
+        })
+    }
+
+    /// The lines of the log from the benchmark's own results heading on.
+    fn results(&self) -> Vec<String> {
+        let lines = self.panel.log.tail_text(usize::MAX);
+        let start = lines
+            .iter()
+            .rposition(|l| l.starts_with("Results (") || l.starts_with("Workload Benchmark"));
+        match start {
+            Some(i) => lines[i..]
+                .iter()
+                .filter(|l| !l.trim().is_empty())
+                .take(24)
+                .map(|l| l.to_string())
+                .collect(),
+            None => Vec::new(),
         }
     }
 }
 
-/// Parse a line like
-/// `Trial 3:  prompt_tps=512.4, generation_tps=102.1, peak_memory=9.23`
-/// into a `BenchTrial`. Returns `None` if the line doesn't match.
-fn parse_trial_line(line: &str) -> Option<BenchTrial> {
-    let trimmed = line.trim_start();
-    let rest = trimmed.strip_prefix("Trial ")?;
-    let (idx_part, rest) = rest.split_once(':')?;
-    let index: usize = idx_part.trim().parse().ok()?;
-
-    let prompt_tps = extract_kv_f64(rest, "prompt_tps")?;
-    let generation_tps = extract_kv_f64(rest, "generation_tps")?;
-    let peak_memory_gb = extract_kv_f64(rest, "peak_memory")?;
-
-    Some(BenchTrial {
-        index,
-        prompt_tps,
-        generation_tps,
-        peak_memory_gb,
-    })
+impl Default for BenchTab {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-fn extract_kv_f64(hay: &str, key: &str) -> Option<f64> {
-    let pos = hay.find(key)?;
-    let after = &hay[pos + key.len()..];
-    let after = after.trim_start();
-    let after = after.strip_prefix('=')?.trim_start();
-    let end = after
-        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e'))
-        .unwrap_or(after.len());
-    after[..end].parse::<f64>().ok()
+impl FormTab for BenchTab {
+    fn panel(&self) -> &JobPanel {
+        &self.panel
+    }
+
+    fn panel_mut(&mut self) -> &mut JobPanel {
+        &mut self.panel
+    }
+
+    fn plan(&self) -> Result<LaunchPlan, Vec<FormIssue>> {
+        if self.is_workload() {
+            self.workload_plan()
+        } else {
+            self.panel.plan_for::<BenchSpec>(|_, _| {})
+        }
+    }
+
+    fn start_title(&self) -> String {
+        "Run benchmark?".to_string()
+    }
+
+    fn summary(&self) -> Vec<String> {
+        let form = &self.panel.form;
+        if self.is_workload() {
+            let mut lines = vec![format!("Mode      workload ({})", form.value("Preset"))];
+            if form.value("Preset") == CUSTOM {
+                lines.push(format!("Model     {}", form.value("Model")));
+                lines.push(format!("Dataset   {}", form.value("Dataset")));
+            }
+            lines.push(format!(
+                "Samples   {} prompts x {} decode steps",
+                form.value("Prompt Samples"),
+                form.value("Decode Steps")
+            ));
+            if let Some(report) = self.report_path() {
+                lines.push(format!("Report    {report}"));
+            }
+            lines
+        } else {
+            form.summary()
+        }
+    }
+
+    fn render(&mut self, area: Rect, buf: &mut Buffer, _: &Telemetry<'_>) {
+        let results = self.results();
+        let mut extras: Vec<Line<'static>> = Vec::new();
+        if !results.is_empty() {
+            extras.push(Line::from(""));
+            extras.push(Line::from(Span::styled("  Results", THEME.kv_key)));
+            let finished = matches!(self.panel.run, RunState::Completed { .. });
+            for line in results {
+                extras.push(Line::from(Span::styled(
+                    format!("  {line}"),
+                    if finished { THEME.text } else { THEME.text_dim },
+                )));
+            }
+        }
+        let height = (8 + extras.len() as u16).min(area.height / 2).max(8);
+        render_standard(&mut self.panel, area, buf, height, extras, "Benchmark Log");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::cli_check::assert_parses;
+    use crate::tui::tabs::panel::Pick;
 
     #[test]
-    fn parses_trial_line() {
-        let t =
-            parse_trial_line("Trial 3:  prompt_tps=512.4, generation_tps=102.1, peak_memory=9.23")
-                .unwrap();
-        assert_eq!(t.index, 3);
-        assert!((t.prompt_tps - 512.4).abs() < 1e-3);
-        assert!((t.generation_tps - 102.1).abs() < 1e-3);
-        assert!((t.peak_memory_gb - 9.23).abs() < 1e-3);
+    fn the_workload_forms_defaults_are_the_commands_own() {
+        let tab = BenchTab::new();
+        let form = &tab.panel.form;
+        // These are what `pmetal bench-workload --help` says.
+        assert_eq!(form.value("Prompt Samples"), "8");
+        assert_eq!(form.value("Decode Steps"), "32");
+        assert_eq!(form.value("Inference Warmup"), "2");
+        assert_eq!(form.value("Train Steps"), "4");
+        assert_eq!(form.value("Inference Context"), "auto");
+        assert_eq!(
+            form.value("Dataset"),
+            "TeichAI/gemini-3-pro-preview-high-reasoning-250x"
+        );
+        // The presets and context sources are the commands' value enums.
+        let preset = form.fields.iter().find(|f| f.label == "Preset").unwrap();
+        let FieldKind::Enum { options } = &preset.kind else {
+            panic!("an enum")
+        };
+        assert_eq!(options[0], "custom");
+        assert!(options.contains(&"dense-qwen3".to_string()), "{options:?}");
+        let context = form
+            .fields
+            .iter()
+            .find(|f| f.label == "Inference Context")
+            .unwrap();
+        let FieldKind::Enum { options } = &context.kind else {
+            panic!("an enum")
+        };
+        assert_eq!(options, &["auto", "prompt", "text-prefix"]);
     }
 
     #[test]
-    fn rejects_unrelated_lines() {
-        assert!(parse_trial_line("Running warmup..").is_none());
-        assert!(parse_trial_line("Averages: prompt_tps=500.0").is_none());
+    fn both_modes_launch_what_the_cli_accepts() {
+        let mut tab = BenchTab::new();
+        // Workload, custom: every knob is spelled.
+        let plan = tab.plan().unwrap();
+        assert_eq!(plan.subcommand, "bench-workload");
+        assert!(plan.argv.contains(&"--prompt-samples".to_string()));
+        assert_parses(&plan);
+        // A preset stands alone, with the warm-up counts and a report.
+        tab.panel.form.set_value("Preset", "dense-qwen3");
+        tab.panel.form.set_value("JSON Report", "/tmp/report.json");
+        let plan = tab.plan().unwrap();
+        assert!(
+            plan.argv
+                .starts_with(&["--preset".to_string(), "dense-qwen3".to_string()])
+        );
+        assert!(!plan.argv.contains(&"--model".to_string()));
+        assert!(plan.argv.contains(&"--inference-warmup-passes".to_string()));
+        assert!(
+            plan.argv
+                .windows(3)
+                .any(|w| w == ["--json", "--output", "/tmp/report.json"])
+        );
+        assert_parses(&plan);
+        // Basic mode is the training benchmark: it takes no report flags.
+        tab.panel.form.set_value("Mode", "basic");
+        tab.on_pick(
+            "Model",
+            Pick::Model {
+                id: "Qwen/Qwen3-0.6B",
+                architecture: None,
+            },
+        );
+        let plan = tab.plan().unwrap();
+        assert_eq!(plan.subcommand, "bench");
+        assert!(
+            !plan.argv.contains(&"--json".to_string()),
+            "{:?}",
+            plan.argv
+        );
+        assert_parses(&plan);
+    }
+
+    #[test]
+    fn problems_name_the_field() {
+        let mut tab = BenchTab::new();
+        tab.panel.form.set_value("Model", "");
+        tab.panel.form.set_value("JSON Report", "report.txt");
+        let issues = tab.plan().unwrap_err();
+        let fields: Vec<&str> = issues.iter().map(|i| i.field.as_str()).collect();
+        assert_eq!(fields, ["Model", "JSON Report"]);
+        tab.panel.form.set_value("Mode", "basic");
+        tab.panel.form.set_value("Batch Size", "0");
+        let issues = tab.plan().unwrap_err();
+        assert_eq!(issues[0].field, "Batch Size");
+    }
+
+    #[test]
+    fn each_mode_shows_its_own_fields() {
+        let mut tab = BenchTab::new();
+        let shown = |tab: &mut BenchTab| -> Vec<String> {
+            let mut seen = Vec::new();
+            tab.panel.form.focus_field("Mode");
+            for _ in 0..tab.panel.form.fields.len() {
+                tab.panel.form.next_param();
+                seen.push(tab.panel.form.current().unwrap().label.clone());
+            }
+            seen
+        };
+        let workload = shown(&mut tab);
+        assert!(workload.contains(&"Dataset".to_string()));
+        assert!(
+            !workload.contains(&"Batch Size".to_string()),
+            "{workload:?}"
+        );
+        tab.panel.form.set_value("Preset", "dense-qwen3");
+        let preset = shown(&mut tab);
+        assert!(
+            !preset.contains(&"Dataset".to_string()),
+            "a preset names its own: {preset:?}"
+        );
+        assert!(preset.contains(&"Inference Warmup".to_string()));
+        tab.panel.form.set_value("Mode", "basic");
+        let basic = shown(&mut tab);
+        assert!(
+            basic.contains(&"Batch Size".to_string()) && basic.contains(&"Seq Len".to_string())
+        );
+        assert!(!basic.contains(&"Prompt Samples".to_string()));
+    }
+
+    #[test]
+    fn the_results_block_is_the_benchmarks_own_report_verbatim() {
+        let mut tab = BenchTab::new();
+        for line in [
+            "Training benchmark",
+            "  Model:        Qwen/Qwen3-0.6B",
+            "",
+            "Training...",
+            "",
+            "Results (4 measured steps)",
+            "  Step time:    median 812.4 ms (min 790.1, max 840.9)",
+            "  Throughput:   median 1260 tokens/s (1024 tokens per step)",
+            "  Peak memory:  3.21 GB",
+            "  Final loss:   2.3456",
+        ] {
+            tab.panel.log.push(line, false);
+        }
+        let results = tab.results();
+        assert_eq!(results.len(), 5);
+        assert_eq!(results[0], "Results (4 measured steps)");
+        assert!(results[2].contains("1260 tokens/s"));
+        // A workload report starts at its own heading.
+        let mut tab = BenchTab::new();
+        for line in [
+            "noise",
+            "Workload Benchmark",
+            "  Device:  Apple M4 Max",
+            "Inference",
+        ] {
+            tab.panel.log.push(line, false);
+        }
+        assert_eq!(tab.results()[0], "Workload Benchmark");
     }
 }

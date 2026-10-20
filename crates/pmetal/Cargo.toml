@@ -63,7 +63,7 @@ cli = [
 ]
 
 # Dashboard: TUI (adds ratatui/crossterm on top of cli)
-dashboard = ["cli", "dep:ratatui", "dep:crossterm", "dep:futures", "dep:tokio-util"]
+dashboard = ["cli", "dep:ratatui", "dep:crossterm", "dep:futures", "dep:tokio-util", "dep:pmetal-supervisor"]
 
 # Serve: HTTP inference server
 serve = ["cli", "dep:pmetal-serve"]
@@ -90,6 +90,7 @@ pmetal-merge = { workspace = true, optional = true }
 pmetal-vocoder = { workspace = true, optional = true }
 pmetal-serve = { workspace = true, optional = true }
 pmetal-mcp = { workspace = true, optional = true }
+pmetal-supervisor = { workspace = true, optional = true }
 
 # Always-on (SDK facade needs these)
 serde_json = { workspace = true }
