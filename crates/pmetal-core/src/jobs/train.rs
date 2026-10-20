@@ -542,7 +542,14 @@ pub struct TrainSpec {
     pub config_path: Option<String>,
 
     /// Resume from latest checkpoint.
-    #[job(skip_descriptor, argv = "--resume", flag, default_bool = false)]
+    #[job(
+        label = "Resume",
+        group = "Training",
+        argv = "--resume",
+        flag,
+        default_bool = false,
+        help = "Continue from the latest checkpoint in the output directory"
+    )]
     #[serde(default)]
     pub resume: bool,
 
@@ -772,7 +779,8 @@ mod tests {
         assert!(descs.iter().any(|d| d.name == "learning_rate"));
         // CLI-only fields are excluded from the descriptor list.
         assert!(!descs.iter().any(|d| d.name == "config_path"));
-        assert!(!descs.iter().any(|d| d.name == "resume"));
+        // `resume` is a form field (a toggle).
+        assert!(descs.iter().any(|d| d.name == "resume"));
     }
 
     #[test]
