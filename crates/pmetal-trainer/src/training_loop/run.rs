@@ -533,11 +533,16 @@ impl TrainingLoop {
                 for cb in &mut self.callbacks {
                     cb.on_step_end_with_metrics(&step_metrics);
                 }
-                if self.check_cancelled() {
-                    tracing::info!("Training cancelled by callback at step {}", self.step);
-                    return Err(SftError::Cancelled);
-                }
             }
+        }
+
+        // After every optimizer step, not only the logged ones: a request to
+        // stop (a caller's Ctrl-C, say) must not wait for the next log line,
+        // which at `log_every = 10` is ten steps off. The run ends as it does
+        // at `max_steps`, so the caller saves what has been trained.
+        if self.check_cancelled() {
+            tracing::info!("Training stopped by a callback after step {}", self.step);
+            return Ok(Flow::Stop);
         }
 
         self.maybe_evaluate(run)?;

@@ -1336,6 +1336,51 @@ fn leftover_micro_batches_take_a_last_optimizer_step() {
     assert!(lora_diff(&model.lora_parameters(), &before) > 0.0);
 }
 
+/// A callback that asks the run to stop once `should_stop` has been asked
+/// `after` times.
+#[derive(Clone)]
+struct StopWhenAsked {
+    asked: Arc<std::sync::atomic::AtomicUsize>,
+    after: usize,
+}
+
+impl TrainingCallback for StopWhenAsked {
+    fn should_stop(&self) -> bool {
+        self.asked
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            >= self.after
+    }
+}
+
+/// A callback's request to stop is honoured after the step it follows, whether
+/// or not that step is one the run logs on (`log_every` defaults to 10), and
+/// the run ends cleanly (`Ok`), so the caller still saves what was trained.
+#[test]
+fn a_callback_that_asks_to_stop_ends_the_run_after_that_step() {
+    let mut config = epoch_based_config();
+    config.log_every = 100;
+    config.training.gradient_accumulation_steps = 1;
+    config.training.num_epochs = 1;
+    config.training.warmup_ratio = None;
+    let stop = StopWhenAsked {
+        asked: Arc::default(),
+        after: 3,
+    };
+    let mut training_loop = TrainingLoop::new(config).unwrap();
+    training_loop.add_callback(Box::new(stop.clone()));
+    let mut model = small_model();
+    let before = model.lora_parameters();
+    training_loop
+        .run(&mut model, create_dummy_dataset(20, 8), None, None)
+        .expect("a requested stop is a clean end, not an error");
+    // Asked after steps 1, 2, 3 and 4: it says yes the fourth time.
+    assert_eq!(training_loop.current_step(), 4);
+    assert!(
+        lora_diff(&model.lora_parameters(), &before) > 0.0,
+        "the steps taken before the stop trained the model"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Failures
 // ---------------------------------------------------------------------------
