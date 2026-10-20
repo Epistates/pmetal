@@ -35,13 +35,15 @@ escape the roots either.
 
 ## Jobs
 
-`jobs::JobManager` starts a `pmetal` subcommand in its own process group and
-owns it until it ends. Output is one ordered sequence, bounded by lines, bytes
-and line length, with tokens redacted. Metrics come from the `--log-metrics`
-file the server asks the command to write (the TUI reads the same file) and from
-`JobEvent` lines on standard output. The manager caps running jobs and kept
-finished jobs, and `shutdown` stops what is left; `run_stdio` calls it however
-the server ends.
+`jobs::JobManager` is the MCP face of `pmetal_supervisor::Supervisor`, the
+supervisor the terminal UI runs its jobs under as well. It starts a `pmetal`
+subcommand in its own process group and owns it until it ends. Output is one
+ordered sequence, bounded by lines, bytes and line length, with tokens redacted
+and terminal escape sequences removed. Metrics come from the `--log-metrics`
+file the server asks the command to write and from `JobEvent` lines on standard
+output. The manager caps running jobs and kept finished jobs, `stop_job` returns
+once the job is gone, and `shutdown` stops what is left; `run_stdio` calls it
+however the server ends.
 
 Commands that run to completion go through `native::Core::run` (a semaphore, so
 a few at a time) and `util::run_command` (time limit, bounded output,

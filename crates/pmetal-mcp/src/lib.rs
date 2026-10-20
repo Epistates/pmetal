@@ -345,6 +345,7 @@ impl PmetalMcpServer {
                                 argv: prepared.argv,
                                 output: prepared.output,
                                 metrics_file: prepared.metrics_file,
+                                ..JobRequest::default()
                             })
                             .await?;
                         structured(&JobStarted::new(&id, prepared.subcommand, output))
