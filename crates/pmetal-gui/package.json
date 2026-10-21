@@ -8,7 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "test": "bun test",
-    "check": "svelte-kit sync && svelte-check --tsgo --tsconfig ./tsconfig.json",
+    "check": "rm -rf .svelte-kit/.svelte-check && svelte-kit sync && svelte-check --tsgo --tsconfig ./tsconfig.json",
     "tauri": "tauri"
   },
   "license": "MIT OR Apache-2.0",
