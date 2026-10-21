@@ -1,87 +1,134 @@
 # Full Control
 
-Advanced Python SDK usage — custom training loops, callbacks, and model operations.
+Advanced Python SDK usage: job specs, callbacks, running any `pmetal` command, and the Hub.
 
-For full control over training and inference, use the lower-level Python classes.
+## The job specs
 
-## Custom Training
+Every `pmetal` subcommand has a spec class (`TrainSpec`, `GrpoSpec`, `PreferenceSpec`, `DistillSpec`,
+`RlkdSpec`, `EmbedTrainSpec`, `QuantizeSpec`, `MergeSpec`, `FuseSpec`, `ServeSpec`, `InferSpec`, and
+the rest). They wrap the job specs of `pmetal-core`, the one definition of each command's fields,
+defaults, bounds and checks that the command line, TUI, GUI, MCP server and Python share.
 
 ```python
 import pmetal
 
-# Configure training components
-lora_config = pmetal.LoraConfig(r=16, alpha=32.0)
-training_config = pmetal.TrainingConfig(
-    learning_rate=2e-4,
-    num_epochs=3,
-    batch_size=4,
-    max_seq_len=2048,
+spec = pmetal.TrainSpec(
+    model="Qwen/Qwen3-0.6B",
+    dataset="train.jsonl",
+    epochs=2,
+    lora_r=16,
+    optimizer="muon",
+    lr_schedule="wsd",
+    wsd_decay_style="cosine",
 )
+spec.learning_rate = 1e-4
 
-# Create trainer
-trainer = pmetal.Trainer(
-    model_id="Qwen/Qwen3-0.6B",
-    lora_config=lora_config,
-    training_config=training_config,
-    dataset_path="train.jsonl",
-)
+spec.validation_errors()   # [] when valid
+spec.normalize()           # raises SpecValidationError listing every problem
+spec.to_argv()             # the arguments of `pmetal train`
+spec.lora_config()         # the adapter config the spec asks for, as a dict
+spec.training_config()     # the optimisation settings, as a dict
+pmetal.TrainSpec.fields()  # every field: type, default, bounds, flag, help
+```
 
-# Add callbacks
-trainer.add_callback(pmetal.ProgressCallback())
-trainer.add_callback(pmetal.LoggingCallback())
+Misspelled fields and wrongly typed values are errors that name the field, and type checkers
+reject them (`TrainSpec(epochz=3)`, `spec.optimizer = "sgdd"`).
 
-# Train
+## Training with callbacks
+
+```python
+class Collect:
+    def __init__(self):
+        self.losses = []
+
+    def on_step_end(self, step, loss):
+        self.losses.append(loss)
+
+    def should_stop(self):
+        return len(self.losses) > 1 and self.losses[-1] < 0.05
+
+trainer = pmetal.Trainer(spec, callbacks=[Collect(), pmetal.LoggingCallback(10)])
 result = trainer.train()
 ```
 
-## Model Loading
+| Method | Called |
+|--------|--------|
+| `on_train_start()` | when the model and data are ready |
+| `on_step_end(step, loss)`, `on_step_metrics(metrics)` | after each optimizer step the run logs: the first, then every `logging_steps` |
+| `on_train_end()` | when the run is over, however it ended |
+| `should_stop() -> bool` | after every optimizer step; true ends the run cleanly |
+
+`pmetal.ProgressCallback(total_steps)`, `pmetal.LoggingCallback(log_every)` and
+`pmetal.MetricsJsonCallback(path)` are the trainer's own. An exception in a callback, like Ctrl-C,
+ends the run after the current step with the weights saved, and is raised from `train()`.
+
+## Running any command
+
+`pmetal.run(spec)` runs the `pmetal` command a spec stands for under the job supervisor the TUI, MCP
+server and GUI share (its own process group, credentials redacted from its output, a stop that reaches
+what the job spawned), so everything the command line does is reachable:
 
 ```python
-# Load model
-model = pmetal.Model.load("Qwen/Qwen3-0.6B")
+pmetal.run(pmetal.MergeSpec(model_a="a", model_b="b", output="merged"))
 
-# Generate
-output = model.generate("Hello world", temperature=0.7)
-print(output)
+job = pmetal.start(
+    pmetal.GrpoSpec(model="Qwen/Qwen3-0.6B", dataset="prompts.jsonl"),
+    on_event=lambda event: print(event["event"]),
+)
+for event in job:          # training commands stream their events
+    ...
+result = job.wait()        # JobFailedError if the command fails; job.cancel() to stop it
 ```
 
-## Configuration Classes
+`job.cancel()` sends SIGTERM to the job's process group and SIGKILL after `stop_grace` seconds;
+`pmetal train` finishes its step and saves the adapter first. The command line is found from `cli=`,
+then `PMETAL_BIN`, then the copy shipped in the package, then `PATH`.
 
-| Class | Description |
-|-------|-------------|
-| `pmetal.LoraConfig` | LoRA rank, alpha, target modules |
-| `pmetal.TrainingConfig` | Learning rate, epochs, batch size, scheduler |
-| `pmetal.GenerationConfig` | Temperature, top-k, top-p, max tokens |
-| `pmetal.DataLoaderConfig` | Dataset format, sequence packing |
-
-## Callbacks
-
-| Callback | Description |
-|----------|-------------|
-| `pmetal.ProgressCallback()` | Progress bar display |
-| `pmetal.LoggingCallback()` | Console logging |
-| `pmetal.MetricsJsonCallback(path)` | JSONL metrics file |
-| Custom | Subclass with `on_step_end(step, loss)` |
-
-## Hub Operations
+## Model loading and generation
 
 ```python
-# Download a model
-pmetal.download_model("Qwen/Qwen3-0.6B")
+model = pmetal.Model.load("Qwen/Qwen3-0.6B")
+output = model.generate(
+    "Hello world",
+    temperature=0.7,
+    seed=42,
+    logit_bias={tokenizer_id: -100.0},
+)
+```
 
-# Download a specific file
-pmetal.download_file("Qwen/Qwen3-0.6B", "config.json")
+`Model` keeps its weights on a thread of its own: it is safe to share between threads, generation
+releases the GIL, and Ctrl-C stops it at the next token. `pmetal.GenerationConfig` bundles sampling
+settings; what a config leaves unset takes the model's own default.
+
+`pmetal.DFlashGenerator(target, draft).generate(prompt_ids, seed=...)` does block-diffusion
+speculative decoding; its tokens are the target's own.
+
+## Hub operations
+
+```python
+path = pmetal.download_model("Qwen/Qwen3-0.6B", revision="main", verify="size", progress=print)
+pmetal.verify_model(path).is_complete
+pmetal.plan_download("Qwen/Qwen3-0.6B").total_bytes
+pmetal.search_models("qwen3 0.6b", limit=5)            # each result carries its fit on this Mac
+pmetal.estimate_fit(path, context_length=8192, kv_cache_bits=8)
 ```
 
 ## Tokenizer
 
 ```python
-tokenizer = pmetal.Tokenizer("Qwen/Qwen3-0.6B")
-tokens = tokenizer.encode("Hello world")
-text = tokenizer.decode(tokens)
+tokenizer = pmetal.Tokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+ids = tokenizer.encode("Hello world")
+text = tokenizer.decode(ids)
 ```
+
+## Errors
+
+Everything pmetal raises is a `pmetal.PMetalError`: `ConfigError` (a `ValueError`),
+`SpecValidationError`, `HubError`, `ModelLoadError`, `TokenizerError`, `TrainingError`,
+`BackendError`, `OutOfMemoryError` (a `MemoryError`), `CancelledError`, and `JobError`. I/O failures
+are the matching `OSError` subclass.
 
 ## See Also
 
-- [Quick Start](/python/quick-start/) — Simplified API
-- [Rust SDK](/sdk/advanced/) — Rust equivalent
+- [Quick Start](/python/quick-start/): the short form
+- [Rust SDK](/sdk/advanced/): Rust equivalent

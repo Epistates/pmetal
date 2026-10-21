@@ -260,62 +260,26 @@ orchestration and ANE-specific workflows.
 
 ## Python SDK
 
-PMetal exposes a Python extension module via PyO3. Install with `maturin develop` from `crates/pmetal-py`.
-
-### Quick Start (Easy API)
+PMetal exposes a typed Python extension module (PyO3, one abi3 wheel for CPython 3.11 and later; macOS 14+,
+Apple Silicon). Every `pmetal` command is a spec class (`TrainSpec`, `GrpoSpec`, `MergeSpec`, ...) with the
+command line's own fields, defaults and checks. Install with `pip install pmetal`, or `maturin develop` from
+`crates/pmetal-py`. See [`crates/pmetal-py/README.md`](crates/pmetal-py/README.md).
 
 ```python
 import pmetal
 
-# Fine-tune with sensible defaults
-result = pmetal.finetune(
-    "Qwen/Qwen3-0.6B",
-    "train.jsonl",
-    lora_r=16,
-    learning_rate=2e-4,
-    epochs=3,
-)
-print(f"Loss: {result['final_loss']}, Steps: {result['total_steps']}")
+# Fine-tune in this process (releases the GIL; Ctrl-C stops after the step and keeps the weights)
+spec = pmetal.TrainSpec(model="Qwen/Qwen3-0.6B", dataset="train.jsonl", epochs=3, lora_r=16)
+result = pmetal.Trainer(spec, callbacks=[pmetal.LoggingCallback(10)]).train()
+print(result.final_loss, result.total_steps, result.weights_path)
+
+# Any other command, as the command line runs it
+pmetal.run(pmetal.MergeSpec(model_a="a", model_b="b", output="merged"))
 
 # Inference
-text = pmetal.infer("Qwen/Qwen3-0.6B", "What is 2+2?")
-print(text)
-
-# Inference with LoRA adapter
-text = pmetal.infer(
-    "Qwen/Qwen3-0.6B",
-    "Explain quantum entanglement",
-    lora="./output/adapter_model.safetensors",
-)
-```
-
-### Full Control
-
-```python
-import pmetal
-
-# Configure training components
-lora_config = pmetal.LoraConfig(r=16, alpha=32.0)
-training_config = pmetal.TrainingConfig(
-    learning_rate=2e-4,
-    num_epochs=3,
-    batch_size=4,
-    max_seq_len=2048,
-)
-
-# Create trainer
-trainer = pmetal.Trainer(
-    model_id="Qwen/Qwen3-0.6B",
-    lora_config=lora_config,
-    training_config=training_config,
-    dataset_path="train.jsonl",
-)
-trainer.add_callback(pmetal.ProgressCallback())
-result = trainer.train()
-
-# Load model for inference
 model = pmetal.Model.load("Qwen/Qwen3-0.6B")
-print(model.generate("Hello world", temperature=0.7))
+print(model.generate("The capital of France is", max_tokens=16, temperature=0.0))
+print(pmetal.infer("Qwen/Qwen3-0.6B", "What is 2+2?", chat=True, no_thinking=True))
 ```
 
 ## Installation

@@ -247,6 +247,14 @@ lto = "thin"
 codegen-units = 4
 strip = false
 
+# The Python wheel: release, but a panic unwinds. `release` aborts, and an
+# abort in an extension module kills the interpreter with SIGABRT instead of
+# raising `pyo3_runtime.PanicException` (PyO3 catches the unwind at every call
+# into Rust). `pmetal-py`'s pyproject builds with it.
+[profile.wheel]
+inherits = "release"
+panic = "unwind"
+
 [profile.dev]
 opt-level = 1
 # File and line in backtraces and profiler stacks, without full DWARF for every

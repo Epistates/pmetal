@@ -1,0 +1,7 @@
+# Build products placed in the package by `maturin develop` and the wheel build.
+py_src/pmetal/*.so
+py_src/pmetal/mlx.metallib
+py_src/pmetal/_bin/
+__pycache__/
+.mypy_cache/
+.pytest_cache/

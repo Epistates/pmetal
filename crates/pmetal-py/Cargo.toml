@@ -16,14 +16,25 @@ pyo3 = { workspace = true, features = ["extension-module", "abi3-py311"] }
 pmetal-core = { workspace = true }
 pmetal-lib = { workspace = true, features = ["hub", "data", "models", "lora", "trainer"] }
 pmetal-runtime = { workspace = true }
+pmetal-metal = { workspace = true }
 pmetal-hub = { workspace = true }
 pmetal-models = { workspace = true }
 pmetal-lora = { workspace = true }
 pmetal-data = { workspace = true }
 pmetal-trainer = { workspace = true }
+pmetal-supervisor = { workspace = true }
+anyhow = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 tracing = { workspace = true }
+
+[features]
+# Hooks that make the extension misbehave on purpose, for the tests that check
+# it fails the way it should (a Rust panic must be a Python exception). Never in
+# a published wheel.
+test-hooks = []
 
 [build-dependencies]
 pyo3-build-config = { workspace = true }

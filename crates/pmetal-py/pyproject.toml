@@ -4,29 +4,82 @@ build-backend = "maturin"
 
 [project]
 name = "pmetal"
+description = "High-performance LLM fine-tuning and inference for Apple Silicon"
+readme = "README.md"
 requires-python = ">=3.11"
-description = "High-performance LLM fine-tuning for Apple Silicon"
-license = { text = "MIT OR Apache-2.0" }
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+keywords = ["llm", "fine-tuning", "lora", "apple-silicon", "mlx", "metal", "inference"]
 classifiers = [
     "Development Status :: 3 - Alpha",
-    "Programming Language :: Rust",
-    "Programming Language :: Python :: Implementation :: CPython",
+    "Environment :: GPU",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Natural Language :: English",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
-    "Operating System :: MacOS",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
 ]
 dynamic = ["version"]
+# No runtime dependencies: everything is in the extension.
 
 [project.urls]
+Homepage = "https://github.com/epistates/pmetal"
 Repository = "https://github.com/epistates/pmetal"
+Issues = "https://github.com/epistates/pmetal/issues"
+Changelog = "https://github.com/epistates/pmetal/blob/main/CHANGELOG.md"
+
+[dependency-groups]
+test = ["pytest>=8"]
+typing = ["mypy>=1.15", "pyright>=1.1.400"]
+dev = [{ include-group = "test" }, { include-group = "typing" }, "ruff>=0.9"]
 
 [tool.maturin]
 python-source = "py_src"
 module-name = "pmetal.pmetal"
 bindings = "pyo3"
+# `release` aborts on a panic, which would end the interpreter; `wheel` is
+# release with unwinding, so a Rust panic is a Python exception.
+profile = "wheel"
+# The wheel carries the metallib MLX loads its kernels from, and (when the
+# release job puts it there) the `pmetal` command line that `pmetal.run` runs.
+include = [
+    { path = "py_src/pmetal/mlx.metallib", format = "wheel" },
+    { path = "py_src/pmetal/_bin/pmetal", format = "wheel" },
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "real_model: needs a real model (set PMETAL_TEST_MODEL_DIR)",
+    "needs_hub: needs network access to the Hugging Face Hub (set PMETAL_TEST_HUB=1)",
+    "needs_cli: needs the real pmetal command line (set PMETAL_BIN)",
+]
+
+[tool.mypy]
+strict = true
+warn_unused_ignores = true
+
+[tool.ruff]
+line-length = 120
+extend-exclude = ["py_src/pmetal/pmetal.pyi", "stub_template.pyi"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "BLE", "S", "PT"]
+ignore = ["S101", "S603", "PT006", "PT007", "PT011", "PT012", "PT018"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "BLE", "E501", "B017", "B011"]
+"stub.py" = ["E501"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
