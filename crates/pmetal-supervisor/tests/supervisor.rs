@@ -521,3 +521,22 @@ async fn running_output_names_the_directory_of_a_running_job_only() {
     s.shutdown().await;
     assert!(matches!(s.running_output(&with), Err(Error::NotRunning)));
 }
+
+#[tokio::test]
+async fn a_job_runs_with_the_environment_it_was_given_and_that_stays_out_of_its_arguments() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = supervisor(dir.path(), r#"echo "seen=${PMETAL_TEST_SECRET:-unset}""#);
+    let id = s
+        .spawn(JobRequest {
+            env: vec![("PMETAL_TEST_SECRET".into(), "value-123".into())],
+            ..request(&[])
+        })
+        .unwrap();
+    finished(&s, &id).await;
+
+    let page = s.logs(&id, 10, None).unwrap();
+    assert_eq!(page.lines, ["seen=value-123"]);
+    // The environment is not part of the recorded command line.
+    let summary = s.summary(&id).unwrap();
+    assert!(!summary.args.iter().any(|a| a.contains("value-123")));
+}

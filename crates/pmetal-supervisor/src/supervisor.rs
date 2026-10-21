@@ -160,6 +160,11 @@ pub struct JobRequest {
     /// whole lines ([`EventKind::Delta`]). For a job whose output is a reply
     /// being typed out.
     pub deltas: bool,
+    /// Environment variables set for the job, on top of what the supervisor's
+    /// own process has. For credentials: unlike arguments they are not visible
+    /// to other users in the process list, and they are never recorded in
+    /// [`JobSummary::args`].
+    pub env: Vec<(String, String)>,
 }
 
 /// Something that happened to a job.
@@ -408,6 +413,7 @@ impl Supervisor {
             metrics_file,
             events_file,
             deltas,
+            env,
         } = request;
         let id = uuid::Uuid::new_v4().to_string();
 
@@ -419,6 +425,7 @@ impl Supervisor {
             .stderr(Stdio::piped())
             // Output goes to a pipe, not a terminal: colour codes in it are noise.
             .env("NO_COLOR", "1")
+            .envs(env)
             // A handle dropped without a stop must not leave a run behind.
             .kill_on_drop(true);
         // Its own process group: a stop signals the group, so helpers the job

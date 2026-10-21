@@ -134,6 +134,7 @@ impl JobHub {
                 events_file: plan.events_file.clone(),
                 metrics_file: None,
                 deltas: plan.deltas,
+                env: Vec::new(),
             })
             .map_err(|e| match e {
                 pmetal_supervisor::Error::TooManyRunning { limit, .. } => format!(
