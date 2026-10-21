@@ -1,30 +1,67 @@
+mod adapters;
+mod binary;
 mod commands;
+mod datasets;
+mod error;
+mod hub;
+mod inference;
+mod jobs;
+mod logging;
+mod models;
+mod paths;
+mod secrets;
+mod settings;
 mod state;
+mod system;
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use commands::*;
-use state::AppState;
-use tauri::{Manager, WindowEvent};
+use state::{AppPaths, AppState};
+use tauri::{AppHandle, Emitter, Manager, RunEvent};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+
+/// Downloads that may transfer at once.
+const DOWNLOADS_AT_ONCE: usize = 3;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Set up file + stderr logging, plus a panic hook that writes to the log.
-    let log_path = init_logging("gui");
-    install_panic_hook(log_path);
+    let log_path = logging::init("gui");
 
-    let app_state = AppState::new();
-
-    tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_dialog::init())
-        .manage(app_state)
-        .setup(|app| {
-            #[cfg(desktop)]
-            {
-                // Auto-updater disabled — requires signing key in CI.
-                // app.handle()
-                //     .plugin(tauri_plugin_updater::Builder::new().build())?;
-                app.handle().plugin(tauri_plugin_process::init())?;
+    // The state exists before the window does; what it sends to the window it
+    // sends through this handle, set once the app is built.
+    let handle: Arc<OnceLock<AppHandle>> = Arc::new(OnceLock::new());
+    let download_handle = handle.clone();
+    let downloads = hub::Downloads::new(
+        DOWNLOADS_AT_ONCE,
+        Arc::new(move |view| {
+            if let Some(app) = download_handle.get() {
+                let _ = app.emit("download-update", view);
             }
+        }),
+    );
+    let binary = binary::locate();
+    match &binary {
+        Ok(path) => tracing::info!(path = %path.display(), "using the pmetal command-line tool"),
+        Err(reason) => tracing::error!("{reason}"),
+    }
+    let state = AppState::new(
+        AppPaths::detect(),
+        secrets::HfToken::system(),
+        binary,
+        downloads,
+    );
+    logging::install_panic_hook(log_path, state.jobs.supervisor().clone());
+
+    let quitting = Arc::new(AtomicBool::new(false));
+    let quitting_for_events = quitting.clone();
+
+    let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .manage(state)
+        .setup(move |app| {
+            let _ = handle.set(app.handle().clone());
 
             // Must run before anything touches MLX, which loads its metallib
             // lazily on the first array operation.
@@ -32,163 +69,167 @@ pub fn run() {
             // Load it now, so a library MLX can't load is reported once, here,
             // rather than failing (or aborting) the first GPU job.
             if let Err(e) = pmetal_runtime::inline_array::init_device() {
-                use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
                 tracing::error!("MLX could not load its Metal library: {e}");
                 app.dialog()
                     .message(format!(
-                        "PMetal could not load its Metal library, so training and \
-                         inference won't run.\n\n{e}\n\nReinstall PMetal, or set \
+                        "PMetal could not load its Metal library, so chat won't run and \
+                         benchmarks may fail.\n\n{e}\n\nReinstall PMetal, or set \
                          PMETAL_METALLIB_PATH to a working mlx.metallib."
                     ))
                     .title("GPU unavailable")
                     .kind(MessageDialogKind::Error)
                     .show(|_| {});
             }
-
-            let state = app.state::<AppState>();
-
-            // Log startup diagnostics for troubleshooting
             log_startup_diagnostics();
 
-            // Start the broadcast -> Tauri event forwarder
-            start_event_forwarder(app.handle().clone(), &state);
-
-            // Load persisted config and refresh model cache on startup.
-            // We clone the inner Arcs because AppState itself is not Clone
-            // (tokio::process::Child is not Clone).
-            let init_state = AppStateInit {
-                config: state.config.clone(),
-                cached_models: state.cached_models.clone(),
-            };
-
+            let state = app.state::<AppState>();
+            let events = Arc::new(TauriJobEvents(app.handle().clone()));
+            let jobs = state.jobs.clone();
             tauri::async_runtime::spawn(async move {
-                init_state.load_config().await;
-                init_state.refresh_cached_models().await;
+                jobs.pump(events);
             });
 
+            // Find the models in the background; the window is already up.
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = app_handle.state::<AppState>();
+                let found = state.refresh_models().await;
+                tracing::info!("found {} models", found.len());
+                let _ = app_handle.emit("models-updated", ());
+            });
+
+            // A job outlives its parent unless the parent says otherwise.
+            // `kill`, a logout or a shutdown arrive as signals, not as a window
+            // closing, so they are given the same orderly end.
+            let signal_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                wait_for_termination_signal().await;
+                tracing::info!("terminated by a signal; stopping jobs");
+                stop_everything_and_exit(&signal_handle).await;
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            // System
+            get_system_info,
             get_config,
             set_config,
-            get_system_info,
-            get_device_info,
-            get_dashboard_stats,
-            // Models
+            set_hf_token,
+            clear_hf_token,
+            pick_directory,
+            pick_file,
             list_models,
+            refresh_models,
             get_model_info,
             get_model_defaults,
-            download_model,
             delete_model,
+            add_model_directory,
+            remove_model_directory,
             search_hub_models,
             get_trending_models,
             get_model_fit,
-            add_model_directory,
-            remove_model_directory,
-            list_model_directories,
-            // Datasets
+            download_model,
+            download_dataset,
+            list_downloads,
+            cancel_download,
+            clear_finished_downloads,
             search_hub_datasets,
             get_trending_datasets,
             list_cached_datasets,
-            download_dataset,
             peek_dataset_columns,
-            // Training
-            start_training,
-            get_training_status,
-            list_training_runs,
-            stop_training,
-            // Distillation
-            start_distillation,
-            get_distillation_status,
-            list_distillation_runs,
-            stop_distillation,
-            // GRPO
-            start_grpo,
-            get_grpo_status,
-            list_grpo_runs,
-            stop_grpo,
-            // Serve
-            start_serve,
-            stop_serve,
-            list_serve_instances,
-            // Bench
-            start_bench,
-            stop_bench,
-            list_bench_runs,
-            // Eval
-            start_eval,
-            stop_eval,
-            list_eval_runs,
-            // Pretrain
-            start_pretrain,
-            stop_pretrain,
-            list_pretrain_runs,
-            // Inference
-            start_inference,
-            stop_inference,
-            // Adapters
+            list_job_forms,
+            start_job,
+            stop_job,
+            forget_job,
+            list_jobs,
+            job_output,
+            job_steps,
             list_trained_adapters,
-            // Merge / Fuse / Quantize
-            merge_models,
-            get_merge_strategies,
-            fuse_lora,
-            quantize_model,
-            // New additive routes
-            start_dflash,
-            start_embed_train,
-            start_rlkd,
-            start_preference,
-            start_ollama,
+            start_chat,
+            stop_chat,
         ])
-        .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { .. } = event {
-                // Cancel all active training/distillation/GRPO runs so Metal
-                // command buffers can drain before the process exits.
-                if let Some(state) = window.try_state::<AppState>() {
-                    if let Ok(flags) = state.cancel_flags.try_read() {
-                        for flag in flags.values() {
-                            flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                        }
-                    }
+        .build(tauri::generate_context!())
+        .expect("error while building pmetal-gui");
 
-                    // Drain the broadcast channel so in-flight events emitted
-                    // just before cancellation have a chance to be forwarded to
-                    // the frontend before the process exits.
-                    //
-                    // Strategy: send a sentinel ModelRemoved("") event to flush
-                    // the forwarder's receive loop, then wait up to 1 s for the
-                    // broadcast channel to become idle (no more receivers). If
-                    // the drain window elapses we proceed anyway — the 1 s bound
-                    // prevents hanging when a task is blocked on a long Metal op.
-                    //
-                    // Note: We cannot join the forwarder task here because Tauri's
-                    // `on_window_event` handler is synchronous and the task handle
-                    // is not exposed. The sleep gives async tasks one tick to flush.
-                    let _ = state.event_tx.send(crate::state::AppEvent::ModelRemoved {
-                        model_id: String::new(),
-                    });
-                }
-
-                // Give in-flight GPU work and the event forwarder up to 1 s to
-                // flush, then force-exit to skip C++ destructor crashes from
-                // MLX's Metal device cleanup.
-                std::thread::sleep(std::time::Duration::from_millis(1_000));
-                std::process::exit(0);
+    app.run(move |app, event| {
+        // Closing the last window, Cmd+Q and the Dock's Quit all end up here.
+        if let RunEvent::ExitRequested { api, code, .. } = event
+            && code.is_none()
+        {
+            api.prevent_exit();
+            if quitting_for_events.swap(true, Ordering::SeqCst) {
+                return;
             }
-        })
-        .run(tauri::generate_context!())
-        .expect("error while running pmetal-gui");
+            let app = app.clone();
+            let quitting = quitting.clone();
+            tauri::async_runtime::spawn(async move {
+                if !confirm_quit(&app).await {
+                    quitting.store(false, Ordering::SeqCst);
+                    return;
+                }
+                stop_everything_and_exit(&app).await;
+            });
+        }
+    });
 }
 
-// ---------------------------------------------------------------------------
-// Lightweight init handle
-//
-// AppState owns a `HashMap<String, tokio::process::Child>` which is not Clone.
-// Rather than making AppState Clone (which would require Arc<Mutex<Child>>
-// everywhere and complicate kill()), we pass just the Arcs we need for
-// startup init tasks.
-// ---------------------------------------------------------------------------
+/// Ask before quitting with jobs running. Quitting stops them: a training run
+/// saves its adapter first, but nothing continues without the app.
+async fn confirm_quit(app: &AppHandle) -> bool {
+    let running = app.state::<AppState>().jobs.running();
+    if running == 0 {
+        return true;
+    }
+    let message = if running == 1 {
+        "A job is still running. Quitting stops it; a training run saves its adapter first."
+            .to_string()
+    } else {
+        format!(
+            "{running} jobs are still running. Quitting stops them; training runs save their \
+             adapters first."
+        )
+    };
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || {
+        app.dialog()
+            .message(message)
+            .title("Quit PMetal?")
+            .kind(MessageDialogKind::Warning)
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                "Stop jobs and quit".to_string(),
+                "Keep running".to_string(),
+            ))
+            .blocking_show()
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Stop the jobs and leave. Training gets time to write its adapter (SIGTERM,
+/// then SIGKILL after a grace period); nothing the app started outlives it.
+async fn stop_everything_and_exit(app: &AppHandle) {
+    let _ = app.emit("app-quitting", ());
+    app.state::<AppState>().shutdown().await;
+    // MLX's Metal teardown can crash in a C++ destructor on a normal exit;
+    // everything that mattered has been stopped and saved by now.
+    std::process::exit(0);
+}
+
+async fn wait_for_termination_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (Ok(mut term), Ok(mut int), Ok(mut hup)) = (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+        signal(SignalKind::hangup()),
+    ) else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = int.recv() => {}
+        _ = hup.recv() => {}
+    }
+}
 
 /// Point the MLX backend at the `mlx.metallib` built with the MLX this app
 /// links.
@@ -198,8 +239,8 @@ pub fn run() {
 /// build produced. The search is `pmetal_runtime::metallib::locate`'s, as the
 /// CLI's: `PMETAL_METALLIB_PATH`, the per-version metallib cache, the build's
 /// own file, then the bundle resource and a copy next to the executable. The
-/// `pmetal` CLI processes this app spawns run their own search.
-fn ensure_metallib(app: &tauri::AppHandle) {
+/// `pmetal` processes this app starts run their own search.
+fn ensure_metallib(app: &AppHandle) {
     use pmetal_runtime::metallib;
     use tauri::path::BaseDirectory;
 
@@ -223,14 +264,11 @@ fn ensure_metallib(app: &tauri::AppHandle) {
             tracing::info!(path = %located.path.display(), "Found mlx.metallib");
             pmetal_runtime::inline_array::set_metallib_path(&located.path.to_string_lossy());
         }
-        None => {
-            tracing::error!(
-                "mlx.metallib not found — MLX kernels will fail to load. \
-                 Reinstall PMetal, or set PMETAL_METALLIB_PATH to the mlx.metallib \
-                 built with MLX {}.",
-                metallib::MLX_REVISION
-            );
-        }
+        None => tracing::error!(
+            "mlx.metallib not found — MLX kernels will fail to load. Reinstall PMetal, or set \
+             PMETAL_METALLIB_PATH to the mlx.metallib built with MLX {}.",
+            metallib::MLX_REVISION
+        ),
     }
 }
 
@@ -242,7 +280,6 @@ fn log_startup_diagnostics() {
         os = std::env::consts::OS,
         "PMetal GUI starting"
     );
-
     match pmetal::metal::MetalContext::global() {
         Ok(ctx) => {
             let props = ctx.properties();
@@ -254,14 +291,11 @@ fn log_startup_diagnostics() {
                 "Metal device initialized"
             );
         }
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                "Metal device initialization failed — GPU features will be unavailable"
-            );
-        }
+        Err(e) => tracing::error!(
+            error = %e,
+            "Metal device initialization failed — GPU features will be unavailable"
+        ),
     }
-
     let device = pmetal::version::device_info();
     tracing::info!(
         total_memory_gb = format!("{:.1}", device.memory_total_gb),
@@ -270,144 +304,5 @@ fn log_startup_diagnostics() {
     );
 }
 
-struct AppStateInit {
-    config: std::sync::Arc<tokio::sync::RwLock<state::AppConfig>>,
-    cached_models: std::sync::Arc<tokio::sync::RwLock<Vec<state::CachedModel>>>,
-}
-
-impl AppStateInit {
-    async fn load_config(&self) {
-        let path = AppState::config_path_pub();
-        if let Ok(data) = tokio::fs::read_to_string(&path).await
-            && let Ok(cfg) = serde_json::from_str::<state::AppConfig>(&data)
-        {
-            *self.config.write().await = cfg;
-            tracing::info!("Loaded config from {}", path.display());
-        }
-    }
-
-    async fn refresh_cached_models(&self) {
-        // Build a temporary AppState-like struct to reuse the full scanning logic
-        let app_state = AppState::new();
-        *app_state.config.write().await = self.config.read().await.clone();
-        app_state.refresh_cached_models().await;
-
-        let models = app_state.cached_models.read().await.clone();
-        let count = models.len();
-        *self.cached_models.write().await = models;
-        tracing::info!("Refreshed model cache: {count} models found");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Persistent logging
-// ---------------------------------------------------------------------------
-
-/// Log directory: ~/.cache/pmetal/logs/
-fn log_dir() -> std::path::PathBuf {
-    let dir = dirs::cache_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from(".cache"))
-        .join("pmetal")
-        .join("logs");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
-}
-
-/// Initialize logging with both stderr and file output.
-///
-/// Log file: `~/.cache/pmetal/logs/{component}.log`
-/// Rotates on startup (previous log renamed to `{component}.log.1`).
-/// Returns the log file path for use in the panic hook.
-fn init_logging(component: &str) -> Option<std::path::PathBuf> {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new(
-            "pmetal_gui=info,pmetal_trainer=info,pmetal_runtime=info,pmetal_cache=info,pmetal_lora=info,pmetal_models=info,pmetal=info",
-        )
-    });
-
-    let dir = log_dir();
-    let log_path = dir.join(format!("{component}.log"));
-
-    // Rotate: keep one previous log
-    let prev = dir.join(format!("{component}.log.1"));
-    if log_path.exists() {
-        let _ = std::fs::rename(&log_path, &prev);
-    }
-
-    let file = match std::fs::File::create(&log_path) {
-        Ok(f) => f,
-        Err(_) => {
-            // Fall back to stderr-only logging
-            let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
-            return None;
-        }
-    };
-
-    // Tee writer: stderr + file
-    let file = std::sync::Arc::new(std::sync::Mutex::new(file));
-    let file_clone = file.clone();
-
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(move || TeeWriter {
-            stderr: std::io::stderr(),
-            file: Some(file_clone.clone()),
-        })
-        .try_init();
-
-    Some(log_path)
-}
-
-/// Writer that tees output to both stderr and a log file.
-struct TeeWriter {
-    stderr: std::io::Stderr,
-    file: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
-}
-
-impl std::io::Write for TeeWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.stderr.write(buf)?;
-        if let Some(ref file) = self.file
-            && let Ok(mut f) = file.lock()
-        {
-            // Strip ANSI escape codes for the file
-            let _ = f.write_all(&buf[..n]);
-        }
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.stderr.flush()?;
-        if let Some(ref file) = self.file
-            && let Ok(mut f) = file.lock()
-        {
-            let _ = f.flush();
-        }
-        Ok(())
-    }
-}
-
-/// Install a panic hook that writes crash details to the log file.
-///
-/// On panic, appends the panic info + backtrace to the log file so that
-/// even if the GUI exits immediately, crash context is preserved on disk.
-fn install_panic_hook(log_path: Option<std::path::PathBuf>) {
-    let original = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        // Write to the log file directly (tracing may not work in a panic)
-        if let Some(ref path) = log_path {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
-                let _ = writeln!(f, "\n=== PANIC ===");
-                let _ = writeln!(f, "Time: {:?}", std::time::SystemTime::now());
-                let _ = writeln!(f, "{info}");
-                let bt = std::backtrace::Backtrace::force_capture();
-                let _ = writeln!(f, "{bt}");
-                let _ = writeln!(f, "=== END PANIC ===\n");
-            }
-        }
-        // Also log via tracing (may or may not work depending on panic context)
-        tracing::error!("PANIC: {info}");
-        original(info);
-    }));
-}
+#[cfg(test)]
+mod tests;

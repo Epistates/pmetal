@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-refresh-models"
+description = "Enables the refresh_models command without any pre-configured scope."
+commands.allow = ["refresh_models"]
+
+[[permission]]
+identifier = "deny-refresh-models"
+description = "Denies the refresh_models command without any pre-configured scope."
+commands.deny = ["refresh_models"]

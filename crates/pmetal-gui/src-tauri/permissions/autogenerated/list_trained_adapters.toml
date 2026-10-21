@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-trained-adapters"
+description = "Enables the list_trained_adapters command without any pre-configured scope."
+commands.allow = ["list_trained_adapters"]
+
+[[permission]]
+identifier = "deny-list-trained-adapters"
+description = "Denies the list_trained_adapters command without any pre-configured scope."
+commands.deny = ["list_trained_adapters"]

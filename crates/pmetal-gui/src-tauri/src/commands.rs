@@ -1,169 +1,110 @@
-use std::path::{Path, PathBuf};
+//! The commands the webview can call.
+//!
+//! Each is a thin wrapper over [`AppState`] or a module; the rules live there.
+//! Every command is listed in `build.rs`, which is what lets the capability
+//! file name them one by one: a command not listed there cannot be called at
+//! all.
+
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use chrono::Utc;
-use futures::FutureExt;
-use pmetal::prelude::{JobFields, TrainingCallback};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
+use tauri_plugin_dialog::DialogExt;
 
-use crate::state::{
-    AppConfig, AppEvent, AppState, BenchRun, CachedModel, DistillationRun, DistillationStatus,
-    EvalRun, GrpoRun, GrpoStatus, JobStatus, PretrainRun, ServeInstance, ServeStatus,
-    TrainingConfigSummary, TrainingRun, TrainingStatus, format_downloads, format_size,
-};
+use crate::adapters::{self, TrainedAdapter};
+use crate::datasets::{self, DatasetPeek};
+use crate::error::{AppError, Result};
+use crate::hub::{self, CachedDatasetInfo, DatasetSearchResult, DownloadView, HubSearchResult};
+use crate::inference::{self, ChatTurn};
+use crate::jobs::form::FormInfo;
+use crate::jobs::kinds::{self, FieldIssue};
+use crate::jobs::{EventSink, JobView, OutputLine, OutputPage, StartError, StepPage};
+use crate::models::{self, CachedModel};
+use crate::state::{AppState, ConfigView, SettingsPatch};
+use crate::system::{self, ModelFitInfo, SystemInfo};
 
 // ---------------------------------------------------------------------------
-// Error type
+// System and settings
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize)]
-pub struct AppError(String);
-
-impl std::fmt::Display for AppError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
+#[tauri::command]
+pub async fn get_system_info() -> Result<SystemInfo> {
+    tokio::task::spawn_blocking(system::system_info)
+        .await
+        .map_err(|e| AppError::new(e.to_string()))
 }
 
-impl From<reqwest::Error> for AppError {
-    fn from(e: reqwest::Error) -> Self {
-        AppError(e.to_string())
-    }
+#[tauri::command]
+pub async fn get_config(state: State<'_, AppState>) -> Result<ConfigView> {
+    Ok(state.config().await)
 }
 
-impl From<std::io::Error> for AppError {
-    fn from(e: std::io::Error) -> Self {
-        AppError(e.to_string())
-    }
+#[tauri::command]
+pub async fn set_config(state: State<'_, AppState>, patch: SettingsPatch) -> Result<ConfigView> {
+    state.update_settings(patch).await
 }
 
-impl From<serde_json::Error> for AppError {
-    fn from(e: serde_json::Error) -> Self {
-        AppError(e.to_string())
-    }
+#[tauri::command]
+pub async fn set_hf_token(state: State<'_, AppState>, token: String) -> Result<ConfigView> {
+    state.set_token(token).await
 }
 
-type Result<T> = std::result::Result<T, AppError>;
-
-struct CancelOnFlag {
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
+#[tauri::command]
+pub async fn clear_hf_token(state: State<'_, AppState>) -> Result<ConfigView> {
+    state.clear_token().await
 }
 
-impl TrainingCallback for CancelOnFlag {
-    fn should_stop(&self) -> bool {
-        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+/// Let the person choose a folder. The webview gets the path and no
+/// filesystem access of its own.
+#[tauri::command]
+pub async fn pick_directory(app: AppHandle, title: Option<String>) -> Result<Option<String>> {
+    let mut dialog = app.dialog().file();
+    if let Some(title) = title {
+        dialog = dialog.set_title(title);
     }
+    let picked = tokio::task::spawn_blocking(move || dialog.blocking_pick_folder())
+        .await
+        .map_err(|e| AppError::new(e.to_string()))?;
+    Ok(picked
+        .and_then(|p| p.into_path().ok())
+        .map(|p| p.display().to_string()))
 }
 
-/// Training metrics callback that streams updates to the frontend via
-/// `tauri::ipc::Channel` — the Tauri-recommended mechanism for streaming
-/// data from backend to frontend. Channel::send() is Send + Sync and
-/// safe to call from any thread, including blocked tokio worker threads.
-struct ChannelMetricsCallback {
-    channel: tauri::ipc::Channel<serde_json::Value>,
-    started_at: chrono::DateTime<chrono::Utc>,
-    best_loss: Option<f64>,
-}
-
-// A `TauriJobEventSink` comes in Phase 4, once the Svelte frontend
-// is migrated to consume `pmetal::core::JobEvent` directly. `Channel<T>` does
-// not implement `Deserialize`, so it can't be wrapped in `Option<>` for a
-// backwards-compatible Phase 2 hook — the migration is necessarily a single
-// step, deferred to Phase 4.
-
-impl TrainingCallback for ChannelMetricsCallback {
-    fn on_train_start(&mut self) {
-        let _ = self.channel.send(serde_json::json!({
-            "event": "train_start",
-            "status_message": "Training started, waiting for first step...",
-        }));
+/// Let the person choose a file.
+#[tauri::command]
+pub async fn pick_file(app: AppHandle, title: Option<String>) -> Result<Option<String>> {
+    let mut dialog = app.dialog().file();
+    if let Some(title) = title {
+        dialog = dialog.set_title(title);
     }
-
-    fn on_step_end_with_metrics(&mut self, metrics: &pmetal::core::StepMetrics) {
-        if self.best_loss.is_none_or(|b| metrics.loss < b) {
-            self.best_loss = Some(metrics.loss);
-        }
-        let elapsed = (chrono::Utc::now() - self.started_at).num_seconds().max(1) as f64;
-        let eta = if metrics.total_steps > 0 && metrics.step > 0 {
-            let remaining = metrics.total_steps.saturating_sub(metrics.step) as f64;
-            Some(((elapsed / metrics.step as f64) * remaining) as u64)
-        } else {
-            None
-        };
-        let _ = self.channel.send(serde_json::json!({
-            "event": "step",
-            "step": metrics.step,
-            "total_steps": metrics.total_steps,
-            "total_epochs": metrics.total_epochs,
-            "epoch": metrics.epoch,
-            "loss": metrics.loss,
-            "best_loss": self.best_loss,
-            "lr": metrics.lr,
-            "tok_sec": metrics.tok_sec,
-            "grad_norm": metrics.grad_norm,
-            "eta_seconds": eta,
-        }));
-    }
-
-    fn on_step_end(&mut self, step: usize, loss: f64) {
-        if self.best_loss.is_none_or(|b| loss < b) {
-            self.best_loss = Some(loss);
-        }
-        let _ = self.channel.send(serde_json::json!({
-            "event": "step",
-            "step": step,
-            "loss": loss,
-            "best_loss": self.best_loss,
-        }));
-    }
-
-    fn on_epoch_end(&mut self, epoch: usize, metrics: &pmetal::core::EvalMetrics) {
-        let _ = self.channel.send(serde_json::json!({
-            "event": "epoch_end",
-            "epoch": epoch,
-            "loss": metrics.loss,
-        }));
-    }
+    let picked = tokio::task::spawn_blocking(move || dialog.blocking_pick_file())
+        .await
+        .map_err(|e| AppError::new(e.to_string()))?;
+    Ok(picked
+        .and_then(|p| p.into_path().ok())
+        .map(|p| p.display().to_string()))
 }
 
 // ---------------------------------------------------------------------------
-// Response DTOs — names match api.ts interfaces exactly
+// Models
 // ---------------------------------------------------------------------------
 
-/// Matches TS `SystemInfo` and `DeviceInfo` (same fields).
-#[derive(Debug, Serialize)]
-pub struct SystemInfo {
-    pub version: String,
-    pub platform: String,
-    pub arch: String,
-    pub is_apple_silicon: bool,
-    pub gpu_name: String,
-    pub chip_tier: Option<String>,
-    pub total_memory: u64,
-    pub available_memory: u64,
-    pub total_memory_formatted: String,
-    pub available_memory_formatted: String,
-    pub gpu_cores: Option<u32>,
-    pub ane_cores: Option<u32>,
-    pub memory_bandwidth_gbps: Option<f64>,
-    pub has_ane: bool,
-    pub has_nax: bool,
+#[tauri::command]
+pub async fn list_models(state: State<'_, AppState>) -> Result<Vec<CachedModel>> {
+    let models = state.models().await;
+    if models.is_empty() {
+        // Nothing yet: the first scan has not finished, or there are no models.
+        return Ok(state.refresh_models().await);
+    }
+    Ok(models)
 }
 
-/// Matches TS `DashboardStats`.
-#[derive(Debug, Serialize)]
-pub struct DashboardStats {
-    pub models_count: usize,
-    pub total_model_size: String,
-    pub active_training_runs: usize,
-    pub completed_training_runs: usize,
-    pub total_training_runs: usize,
-    pub active_grpo_runs: usize,
-    pub active_distillation_runs: usize,
+#[tauri::command]
+pub async fn refresh_models(state: State<'_, AppState>) -> Result<Vec<CachedModel>> {
+    Ok(state.refresh_models().await)
 }
 
-/// Matches TS `ModelInfo`.
 #[derive(Debug, Serialize)]
 pub struct ModelInfo {
     pub id: String,
@@ -171,576 +112,122 @@ pub struct ModelInfo {
     pub size: u64,
     pub size_formatted: String,
     pub model_type: Option<String>,
-    pub hidden_size: Option<usize>,
-    pub num_layers: Option<usize>,
-    pub vocab_size: Option<usize>,
-    pub context_length: Option<usize>,
+    pub hidden_size: Option<u64>,
+    pub num_layers: Option<u64>,
+    pub vocab_size: Option<u64>,
+    pub context_length: Option<u64>,
 }
 
-/// Matches TS `ModelFitInfo`.
-#[derive(Debug, Serialize)]
-pub struct ModelFitInfo {
-    pub inference_fit: String,
-    pub training_fit: String,
-    pub weights_gb: f64,
-    pub inference_memory_gb: f64,
-    pub training_memory_gb: f64,
-    pub available_memory_gb: f64,
-    pub estimated_tps: Option<f64>,
-    pub recommended_batch_size: u32,
+#[tauri::command]
+pub async fn get_model_info(
+    state: State<'_, AppState>,
+    model_id: String,
+) -> Result<Option<ModelInfo>> {
+    let Some(model) = state.find_model(&model_id).await else {
+        return Ok(None);
+    };
+    let path = std::path::PathBuf::from(&model.path);
+    let config = tokio::task::spawn_blocking(move || models::read_config(&path))
+        .await
+        .map_err(|e| AppError::new(e.to_string()))?;
+    let get = |keys: &[&str]| {
+        config
+            .as_ref()
+            .and_then(|c| keys.iter().find_map(|k| c[*k].as_u64()))
+    };
+    Ok(Some(ModelInfo {
+        model_type: config
+            .as_ref()
+            .and_then(|c| c["model_type"].as_str().map(str::to_string))
+            .or(Some(model.model_type.clone())),
+        hidden_size: get(&["hidden_size"]),
+        num_layers: get(&["num_hidden_layers", "n_layer"]),
+        vocab_size: get(&["vocab_size"]),
+        context_length: get(&["max_position_embeddings", "max_seq_len", "n_ctx"]),
+        id: model.id,
+        path: model.path,
+        size: model.size,
+        size_formatted: model.size_formatted,
+    }))
 }
 
-/// Matches TS `HubSearchResult`.
-#[derive(Debug, Serialize)]
-pub struct HubSearchResult {
-    pub id: String,
-    pub author: Option<String>,
-    pub downloads: u64,
-    pub downloads_formatted: String,
-    pub likes: u64,
-    pub pipeline_tag: Option<String>,
-    pub is_gated: bool,
-    pub library_name: Option<String>,
-    pub tags: Vec<String>,
-}
-
-/// Matches TS `DatasetSearchResult`.
-#[derive(Debug, Serialize)]
-pub struct DatasetSearchResult {
-    pub id: String,
-    pub author: Option<String>,
-    pub downloads: u64,
-    pub downloads_formatted: String,
-    pub likes: u64,
-    pub tags: Vec<String>,
-    pub description: Option<String>,
-}
-
-/// Matches TS `CachedDatasetInfo`.
-#[derive(Debug, Serialize)]
-pub struct CachedDatasetInfo {
-    pub name: String,
-    pub path: String,
-    pub size_bytes: u64,
-    pub size_formatted: String,
-}
-
-/// Matches TS `MergeStrategy`.
-#[derive(Debug, Serialize)]
-pub struct MergeStrategy {
-    pub name: String,
-    pub description: String,
-    pub supports_weights: bool,
-}
-
-/// Matches TS `FuseResult`.
-#[derive(Debug, Serialize)]
-pub struct FuseResult {
-    pub output_dir: String,
-    pub model_size_bytes: u64,
-}
-
-/// A discovered LoRA adapter on disk. Matches TS `TrainedAdapter`.
-#[derive(Debug, Clone, Serialize)]
-pub struct TrainedAdapter {
-    /// Absolute path to the adapter directory.
-    pub path: String,
-    /// Human-readable name (directory basename).
-    pub name: String,
-    /// Base model this adapter was trained on (if known).
-    pub base_model: Option<String>,
-    /// LoRA rank from adapter_config.json.
-    pub rank: Option<u32>,
-    /// LoRA alpha from adapter_config.json.
-    pub alpha: Option<f32>,
-    /// Size of the weights file in bytes.
-    pub size_bytes: u64,
-}
-
-/// Model generation/training defaults read from generation_config.json + config.json.
-/// Matches TS `ModelDefaults`.
+/// What a model recommends: sampling from its `generation_config.json`, and
+/// its shape from `config.json`.
 #[derive(Debug, Default, Serialize)]
 pub struct ModelDefaults {
-    // Generation params (from generation_config.json)
     pub temperature: Option<f32>,
     pub top_k: Option<u32>,
     pub top_p: Option<f32>,
     pub max_new_tokens: Option<u32>,
     pub repetition_penalty: Option<f32>,
-    // Model arch info (from config.json)
     pub max_position_embeddings: Option<u32>,
     pub hidden_size: Option<u32>,
     pub num_hidden_layers: Option<u32>,
     pub vocab_size: Option<u32>,
 }
 
-// ---------------------------------------------------------------------------
-// Request DTOs — match api.ts invoke calls
-// ---------------------------------------------------------------------------
-
-/// GUI-only chat message — not part of InferSpec; passed alongside the spec
-/// so `start_inference` can forward prior conversation history to the runner.
-#[derive(Debug, Deserialize, Clone)]
-pub struct InferenceMessage {
-    pub role: String,
-    pub content: String,
-}
-
-fn chat_message_from_inference_message(
-    message: &InferenceMessage,
-) -> std::result::Result<pmetal::data::chat_templates::Message, String> {
-    match message.role.as_str() {
-        "user" => Ok(pmetal::data::chat_templates::Message::user(
-            message.content.clone(),
-        )),
-        "assistant" => Ok(pmetal::data::chat_templates::Message::assistant(
-            message.content.clone(),
-        )),
-        "system" => Ok(pmetal::data::chat_templates::Message::system(
-            message.content.clone(),
-        )),
-        other => Err(format!(
-            "unsupported chat role '{other}' in GUI inference history"
-        )),
-    }
-}
-
-// All other hand-rolled request DTOs (TrainingConfig, DistillationConfig,
-// GrpoConfig, InferenceConfig, ServeConfigDto, BenchConfigDto, EvalConfigDto,
-// PretrainConfigDto, MergeConfig, MergeModelEntry) have been removed.
-// Commands now accept pmetal::core::jobs::*Spec types directly.
-
-// ---------------------------------------------------------------------------
-// System commands
-// ---------------------------------------------------------------------------
-
-/// Returns combined `SystemInfo` / `DeviceInfo` from the library runtime.
-async fn get_system_info_inner() -> SystemInfo {
-    let version = pmetal::version::VERSION.to_string();
-    let platform = std::env::consts::OS.to_string();
-    let arch = std::env::consts::ARCH.to_string();
-    let is_apple_silicon = arch == "aarch64" && platform == "macos";
-
-    let device_info = pmetal::version::device_info();
-    let total_memory = (device_info.memory_total_gb * 1024.0_f64.powi(3)) as u64;
-    let available_memory = (device_info.memory_available_gb * 1024.0_f64.powi(3)) as u64;
-
-    let mut gpu_name = "Apple GPU".to_string();
-    let mut chip_tier: Option<String> = None;
-    let mut gpu_cores: Option<u32> = None;
-    let mut ane_cores: Option<u32> = None;
-    let mut memory_bandwidth_gbps: Option<f64> = None;
-    let mut has_ane = is_apple_silicon;
-    let mut has_nax = false;
-
-    if let Ok(ctx) = pmetal::metal::MetalContext::global() {
-        let props = ctx.properties();
-        gpu_name = props.name.clone();
-        gpu_cores = Some(props.gpu_core_count);
-        ane_cores = Some(props.ane_core_count);
-        memory_bandwidth_gbps = Some(props.memory_bandwidth_gbps);
-        has_ane = props.ane_core_count > 0;
-        has_nax = props.has_nax;
-        chip_tier = Some(format!("{:?}", props.device_tier).to_lowercase());
-    }
-
-    SystemInfo {
-        version,
-        platform,
-        arch,
-        is_apple_silicon,
-        gpu_name,
-        chip_tier,
-        total_memory,
-        available_memory,
-        total_memory_formatted: format_size(total_memory),
-        available_memory_formatted: format_size(available_memory),
-        gpu_cores,
-        ane_cores,
-        memory_bandwidth_gbps,
-        has_ane,
-        has_nax,
-    }
-}
-
-#[tauri::command]
-pub async fn get_system_info() -> Result<SystemInfo> {
-    Ok(get_system_info_inner().await)
-}
-
-/// `get_device_info` returns the same struct as `get_system_info` — both map to SystemInfo.
-#[tauri::command]
-pub async fn get_device_info() -> Result<SystemInfo> {
-    Ok(get_system_info_inner().await)
-}
-
-#[tauri::command]
-pub async fn get_config(state: State<'_, AppState>) -> Result<AppConfig> {
-    Ok(state.config.read().await.clone())
-}
-
-#[tauri::command]
-pub async fn set_config(state: State<'_, AppState>, config: AppConfig) -> Result<()> {
-    *state.config.write().await = config;
-    state.save_config().await;
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn get_dashboard_stats(state: State<'_, AppState>) -> Result<DashboardStats> {
-    let models = state.cached_models.read().await;
-    let training = state.training_runs.read().await;
-    let distillation = state.distillation_runs.read().await;
-    let grpo = state.grpo_runs.read().await;
-
-    let total_size: u64 = models.iter().map(|m| m.size).sum();
-
-    let active_training = training
-        .iter()
-        .filter(|r| r.status == TrainingStatus::Running)
-        .count();
-    let completed_training = training
-        .iter()
-        .filter(|r| r.status == TrainingStatus::Completed)
-        .count();
-    let active_grpo = grpo
-        .iter()
-        .filter(|r| r.status == GrpoStatus::Running)
-        .count();
-    let active_distillation = distillation
-        .iter()
-        .filter(|r| {
-            r.status == DistillationStatus::Training
-                || r.status == DistillationStatus::LoadingModels
-                || r.status == DistillationStatus::GeneratingSignals
-        })
-        .count();
-
-    Ok(DashboardStats {
-        models_count: models.len(),
-        total_model_size: format_size(total_size),
-        active_training_runs: active_training,
-        completed_training_runs: completed_training,
-        total_training_runs: training.len(),
-        active_grpo_runs: active_grpo,
-        active_distillation_runs: active_distillation,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Model commands
-// ---------------------------------------------------------------------------
-
-#[tauri::command]
-pub async fn list_models(state: State<'_, AppState>) -> Result<Vec<CachedModel>> {
-    Ok(state.cached_models.read().await.clone())
-}
-
-/// Returns a `ModelInfo` by reading `config.json` from the model snapshot directory.
-#[tauri::command]
-pub async fn get_model_info(
-    state: State<'_, AppState>,
-    model_id: String,
-) -> Result<Option<ModelInfo>> {
-    let cached = {
-        let models = state.cached_models.read().await;
-        models.iter().find(|m| m.id == model_id).cloned()
-    };
-
-    let Some(cached) = cached else {
-        return Ok(None);
-    };
-
-    // Attempt to read config.json from the snapshots directory
-    let config_json = read_model_config_json(&cached.path).await;
-
-    let model_type = config_json
-        .as_ref()
-        .and_then(|v| v["model_type"].as_str().map(str::to_string))
-        .or_else(|| cached.model_type.clone());
-
-    let hidden_size = config_json
-        .as_ref()
-        .and_then(|v| v["hidden_size"].as_u64().map(|n| n as usize));
-
-    let num_layers = config_json.as_ref().and_then(|v| {
-        v["num_hidden_layers"]
-            .as_u64()
-            .or_else(|| v["n_layer"].as_u64())
-            .map(|n| n as usize)
-    });
-
-    let vocab_size = config_json
-        .as_ref()
-        .and_then(|v| v["vocab_size"].as_u64().map(|n| n as usize));
-
-    let context_length = config_json.as_ref().and_then(|v| {
-        v["max_position_embeddings"]
-            .as_u64()
-            .or_else(|| v["max_seq_len"].as_u64())
-            .or_else(|| v["n_ctx"].as_u64())
-            .map(|n| n as usize)
-    });
-
-    Ok(Some(ModelInfo {
-        id: cached.id,
-        path: cached.path,
-        size: cached.size,
-        size_formatted: cached.size_formatted,
-        model_type,
-        hidden_size,
-        num_layers,
-        vocab_size,
-        context_length,
-    }))
-}
-
-/// Read generation_config.json + config.json defaults for a model.
-///
-/// Returns recommended sampling parameters and model architecture info
-/// so the GUI can auto-fill params when a model is selected.
 #[tauri::command]
 pub async fn get_model_defaults(
     state: State<'_, AppState>,
     model_id: String,
 ) -> Result<ModelDefaults> {
-    let model_path = {
-        let models = state.cached_models.read().await;
-        models
-            .iter()
-            .find(|m| m.id == model_id)
-            .map(|m| m.path.clone())
-            .unwrap_or_default()
-    };
-
-    if model_path.is_empty() {
+    let Some(model) = state.find_model(&model_id).await else {
         return Ok(ModelDefaults::default());
-    }
-    let model_path = PathBuf::from(&model_path);
+    };
+    let path = std::path::PathBuf::from(&model.path);
+    tokio::task::spawn_blocking(move || model_defaults(&path, &model.id))
+        .await
+        .map_err(|e| AppError::new(e.to_string()))
+}
+
+fn model_defaults(path: &std::path::Path, id: &str) -> ModelDefaults {
+    use pmetal::data::chat_templates::{ChatTemplateKwargs, detect_chat_template};
+    use pmetal::data::inference_config::{context_window, default_max_tokens};
 
     let mut defaults = ModelDefaults::default();
-
-    // Read generation_config.json for sampling params
-    let gen_config_path = model_path.join("generation_config.json");
-    if let Ok(content) = tokio::fs::read_to_string(&gen_config_path).await
-        && let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&content)
+    if let Some(generation) = std::fs::read_to_string(path.join("generation_config.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
     {
-        defaults.temperature = cfg["temperature"].as_f64().map(|v| v as f32);
-        defaults.top_k = cfg["top_k"].as_u64().map(|v| v as u32);
-        defaults.top_p = cfg["top_p"].as_f64().map(|v| v as f32);
-        defaults.repetition_penalty = cfg["repetition_penalty"].as_f64().map(|v| v as f32);
+        defaults.temperature = generation["temperature"].as_f64().map(|v| v as f32);
+        defaults.top_k = generation["top_k"].as_u64().map(|v| v as u32);
+        defaults.top_p = generation["top_p"].as_f64().map(|v| v as f32);
+        defaults.repetition_penalty = generation["repetition_penalty"].as_f64().map(|v| v as f32);
     }
-
-    // The output budget `pmetal infer` would pick: generation_config.json's,
-    // else the thinking-model default when the chat template thinks.
-    {
-        use pmetal::data::chat_templates::{ChatTemplateKwargs, detect_chat_template};
-        use pmetal::data::inference_config::{context_window, default_max_tokens};
-        let thinking =
-            detect_chat_template(&model_path, &model_id).thinks_with(&ChatTemplateKwargs::new());
-        let budget =
-            default_max_tokens(&model_path, thinking).for_prompt(0, context_window(&model_path));
-        defaults.max_new_tokens = Some(u32::try_from(budget).unwrap_or(u32::MAX));
+    // The output budget `pmetal infer` would pick.
+    let thinking = detect_chat_template(path, id).thinks_with(&ChatTemplateKwargs::new());
+    let budget = default_max_tokens(path, thinking).for_prompt(0, context_window(path));
+    defaults.max_new_tokens = Some(u32::try_from(budget).unwrap_or(u32::MAX));
+    if let Some(config) = models::read_config(path) {
+        let get = |k: &str| config[k].as_u64().map(|v| v as u32);
+        defaults.max_position_embeddings =
+            get("max_position_embeddings").or_else(|| get("max_seq_len"));
+        defaults.hidden_size = get("hidden_size");
+        defaults.num_hidden_layers = get("num_hidden_layers");
+        defaults.vocab_size = get("vocab_size");
     }
-
-    // Read config.json for model arch info
-    if let Some(cfg) = read_model_config_json(&model_path.to_string_lossy()).await {
-        defaults.max_position_embeddings = cfg["max_position_embeddings"]
-            .as_u64()
-            .or_else(|| cfg["max_seq_len"].as_u64())
-            .map(|v| v as u32);
-        defaults.hidden_size = cfg["hidden_size"].as_u64().map(|v| v as u32);
-        defaults.num_hidden_layers = cfg["num_hidden_layers"].as_u64().map(|v| v as u32);
-        defaults.vocab_size = cfg["vocab_size"].as_u64().map(|v| v as u32);
-    }
-
-    Ok(defaults)
+    defaults
 }
 
 #[tauri::command]
 pub async fn delete_model(state: State<'_, AppState>, model_id: String) -> Result<()> {
-    // Refuse to delete a model that is the source of an active run. Checking
-    // all three run types that hold a `model` field avoids orphaned Metal
-    // command buffers that would reference a deleted weight directory.
-    {
-        let training = state.training_runs.read().await;
-        if training.iter().any(|r| {
-            r.model == model_id
-                && matches!(r.status, TrainingStatus::Pending | TrainingStatus::Running)
-        }) {
-            return Err(AppError(format!(
-                "Cannot delete '{model_id}': a training run is currently using it."
-            )));
-        }
-    }
-    {
-        let distillation = state.distillation_runs.read().await;
-        if distillation.iter().any(|r| {
-            (r.student_model == model_id || r.teacher_model == model_id)
-                && !matches!(
-                    r.status,
-                    DistillationStatus::Completed
-                        | DistillationStatus::Failed
-                        | DistillationStatus::Cancelled
-                )
-        }) {
-            return Err(AppError(format!(
-                "Cannot delete '{model_id}': a distillation run is currently using it."
-            )));
-        }
-    }
-    {
-        let grpo = state.grpo_runs.read().await;
-        if grpo.iter().any(|r| {
-            r.model == model_id && matches!(r.status, GrpoStatus::Pending | GrpoStatus::Running)
-        }) {
-            return Err(AppError(format!(
-                "Cannot delete '{model_id}': a GRPO run is currently using it."
-            )));
-        }
-    }
-
-    let path = {
-        let models = state.cached_models.read().await;
-        models
-            .iter()
-            .find(|m| m.id == model_id)
-            .map(|m| m.path.clone())
-    };
-
-    if let Some(path) = path {
-        tokio::fs::remove_dir_all(&path)
-            .await
-            .map_err(|e| AppError(format!("Failed to delete model directory: {}", e)))?;
-
-        state
-            .cached_models
-            .write()
-            .await
-            .retain(|m| m.id != model_id);
-        let _ = state.event_tx.send(AppEvent::ModelRemoved { model_id });
-    }
-
-    Ok(())
+    state.delete_model(&model_id).await
 }
 
-/// Add a custom directory to scan for models (e.g. another app's model folder).
 #[tauri::command]
 pub async fn add_model_directory(
     state: State<'_, AppState>,
     path: String,
 ) -> Result<Vec<CachedModel>> {
-    let dir = PathBuf::from(&path);
-    if !dir.exists() {
-        return Err(AppError(format!("Directory does not exist: {path}")));
-    }
-    if !dir.is_dir() {
-        return Err(AppError(format!("Not a directory: {path}")));
-    }
-
-    // Add to config if not already present
-    {
-        let mut cfg = state.config.write().await;
-        if !cfg.custom_model_dirs.contains(&path) {
-            cfg.custom_model_dirs.push(path);
-        }
-    }
-    state.save_config().await;
-
-    // Rescan all models
-    state.refresh_cached_models().await;
-    Ok(state.cached_models.read().await.clone())
+    state.add_model_directory(&path).await
 }
 
-/// Remove a custom model directory.
 #[tauri::command]
 pub async fn remove_model_directory(
     state: State<'_, AppState>,
     path: String,
 ) -> Result<Vec<CachedModel>> {
-    {
-        let mut cfg = state.config.write().await;
-        cfg.custom_model_dirs.retain(|d| d != &path);
-    }
-    state.save_config().await;
-
-    // Rescan all models
-    state.refresh_cached_models().await;
-    Ok(state.cached_models.read().await.clone())
-}
-
-/// List configured custom model directories.
-#[tauri::command]
-pub async fn list_model_directories(state: State<'_, AppState>) -> Result<Vec<String>> {
-    Ok(state.config.read().await.custom_model_dirs.clone())
-}
-
-#[tauri::command]
-pub async fn download_model(
-    state: State<'_, AppState>,
-    app_handle: AppHandle,
-    model_id: String,
-    revision: Option<String>,
-) -> Result<String> {
-    let run_id = uuid::Uuid::new_v4().to_string();
-    let run_id_task = run_id.clone();
-    let model_id_task = model_id.clone();
-
-    let hf_token = state.config.read().await.hf_token.clone();
-    let cached_models = state.cached_models.clone();
-    let cache_dir = state.config.read().await.cache_dir.clone();
-    // Clone the semaphore Arc so the spawned task can acquire a permit.
-    // The permit is dropped when the download completes (success or error),
-    // releasing the slot for the next queued download.
-    let semaphore = state.download_semaphore.clone();
-
-    tokio::spawn(async move {
-        // Acquire the permit before announcing the download so the frontend
-        // queuing indicator is accurate: "download-started" fires only once
-        // a slot is actually available.
-        let _permit = semaphore.acquire().await;
-
-        let _ = app_handle.emit("download-started", &run_id_task);
-
-        let _ = app_handle.emit(
-            "download-progress",
-            serde_json::json!({
-                "run_id": run_id_task,
-                "line": format!("Resolving {model_id_task}"),
-            }),
-        );
-
-        let token = hf_token
-            .as_ref()
-            .map(|s| pmetal::core::SecretString::from(s.clone()));
-        match pmetal::hub::download_model(&model_id_task, revision.as_deref(), token.as_ref()).await
-        {
-            Ok(path) => {
-                let _ = app_handle.emit(
-                    "download-progress",
-                    serde_json::json!({
-                        "run_id": run_id_task,
-                        "line": format!("Downloaded to {}", path.display()),
-                    }),
-                );
-
-                let hub_dir = PathBuf::from(&cache_dir).join("hub");
-                let models = crate::state::scan_hub_cache_pub(&hub_dir).await;
-                *cached_models.write().await = models;
-
-                let _ = app_handle.emit("download-completed", &run_id_task);
-            }
-            Err(e) => {
-                let _ = app_handle.emit(
-                    "download-error",
-                    serde_json::json!({ "run_id": run_id_task, "error": e.to_string() }),
-                );
-            }
-        }
-        // _permit is dropped here, releasing the semaphore slot.
-    });
-
-    Ok(run_id)
+    state.remove_model_directory(&path).await
 }
 
 #[tauri::command]
@@ -749,8 +236,18 @@ pub async fn search_hub_models(
     query: String,
     limit: Option<u32>,
 ) -> Result<Vec<HubSearchResult>> {
-    let token = state.config.read().await.hf_token.clone();
-    search_hf_models_inner(query, limit.unwrap_or(20), token).await
+    let token = state.token_for_hub().await;
+    let device = tokio::task::spawn_blocking(system::device_spec)
+        .await
+        .ok()
+        .flatten();
+    hub::search_models(
+        &query,
+        limit.unwrap_or(20) as usize,
+        token.as_ref(),
+        device.as_ref(),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -758,80 +255,128 @@ pub async fn get_trending_models(
     state: State<'_, AppState>,
     limit: Option<u32>,
 ) -> Result<Vec<HubSearchResult>> {
-    let token = state.config.read().await.hf_token.clone();
-    search_hf_models_inner(String::new(), limit.unwrap_or(20), token).await
+    search_hub_models(state, String::new(), limit).await
 }
 
+/// How a model would run on this Mac. A model on disk is measured; one that is
+/// only on the Hub is estimated from what the Hub says about it.
 #[tauri::command]
 pub async fn get_model_fit(state: State<'_, AppState>, model_id: String) -> Result<ModelFitInfo> {
-    let available_memory = get_available_memory_bytes()
+    let device = tokio::task::spawn_blocking(system::device_spec)
         .await
-        .unwrap_or_else(|| get_total_memory_bytes_sync() / 2);
-    let available_memory_gb = available_memory as f64 / (1024.0_f64.powi(3));
-
-    let param_b = estimate_params_b(&model_id);
-
-    // Attempt to get actual size from cached models
-    let size_from_cache = {
-        let models = state.cached_models.read().await;
-        models.iter().find(|m| m.id == model_id).map(|m| m.size)
-    };
-
-    let weights_gb = if let Some(bytes) = size_from_cache {
-        bytes as f64 / (1024.0_f64.powi(3))
-    } else {
-        // Estimate: fp16 ~= 2 bytes/param
-        param_b * 2.0
-    };
-
-    // Inference: weights + KV cache overhead (~10%)
-    let inference_memory_gb = weights_gb * 1.1;
-    // Training with LoRA: weights + optimizer states + activations (~4x)
-    let training_memory_gb = weights_gb * 4.0;
-
-    // Bandwidth estimate for tok/s
-    let bandwidth_gbps = get_bandwidth_gbps().await.unwrap_or(400.0);
-    let estimated_tps = if weights_gb > 0.01 {
-        Some((bandwidth_gbps / weights_gb) * 0.55)
-    } else {
-        None
-    };
-
-    let inference_fit = if inference_memory_gb <= available_memory_gb * 0.85 {
-        "fits".to_string()
-    } else if inference_memory_gb <= available_memory_gb {
-        "tight".to_string()
-    } else {
-        "too_large".to_string()
-    };
-
-    let training_fit = if training_memory_gb <= available_memory_gb * 0.85 {
-        "fits".to_string()
-    } else if training_memory_gb <= available_memory_gb {
-        "tight".to_string()
-    } else {
-        "too_large".to_string()
-    };
-
-    // Recommended batch size: scale with available headroom
-    let headroom_gb = (available_memory_gb - inference_memory_gb).max(0.0);
-    // Rough estimate: ~0.5 GB per batch slot for typical models
-    let recommended_batch_size = ((headroom_gb / (weights_gb * 0.05 + 0.5)) as u32).clamp(1, 64);
-
-    Ok(ModelFitInfo {
-        inference_fit,
-        training_fit,
-        weights_gb,
-        inference_memory_gb,
-        training_memory_gb,
-        available_memory_gb,
-        estimated_tps,
-        recommended_batch_size,
-    })
+        .ok()
+        .flatten()
+        .ok_or_else(|| {
+            AppError::new("This Mac's GPU could not be queried, so a fit cannot be estimated.")
+        })?;
+    if let Some(model) = state.find_model(&model_id).await {
+        let path = std::path::PathBuf::from(&model.path);
+        let spec = tokio::task::spawn_blocking(move || pmetal::hub::model_spec_from_dir(&path))
+            .await
+            .map_err(|e| AppError::new(e.to_string()))?;
+        if let Some(spec) = spec {
+            return Ok(system::fit(&spec, &device));
+        }
+    }
+    let token = state.token_for_hub().await;
+    let meta = pmetal::hub::fetch_model_meta(&model_id, token.as_ref())
+        .await
+        .map_err(|e| AppError::new(format!("Could not look up {model_id} on the Hub: {e}")))?;
+    Ok(system::fit(
+        &meta.model_spec(pmetal::hub::DEFAULT_FIT_CONTEXT),
+        &device,
+    ))
 }
 
 // ---------------------------------------------------------------------------
-// Dataset commands
+// Downloads
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn download_model(
+    state: State<'_, AppState>,
+    model_id: String,
+    revision: Option<String>,
+) -> Result<DownloadView> {
+    let model_id = model_id.trim().to_string();
+    if !pmetal::hub::is_hf_id(&model_id) {
+        return Err(AppError::new(format!(
+            "'{model_id}' is not a Hugging Face model id. Use the form owner/name, \
+             for example Qwen/Qwen3-0.6B."
+        )));
+    }
+    let token = state.token_for_hub().await;
+    let id = model_id.clone();
+    state
+        .downloads
+        .start("model", &model_id, move |progress| async move {
+            let mut options =
+                pmetal::hub::DownloadOptions::new(revision.as_deref(), token.as_ref());
+            options.progress = Some(progress);
+            pmetal::hub::download_model_with(&id, &options)
+                .await
+                .map_err(|e| download_error(&id, &e.to_string()))
+        })
+}
+
+#[tauri::command]
+pub async fn download_dataset(
+    state: State<'_, AppState>,
+    dataset_id: String,
+) -> Result<DownloadView> {
+    let dataset_id = dataset_id.trim().to_string();
+    if !pmetal::hub::is_hf_id(&dataset_id) {
+        return Err(AppError::new(format!(
+            "'{dataset_id}' is not a Hugging Face dataset id. Use the form owner/name."
+        )));
+    }
+    let token = state.token_for_hub().await;
+    let id = dataset_id.clone();
+    state
+        .downloads
+        .start("dataset", &dataset_id, move |progress| async move {
+            let mut options = pmetal::hub::DownloadOptions::new(None, token.as_ref());
+            options.progress = Some(progress);
+            pmetal::hub::download_dataset_with(&id, None, &options)
+                .await
+                .map_err(|e| download_error(&id, &e.to_string()))
+        })
+}
+
+fn download_error(id: &str, detail: &str) -> String {
+    let lower = detail.to_lowercase();
+    let hint = if lower.contains("401")
+        || lower.contains("403")
+        || lower.contains("token")
+        || lower.contains("gated")
+    {
+        " If it is gated or private, accept its terms on huggingface.co and add an access token in Settings."
+    } else if lower.contains("404") || lower.contains("not found") {
+        " Check the spelling of the name."
+    } else {
+        ""
+    };
+    format!("Could not download {id}: {detail}.{hint}")
+}
+
+#[tauri::command]
+pub async fn list_downloads(state: State<'_, AppState>) -> Result<Vec<DownloadView>> {
+    Ok(state.downloads.list())
+}
+
+#[tauri::command]
+pub async fn cancel_download(state: State<'_, AppState>, download_id: String) -> Result<()> {
+    state.downloads.cancel(&download_id)
+}
+
+#[tauri::command]
+pub async fn clear_finished_downloads(state: State<'_, AppState>) -> Result<()> {
+    state.downloads.clear_finished();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Datasets
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
@@ -840,8 +385,8 @@ pub async fn search_hub_datasets(
     query: String,
     limit: Option<u32>,
 ) -> Result<Vec<DatasetSearchResult>> {
-    let token = state.config.read().await.hf_token.clone();
-    search_hf_datasets_inner(query, limit.unwrap_or(20), token).await
+    let token = state.token_for_hub().await;
+    hub::search_datasets(&query, limit.unwrap_or(20) as usize, token.as_ref()).await
 }
 
 #[tauri::command]
@@ -849,3379 +394,198 @@ pub async fn get_trending_datasets(
     state: State<'_, AppState>,
     limit: Option<u32>,
 ) -> Result<Vec<DatasetSearchResult>> {
-    let token = state.config.read().await.hf_token.clone();
-    search_hf_datasets_inner(String::new(), limit.unwrap_or(20), token).await
+    search_hub_datasets(state, String::new(), limit).await
 }
 
 #[tauri::command]
 pub async fn list_cached_datasets(state: State<'_, AppState>) -> Result<Vec<CachedDatasetInfo>> {
-    let cache_dir = state.config.read().await.cache_dir.clone();
-    let hub_dir = PathBuf::from(&cache_dir).join("hub");
-    let mut datasets = Vec::new();
-
-    let mut rd = match tokio::fs::read_dir(&hub_dir).await {
-        Ok(rd) => rd,
-        Err(_) => return Ok(datasets),
-    };
-
-    while let Ok(Some(entry)) = rd.next_entry().await {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if name_str.starts_with("datasets--") {
-            let id = name_str
-                .strip_prefix("datasets--")
-                .unwrap_or(&name_str)
-                .replace("--", "/");
-            let path = entry.path();
-            let size_bytes = dir_size_simple(&path).await;
-            datasets.push(CachedDatasetInfo {
-                name: id,
-                path: path.to_string_lossy().into_owned(),
-                size_bytes,
-                size_formatted: format_size(size_bytes),
-            });
-        }
-    }
-
-    Ok(datasets)
-}
-
-/// Download a dataset from HuggingFace Hub (or validate a local path).
-///
-/// Returns the resolved path to the dataset file on disk.
-#[tauri::command]
-pub async fn download_dataset(dataset_id: String) -> Result<String> {
-    let path = resolve_dataset_path(&dataset_id).await?;
-    Ok(path.to_string_lossy().into_owned())
-}
-
-/// Peek at the first JSONL record in a file and return the available field names.
-///
-/// Peek at a dataset file: returns column names and rough length statistics
-/// (sampled from the first 100 records) so the frontend can show seq len warnings.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct DatasetPeek {
-    pub columns: Vec<String>,
-    /// Estimated average token count (chars / 4 heuristic, sampled from first 100 rows).
-    pub avg_tokens_estimate: usize,
-    /// Estimated max token count in the sample.
-    pub max_tokens_estimate: usize,
-    /// Suggested max_seq_len (next power of two covering the p95 estimate).
-    pub suggested_seq_len: usize,
-    /// Number of rows sampled.
-    pub rows_sampled: usize,
+    let cache = state.paths.hub_cache.clone();
+    tokio::task::spawn_blocking(move || hub::cached_datasets(&cache))
+        .await
+        .map_err(|e| AppError::new(e.to_string()))
 }
 
 #[tauri::command]
 pub async fn peek_dataset_columns(path: String, limit: Option<usize>) -> Result<DatasetPeek> {
-    let sample_limit = limit.unwrap_or(100);
-
-    let p = std::path::PathBuf::from(&path);
-    let columns = pmetal::data::peek_columns(&p).map_err(|e| AppError(e.to_string()))?;
-
-    // Sample the first rows (any container: JSONL, Parquet, ...) for length
-    // estimates; 0 scans them all.
-    let char_lengths = pmetal::data::sample_row_chars(&p, sample_limit).unwrap_or_default();
-
-    let rows_sampled = char_lengths.len();
-    // Rough estimate: 1 token ≈ 4 characters for English text
-    let token_estimates: Vec<usize> = char_lengths.iter().map(|&c| c / 4).collect();
-    let avg = if token_estimates.is_empty() {
-        0
-    } else {
-        token_estimates.iter().sum::<usize>() / token_estimates.len()
-    };
-    let max = token_estimates.iter().copied().max().unwrap_or(0);
-
-    // p95 estimate for suggested seq len
-    let mut sorted = token_estimates;
-    sorted.sort();
-    let p95 = sorted
-        .get((sorted.len() as f64 * 0.95) as usize)
-        .copied()
-        .unwrap_or(avg);
-    // Round up to next multiple of 64 (practical for GPU alignment)
-    let suggested = if p95 > 0 { p95.div_ceil(64) * 64 } else { 2048 };
-
-    Ok(DatasetPeek {
-        columns,
-        avg_tokens_estimate: avg,
-        max_tokens_estimate: max,
-        suggested_seq_len: suggested,
-        rows_sampled,
-    })
+    tokio::task::spawn_blocking(move || datasets::peek(&path, limit))
+        .await
+        .map_err(|e| AppError::new(e.to_string()))?
 }
 
 // ---------------------------------------------------------------------------
-// Training commands
+// Jobs
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
-pub async fn start_training(
-    state: State<'_, AppState>,
-    _app_handle: AppHandle,
-    mut spec: pmetal::core::jobs::TrainSpec,
-    on_metrics: tauri::ipc::Channel<serde_json::Value>,
-) -> Result<String> {
-    spec.normalize()
-        .map_err(|errs| AppError(errs[0].message.clone()))?;
+/// Why a job did not start.
+#[derive(Debug, Serialize)]
+pub struct StartFailure {
+    pub message: String,
+    /// The fields of the form that are wrong, each with what is wrong.
+    pub issues: Vec<FieldIssue>,
+}
 
-    // Determine training method from quantization field and ane flag for
-    // display purposes (the actual dispatch is inside the orchestrator).
-    let method = if spec.ane {
-        "ane"
-    } else if spec.quantization.as_deref().is_some_and(|q| q != "none") {
-        "qlora"
-    } else {
-        "lora"
-    };
-
-    // -----------------------------------------------------------------------
-    // Pre-flight validation: resolve dataset before creating the run so that
-    // HF download errors surface immediately rather than silently after spawn.
-    // -----------------------------------------------------------------------
-    let dataset_id = spec.dataset.clone();
-    let resolved_dataset = resolve_dataset_path(&dataset_id)
-        .await
-        .map_err(|e| AppError(format!("Dataset not found: {e}")))?;
-
-    let total_epochs = spec.epochs as u32;
-
-    // Resolve output_dir to an absolute path under ~/pmetal-output/ when the
-    // spec carries a relative or placeholder path, so the GUI process working
-    // directory doesn't affect the result.
-    let output_dir = {
-        let raw = &spec.output_dir;
-        let p = PathBuf::from(raw);
-        let base = dirs::home_dir()
-            .map(|h| h.join("pmetal-output"))
-            .unwrap_or_else(|| PathBuf::from("./pmetal-output"));
-        let _ = std::fs::create_dir_all(&base);
-
-        if p.is_absolute() {
-            p.to_string_lossy().to_string()
-        } else if raw != "./output" && !raw.is_empty() {
-            // User supplied a custom relative name — anchor it under ~/pmetal-output/.
-            base.join(p.file_name().unwrap_or(std::ffi::OsStr::new("output")))
-                .to_string_lossy()
-                .to_string()
-        } else {
-            // Auto-generate: "Qwen3-0.6B-lora-20260318-2145"
-            let model_short = spec.model.rsplit('/').next().unwrap_or(&spec.model);
-            let ts = chrono::Local::now().format("%Y%m%d-%H%M");
-            base.join(format!("{model_short}-{method}-{ts}"))
-                .to_string_lossy()
-                .to_string()
+impl From<StartError> for StartFailure {
+    fn from(e: StartError) -> Self {
+        match e {
+            StartError::Message(m) => Self {
+                message: m.message().to_string(),
+                issues: Vec::new(),
+            },
+            StartError::Invalid(issues) => Self {
+                message: issues
+                    .iter()
+                    .take(3)
+                    .map(|i| {
+                        if i.field.is_empty() {
+                            i.message.clone()
+                        } else {
+                            format!("{}: {}", i.field.replace('_', " "), i.message)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; "),
+                issues,
+            },
         }
-    };
-    // Propagate the resolved path back so the orchestrator and metadata use it.
-    spec.output_dir = output_dir.clone();
+    }
+}
 
-    let metrics_path = PathBuf::from(&output_dir).join("metrics.jsonl");
-    let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+/// The form of every job the app can start.
+#[tauri::command]
+pub async fn list_job_forms() -> Result<Vec<FormInfo>> {
+    Ok(kinds::all().iter().map(|k| k.form()).collect())
+}
 
-    // Build a config summary for display in the UI.
-    let config_summary = TrainingConfigSummary {
-        learning_rate: spec.learning_rate,
-        batch_size: spec.batch_size,
-        max_seq_len: spec.max_seq_len,
-        lora_rank: Some(spec.lora_r),
-        lora_alpha: Some(spec.lora_alpha),
-        sequence_packing: !spec.no_sequence_packing,
-        gradient_checkpointing: !spec.no_gradient_checkpointing,
-    };
-
-    let mut run = TrainingRun::new(
-        &spec.model,
-        method,
-        Some(&dataset_id),
-        Some(&output_dir),
-        total_epochs,
-    );
-    run.status = TrainingStatus::Running;
-    run.status_message = Some("Starting…".to_string());
-    run.config_summary = Some(config_summary);
-    let run_id = run.id.clone();
-
+#[tauri::command]
+pub async fn start_job(
+    state: State<'_, AppState>,
+    kind: String,
+    values: BTreeMap<String, String>,
+) -> std::result::Result<JobView, StartFailure> {
+    let token = state.token_for_hub().await;
     state
-        .cancel_flags
-        .write()
+        .jobs
+        .start(&kind, &values, token.as_ref())
+        .map_err(StartFailure::from)
+}
+
+#[tauri::command]
+pub async fn stop_job(state: State<'_, AppState>, job_id: String) -> Result<()> {
+    state.jobs.stop(&job_id)
+}
+
+#[tauri::command]
+pub async fn forget_job(state: State<'_, AppState>, job_id: String) -> Result<()> {
+    state.jobs.forget(&job_id)
+}
+
+#[tauri::command]
+pub async fn list_jobs(state: State<'_, AppState>) -> Result<Vec<JobView>> {
+    Ok(state.jobs.list())
+}
+
+#[tauri::command]
+pub async fn job_output(
+    state: State<'_, AppState>,
+    job_id: String,
+    tail: Option<usize>,
+    since: Option<u64>,
+) -> Result<OutputPage> {
+    state
+        .jobs
+        .output(&job_id, tail.unwrap_or(500).min(5000), since)
+}
+
+#[tauri::command]
+pub async fn job_steps(
+    state: State<'_, AppState>,
+    job_id: String,
+    since: Option<u64>,
+) -> Result<StepPage> {
+    state.jobs.steps(&job_id, since.unwrap_or(0))
+}
+
+#[tauri::command]
+pub async fn list_trained_adapters(state: State<'_, AppState>) -> Result<Vec<TrainedAdapter>> {
+    let root = state.paths.output_root.clone();
+    tokio::task::spawn_blocking(move || adapters::scan(&root))
         .await
-        .insert(run_id.clone(), cancel_flag.clone());
+        .map_err(|e| AppError::new(e.to_string()))
+}
 
-    state.create_training_run(run).await;
+// ---------------------------------------------------------------------------
+// Chat
+// ---------------------------------------------------------------------------
 
-    let run_id_task = run_id.clone();
-    let state_arc = state.training_runs.clone();
-    let event_tx = state.event_tx.clone();
-    let cancel_flags = state.cancel_flags.clone();
-    // The job every surface runs a train spec as; what is the GUI's own is
-    // set below.
-    let mut job_config = pmetal::trainer::TrainingJobConfig::from_spec(&spec).map_err(AppError)?;
-    job_config.dataset = resolved_dataset.to_string_lossy().into_owned();
-    job_config.log_metrics = Some(metrics_path.display().to_string());
-    job_config.emit_console_output = false;
+struct ChatEvents(AppHandle);
 
-    // Write training_info.json before spawning so the adapter scanner can
-    // find base_model + dataset even if training is still running.
-    let _ = std::fs::create_dir_all(&output_dir);
-    {
-        let info = serde_json::json!({
-            "base_model": spec.model,
-            "dataset": dataset_id,
-            "method": method,
-            "created": chrono::Local::now().to_rfc3339(),
-        });
-        let _ = std::fs::write(
-            PathBuf::from(&output_dir).join("training_info.json"),
-            serde_json::to_string_pretty(&info).unwrap_or_default(),
+impl inference::Sink for ChatEvents {
+    fn token(&self, session_id: &str, text: &str) {
+        let _ = self.0.emit(
+            "chat-token",
+            serde_json::json!({ "session_id": session_id, "text": text }),
         );
     }
 
-    tokio::spawn(async move {
-        let _ = tokio::fs::create_dir_all(&output_dir).await;
-        let _ = tokio::fs::write(&metrics_path, "").await;
+    fn done(&self, metrics: &inference::Metrics) {
+        let _ = self.0.emit("chat-done", metrics);
+    }
 
-        // Emit a "loading model" status before the expensive model load.
-        {
-            let mut runs = state_arc.write().await;
-            if let Some(run) = runs.iter_mut().find(|r| r.id == run_id_task) {
-                run.status_message = Some("Loading model…".to_string());
-                let _ = event_tx.send(AppEvent::TrainingUpdate { run: run.clone() });
-            }
-        }
-
-        // Wire PhaseCallback to update the GUI run status
-        let status_state = state_arc.clone();
-        let status_tx = event_tx.clone();
-        let status_run_id = run_id_task.clone();
-        let phase_cb = move |phase: &pmetal::trainer::TrainingPhase| {
-            if let Ok(mut runs) = status_state.try_write()
-                && let Some(run) = runs.iter_mut().find(|r| r.id == status_run_id)
-            {
-                run.status_message = Some(phase.message().to_string());
-                let _ = status_tx.send(AppEvent::TrainingUpdate { run: run.clone() });
-            }
-        };
-
-        let callbacks: Vec<Box<dyn pmetal::core::TrainingCallback>> = vec![
-            Box::new(CancelOnFlag {
-                cancelled: cancel_flag.clone(),
-            }),
-            Box::new(ChannelMetricsCallback {
-                channel: on_metrics,
-                started_at: Utc::now(),
-                best_loss: None,
-            }),
-        ];
-
-        let result =
-            pmetal::trainer::orchestrator::run_training(job_config, Some(&phase_cb), callbacks)
-                .await
-                .map(|_| ())
-                .map_err(|e| AppError(e.to_string()));
-
-        // Clear the status message on success so the UI can show step progress.
-        if result.is_ok() {
-            let mut runs = state_arc.write().await;
-            if let Some(run) = runs.iter_mut().find(|r| r.id == run_id_task) {
-                run.status_message = None;
-                let _ = event_tx.send(AppEvent::TrainingUpdate { run: run.clone() });
-            }
-        }
-
-        let success = result.is_ok();
-        let error = result.err().map(|e| e.to_string());
-        finalize_training_run(
-            &state_arc,
-            &event_tx,
-            &run_id_task,
-            &cancel_flag,
-            success,
-            error,
-        )
-        .await;
-
-        // Release MLX Metal buffer cache after training ends (success, error, or cancel).
-        pmetal_runtime::inline_array::clear_cache();
-        tracing::info!("Training cleanup: MLX cache cleared");
-
-        cancel_flags.write().await.remove(&run_id_task);
-    });
-
-    Ok(run_id)
+    fn failed(&self, session_id: &str, message: &str) {
+        let _ = self.0.emit(
+            "chat-error",
+            serde_json::json!({ "session_id": session_id, "error": message }),
+        );
+    }
 }
 
+/// Start a reply. Its events carry `session_id`, which the page chose.
 #[tauri::command]
-pub async fn get_training_status(
+pub async fn start_chat(
     state: State<'_, AppState>,
-    run_id: String,
-) -> Result<Option<TrainingRun>> {
-    Ok(state.get_training_run(&run_id).await)
-}
-
-#[tauri::command]
-pub async fn list_training_runs(state: State<'_, AppState>) -> Result<Vec<TrainingRun>> {
-    Ok(state.list_training_runs().await)
-}
-
-#[tauri::command]
-pub async fn stop_training(state: State<'_, AppState>, run_id: String) -> Result<()> {
-    state.cancel_training_run(&run_id).await;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Distillation commands
-// ---------------------------------------------------------------------------
-
-#[tauri::command]
-pub async fn start_distillation(
-    state: State<'_, AppState>,
-    _app_handle: AppHandle,
-    mut spec: pmetal::core::jobs::DistillSpec,
-    on_event: tauri::ipc::Channel<serde_json::Value>,
-) -> Result<String> {
-    spec.normalize()
-        .map_err(|errs| AppError(errs[0].message.clone()))?;
-
-    let temperature = spec.temperature as f64;
-    let loss_type = spec.loss_type.clone();
-    let total_epochs = spec.epochs as u64;
-    let output_dir = spec.output_dir.clone();
-    let metrics_path = PathBuf::from(&output_dir).join("metrics.jsonl");
-
-    let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    let mut run = DistillationRun::new(
-        &spec.student,
-        &spec.teacher,
-        Some(spec.dataset.as_str()),
-        &loss_type,
-        temperature,
-        total_epochs,
-        Some(&output_dir),
-    );
-    run.status = DistillationStatus::Training;
-    let run_id = run.id.clone();
-
-    state
-        .cancel_flags
-        .write()
-        .await
-        .insert(run_id.clone(), cancel_flag.clone());
-    state.create_distillation_run(run).await;
-
-    let run_id_task = run_id.clone();
-    let state_arc = state.distillation_runs.clone();
-    let event_tx = state.event_tx.clone();
-    let cancel_flags = state.cancel_flags.clone();
-
-    tokio::spawn(async move {
-        let _ = tokio::fs::create_dir_all(&output_dir).await;
-        let _ = tokio::fs::write(&metrics_path, "").await;
-
-        // Tail the metrics JSONL file and forward each row through the IPC
-        // channel. This replaces the legacy file-poll watcher with a channel-
-        // based approach so the frontend can consume events without polling.
-        let watcher_metrics = metrics_path.clone();
-        let watcher_cancel = cancel_flag.clone();
-        let watcher_state = state_arc.clone();
-        let watcher_event_tx = event_tx.clone();
-        let watcher_run_id = run_id_task.clone();
-        tokio::spawn(async move {
-            tail_jsonl_to_channel(watcher_metrics, watcher_cancel, on_event, move |row| {
-                let mut runs = watcher_state.try_write().ok()?;
-                let run = runs.iter_mut().find(|r| r.id == watcher_run_id)?;
-                let started_at = Utc::now(); // approximate; ETA is best-effort
-                apply_metrics_to_distillation(run, row, started_at);
-                let _ = watcher_event_tx.send(AppEvent::DistillationUpdate { run: run.clone() });
-                Some(())
-            })
-            .await;
-        });
-
-        let result = std::panic::AssertUnwindSafe(run_distillation_in_process(
-            &spec,
-            &metrics_path,
-            cancel_flag.clone(),
-        ))
-        .catch_unwind()
-        .await;
-
-        let (success, error) = match result {
-            Ok(Ok(())) => (true, None),
-            Ok(Err(e)) => (false, Some(e.to_string())),
-            Err(panic_payload) => {
-                let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
-                    format!("Distillation crashed: {s}")
-                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                    format!("Distillation crashed: {s}")
-                } else {
-                    "Distillation crashed (internal panic)".to_string()
-                };
-                (false, Some(msg))
-            }
-        };
-        finalize_distillation_run(
-            &state_arc,
-            &event_tx,
-            &run_id_task,
-            &cancel_flag,
-            success,
-            error,
-        )
-        .await;
-
-        cancel_flags.write().await.remove(&run_id_task);
-    });
-
-    Ok(run_id)
-}
-
-#[tauri::command]
-pub async fn get_distillation_status(
-    state: State<'_, AppState>,
-    run_id: String,
-) -> Result<Option<DistillationRun>> {
-    Ok(state.get_distillation_run(&run_id).await)
-}
-
-#[tauri::command]
-pub async fn list_distillation_runs(state: State<'_, AppState>) -> Result<Vec<DistillationRun>> {
-    Ok(state.list_distillation_runs().await)
-}
-
-#[tauri::command]
-pub async fn stop_distillation(state: State<'_, AppState>, run_id: String) -> Result<()> {
-    state.cancel_distillation_run(&run_id).await;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// GRPO commands
-// ---------------------------------------------------------------------------
-
-#[tauri::command]
-pub async fn start_grpo(
-    state: State<'_, AppState>,
-    _app_handle: AppHandle,
-    mut spec: pmetal::core::jobs::GrpoSpec,
-    on_event: tauri::ipc::Channel<serde_json::Value>,
-) -> Result<String> {
-    spec.normalize()
-        .map_err(|errs| AppError(errs[0].message.clone()))?;
-
-    let group_size = spec.num_generations as u32;
-    let beta = spec.beta;
-    let output_dir = spec.output_dir.clone();
-    let metrics_path = PathBuf::from(&output_dir).join("metrics.jsonl");
-
-    let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    let mut run = GrpoRun::new(
-        &spec.model,
-        Some(spec.dataset.as_str()),
-        group_size,
-        beta,
-        Some(&output_dir),
-    );
-    run.status = GrpoStatus::Running;
-    let run_id = run.id.clone();
-
-    state
-        .cancel_flags
-        .write()
-        .await
-        .insert(run_id.clone(), cancel_flag.clone());
-    state.create_grpo_run(run).await;
-
-    let run_id_task = run_id.clone();
-    let state_arc = state.grpo_runs.clone();
-    let event_tx = state.event_tx.clone();
-    let cancel_flags = state.cancel_flags.clone();
-
-    tokio::spawn(async move {
-        let _ = tokio::fs::create_dir_all(&output_dir).await;
-        let _ = tokio::fs::write(&metrics_path, "").await;
-
-        let watcher_metrics = metrics_path.clone();
-        let watcher_cancel = cancel_flag.clone();
-        let watcher_state = state_arc.clone();
-        let watcher_event_tx = event_tx.clone();
-        let watcher_run_id = run_id_task.clone();
-        tokio::spawn(async move {
-            tail_jsonl_to_channel(watcher_metrics, watcher_cancel, on_event, move |row| {
-                let mut runs = watcher_state.try_write().ok()?;
-                let run = runs.iter_mut().find(|r| r.id == watcher_run_id)?;
-                let started_at = Utc::now();
-                apply_metrics_to_grpo(run, row, started_at);
-                let _ = watcher_event_tx.send(AppEvent::GrpoUpdate { run: run.clone() });
-                Some(())
-            })
-            .await;
-        });
-
-        let result = std::panic::AssertUnwindSafe(run_grpo_in_process(
-            &spec,
-            &metrics_path,
-            cancel_flag.clone(),
-        ))
-        .catch_unwind()
-        .await;
-
-        let (success, error) = match result {
-            Ok(Ok(())) => (true, None),
-            Ok(Err(e)) => (false, Some(e.to_string())),
-            Err(panic_payload) => {
-                let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
-                    format!("GRPO crashed: {s}")
-                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                    format!("GRPO crashed: {s}")
-                } else {
-                    "GRPO crashed (internal panic)".to_string()
-                };
-                (false, Some(msg))
-            }
-        };
-        finalize_grpo_run(
-            &state_arc,
-            &event_tx,
-            &run_id_task,
-            &cancel_flag,
-            success,
-            error,
-        )
-        .await;
-
-        cancel_flags.write().await.remove(&run_id_task);
-    });
-
-    Ok(run_id)
-}
-
-#[tauri::command]
-pub async fn get_grpo_status(
-    state: State<'_, AppState>,
-    run_id: String,
-) -> Result<Option<GrpoRun>> {
-    Ok(state.get_grpo_run(&run_id).await)
-}
-
-#[tauri::command]
-pub async fn list_grpo_runs(state: State<'_, AppState>) -> Result<Vec<GrpoRun>> {
-    Ok(state.list_grpo_runs().await)
-}
-
-#[tauri::command]
-pub async fn stop_grpo(state: State<'_, AppState>, run_id: String) -> Result<()> {
-    state.cancel_grpo_run(&run_id).await;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Serve — long-running HTTP inference server
-//
-// Spawns `pmetal serve` as a child process, tails its stdout/stderr into the
-// ServeInstance log buffer, and broadcasts status transitions through
-// AppEvent. Matches the TUI Serve tab behavior exactly so config built in
-// either surface produces the same running server.
-// ---------------------------------------------------------------------------
-
-#[tauri::command]
-pub async fn list_serve_instances(state: State<'_, AppState>) -> Result<Vec<ServeInstance>> {
-    Ok(state.list_serve_instances().await)
-}
-
-#[tauri::command]
-pub async fn stop_serve(state: State<'_, AppState>, instance_id: String) -> Result<()> {
-    state.stop_serve_instance(&instance_id).await;
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn start_serve(
-    state: State<'_, AppState>,
-    _app_handle: AppHandle,
-    mut spec: pmetal::core::jobs::ServeSpec,
-) -> Result<String> {
-    spec.normalize()
-        .map_err(|errs| AppError(errs[0].message.clone()))?;
-
-    let host = spec.host.clone();
-    let port = spec.port;
-    // 0: the model's own default, which `pmetal serve` picks.
-    let max_seq_len = spec.max_seq_len.unwrap_or(0);
-    let fp8 = spec.fp8;
-    // Derive a display kv_cache string from spec fields (for ServeInstance display).
-    let kv_cache_display = if spec.kv_turboquant {
-        if let Some(ref preset) = spec.kv_turboquant_preset {
-            format!("tq_{preset}")
-        } else if let Some(bits) = spec.kv_quant {
-            format!("tq{bits}")
-        } else {
-            "turboquant".into()
-        }
-    } else if spec.no_kv_quant {
-        "fp16".into()
-    } else if let Some(bits) = spec.kv_quant {
-        format!("q{bits}")
-    } else {
-        "auto".into()
-    };
-
-    // Refuse to start if something is already bound to the same port, so
-    // the operator sees a clean error instead of a mysterious crash loop
-    // from the child process's bind() failure.
-    {
-        let instances = state.serve_instances.read().await;
-        if instances.iter().any(|i| {
-            matches!(i.status, ServeStatus::Starting | ServeStatus::Running) && i.port == port
-        }) {
-            return Err(AppError(format!(
-                "A serve instance is already running on port {port}. Stop it first."
-            )));
-        }
-    }
-
-    let instance = ServeInstance::new(
-        &spec.model,
-        &host,
-        port,
-        max_seq_len,
-        fp8,
-        &kv_cache_display,
-    );
-    let instance_id = instance.id.clone();
-    state.create_serve_instance(instance).await;
-
-    // Build the `pmetal serve` argv via ServeSpec::to_argv().
-    let argv = spec.to_argv();
-    let mut args: Vec<String> = vec!["serve".into()];
-    args.extend(argv);
-
-    let binary = pmetal_binary();
-    let mut cmd = tokio::process::Command::new(&binary);
-    cmd.args(&args);
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    // Put the child in its own process group so `child.kill()` also
-    // reaches any grandchildren the serve binary may have spawned.
-    #[cfg(unix)]
-    cmd.process_group(0);
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| AppError(format!("Failed to spawn `{}`: {e}", binary.display())))?;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    state
-        .active_processes
-        .write()
-        .await
-        .insert(instance_id.clone(), child);
-
-    // Stream stdout + stderr into the ServeInstance log tail and
-    // broadcast each line so the frontend can update the log panel
-    // live. A dedicated task per stream avoids blocking the command
-    // handler.
-    spawn_serve_output_reader(
-        state.serve_instances.clone(),
-        state.event_tx.clone(),
-        instance_id.clone(),
-        stdout,
-        stderr,
-    );
-    spawn_serve_exit_watcher(
-        state.serve_instances.clone(),
-        state.active_processes.clone(),
-        state.event_tx.clone(),
-        instance_id.clone(),
-    );
-
-    Ok(instance_id)
-}
-
-fn spawn_serve_output_reader(
-    instances: Arc<tokio::sync::RwLock<Vec<ServeInstance>>>,
-    event_tx: tokio::sync::broadcast::Sender<AppEvent>,
-    instance_id: String,
-    stdout: Option<tokio::process::ChildStdout>,
-    stderr: Option<tokio::process::ChildStderr>,
-) {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
-    // Merge stdout + stderr into one push loop keyed by instance_id.
-    let merge = |maybe_stream: Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>,
-                 instances: Arc<tokio::sync::RwLock<Vec<ServeInstance>>>,
-                 event_tx: tokio::sync::broadcast::Sender<AppEvent>,
-                 instance_id: String| async move {
-        let Some(stream) = maybe_stream else { return };
-        let mut reader = BufReader::new(stream).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            let mut instances_w = instances.write().await;
-            if let Some(inst) = instances_w.iter_mut().find(|i| i.id == instance_id) {
-                inst.append_log(&line);
-                let _ = event_tx.send(AppEvent::ServeUpdate {
-                    instance: inst.clone(),
-                });
-            } else {
-                break;
-            }
-        }
-    };
-
-    if let Some(s) = stdout {
-        let boxed: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(s);
-        let instances_cl = instances.clone();
-        let event_tx_cl = event_tx.clone();
-        let id_cl = instance_id.clone();
-        tokio::spawn(merge(Some(boxed), instances_cl, event_tx_cl, id_cl));
-    }
-    if let Some(s) = stderr {
-        let boxed: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(s);
-        tokio::spawn(merge(Some(boxed), instances, event_tx, instance_id));
-    }
-}
-
-fn spawn_serve_exit_watcher(
-    instances: Arc<tokio::sync::RwLock<Vec<ServeInstance>>>,
-    active_processes: Arc<
-        tokio::sync::RwLock<std::collections::HashMap<String, tokio::process::Child>>,
-    >,
-    event_tx: tokio::sync::broadcast::Sender<AppEvent>,
-    instance_id: String,
-) {
-    tokio::spawn(async move {
-        // Poll the child every 250ms until it exits. We keep the child in
-        // `active_processes` so stop_serve can still kill it directly; we
-        // take ownership here only when it has actually exited.
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
-            let mut procs = active_processes.write().await;
-            let Some(child) = procs.get_mut(&instance_id) else {
-                // Someone else removed it (stop_serve called). Done.
-                return;
-            };
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    // Exited. Remove from the registry and mark the
-                    // instance as Stopped (success) or Failed.
-                    procs.remove(&instance_id);
-                    drop(procs);
-                    let mut instances_w = instances.write().await;
-                    if let Some(inst) = instances_w.iter_mut().find(|i| i.id == instance_id)
-                        && matches!(inst.status, ServeStatus::Starting | ServeStatus::Running)
-                    {
-                        if status.success() {
-                            inst.status = ServeStatus::Stopped;
-                            inst.status_message = Some("Exited cleanly".to_string());
-                        } else {
-                            inst.status = ServeStatus::Failed;
-                            let msg = format!("Process exited with status {status}");
-                            inst.error_message = Some(msg.clone());
-                            inst.status_message = Some(msg);
-                        }
-                        inst.stopped_at = Some(Utc::now());
-                        let _ = event_tx.send(AppEvent::ServeUpdate {
-                            instance: inst.clone(),
-                        });
-                        let _ = event_tx.send(AppEvent::ServeStopped {
-                            instance_id: instance_id.clone(),
-                        });
-                    }
-                    return;
-                }
-                Ok(None) => continue,
-                Err(_) => return,
-            }
-        }
-    });
-}
-
-// ---------------------------------------------------------------------------
-// Bench — one-shot benchmark subprocess, trial rows parsed into BenchRun
-// ---------------------------------------------------------------------------
-
-#[tauri::command]
-pub async fn list_bench_runs(state: State<'_, AppState>) -> Result<Vec<BenchRun>> {
-    Ok(state.list_bench_runs().await)
-}
-
-#[tauri::command]
-pub async fn stop_bench(state: State<'_, AppState>, run_id: String) -> Result<()> {
-    state.cancel_bench_run(&run_id).await;
-    Ok(())
-}
-
-#[derive(Debug, Deserialize)]
-pub struct GuiBenchSpec {
-    pub mode: Option<String>,
-    pub model: String,
-    pub dataset: Option<String>,
-    pub preset: Option<String>,
-    pub experts_dir: Option<String>,
-    pub inference_context: Option<String>,
-    pub prompt_samples: Option<usize>,
-    pub max_prompt_tokens: Option<usize>,
-    pub decode_steps: Option<usize>,
-    pub inference_warmup_passes: Option<usize>,
-    pub inference_session_repeats: Option<usize>,
-    pub inference_repeats: Option<usize>,
-    pub train_samples: Option<usize>,
-    pub train_steps: Option<usize>,
-    pub batch_size: Option<usize>,
-    pub seq_len: Option<usize>,
-    pub max_seq_len: Option<usize>,
-    pub json: Option<bool>,
-    pub output: Option<String>,
-}
-
-#[tauri::command]
-pub async fn start_bench(
-    state: State<'_, AppState>,
-    _app_handle: AppHandle,
-    spec: GuiBenchSpec,
-    on_event: tauri::ipc::Channel<serde_json::Value>,
-) -> Result<String> {
-    let mode = spec.mode.as_deref().unwrap_or("basic");
-    if !matches!(mode, "basic" | "workload") {
-        return Err(AppError(format!("unknown benchmark mode: {mode}")));
-    }
-    let preset = spec
-        .preset
-        .as_deref()
-        .filter(|p| !p.is_empty() && *p != "custom");
-    if (mode == "basic" || preset.is_none()) && spec.model.trim().is_empty() {
-        return Err(AppError("model is required".into()));
-    }
-
-    let run = BenchRun::new(mode, &spec.model, preset);
-    let run_id = run.id.clone();
-    state.create_bench_run(run).await;
-
-    let mut args: Vec<String> = if mode == "workload" {
-        let mut args = vec!["bench-workload".into()];
-        if let Some(preset) = preset {
-            args.extend(["--preset".into(), preset.to_string()]);
-        } else {
-            let dataset = spec.dataset.as_deref().unwrap_or_default().trim();
-            if dataset.is_empty() {
-                return Err(AppError(
-                    "dataset is required for custom workload benchmarks".into(),
-                ));
-            }
-            args.extend(["--model".into(), spec.model.clone()]);
-            args.extend(["--dataset".into(), dataset.to_string()]);
-            args.extend([
-                "--inference-context".into(),
-                spec.inference_context
-                    .as_deref()
-                    .unwrap_or("auto")
-                    .to_string(),
-            ]);
-            args.extend([
-                "--prompt-samples".into(),
-                spec.prompt_samples.unwrap_or(8).to_string(),
-            ]);
-            args.extend([
-                "--max-prompt-tokens".into(),
-                spec.max_prompt_tokens.unwrap_or(0).to_string(),
-            ]);
-            args.extend([
-                "--decode-steps".into(),
-                spec.decode_steps.unwrap_or(32).to_string(),
-            ]);
-            args.extend([
-                "--inference-repeats".into(),
-                spec.inference_repeats.unwrap_or(1).to_string(),
-            ]);
-            args.extend([
-                "--train-samples".into(),
-                spec.train_samples.unwrap_or(8).to_string(),
-            ]);
-            args.extend([
-                "--train-steps".into(),
-                spec.train_steps.unwrap_or(4).to_string(),
-            ]);
-            args.extend([
-                "--batch-size".into(),
-                spec.batch_size.unwrap_or(1).to_string(),
-            ]);
-            args.extend([
-                "--max-seq-len".into(),
-                spec.max_seq_len.unwrap_or(0).to_string(),
-            ]);
-        }
-        if let Some(experts_dir) = spec.experts_dir.as_deref().filter(|s| !s.trim().is_empty()) {
-            args.extend(["--experts-dir".into(), experts_dir.to_string()]);
-        }
-        args.extend([
-            "--inference-warmup-passes".into(),
-            spec.inference_warmup_passes.unwrap_or(2).to_string(),
-        ]);
-        args.extend([
-            "--inference-session-repeats".into(),
-            spec.inference_session_repeats.unwrap_or(1).to_string(),
-        ]);
-        args
-    } else {
-        vec![
-            "bench".into(),
-            "--model".into(),
-            spec.model.clone(),
-            "--batch-size".into(),
-            spec.batch_size.unwrap_or(1).to_string(),
-            "--seq-len".into(),
-            spec.seq_len.unwrap_or(512).to_string(),
-        ]
-    };
-    if spec.json.unwrap_or(false) {
-        args.push("--json".into());
-    }
-    if let Some(output) = spec.output.as_deref().filter(|s| !s.trim().is_empty()) {
-        args.extend(["--output".into(), output.to_string()]);
-    }
-
-    spawn_job_subprocess(&state, run_id.clone(), args, JobKind::Bench, on_event).await?;
-    Ok(run_id)
-}
-
-// ---------------------------------------------------------------------------
-// Eval — one-shot evaluation subprocess, metrics parsed into EvalRun
-// ---------------------------------------------------------------------------
-
-#[tauri::command]
-pub async fn list_eval_runs(state: State<'_, AppState>) -> Result<Vec<EvalRun>> {
-    Ok(state.list_eval_runs().await)
-}
-
-#[tauri::command]
-pub async fn stop_eval(state: State<'_, AppState>, run_id: String) -> Result<()> {
-    state.cancel_eval_run(&run_id).await;
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn start_eval(
-    state: State<'_, AppState>,
-    _app_handle: AppHandle,
-    mut spec: pmetal::core::jobs::EvalSpec,
-    on_event: tauri::ipc::Channel<serde_json::Value>,
-) -> Result<String> {
-    spec.normalize()
-        .map_err(|errs| AppError(errs[0].message.clone()))?;
-
-    let run = EvalRun::new(&spec.model, &spec.dataset);
-    let run_id = run.id.clone();
-    state.create_eval_run(run).await;
-
-    let mut args: Vec<String> = vec!["eval".into()];
-    args.extend(spec.to_argv());
-
-    spawn_job_subprocess(&state, run_id.clone(), args, JobKind::Eval, on_event).await?;
-    Ok(run_id)
-}
-
-/// Kind of one-shot measurement job — discriminates which state helpers
-/// to call from the shared `spawn_job_subprocess` driver.
-#[derive(Debug, Clone, Copy)]
-enum JobKind {
-    Bench,
-    Eval,
-    Pretrain,
-}
-
-/// Spawn a `pmetal <subcommand>` child for a one-shot job and wire up
-/// stdout/stderr tailing + exit watching. Shared between Bench, Eval, and
-/// Pretrain so they can't drift — any change to the subprocess lifecycle
-/// lands in all surfaces at once.
-async fn spawn_job_subprocess(
-    state: &AppState,
-    run_id: String,
-    args: Vec<String>,
-    kind: JobKind,
-    on_event: tauri::ipc::Channel<serde_json::Value>,
-) -> Result<()> {
-    let binary = pmetal_binary();
-    let mut cmd = tokio::process::Command::new(&binary);
-    cmd.args(&args);
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    #[cfg(unix)]
-    cmd.process_group(0);
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| AppError(format!("Failed to spawn `{}`: {e}", binary.display())))?;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    state
-        .active_processes
-        .write()
-        .await
-        .insert(run_id.clone(), child);
-
-    // Stream output into the appropriate run record.
-    let bench_runs = state.bench_runs.clone();
-    let eval_runs = state.eval_runs.clone();
-    let pretrain_runs = state.pretrain_runs.clone();
-    let event_tx = state.event_tx.clone();
-
-    spawn_job_reader(
-        kind,
-        bench_runs.clone(),
-        eval_runs.clone(),
-        pretrain_runs.clone(),
-        event_tx.clone(),
-        run_id.clone(),
-        stdout,
-        stderr,
-        on_event,
-    );
-    spawn_job_exit_watcher(
-        kind,
-        bench_runs,
-        eval_runs,
-        pretrain_runs,
-        state.active_processes.clone(),
-        event_tx,
-        run_id,
-    );
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn spawn_job_reader(
-    kind: JobKind,
-    bench_runs: Arc<tokio::sync::RwLock<Vec<BenchRun>>>,
-    eval_runs: Arc<tokio::sync::RwLock<Vec<EvalRun>>>,
-    pretrain_runs: Arc<tokio::sync::RwLock<Vec<PretrainRun>>>,
-    event_tx: tokio::sync::broadcast::Sender<AppEvent>,
-    run_id: String,
-    stdout: Option<tokio::process::ChildStdout>,
-    stderr: Option<tokio::process::ChildStderr>,
-    on_event: tauri::ipc::Channel<serde_json::Value>,
-) {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
-    async fn drain<R: tokio::io::AsyncRead + Unpin>(
-        kind: JobKind,
-        bench_runs: Arc<tokio::sync::RwLock<Vec<BenchRun>>>,
-        eval_runs: Arc<tokio::sync::RwLock<Vec<EvalRun>>>,
-        pretrain_runs: Arc<tokio::sync::RwLock<Vec<PretrainRun>>>,
-        event_tx: tokio::sync::broadcast::Sender<AppEvent>,
-        run_id: String,
-        stream: R,
-        on_event: tauri::ipc::Channel<serde_json::Value>,
-    ) {
-        let mut reader = BufReader::new(stream).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            // Forward every stdout/stderr line to the frontend channel so the
-            // page can display a live log without polling.
-            let _ = on_event.send(serde_json::json!({ "event": "log", "line": &line }));
-
-            match kind {
-                JobKind::Bench => {
-                    let mut runs = bench_runs.write().await;
-                    if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-                        run.append_log(&line);
-                        let _ = event_tx.send(AppEvent::BenchUpdate { run: run.clone() });
-                    } else {
-                        break;
-                    }
-                }
-                JobKind::Eval => {
-                    let mut runs = eval_runs.write().await;
-                    if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-                        run.append_log(&line);
-                        let _ = event_tx.send(AppEvent::EvalUpdate { run: run.clone() });
-                    } else {
-                        break;
-                    }
-                }
-                JobKind::Pretrain => {
-                    let mut runs = pretrain_runs.write().await;
-                    if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-                        run.append_log(&line);
-                        let _ = event_tx.send(AppEvent::PretrainUpdate { run: run.clone() });
-                    } else {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    // Stdout lines are forwarded to the IPC channel. Stderr is also captured
-    // for the log tail but shares the channel via Clone (Channel<T> wraps Arc).
-    if let Some(s) = stdout {
-        let bench_runs_cl = bench_runs.clone();
-        let eval_runs_cl = eval_runs.clone();
-        let pretrain_runs_cl = pretrain_runs.clone();
-        let event_tx_cl = event_tx.clone();
-        let run_id_cl = run_id.clone();
-        let on_event_cl = on_event.clone();
-        tokio::spawn(async move {
-            drain(
-                kind,
-                bench_runs_cl,
-                eval_runs_cl,
-                pretrain_runs_cl,
-                event_tx_cl,
-                run_id_cl,
-                s,
-                on_event_cl,
-            )
-            .await;
-        });
-    }
-    if let Some(s) = stderr {
-        tokio::spawn(async move {
-            drain(
-                kind,
-                bench_runs,
-                eval_runs,
-                pretrain_runs,
-                event_tx,
-                run_id,
-                s,
-                on_event,
-            )
-            .await;
-        });
-    }
-}
-
-fn spawn_job_exit_watcher(
-    kind: JobKind,
-    bench_runs: Arc<tokio::sync::RwLock<Vec<BenchRun>>>,
-    eval_runs: Arc<tokio::sync::RwLock<Vec<EvalRun>>>,
-    pretrain_runs: Arc<tokio::sync::RwLock<Vec<PretrainRun>>>,
-    active_processes: Arc<
-        tokio::sync::RwLock<std::collections::HashMap<String, tokio::process::Child>>,
-    >,
-    event_tx: tokio::sync::broadcast::Sender<AppEvent>,
-    run_id: String,
-) {
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
-            let mut procs = active_processes.write().await;
-            let Some(child) = procs.get_mut(&run_id) else {
-                return;
-            };
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    procs.remove(&run_id);
-                    drop(procs);
-                    let success = status.success();
-                    let msg = if success {
-                        None
-                    } else {
-                        Some(format!("Process exited with status {status}"))
-                    };
-                    match kind {
-                        JobKind::Bench => {
-                            let mut runs = bench_runs.write().await;
-                            if let Some(run) = runs.iter_mut().find(|r| r.id == run_id)
-                                && matches!(run.status, JobStatus::Running | JobStatus::Pending)
-                            {
-                                run.status = if success {
-                                    JobStatus::Completed
-                                } else {
-                                    JobStatus::Failed
-                                };
-                                run.ended_at = Some(Utc::now());
-                                run.error_message = msg.clone();
-                                let _ = event_tx.send(AppEvent::BenchUpdate { run: run.clone() });
-                                let _ = event_tx.send(AppEvent::BenchStopped {
-                                    run_id: run_id.clone(),
-                                });
-                            }
-                        }
-                        JobKind::Eval => {
-                            let mut runs = eval_runs.write().await;
-                            if let Some(run) = runs.iter_mut().find(|r| r.id == run_id)
-                                && matches!(run.status, JobStatus::Running | JobStatus::Pending)
-                            {
-                                run.status = if success {
-                                    JobStatus::Completed
-                                } else {
-                                    JobStatus::Failed
-                                };
-                                run.ended_at = Some(Utc::now());
-                                run.error_message = msg.clone();
-                                let _ = event_tx.send(AppEvent::EvalUpdate { run: run.clone() });
-                                let _ = event_tx.send(AppEvent::EvalStopped {
-                                    run_id: run_id.clone(),
-                                });
-                            }
-                        }
-                        JobKind::Pretrain => {
-                            let mut runs = pretrain_runs.write().await;
-                            if let Some(run) = runs.iter_mut().find(|r| r.id == run_id)
-                                && matches!(run.status, JobStatus::Running | JobStatus::Pending)
-                            {
-                                run.status = if success {
-                                    JobStatus::Completed
-                                } else {
-                                    JobStatus::Failed
-                                };
-                                run.ended_at = Some(Utc::now());
-                                run.error_message = msg.clone();
-                                let _ =
-                                    event_tx.send(AppEvent::PretrainUpdate { run: run.clone() });
-                                let _ = event_tx.send(AppEvent::PretrainStopped {
-                                    run_id: run_id.clone(),
-                                });
-                            }
-                        }
-                    }
-                    return;
-                }
-                Ok(None) => continue,
-                Err(_) => return,
-            }
-        }
-    });
-}
-
-// ---------------------------------------------------------------------------
-// Pretrain commands
-// ---------------------------------------------------------------------------
-
-#[tauri::command]
-pub async fn start_pretrain(
-    state: State<'_, AppState>,
-    _app_handle: AppHandle,
-    mut spec: pmetal::core::jobs::PretrainSpec,
-    on_event: tauri::ipc::Channel<serde_json::Value>,
-) -> Result<String> {
-    spec.normalize()
-        .map_err(|errs| AppError(errs[0].message.clone()))?;
-
-    let run = PretrainRun::new(&spec.arch, &spec.output_dir);
-    let run_id = run.id.clone();
-    state.create_pretrain_run(run).await;
-
-    let mut args: Vec<String> = vec!["pretrain".into()];
-    args.extend(spec.to_argv());
-
-    spawn_job_subprocess(&state, run_id.clone(), args, JobKind::Pretrain, on_event).await?;
-    Ok(run_id)
-}
-
-#[tauri::command]
-pub async fn list_pretrain_runs(state: State<'_, AppState>) -> Result<Vec<PretrainRun>> {
-    Ok(state.list_pretrain_runs().await)
-}
-
-#[tauri::command]
-pub async fn stop_pretrain(state: State<'_, AppState>, run_id: String) -> Result<()> {
-    state.cancel_pretrain_run(&run_id).await;
-    Ok(())
-}
-
-/// Resolve the `pmetal` CLI binary used to spawn long-running subprocesses
-/// (serve / bench / eval / quantize / merge / ollama / ...).
-///
-/// A release bundle carries the CLI as a Tauri sidecar, which lands next to the
-/// app executable in `Contents/MacOS/`, so that is checked first. Failing that
-/// we look in the usual install locations *by absolute path*.
-///
-/// Relying on a bare `pmetal` PATH lookup is not enough: an app launched from
-/// Finder inherits launchd's PATH (`/usr/bin:/bin:/usr/sbin:/sbin`), which
-/// contains neither Homebrew's `/opt/homebrew/bin` nor cargo's `~/.cargo/bin`.
-/// A `cargo install pmetal` or `brew install pmetal` would otherwise be
-/// invisible to the packaged GUI even though it works fine in a terminal.
-fn pmetal_binary() -> PathBuf {
-    // Explicit override wins, for unusual installs and for testing.
-    if let Some(path) = std::env::var_os("PMETAL_CLI") {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return path;
-        }
-    }
-
-    let mut candidates: Vec<PathBuf> = Vec::new();
-
-    // Bundled sidecar, then the dev-build siblings.
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(parent) = exe.parent()
-    {
-        candidates.push(parent.join("pmetal"));
-        candidates.push(parent.join("../pmetal/pmetal"));
-        candidates.push(parent.join("../../debug/pmetal"));
-        candidates.push(parent.join("../../release/pmetal"));
-    }
-
-    // `cargo install pmetal` — respects CARGO_HOME when it is set.
-    let cargo_bin = std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")))
-        .map(|c| c.join("bin/pmetal"));
-    candidates.extend(cargo_bin);
-
-    // Homebrew (Apple Silicon, then Intel), and the location the install docs
-    // tell people to drop the prebuilt binary in.
-    candidates.push("/opt/homebrew/bin/pmetal".into());
-    candidates.push("/usr/local/bin/pmetal".into());
-
-    candidates
-        .into_iter()
-        .find(|c| c.is_file())
-        // Last resort: let the OS resolve it, which works when the GUI was
-        // started from a shell that already has the right PATH.
-        .unwrap_or_else(|| PathBuf::from("pmetal"))
-}
-
-// ---------------------------------------------------------------------------
-// Inference helpers
-// ---------------------------------------------------------------------------
-
-/// Run streaming inference — mirrors the logic from `pmetal infer`.
-///
-/// Accepts an `InferSpec` for all model/sampling configuration plus an
-/// optional GUI-only `messages` list for chat history (not part of InferSpec
-/// because InferSpec maps to the CLI which cannot represent multi-turn history
-/// as a structured argument).
-async fn run_inference_streaming(
-    spec: &pmetal::core::jobs::InferSpec,
-    messages: Option<&[InferenceMessage]>,
-    cancel_flag: &std::sync::atomic::AtomicBool,
-    app_handle: &AppHandle,
-) -> std::result::Result<serde_json::Value, String> {
-    use pmetal::inference_runner::{InferenceRunner, InferenceRunnerConfig, TurboQuantPreset};
-
-    let kv_turboquant_preset = match spec.kv_turboquant_preset.as_deref() {
-        Some("q2_5") => Some(TurboQuantPreset::Q2_5),
-        Some("q3_5") => Some(TurboQuantPreset::Q3_5),
-        Some(other) => {
-            return Err(format!("unsupported TurboQuant preset: {other}"));
-        }
-        None => None,
-    };
-
-    let model_path = resolve_model_path(&spec.model)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let chat_messages = messages
-        .map(|msgs| {
-            msgs.iter()
-                .map(chat_message_from_inference_message)
-                .collect::<std::result::Result<Vec<_>, _>>()
-        })
-        .transpose()?;
-
-    let runner_config = InferenceRunnerConfig {
-        model_path,
-        lora_path: spec.lora.clone(),
-        mtp_assistant_path: None,
-        qwen_mtp_path: None,
-        qwen_mtp: false,
-        qwen_mtp_draft_tokens: 3,
-        experts_dir: spec.experts_dir.clone(),
-        fp8: spec.fp8,
-        prompt: spec.prompt.clone(),
-        chat_messages,
-        system_message: spec.system.clone(),
-        chat: false, // let the shared runner auto-detect chat-capable models
-        no_thinking: spec.no_thinking,
-        chat_template_kwargs: pmetal::data::chat_templates::ChatTemplateKwargs::from_controls(
-            spec.chat_template_kwargs.as_deref(),
-            spec.no_thinking,
-            spec.reasoning_effort.as_deref(),
-            spec.no_preserve_thinking,
-        )?,
-        tools: None,
-        images: Vec::new(),
-        videos: Vec::new(),
-        temperature: spec.temperature,
-        top_k: spec.top_k,
-        top_p: spec.top_p,
-        min_p: spec.min_p,
-        max_tokens: spec.max_tokens,
-        repetition_penalty: spec.repetition_penalty,
-        frequency_penalty: spec.frequency_penalty,
-        presence_penalty: spec.presence_penalty,
-        seed: spec.seed,
-        kv_quant: spec.kv_quant,
-        kv_k_bits: spec.kv_k_bits,
-        kv_v_bits: spec.kv_v_bits,
-        kv_group_size: spec.kv_group_size,
-        kv_turboquant: spec.kv_turboquant,
-        kv_turboquant_preset,
-        kv_quant_preset: spec.kv_quant_preset.clone(),
-        no_kv_quant: spec.no_kv_quant,
-        kv_qjl: spec.kv_qjl,
-        mode: pmetal::data::inference_config::SamplingMode::Auto,
-        detect_repetition: false,
-    };
-
-    let prompt_tokens = runner_config.prompt.len(); // rough pre-tokenize hint
-    let mut runner = InferenceRunner::prepare(runner_config).map_err(|e| e.to_string())?;
-
-    let mut token_buf: Vec<u32> = Vec::new();
-    let mut streamed_text = String::new();
-    let start = std::time::Instant::now();
-    let mut first_token_time: Option<std::time::Instant> = None;
-    let mut generated_tokens: usize = 0;
-
-    // Split borrow: &runner.tokenizer captured by closure, runner.gen borrows the rest.
-    let tokenizer = &runner.tokenizer;
-    runner
-        .state
-        .generate_streaming(|token_id| {
-            generated_tokens += 1;
-            if first_token_time.is_none() {
-                first_token_time = Some(std::time::Instant::now());
-            }
-            token_buf.push(token_id);
-            if let Ok(text) = tokenizer.decode(&token_buf) {
-                if text.len() > streamed_text.len() {
-                    let start = text.ceil_char_boundary(streamed_text.len());
-                    if start < text.len() {
-                        let delta = &text[start..];
-                        if !delta.is_empty() {
-                            if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                                return false;
-                            }
-                            let _ = app_handle.emit("inference-token", delta);
-                        }
-                    }
-                }
-                streamed_text = text;
-            }
-            true
-        })
-        .map_err(|e| e.to_string())?;
-
-    let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-    // TTFT is measured from when generate_streaming starts (post model-load), so it correctly
-    // captures only prefill + first-token latency.  decode_ms = total - ttft covers decode only.
-    let ttft_ms = first_token_time.map(|t| t.duration_since(start).as_secs_f64() * 1000.0);
-    let decode_ms = ttft_ms.map(|ttft| total_ms - ttft);
-
-    // For native paths, prefer the runtime's own decode metrics (measured inside the decode loop,
-    // skipping the first 10 steps and excluding stop-token overhead) over wall-clock estimation.
-    // Fall back to wall-clock calculation for non-native paths.
-    let (tok_per_sec, avg_step_ms, p50_step_ms) = if let Some(m) = runner.state.last_decode_metrics
-    {
-        (
-            Some(m.tok_per_sec),
-            Some(m.avg_step_ms),
-            Some(m.p50_step_ms),
-        )
-    } else {
-        // Token 1 is the prefill output (counted in TTFT); tokens 2..N are decode steps.
-        let tps = if let Some(dm) = decode_ms {
-            if dm > 0.0 && generated_tokens > 1 {
-                Some((generated_tokens - 1) as f64 / (dm / 1000.0))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        (tps, None, None)
-    };
-
-    let parsed_response = pmetal::response_parser::parse_assistant_response(&streamed_text);
-
-    Ok(serde_json::json!({
-        "prompt_tokens": prompt_tokens,
-        "generated_tokens": generated_tokens,
-        "total_ms": total_ms,
-        "ttft_ms": ttft_ms,
-        "tok_per_sec": tok_per_sec,
-        "avg_step_ms": avg_step_ms,
-        "p50_step_ms": p50_step_ms,
-        "response_text": parsed_response.response,
-        "thinking": parsed_response.thinking,
-        "truncated_thinking": parsed_response.truncated_thinking,
-    }))
-}
-
-// ---------------------------------------------------------------------------
-// Inference commands
-// ---------------------------------------------------------------------------
-
-#[tauri::command]
-pub async fn start_inference(
-    state: State<'_, AppState>,
-    app_handle: AppHandle,
+    app: AppHandle,
     spec: pmetal::core::jobs::InferSpec,
-    // GUI-only chat history — not part of InferSpec; None for single-turn requests.
-    messages: Option<Vec<InferenceMessage>>,
+    messages: Option<Vec<ChatTurn>>,
+    session_id: String,
 ) -> Result<()> {
-    let session_id = uuid::Uuid::new_v4().to_string();
-    let session_id_task = session_id.clone();
-    let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let inference_flags = state.inference_cancel_flags.clone();
-    state
-        .inference_cancel_flags
-        .write()
-        .await
-        .insert(session_id.clone(), cancel_flag.clone());
-
-    tokio::spawn(async move {
-        let result =
-            run_inference_streaming(&spec, messages.as_deref(), &cancel_flag, &app_handle).await;
-
-        match result {
-            Ok(metrics) => {
-                let _ = app_handle.emit("inference-done", metrics);
-            }
-            Err(e) => {
-                let _ = app_handle.emit(
-                    "inference-error",
-                    serde_json::json!({ "session_id": session_id_task, "error": e }),
-                );
-            }
-        }
-
-        inference_flags.write().await.remove(&session_id_task);
-    });
-
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn stop_inference(state: State<'_, AppState>, session_id: Option<String>) -> Result<()> {
-    if let Some(id) = session_id {
-        let flags = state.inference_cancel_flags.read().await;
-        if let Some(flag) = flags.get(&id) {
-            flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-    } else {
-        let flags = state.inference_cancel_flags.read().await;
-        for flag in flags.values() {
-            flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Merge / Fuse / Quantize commands
-// ---------------------------------------------------------------------------
-
-#[tauri::command]
-pub async fn get_merge_strategies() -> Result<Vec<MergeStrategy>> {
-    Ok(vec![
-        MergeStrategy {
-            name: "linear".to_string(),
-            description: "Simple weighted average of model weights".to_string(),
-            supports_weights: true,
-        },
-        MergeStrategy {
-            name: "slerp".to_string(),
-            description: "Spherical linear interpolation for smooth weight blending".to_string(),
-            supports_weights: true,
-        },
-        MergeStrategy {
-            name: "ties".to_string(),
-            description: "Trim, elect sign, merge — conflict-free parameter merging".to_string(),
-            supports_weights: true,
-        },
-        MergeStrategy {
-            name: "dare_ties".to_string(),
-            description: "DARE pruning followed by TIES merge".to_string(),
-            supports_weights: true,
-        },
-        MergeStrategy {
-            name: "dare_linear".to_string(),
-            description: "DARE pruning followed by linear merge".to_string(),
-            supports_weights: true,
-        },
-        MergeStrategy {
-            name: "task_arithmetic".to_string(),
-            description: "Task-vector arithmetic against a base model".to_string(),
-            supports_weights: true,
-        },
-        MergeStrategy {
-            name: "della".to_string(),
-            description: "Magnitude-aware delta merge with DARE-style sparsification".to_string(),
-            supports_weights: true,
-        },
-        MergeStrategy {
-            name: "breadcrumbs".to_string(),
-            description: "Remove outlier deltas before merging task vectors".to_string(),
-            supports_weights: true,
-        },
-        MergeStrategy {
-            name: "model_stock".to_string(),
-            description: "Geometric mean based merging using model weights as anchors".to_string(),
-            supports_weights: false,
-        },
-        MergeStrategy {
-            name: "nearswap".to_string(),
-            description: "Swap weights from the closest model where deltas agree".to_string(),
-            supports_weights: false,
-        },
-        MergeStrategy {
-            name: "passthrough".to_string(),
-            description: "Copy model weights through the merge pipeline".to_string(),
-            supports_weights: false,
-        },
-    ])
-}
-
-#[tauri::command]
-pub async fn merge_models(
-    _app_handle: AppHandle,
-    mut spec: pmetal::core::jobs::MergeSpec,
-) -> Result<String> {
-    spec.normalize()
-        .map_err(|errs| AppError(errs[0].message.clone()))?;
-
-    let mut args = vec!["merge".to_string()];
-    args.extend(spec.to_argv());
-    run_pmetal_subprocess_to_completion(args).await?;
-    Ok(spec.output)
-}
-
-#[tauri::command]
-pub async fn fuse_lora(
-    _app_handle: AppHandle,
-    base_model: String,
-    lora_path: String,
-    output_dir: String,
-) -> Result<FuseResult> {
-    // Resolve remote model IDs (e.g. "Qwen/Qwen3-0.6B-Base") before the
-    // blocking fuse step, since `run_fuse_in_process` cannot be async.
-    let resolved_base = resolve_model_path(&base_model).await?;
-    let base_model_task = resolved_base.to_string_lossy().into_owned();
-    let lora_path_task = lora_path.clone();
-    let output_dir_task = output_dir.clone();
-
-    tokio::task::spawn_blocking(move || {
-        run_fuse_in_process(&base_model_task, &lora_path_task, &output_dir_task)
-    })
+    let token = state.token_for_hub().await;
+    inference::start(
+        state.sessions.clone(),
+        spec,
+        messages,
+        token,
+        Arc::new(ChatEvents(app)),
+        session_id,
+    )
     .await
-    .map_err(|e| AppError(format!("fuse task failed: {e}")))?
-    .map_err(|e| AppError(e.to_string()))?;
-
-    let output_path = PathBuf::from(&output_dir);
-    let model_size_bytes = dir_size_simple(&output_path).await;
-
-    Ok(FuseResult {
-        output_dir,
-        model_size_bytes,
-    })
 }
 
-/// Scan for trained LoRA adapters on disk.
-///
-/// Checks `~/pmetal-output/` (GUI default) for directories containing
-/// `adapter_config.json` or `lora_weights.safetensors`.
 #[tauri::command]
-pub async fn list_trained_adapters() -> Result<Vec<TrainedAdapter>> {
-    tokio::task::spawn_blocking(scan_trained_adapters)
-        .await
-        .map_err(|e| AppError(format!("scan failed: {e}")))
-}
-
-fn scan_trained_adapters() -> Vec<TrainedAdapter> {
-    let mut adapters = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    // Scan roots
-    let mut roots: Vec<PathBuf> = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        roots.push(home.join("pmetal-output"));
-    }
-
-    for root in &roots {
-        if !root.is_dir() {
-            continue;
-        }
-        // Scan up to 2 levels deep
-        if let Ok(entries) = std::fs::read_dir(root) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    try_add_adapter(&path, &mut adapters, &mut seen);
-                    // One more level
-                    if let Ok(sub_entries) = std::fs::read_dir(&path) {
-                        for sub in sub_entries.flatten() {
-                            let sub_path = sub.path();
-                            if sub_path.is_dir() {
-                                try_add_adapter(&sub_path, &mut adapters, &mut seen);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Sort by size (largest first)
-    adapters.sort_by_key(|a| std::cmp::Reverse(a.size_bytes));
-    adapters
-}
-
-fn try_add_adapter(
-    dir: &Path,
-    adapters: &mut Vec<TrainedAdapter>,
-    seen: &mut std::collections::HashSet<PathBuf>,
-) {
-    let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    if !seen.insert(canonical) {
-        return;
-    }
-
-    let has_config = dir.join("adapter_config.json").exists();
-    let weights_file = pmetal::lora::peft::find_adapter_weights(dir);
-
-    if !has_config && weights_file.is_none() {
-        return;
-    }
-
-    let dir_name = dir
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| dir.display().to_string());
-
-    let size_bytes = weights_file
-        .as_ref()
-        .and_then(|f| f.metadata().ok())
-        .map(|m| m.len())
-        .unwrap_or(0);
-
-    // Read adapter_config.json for rank/alpha
-    let (rank, alpha, base_model) = if has_config {
-        let cfg = std::fs::read_to_string(dir.join("adapter_config.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-        let r = cfg.as_ref().and_then(|c| c["r"].as_u64()).map(|v| v as u32);
-        let a = cfg
-            .as_ref()
-            .and_then(|c| c["alpha"].as_f64().or_else(|| c["lora_alpha"].as_f64()))
-            .map(|v| v as f32);
-        let bm = cfg
-            .as_ref()
-            .and_then(pmetal::lora::peft::adapter_base_model);
-        (r, a, bm)
-    } else {
-        (None, None, None)
-    };
-
-    // Also check training_info.json for base_model + dataset (written by TUI/GUI)
-    let training_info = std::fs::read_to_string(dir.join("training_info.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-    let base_model = base_model.or_else(|| {
-        training_info
-            .as_ref()
-            .and_then(|c| c["base_model"].as_str().map(String::from))
-    });
-    let dataset = training_info
-        .as_ref()
-        .and_then(|c| c["dataset"].as_str().map(String::from));
-
-    // Build a descriptive display name like TUI:
-    // - "Qwen3-0.6B-Base + my-dataset — dir_name"
-    // - "Qwen3-0.6B-Base — dir_name"
-    // - Just dir_name if no metadata
-    let display_name = match (&base_model, &dataset) {
-        (Some(bm), Some(ds)) => {
-            let model_short = bm.rsplit('/').next().unwrap_or(bm);
-            let ds_short = ds.rsplit('/').next().unwrap_or(ds);
-            format!("{model_short} + {ds_short}")
-        }
-        (Some(bm), None) => {
-            let model_short = bm.rsplit('/').next().unwrap_or(bm);
-            format!("{model_short} — {dir_name}")
-        }
-        _ => dir_name,
-    };
-
-    adapters.push(TrainedAdapter {
-        path: dir.display().to_string(),
-        name: display_name,
-        base_model,
-        rank,
-        alpha,
-        size_bytes,
-    });
-}
-
-// Each argument is a named field of the frontend's `invoke` payload, so
-// bundling them into a struct would change the call the Svelte side makes.
-#[allow(clippy::too_many_arguments)]
-#[tauri::command]
-pub async fn quantize_model(
-    _app_handle: AppHandle,
-    model_id: String,
-    quant_type: String,
-    output_path: String,
-    imatrix: Option<String>,
-    format: Option<String>,
-    bits: Option<i32>,
-    group_size: Option<i32>,
-    kl_calibrate: Option<bool>,
-    target_bpw: Option<f32>,
-    kl_threshold: Option<f64>,
-) -> Result<String> {
-    // Resolve remote model IDs (e.g. "Qwen/Qwen3-0.6B-Base") to local cache paths
-    let resolved_path = resolve_model_path(&model_id).await?;
-    let mut args = vec![
-        "quantize".to_string(),
-        "--model".to_string(),
-        resolved_path.to_string_lossy().into_owned(),
-        "--output".to_string(),
-        output_path.clone(),
-        "--method".to_string(),
-        quant_type,
-    ];
-    if let Some(path) = imatrix.as_deref().filter(|s| !s.trim().is_empty()) {
-        args.extend(["--imatrix".to_string(), path.to_string()]);
-    }
-    args.extend([
-        "--format".to_string(),
-        format.unwrap_or_else(|| "gguf".to_string()),
-    ]);
-    args.extend(["--bits".to_string(), bits.unwrap_or(4).to_string()]);
-    args.extend([
-        "--group-size".to_string(),
-        group_size.unwrap_or(64).to_string(),
-    ]);
-    if kl_calibrate.unwrap_or(false) {
-        args.push("--kl-calibrate".to_string());
-    }
-    if let Some(target) = target_bpw {
-        args.extend(["--target-bpw".to_string(), target.to_string()]);
-    }
-    args.extend([
-        "--kl-threshold".to_string(),
-        kl_threshold.unwrap_or(0.01).to_string(),
-    ]);
-
-    run_pmetal_subprocess_to_completion(args).await?;
-    Ok(output_path)
-}
-
-async fn finalize_training_run(
-    state_arc: &Arc<tokio::sync::RwLock<Vec<TrainingRun>>>,
-    event_tx: &tokio::sync::broadcast::Sender<AppEvent>,
-    run_id: &str,
-    cancel_flag: &Arc<std::sync::atomic::AtomicBool>,
-    success: bool,
-    error: Option<String>,
-) {
-    // Signal the metrics watcher to exit before updating state.
-    cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-
-    let mut runs = state_arc.write().await;
-    if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-        // Preserve Cancelled if already set by cancel_training_run(); only
-        // override status when the run ended naturally (success or failure).
-        if run.status != TrainingStatus::Cancelled {
-            run.status = if success {
-                TrainingStatus::Completed
-            } else {
-                TrainingStatus::Failed
-            };
-        }
-        run.ended_at = Some(Utc::now());
-        run.error_message = error;
-        run.status_message = None;
-        let _ = event_tx.send(AppEvent::TrainingUpdate { run: run.clone() });
-        let _ = event_tx.send(AppEvent::TrainingStopped {
-            run_id: run_id.to_string(),
-        });
-    }
-}
-
-/// Tail a JSONL metrics file written by the in-process trainer, forwarding
-/// each parsed row to `on_event` and calling `on_row` for state updates.
-///
-/// This replaces the former per-job `watch_*_metrics_file` helpers with a
-/// single shared implementation. `on_row` is a sync closure that updates the
-/// caller's run record in the shared state vec and returns `Some(())` on
-/// success or `None` if the run record is gone (caller should stop).
-async fn tail_jsonl_to_channel<F>(
-    metrics_path: PathBuf,
-    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
-    on_event: tauri::ipc::Channel<serde_json::Value>,
-    mut on_row: F,
-) where
-    F: FnMut(&serde_json::Value) -> Option<()> + Send + 'static,
-{
-    let mut last_pos: u64 = 0;
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
-
-    loop {
-        interval.tick().await;
-
-        if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
-            break;
-        }
-
-        let Ok(file) = tokio::fs::File::open(&metrics_path).await else {
-            continue;
-        };
-        let Ok(metadata) = file.metadata().await else {
-            continue;
-        };
-        let file_len = metadata.len();
-        if file_len < last_pos {
-            // File was truncated (ANE→GPU fallback recreates the metrics file).
-            last_pos = 0;
-        }
-        if file_len <= last_pos {
-            continue;
-        }
-
-        let path = metrics_path.clone();
-        let read_result = tokio::task::spawn_blocking(move || {
-            use std::io::{BufRead, Seek};
-
-            let Ok(file) = std::fs::File::open(&path) else {
-                return (last_pos, Vec::<serde_json::Value>::new());
-            };
-            let mut reader = std::io::BufReader::new(file);
-            if reader.seek(std::io::SeekFrom::Start(last_pos)).is_err() {
-                return (last_pos, Vec::new());
-            }
-
-            let mut line = String::new();
-            let mut rows = Vec::new();
-            while reader.read_line(&mut line).unwrap_or(0) > 0 {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
-                    rows.push(json);
-                }
-                line.clear();
-            }
-
-            let pos = reader.stream_position().unwrap_or(last_pos);
-            (pos, rows)
-        })
-        .await;
-
-        let Ok((new_pos, rows)) = read_result else {
-            continue;
-        };
-        last_pos = new_pos;
-
-        for row in &rows {
-            // Forward the raw JSON row to the channel so the frontend page
-            // receives live step events without polling.
-            let _ = on_event.send(row.clone());
-            // Also update the shared run record for list/status queries.
-            if on_row(row).is_none() {
-                return;
-            }
-        }
-    }
-}
-
-fn apply_metrics_to_distillation(
-    run: &mut DistillationRun,
-    metrics: &serde_json::Value,
-    started_at: chrono::DateTime<Utc>,
-) {
-    if let Some(v) = metrics["step"].as_u64() {
-        run.step = v;
-    }
-    if let Some(v) = metrics["total_steps"].as_u64() {
-        run.total_steps = Some(v);
-    }
-    if let Some(v) = metrics["epoch"].as_u64() {
-        run.epoch = v;
-    }
-    if let Some(v) = metrics["loss"].as_f64() {
-        run.loss = Some(v);
-        if run.best_loss.is_none_or(|best| v < best) {
-            run.best_loss = Some(v);
-        }
-    }
-    if let Some(v) = metrics["lr"]
-        .as_f64()
-        .or_else(|| metrics["learning_rate"].as_f64())
-    {
-        run.learning_rate = Some(v);
-    }
-    if let Some(v) = metrics["tok_sec"]
-        .as_f64()
-        .or_else(|| metrics["tokens_per_second"].as_f64())
-    {
-        run.tokens_per_second = Some(v);
-    }
-    if let (Some(total_steps), step) = (run.total_steps, run.step)
-        && step > 0
-    {
-        let elapsed = (Utc::now() - started_at).num_seconds().max(1) as f64;
-        let remaining = total_steps.saturating_sub(step) as f64;
-        run.eta_seconds = Some(((elapsed / step as f64) * remaining) as u64);
-    }
-}
-
-async fn finalize_distillation_run(
-    state_arc: &Arc<tokio::sync::RwLock<Vec<DistillationRun>>>,
-    event_tx: &tokio::sync::broadcast::Sender<AppEvent>,
-    run_id: &str,
-    cancel_flag: &Arc<std::sync::atomic::AtomicBool>,
-    success: bool,
-    error: Option<String>,
-) {
-    // Signal the metrics watcher to exit before updating state.
-    cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-
-    let mut runs = state_arc.write().await;
-    if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-        if run.status != DistillationStatus::Cancelled {
-            run.status = if success {
-                DistillationStatus::Completed
-            } else {
-                DistillationStatus::Failed
-            };
-        }
-        run.ended_at = Some(Utc::now());
-        run.error_message = error;
-        let _ = event_tx.send(AppEvent::DistillationUpdate { run: run.clone() });
-        let _ = event_tx.send(AppEvent::DistillationStopped {
-            run_id: run_id.to_string(),
-        });
-    }
-}
-
-fn apply_metrics_to_grpo(
-    run: &mut GrpoRun,
-    metrics: &serde_json::Value,
-    started_at: chrono::DateTime<Utc>,
-) {
-    if let Some(v) = metrics["step"].as_u64() {
-        run.step = v;
-    }
-    if let Some(v) = metrics["total_steps"].as_u64() {
-        run.total_steps = Some(v);
-    }
-    if let Some(v) = metrics["loss"].as_f64() {
-        run.loss = Some(v);
-        if run.best_loss.is_none_or(|best| v < best) {
-            run.best_loss = Some(v);
-        }
-    }
-    if let Some(v) = metrics["reward_mean"].as_f64() {
-        run.reward_mean = Some(v);
-    }
-    if let Some(v) = metrics["reward_std"].as_f64() {
-        run.reward_std = Some(v);
-    }
-    if let Some(v) = metrics["kl_div"].as_f64() {
-        run.kl_div = Some(v);
-    }
-    if let Some(v) = metrics["lr"]
-        .as_f64()
-        .or_else(|| metrics["learning_rate"].as_f64())
-    {
-        run.learning_rate = Some(v);
-    }
-    if let Some(v) = metrics["tok_sec"]
-        .as_f64()
-        .or_else(|| metrics["tokens_per_second"].as_f64())
-    {
-        run.tokens_per_second = Some(v);
-    }
-    if let (Some(total_steps), step) = (run.total_steps, run.step)
-        && step > 0
-    {
-        let elapsed = (Utc::now() - started_at).num_seconds().max(1) as f64;
-        let remaining = total_steps.saturating_sub(step) as f64;
-        run.eta_seconds = Some(((elapsed / step as f64) * remaining) as u64);
-    }
-}
-
-async fn finalize_grpo_run(
-    state_arc: &Arc<tokio::sync::RwLock<Vec<GrpoRun>>>,
-    event_tx: &tokio::sync::broadcast::Sender<AppEvent>,
-    run_id: &str,
-    cancel_flag: &Arc<std::sync::atomic::AtomicBool>,
-    success: bool,
-    error: Option<String>,
-) {
-    // Signal the metrics watcher to exit before updating state.
-    cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-
-    let mut runs = state_arc.write().await;
-    if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-        if run.status != GrpoStatus::Cancelled {
-            run.status = if success {
-                GrpoStatus::Completed
-            } else {
-                GrpoStatus::Failed
-            };
-        }
-        run.ended_at = Some(Utc::now());
-        run.error_message = error;
-        let _ = event_tx.send(AppEvent::GrpoUpdate { run: run.clone() });
-        let _ = event_tx.send(AppEvent::GrpoStopped {
-            run_id: run_id.to_string(),
-        });
-    }
-}
-
-async fn resolve_model_path(model_id: &str) -> Result<PathBuf> {
-    pmetal::hub::resolve_model_path(model_id, None, None)
-        .await
-        .map_err(|e| AppError(e.to_string()))
-}
-
-async fn resolve_dataset_path(dataset_id: &str) -> Result<PathBuf> {
-    match pmetal::data::resolve_dataset_source(dataset_id) {
-        pmetal::data::DatasetSource::Local(path) => {
-            // Resolve directories to a data file within (handles HF cache structure)
-            pmetal::data::TrainingDataset::resolve_dataset_path_pub(&path)
-                .map_err(|e| AppError(e.to_string()))
-        }
-        pmetal::data::DatasetSource::HuggingFace(id) => {
-            let dir = pmetal::hub::download_dataset(&id, None, None, None)
-                .await
-                .map_err(|e| AppError(e.to_string()))?;
-            if let Ok(path) = pmetal::data::TrainingDataset::resolve_dataset_path_pub(&dir) {
-                return Ok(path);
-            }
-            // Last resort: HF API (slow, network call)
-            let parquet_paths = pmetal::hub::download_dataset_parquet(&id, "train", None, None)
-                .await
-                .map_err(|e| AppError(e.to_string()))?;
-            match parquet_paths.as_slice() {
-                [] => Err(AppError(format!("No dataset files found for {id}"))),
-                [only] => Ok(only.clone()),
-                // Shards of one split are read together, from their directory.
-                [first, rest @ ..] => match first.parent() {
-                    Some(parent) if rest.iter().all(|p| p.parent() == Some(parent)) => {
-                        Ok(parent.to_path_buf())
-                    }
-                    _ => Ok(first.clone()),
-                },
-            }
-        }
-    }
-}
-
-async fn run_distillation_in_process(
-    spec: &pmetal::core::jobs::DistillSpec,
-    metrics_path: &PathBuf,
-    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
-) -> Result<()> {
-    let teacher_path = resolve_model_path(&spec.teacher).await?;
-    let student_path = resolve_model_path(&spec.student).await?;
-    let dataset_path = resolve_dataset_path(&spec.dataset).await?;
-
-    let tokenizer = pmetal::data::Tokenizer::from_model_dir(&student_path)
-        .map_err(|e| AppError(e.to_string()))?;
-    let chat_template =
-        pmetal::data::chat_templates::detect_chat_template(&student_path, &spec.student);
-
-    let max_seq_len = spec.max_seq_len;
-
-    // Build column config from the spec fields.
-    let col_cfg = {
-        let text_column = spec.text_column.clone();
-        let text_columns = spec
-            .text_columns
-            .as_ref()
-            .map(|s| s.split(',').map(str::to_string).collect::<Vec<_>>());
-        let prompt_column = spec.prompt_column.clone();
-        let response_column = spec.response_column.clone();
-        let column_separator = spec.column_separator.clone();
-        if text_column.is_some()
-            || text_columns.is_some()
-            || prompt_column.is_some()
-            || response_column.is_some()
-        {
-            Some(pmetal::data::DatasetColumnConfig {
-                text_column,
-                text_columns,
-                column_separator,
-                prompt_column,
-                response_column,
-            })
-        } else {
-            None
-        }
-    };
-
-    let train_dataset = pmetal::data::TrainingDataset::from_jsonl_tokenized(
-        &dataset_path,
-        &tokenizer,
-        pmetal::data::DatasetFormat::Auto,
-        max_seq_len,
-        Some(&chat_template),
-        col_cfg.as_ref(),
-    )
-    .map_err(|e| AppError(e.to_string()))?;
-
-    let mut teacher_model =
-        pmetal::models::DynamicModel::load(&teacher_path).map_err(|e| AppError(e.to_string()))?;
-
-    let student_lora_config = pmetal::core::LoraConfig {
-        r: spec.lora_r,
-        alpha: spec.lora_alpha,
-        ..Default::default()
-    };
-    let mut student_model =
-        pmetal::lora::DynamicLoraModel::from_pretrained(&student_path, student_lora_config.clone())
-            .map_err(|e| AppError(e.to_string()))?;
-
-    let loss_type = match spec.loss_type.to_lowercase().as_str() {
-        "kl" | "kl_divergence" => pmetal::distill::LossType::KlDivergence,
-        "js" | "jensen_shannon" => pmetal::distill::LossType::JensenShannon,
-        "soft_cross_entropy" => pmetal::distill::LossType::SoftCrossEntropy,
-        "mse" | "mse_loss" => pmetal::distill::LossType::MseLoss,
-        other => {
-            return Err(AppError(format!(
-                "Unsupported distillation loss type: {other}"
-            )));
-        }
-    };
-
-    let distill_config = pmetal::distill::DistillConfig {
-        teacher: spec.teacher.clone(),
-        student: spec.student.clone(),
-        method: pmetal::distill::DistillMethod::Online,
-        loss: pmetal::distill::LossConfig {
-            loss_type,
-            temperature: spec.temperature,
-            alpha: spec.alpha,
-            ..Default::default()
-        },
-        offline: None,
-        output_path: Some(PathBuf::from(&spec.output_dir)),
-        training: pmetal::distill::TrainingConfig {
-            batch_size: spec.batch_size,
-            learning_rate: spec.learning_rate,
-            epochs: spec.epochs,
-            max_seq_len,
-            ..Default::default()
-        },
-    };
-
-    let distiller =
-        pmetal::distill::Distiller::new(distill_config).map_err(|e| AppError(e.to_string()))?;
-
-    let training_loop_config = pmetal::trainer::TrainingLoopConfig {
-        training: pmetal::core::TrainingConfig {
-            learning_rate: spec.learning_rate as f64,
-            optimizer: pmetal::core::jobs::parse_optimizer(&spec.optimizer).map_err(AppError)?,
-            batch_size: spec.batch_size,
-            num_epochs: spec.epochs,
-            max_seq_len,
-            // One optimizer step per batch.
-            gradient_accumulation_steps: 1,
-            output_dir: spec.output_dir.clone(),
-            ..Default::default()
-        },
-        dataloader: pmetal::data::DataLoaderConfig {
-            batch_size: spec.batch_size,
-            max_seq_len,
-            shuffle: true,
-            seed: spec.seed,
-            pad_token_id: tokenizer.pad_token_id().unwrap_or(0),
-            drop_last: false,
-            ..Default::default()
-        },
-        log_every: 1,
-        checkpoint_every: 100,
-        eval_every: 0,
-        use_sequence_packing: true,
-        gradient_checkpointing: true,
-        gradient_checkpointing_layers: 4,
-        embedding_lr: None,
-        loraplus_lr_ratio: None,
-        ..Default::default()
-    };
-
-    let mut trainer = pmetal::trainer::DistillationTrainer::new(distiller, training_loop_config)
-        .map_err(|e| AppError(e.to_string()))?;
-    let adaptive_config = pmetal::trainer::AdaptiveLrConfig::for_distillation();
-    let control_file = PathBuf::from(&spec.output_dir).join(".lr_control.json");
-    trainer.enable_adaptive_lr_with_control(adaptive_config, control_file);
-
-    let callback = pmetal::trainer::MetricsJsonCallback::new(metrics_path)
-        .map_err(|e| AppError(e.to_string()))?
-        .with_run_name(format!("distill-{}", spec.student.replace('/', "-")));
-    trainer.add_callback(Box::new(callback));
-    trainer.add_callback(Box::new(CancelOnFlag {
-        cancelled: cancel_flag,
-    }));
-
-    trainer
-        .run(
-            &mut student_model,
-            &mut teacher_model,
-            train_dataset,
-            None,
-            None,
-        )
-        .map_err(|e| AppError(e.to_string()))?;
-
-    pmetal::trainer::orchestrator::save_adapter(
-        &student_model,
-        &PathBuf::from(&spec.output_dir),
-        &student_lora_config,
-        Some(&spec.student),
-    )
-    .map_err(|e| AppError(e.to_string()))?;
-
+pub async fn stop_chat(state: State<'_, AppState>, session_id: Option<String>) -> Result<()> {
+    state.sessions.cancel(session_id.as_deref());
     Ok(())
 }
 
-async fn run_grpo_in_process(
-    spec: &pmetal::core::jobs::GrpoSpec,
-    metrics_path: &PathBuf,
-    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
-) -> Result<()> {
-    let model_path = resolve_model_path(&spec.model).await?;
-    let dataset_path = resolve_dataset_path(&spec.dataset).await?;
-    let tokenizer = pmetal::data::Tokenizer::from_model_dir(&model_path)
-        .map_err(|e| AppError(e.to_string()))?;
-    let chat_template =
-        pmetal::data::chat_templates::detect_chat_template(&model_path, &spec.model);
-
-    let max_seq_len = spec.max_seq_len;
-
-    // Each row's conversation up to where the model writes, with its answer
-    // kept aside as the accuracy reward's reference.
-    let prompts = pmetal::trainer::grpo::load_prompts_with(
-        &dataset_path,
-        &tokenizer,
-        &chat_template,
-        max_seq_len,
-        &pmetal::trainer::grpo::PromptColumns {
-            prompt: spec.prompt_column.clone(),
-            reference: spec.response_column.clone(),
-        },
-    )
-    .map_err(|e| AppError(e.to_string()))?;
-
-    let lora_config = pmetal::core::LoraConfig {
-        r: spec.lora_r,
-        alpha: spec.lora_alpha,
-        ..Default::default()
-    };
-    let mut model =
-        pmetal::lora::DynamicLoraModel::from_pretrained(&model_path, lora_config.clone())
-            .map_err(|e| AppError(e.to_string()))?;
-
-    let mut grpo_config =
-        pmetal::trainer::GrpoConfig::new(spec.num_generations).with_beta(spec.beta);
-    if spec.dapo {
-        grpo_config = grpo_config.for_dapo();
-    }
-    grpo_config = grpo_config
-        .with_loss_preset(&spec.loss_type)
-        .map_err(AppError)?;
-    grpo_config.num_iterations = spec.num_iterations.max(1);
-    grpo_config.max_prompt_length = max_seq_len;
-    grpo_config.max_completion_length = spec.max_completion_length;
-    grpo_config.kv_cache_bits = spec.grpo_kv_bits;
-    // A completion ends where the model would stop, not only at the tokenizer's EOS.
-    grpo_config.stop_tokens = pmetal::data::inference_config::collect_all_stop_tokens(
-        std::path::Path::new(&model_path),
-        &tokenizer,
-        Some(chat_template.template_type),
-    );
-
-    // The reasoning rewards, which add the accuracy of the final answer when
-    // every prompt has a reference answer; or the accuracy alone.
-    let with_references = prompts.iter().all(|p| p.reference.is_some());
-    let rewards = if spec.reasoning_rewards {
-        pmetal::trainer::CombinedReward::reasoning(max_seq_len * 2, with_references)
-    } else if with_references {
-        pmetal::trainer::CombinedReward::new()
-            .add(Box::new(pmetal::trainer::AccuracyReward::new()), 1.0)
-    } else {
-        return Err(AppError(
-            "GRPO requires a reward function. Enable 'Reasoning Rewards', give every dataset \
-             row an `answer`, or use the CLI with a reward model."
-                .to_string(),
-        ));
-    };
-
-    let output_dir = spec.output_dir.clone();
-    let training_config = pmetal::core::TrainingConfig {
-        learning_rate: spec.learning_rate,
-        optimizer: pmetal::core::jobs::parse_optimizer(&spec.optimizer).map_err(AppError)?,
-        batch_size: 1,
-        num_epochs: spec.epochs,
-        max_seq_len,
-        output_dir: output_dir.clone(),
-        ..Default::default()
-    };
-
-    let mut trainer = pmetal::trainer::GrpoTrainer::new(grpo_config, training_config)
-        .map_err(|e| AppError(e.to_string()))?;
-    let callback = pmetal::trainer::MetricsJsonCallback::new(metrics_path)
-        .map_err(|e| AppError(e.to_string()))?
-        .with_run_name(format!("grpo-{}", spec.model.replace('/', "-")));
-    trainer.add_callback(Box::new(callback));
-    trainer.add_callback(Box::new(CancelOnFlag {
-        cancelled: cancel_flag,
-    }));
-
-    let adaptive_config = pmetal::trainer::AdaptiveLrConfig::default();
-    let control_file = PathBuf::from(&output_dir).join(".lr_control.json");
-    trainer.enable_adaptive_lr_with_control(adaptive_config, control_file);
-
-    let mut optimizer = pmetal::trainer::TrainOptimizer::from_config(&trainer.training_config);
-    // The reference model is only the KL penalty's.
-    let mut ref_model = if spec.beta > 0.0 {
-        Some(pmetal::models::DynamicModel::load(&model_path).map_err(|e| AppError(e.to_string()))?)
-    } else {
-        None
-    };
-
-    trainer
-        .run(
-            &mut model,
-            ref_model.as_mut(),
-            &tokenizer,
-            &prompts,
-            &rewards,
-            &mut optimizer,
-            |opt, lr| opt.set_lr(lr),
-        )
-        .map_err(|e| AppError(e.to_string()))?;
-
-    pmetal::trainer::orchestrator::save_adapter(
-        &model,
-        &PathBuf::from(output_dir),
-        &lora_config,
-        Some(&spec.model),
-    )
-    .map_err(|e| AppError(e.to_string()))?;
-
-    Ok(())
-}
-
-fn run_fuse_in_process(
-    model_path: &str,
-    lora_path: &str,
-    output_path: &str,
-) -> std::result::Result<(), AppError> {
-    use pmetal::merge::{AccurateMergeConfig, streaming_lora_merge};
-
-    // The caller (`fuse_lora`) has already resolved remote model IDs to local
-    // cache paths, so model_path is always a local directory at this point.
-    // The adapter is a directory, or one of its weight files.
-    let adapter_dir = pmetal::lora::peft::adapter_dir(lora_path);
-
-    // The same streaming merge `pmetal fuse` runs: scale, rsLoRA and DoRA from
-    // the adapter itself, the base's tensor layout kept, and an adapter tensor
-    // that cannot be applied an error rather than a skipped layer.
-    let config = AccurateMergeConfig::new(
-        PathBuf::from(model_path),
-        adapter_dir,
-        PathBuf::from(output_path),
-    );
-    streaming_lora_merge(&config)
-        .map(|_| ())
-        .map_err(|e| AppError(format!("LoRA fuse failed: {e}")))
-}
-
 // ---------------------------------------------------------------------------
-// Event forwarder
+// Events
 // ---------------------------------------------------------------------------
 
-/// Subscribes to the broadcast channel and re-emits events as Tauri events.
-pub fn start_event_forwarder(app_handle: AppHandle, state: &AppState) {
-    let mut rx = state.subscribe();
-    tauri::async_runtime::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    let (event_name, payload) = match &event {
-                        AppEvent::TrainingStarted { run } => (
-                            "training-started",
-                            serde_json::to_value(run).unwrap_or_default(),
-                        ),
-                        AppEvent::TrainingStopped { run_id } => (
-                            "training-stopped",
-                            serde_json::Value::String(run_id.clone()),
-                        ),
-                        AppEvent::TrainingUpdate { run } => (
-                            "training-update",
-                            serde_json::to_value(run).unwrap_or_default(),
-                        ),
-                        AppEvent::DistillationStarted { run } => (
-                            "distillation-started",
-                            serde_json::to_value(run).unwrap_or_default(),
-                        ),
-                        AppEvent::DistillationStopped { run_id } => (
-                            "distillation-stopped",
-                            serde_json::Value::String(run_id.clone()),
-                        ),
-                        AppEvent::DistillationUpdate { run } => (
-                            "distillation-update",
-                            serde_json::to_value(run).unwrap_or_default(),
-                        ),
-                        AppEvent::GrpoStarted { run } => (
-                            "grpo-started",
-                            serde_json::to_value(run).unwrap_or_default(),
-                        ),
-                        AppEvent::GrpoStopped { run_id } => {
-                            ("grpo-stopped", serde_json::Value::String(run_id.clone()))
-                        }
-                        AppEvent::GrpoUpdate { run } => {
-                            ("grpo-update", serde_json::to_value(run).unwrap_or_default())
-                        }
-                        AppEvent::ServeStarted { instance } => (
-                            "serve-started",
-                            serde_json::to_value(instance).unwrap_or_default(),
-                        ),
-                        AppEvent::ServeStopped { instance_id } => (
-                            "serve-stopped",
-                            serde_json::Value::String(instance_id.clone()),
-                        ),
-                        AppEvent::ServeUpdate { instance } => (
-                            "serve-update",
-                            serde_json::to_value(instance).unwrap_or_default(),
-                        ),
-                        AppEvent::BenchStarted { run } => (
-                            "bench-started",
-                            serde_json::to_value(run).unwrap_or_default(),
-                        ),
-                        AppEvent::BenchStopped { run_id } => {
-                            ("bench-stopped", serde_json::Value::String(run_id.clone()))
-                        }
-                        AppEvent::BenchUpdate { run } => (
-                            "bench-update",
-                            serde_json::to_value(run).unwrap_or_default(),
-                        ),
-                        AppEvent::EvalStarted { run } => (
-                            "eval-started",
-                            serde_json::to_value(run).unwrap_or_default(),
-                        ),
-                        AppEvent::EvalStopped { run_id } => {
-                            ("eval-stopped", serde_json::Value::String(run_id.clone()))
-                        }
-                        AppEvent::EvalUpdate { run } => {
-                            ("eval-update", serde_json::to_value(run).unwrap_or_default())
-                        }
-                        AppEvent::PretrainStarted { run } => (
-                            "pretrain-started",
-                            serde_json::to_value(run).unwrap_or_default(),
-                        ),
-                        AppEvent::PretrainStopped { run_id } => (
-                            "pretrain-stopped",
-                            serde_json::Value::String(run_id.clone()),
-                        ),
-                        AppEvent::PretrainUpdate { run } => (
-                            "pretrain-update",
-                            serde_json::to_value(run).unwrap_or_default(),
-                        ),
-                        AppEvent::ModelRemoved { model_id } => {
-                            ("model-removed", serde_json::json!({ "model_id": model_id }))
-                        }
-                    };
-                    if let Err(e) = app_handle.emit(event_name, payload) {
-                        tracing::debug!("Event emit error (no listeners): {}", e);
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!("Event forwarder lagged, dropped {} events", n);
-                }
-            }
-        }
-    });
-}
+/// Sends job updates to the webview as Tauri events.
+pub struct TauriJobEvents(pub AppHandle);
 
-// ---------------------------------------------------------------------------
-// HF API helpers
-// ---------------------------------------------------------------------------
-
-async fn search_hf_models_inner(
-    query: String,
-    limit: u32,
-    token: Option<String>,
-) -> Result<Vec<HubSearchResult>> {
-    let client = reqwest::Client::new();
-
-    // When query is empty (trending), sort by trending score; otherwise sort by downloads for search
-    let sort = if query.is_empty() {
-        "trending"
-    } else {
-        "downloads"
-    };
-    let mut url = format!(
-        "https://huggingface.co/api/models?filter=text-generation&sort={sort}&limit={}",
-        limit
-    );
-    if !query.is_empty() {
-        url.push_str(&format!("&search={}", url_encode(&query)));
+impl EventSink for TauriJobEvents {
+    fn update(&self, job: &JobView) {
+        let _ = self.0.emit("job-update", job);
     }
 
-    let mut req = client.get(&url).header(
-        "User-Agent",
-        concat!("pmetal-gui/", env!("CARGO_PKG_VERSION")),
-    );
-
-    if let Some(t) = token {
-        req = req.header("Authorization", format!("Bearer {}", t));
+    fn output(&self, id: &str, lines: &[OutputLine]) {
+        let _ = self.0.emit(
+            "job-output",
+            serde_json::json!({ "job_id": id, "lines": lines }),
+        );
     }
 
-    let resp = req.send().await?;
-    let items: Vec<serde_json::Value> = resp.json().await?;
-
-    let results = items
-        .into_iter()
-        .map(|v| {
-            let id = v["id"].as_str().unwrap_or("").to_string();
-            let author = id.split('/').next().map(str::to_string);
-            let downloads = v["downloads"].as_u64().unwrap_or(0);
-            let tags: Vec<String> = v["tags"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|t| t.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let is_gated =
-                v["gated"].as_bool().unwrap_or(false) || tags.iter().any(|t| t == "gated");
-            HubSearchResult {
-                author,
-                downloads_formatted: format_downloads(downloads),
-                downloads,
-                id,
-                likes: v["likes"].as_u64().unwrap_or(0),
-                pipeline_tag: v["pipeline_tag"].as_str().map(str::to_string),
-                is_gated,
-                library_name: v["library_name"].as_str().map(str::to_string),
-                tags,
-            }
-        })
-        .collect();
-
-    Ok(results)
-}
-
-async fn search_hf_datasets_inner(
-    query: String,
-    limit: u32,
-    token: Option<String>,
-) -> Result<Vec<DatasetSearchResult>> {
-    let client = reqwest::Client::new();
-
-    let sort = if query.is_empty() {
-        "trending"
-    } else {
-        "downloads"
-    };
-    let mut url = format!(
-        "https://huggingface.co/api/datasets?sort={sort}&limit={}",
-        limit
-    );
-    if !query.is_empty() {
-        url.push_str(&format!("&search={}", url_encode(&query)));
-    }
-
-    let mut req = client.get(&url).header(
-        "User-Agent",
-        concat!("pmetal-gui/", env!("CARGO_PKG_VERSION")),
-    );
-
-    if let Some(t) = token {
-        req = req.header("Authorization", format!("Bearer {}", t));
-    }
-
-    let resp = req.send().await?;
-    let items: Vec<serde_json::Value> = resp.json().await?;
-
-    let results = items
-        .into_iter()
-        .map(|v| {
-            let id = v["id"].as_str().unwrap_or("").to_string();
-            let author = id.split('/').next().map(str::to_string);
-            let downloads = v["downloads"].as_u64().unwrap_or(0);
-            DatasetSearchResult {
-                author,
-                downloads_formatted: format_downloads(downloads),
-                downloads,
-                id,
-                likes: v["likes"].as_u64().unwrap_or(0),
-                tags: v["tags"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|t| t.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                description: v["description"].as_str().map(str::to_string),
-            }
-        })
-        .collect();
-
-    Ok(results)
-}
-
-// ---------------------------------------------------------------------------
-// Utility helpers
-// ---------------------------------------------------------------------------
-
-fn get_total_memory_bytes_sync() -> u64 {
-    let device_info = pmetal::version::device_info();
-    (device_info.memory_total_gb * 1024.0_f64.powi(3)) as u64
-}
-
-async fn get_available_memory_bytes() -> Option<u64> {
-    let device_info = pmetal::version::device_info();
-    Some((device_info.memory_available_gb * 1024.0_f64.powi(3)) as u64)
-}
-
-async fn get_bandwidth_gbps() -> Option<f64> {
-    pmetal::metal::MetalContext::global()
-        .ok()
-        .map(|ctx| ctx.properties().memory_bandwidth_gbps)
-}
-
-/// Percent-encode a string for use in a URL query parameter value.
-fn url_encode(s: &str) -> String {
-    s.chars()
-        .flat_map(|c| match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => {
-                vec![c.to_string()]
-            }
-            ' ' => vec!["+".to_string()],
-            c => {
-                // Encode each UTF-8 byte
-                let mut buf = [0u8; 4];
-                let s = c.encode_utf8(&mut buf);
-                s.bytes().map(|b| format!("%{:02X}", b)).collect()
-            }
-        })
-        .collect()
-}
-
-fn estimate_params_b(model_id: &str) -> f64 {
-    let lower = model_id.to_lowercase();
-    let patterns: &[(&str, f64)] = &[
-        ("0.5b", 0.5),
-        ("1b", 1.0),
-        ("1.5b", 1.5),
-        ("1.8b", 1.8),
-        ("2b", 2.0),
-        ("3b", 3.0),
-        ("3.8b", 3.8),
-        ("4b", 4.0),
-        ("7b", 7.0),
-        ("8b", 8.0),
-        ("9b", 9.0),
-        ("11b", 11.0),
-        ("13b", 13.0),
-        ("14b", 14.0),
-        ("20b", 20.0),
-        ("27b", 27.0),
-        ("32b", 32.0),
-        ("34b", 34.0),
-        ("40b", 40.0),
-        ("70b", 70.0),
-        ("72b", 72.0),
-        ("110b", 110.0),
-        ("235b", 235.0),
-    ];
-    patterns
-        .iter()
-        .filter(|(pat, _)| lower.contains(pat))
-        .max_by_key(|(pat, _)| pat.len())
-        .map(|(_, b)| *b)
-        .unwrap_or(7.0)
-}
-
-/// Simple non-symlink-aware dir size (for output directories we just created).
-async fn dir_size_simple(path: &Path) -> u64 {
-    let mut total: u64 = 0;
-    let mut stack = vec![path.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let mut rd = match tokio::fs::read_dir(&dir).await {
-            Ok(rd) => rd,
-            Err(_) => continue,
-        };
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            let ft = match entry.file_type().await {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if ft.is_file() {
-                if let Ok(meta) = entry.metadata().await {
-                    total += meta.len();
-                }
-            } else if ft.is_dir() {
-                stack.push(entry.path());
-            }
-        }
-    }
-    total
-}
-
-/// Read `config.json` from a model path.
-///
-/// Checks (in order):
-/// 1. Direct `config.json` at path root (custom dirs, GGUF models with config)
-/// 2. HF hub cache layout: `snapshots/{hash}/config.json`
-async fn read_model_config_json(repo_path: &str) -> Option<serde_json::Value> {
-    let base = PathBuf::from(repo_path);
-
-    // 1. Check root config.json (custom dirs, non-HF layouts)
-    let root_config = base.join("config.json");
-    if let Ok(data) = tokio::fs::read_to_string(&root_config).await
-        && let Ok(cfg) = serde_json::from_str(&data)
-    {
-        return Some(cfg);
-    }
-
-    // 2. Check HF hub cache layout: snapshots/{hash}/config.json
-    let snapshots = base.join("snapshots");
-    if let Ok(mut rd) = tokio::fs::read_dir(&snapshots).await {
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            if entry.file_type().await.ok().is_some_and(|ft| ft.is_dir()) {
-                let config_path = entry.path().join("config.json");
-                if let Ok(data) = tokio::fs::read_to_string(&config_path).await
-                    && let Ok(cfg) = serde_json::from_str(&data)
-                {
-                    return Some(cfg);
-                }
-            }
-        }
-    }
-
-    None
-}
-
-// ---------------------------------------------------------------------------
-// DFlash — block-diffusion speculative decoding (additive new route)
-// ---------------------------------------------------------------------------
-
-/// Hand-rolled DTO matching `DflashSpec` field names so the future
-/// DTO-migration PR is a no-op: only the Rust type changes, not the JSON shape.
-#[derive(Debug, Deserialize)]
-pub struct DflashDto {
-    pub target: String,
-    pub draft: String,
-    pub prompt: String,
-    pub max_new_tokens: Option<usize>,
-    pub temperature: Option<f32>,
-    pub speculative_tokens: Option<usize>,
-    pub draft_fp8: Option<bool>,
-    pub json: Option<bool>,
-    pub no_chat: Option<bool>,
-    pub tree_budget: Option<usize>,
-    pub compare_greedy: Option<bool>,
-}
-
-#[tauri::command]
-pub async fn start_dflash(
-    config: DflashDto,
-    on_event: tauri::ipc::Channel<serde_json::Value>,
-) -> Result<String> {
-    if config.target.is_empty() {
-        return Err(AppError("target model is required".into()));
-    }
-    if config.draft.is_empty() {
-        return Err(AppError("draft model is required".into()));
-    }
-    if config.prompt.is_empty() {
-        return Err(AppError("prompt is required".into()));
-    }
-
-    let run_id = uuid::Uuid::new_v4().to_string();
-
-    let mut args: Vec<String> = vec!["dflash".into()];
-    args.extend(["--target".into(), config.target.clone()]);
-    args.extend(["--draft".into(), config.draft.clone()]);
-    args.extend(["--prompt".into(), config.prompt.clone()]);
-    args.extend([
-        "--max-new-tokens".into(),
-        config.max_new_tokens.unwrap_or(128).to_string(),
-    ]);
-    args.extend([
-        "--temperature".into(),
-        config.temperature.unwrap_or(0.0).to_string(),
-    ]);
-    if let Some(n) = config.speculative_tokens {
-        args.extend(["--speculative-tokens".into(), n.to_string()]);
-    }
-    if config.draft_fp8.unwrap_or(false) {
-        args.push("--draft-fp8".into());
-    }
-    if config.json.unwrap_or(false) {
-        args.push("--json".into());
-    }
-    if config.no_chat.unwrap_or(false) {
-        args.push("--no-chat".into());
-    }
-    let tree_budget = config.tree_budget.unwrap_or(0);
-    if tree_budget > 0 {
-        args.extend(["--tree-budget".into(), tree_budget.to_string()]);
-    }
-    if config.compare_greedy.unwrap_or(false) {
-        args.push("--compare-greedy".into());
-    }
-
-    spawn_oneshot_subprocess(run_id.clone(), args, on_event).await?;
-    Ok(run_id)
-}
-
-// ---------------------------------------------------------------------------
-// EmbedTrain — sentence-embedding contrastive training (additive new route)
-// ---------------------------------------------------------------------------
-
-/// Hand-rolled DTO matching `EmbedTrainSpec` field names.
-#[derive(Debug, Deserialize)]
-pub struct EmbedTrainDto {
-    pub model: String,
-    pub dataset: String,
-    pub output_dir: Option<String>,
-    pub loss: Option<String>,
-    pub pooling: Option<String>,
-    pub temperature: Option<f32>,
-    pub margin: Option<f32>,
-    pub learning_rate: Option<f64>,
-    pub batch_size: Option<usize>,
-    pub epochs: Option<usize>,
-    pub max_seq_len: Option<usize>,
-    pub weight_decay: Option<f64>,
-    pub no_normalize: Option<bool>,
-    pub log_every: Option<usize>,
-    pub seed: Option<u64>,
-}
-
-#[tauri::command]
-pub async fn start_embed_train(
-    config: EmbedTrainDto,
-    on_event: tauri::ipc::Channel<serde_json::Value>,
-) -> Result<String> {
-    if config.model.is_empty() {
-        return Err(AppError("model is required".into()));
-    }
-    if config.dataset.is_empty() {
-        return Err(AppError("dataset is required".into()));
-    }
-
-    let run_id = uuid::Uuid::new_v4().to_string();
-    let output_dir = config
-        .output_dir
-        .as_deref()
-        .unwrap_or("./output-embed")
-        .to_string();
-
-    let mut args: Vec<String> = vec!["embed-train".into()];
-    args.extend(["--model".into(), config.model.clone()]);
-    args.extend(["--dataset".into(), config.dataset.clone()]);
-    args.extend(["--output".into(), output_dir]);
-    args.extend([
-        "--loss".into(),
-        config.loss.unwrap_or_else(|| "info_nce".into()),
-    ]);
-    args.extend([
-        "--pooling".into(),
-        config.pooling.unwrap_or_else(|| "mean".into()),
-    ]);
-    args.extend([
-        "--temperature".into(),
-        config.temperature.unwrap_or(0.05).to_string(),
-    ]);
-    args.extend(["--margin".into(), config.margin.unwrap_or(0.3).to_string()]);
-    args.extend([
-        "--learning-rate".into(),
-        config.learning_rate.unwrap_or(2e-5).to_string(),
-    ]);
-    args.extend([
-        "--batch-size".into(),
-        config.batch_size.unwrap_or(32).to_string(),
-    ]);
-    args.extend(["--epochs".into(), config.epochs.unwrap_or(3).to_string()]);
-    args.extend([
-        "--max-seq-len".into(),
-        config.max_seq_len.unwrap_or(512).to_string(),
-    ]);
-    args.extend([
-        "--weight-decay".into(),
-        config.weight_decay.unwrap_or(0.01).to_string(),
-    ]);
-    if config.no_normalize.unwrap_or(false) {
-        args.push("--no-normalize".into());
-    }
-    args.extend([
-        "--log-every".into(),
-        config.log_every.unwrap_or(10).to_string(),
-    ]);
-    args.extend(["--seed".into(), config.seed.unwrap_or(42).to_string()]);
-
-    spawn_oneshot_subprocess(run_id.clone(), args, on_event).await?;
-    Ok(run_id)
-}
-
-// ---------------------------------------------------------------------------
-// RLKD — Reinforcement Learning with Knowledge Distillation (additive new route)
-// ---------------------------------------------------------------------------
-
-/// Hand-rolled DTO matching `RlkdSpec` field names.
-#[derive(Debug, Deserialize)]
-pub struct RlkdDto {
-    pub model: String,
-    pub teacher_model: String,
-    pub dataset: String,
-    pub output_dir: Option<String>,
-    pub distill_alpha: Option<f32>,
-    pub final_alpha: Option<f32>,
-    pub anneal_alpha: Option<bool>,
-    pub distill_temperature: Option<f32>,
-    pub num_generations: Option<usize>,
-    pub beta: Option<f64>,
-    pub learning_rate: Option<f64>,
-    pub epochs: Option<usize>,
-    pub lora_r: Option<usize>,
-    pub lora_alpha: Option<f32>,
-    pub max_seq_len: Option<usize>,
-    pub max_completion_length: Option<usize>,
-    pub seed: Option<u64>,
-    pub reasoning_rewards: Option<bool>,
-    pub prompt_column: Option<String>,
-    pub response_column: Option<String>,
-}
-
-#[tauri::command]
-pub async fn start_rlkd(
-    config: RlkdDto,
-    on_event: tauri::ipc::Channel<serde_json::Value>,
-) -> Result<String> {
-    if config.model.is_empty() {
-        return Err(AppError("policy model is required".into()));
-    }
-    if config.teacher_model.is_empty() {
-        return Err(AppError("teacher model is required".into()));
-    }
-    if config.dataset.is_empty() {
-        return Err(AppError("dataset is required".into()));
-    }
-
-    let run_id = uuid::Uuid::new_v4().to_string();
-    let output_dir = config
-        .output_dir
-        .as_deref()
-        .unwrap_or("./output/rlkd")
-        .to_string();
-
-    let mut args: Vec<String> = vec!["rlkd".into()];
-    args.extend(["--model".into(), config.model.clone()]);
-    args.extend(["--teacher-model".into(), config.teacher_model.clone()]);
-    args.extend(["--dataset".into(), config.dataset.clone()]);
-    args.extend(["--output".into(), output_dir]);
-    args.extend([
-        "--distill-alpha".into(),
-        config.distill_alpha.unwrap_or(0.3).to_string(),
-    ]);
-    args.extend([
-        "--final-alpha".into(),
-        config.final_alpha.unwrap_or(0.05).to_string(),
-    ]);
-    if config.anneal_alpha.unwrap_or(false) {
-        args.push("--anneal-alpha".into());
-    }
-    args.extend([
-        "--distill-temperature".into(),
-        config.distill_temperature.unwrap_or(2.0).to_string(),
-    ]);
-    args.extend([
-        "--num-generations".into(),
-        config.num_generations.unwrap_or(8).to_string(),
-    ]);
-    args.extend(["--beta".into(), config.beta.unwrap_or(0.0).to_string()]);
-    args.extend([
-        "--learning-rate".into(),
-        config.learning_rate.unwrap_or(5e-6).to_string(),
-    ]);
-    args.extend(["--epochs".into(), config.epochs.unwrap_or(1).to_string()]);
-    args.extend(["--lora-r".into(), config.lora_r.unwrap_or(16).to_string()]);
-    args.extend([
-        "--lora-alpha".into(),
-        config.lora_alpha.unwrap_or(32.0).to_string(),
-    ]);
-    args.extend([
-        "--max-seq-len".into(),
-        config.max_seq_len.unwrap_or(512).to_string(),
-    ]);
-    args.extend([
-        "--max-completion-length".into(),
-        config.max_completion_length.unwrap_or(512).to_string(),
-    ]);
-    args.extend(["--seed".into(), config.seed.unwrap_or(42).to_string()]);
-    if config.reasoning_rewards.unwrap_or(false) {
-        args.push("--reasoning-rewards".into());
-    }
-    if let Some(ref pc) = config.prompt_column
-        && !pc.is_empty()
-    {
-        args.extend(["--prompt-column".into(), pc.clone()]);
-    }
-    if let Some(ref rc) = config.response_column
-        && !rc.is_empty()
-    {
-        args.extend(["--response-column".into(), rc.clone()]);
-    }
-
-    spawn_oneshot_subprocess(run_id.clone(), args, on_event).await?;
-    Ok(run_id)
-}
-
-// ---------------------------------------------------------------------------
-// Modelfile export — file-based Ollama compatibility, no runtime coupling
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-pub struct ModelfileExportDto {
-    pub base: String,
-    pub lora: Option<String>,
-    pub output: String,
-    pub template: Option<String>,
-    pub system: Option<String>,
-    pub temperature: Option<f32>,
-    pub num_ctx: Option<i32>,
-    pub top_k: Option<i32>,
-    pub top_p: Option<f32>,
-    pub license: Option<String>,
-}
-
-#[tauri::command]
-pub async fn start_ollama(
-    config: ModelfileExportDto,
-    on_event: tauri::ipc::Channel<serde_json::Value>,
-) -> Result<String> {
-    if config.base.trim().is_empty() {
-        return Err(AppError("base model is required".into()));
-    }
-    if config.output.trim().is_empty() {
-        return Err(AppError("output path is required".into()));
-    }
-
-    let run_id = uuid::Uuid::new_v4().to_string();
-
-    let mut args: Vec<String> = vec![
-        "ollama".into(),
-        "modelfile".into(),
-        "--base".into(),
-        config.base,
-        "--output".into(),
-        config.output,
-    ];
-    if let Some(lora) = config.lora.as_deref().filter(|s| !s.trim().is_empty()) {
-        args.extend(["--lora".into(), lora.to_string()]);
-    }
-    if let Some(template) = config
-        .template
-        .as_deref()
-        .filter(|s| !s.trim().is_empty() && *s != "auto")
-    {
-        args.extend(["--template".into(), template.to_string()]);
-    }
-    if let Some(system) = config.system.as_deref().filter(|s| !s.trim().is_empty()) {
-        args.extend(["--system".into(), system.to_string()]);
-    }
-    if let Some(temperature) = config.temperature {
-        args.extend(["--temperature".into(), temperature.to_string()]);
-    }
-    if let Some(num_ctx) = config.num_ctx {
-        args.extend(["--num-ctx".into(), num_ctx.to_string()]);
-    }
-    if let Some(top_k) = config.top_k {
-        args.extend(["--top-k".into(), top_k.to_string()]);
-    }
-    if let Some(top_p) = config.top_p {
-        args.extend(["--top-p".into(), top_p.to_string()]);
-    }
-    if let Some(license) = config.license.as_deref().filter(|s| !s.trim().is_empty()) {
-        args.extend(["--license".into(), license.to_string()]);
-    }
-
-    spawn_oneshot_subprocess(run_id.clone(), args, on_event).await?;
-    Ok(run_id)
-}
-
-// ---------------------------------------------------------------------------
-// Preference optimization — DPO, IPO, hinge, SimPO, ORPO, KTO with LoRA
-// ---------------------------------------------------------------------------
-
-#[tauri::command]
-pub async fn start_preference(
-    mut spec: pmetal::core::jobs::PreferenceSpec,
-    on_event: tauri::ipc::Channel<serde_json::Value>,
-) -> Result<String> {
-    spec.normalize().map_err(|errs| {
-        AppError(
-            errs.iter()
-                .map(|e| e.message.as_str())
-                .collect::<Vec<_>>()
-                .join("; "),
-        )
-    })?;
-    let run_id = uuid::Uuid::new_v4().to_string();
-    let mut args: Vec<String> = vec!["preference".into()];
-    args.extend(spec.to_argv());
-    spawn_oneshot_subprocess(run_id.clone(), args, on_event).await?;
-    Ok(run_id)
-}
-
-/// Spawn a `pmetal <subcommand>` child for a one-shot job that doesn't need
-/// state tracking — just streams stdout/stderr lines through the IPC channel.
-/// Used by DFlash, EmbedTrain, RLKD, Preference, and Modelfile export which have no corresponding
-/// run-list state in AppState (they're additive routes with no legacy state).
-async fn spawn_oneshot_subprocess(
-    run_id: String,
-    args: Vec<String>,
-    on_event: tauri::ipc::Channel<serde_json::Value>,
-) -> Result<()> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
-    let binary = pmetal_binary();
-    let mut cmd = tokio::process::Command::new(&binary);
-    cmd.args(&args);
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    #[cfg(unix)]
-    cmd.process_group(0);
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| AppError(format!("Failed to spawn `{}`: {e}", binary.display())))?;
-
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-
-    let run_id_stdout = run_id.clone();
-    let run_id_stderr = run_id.clone();
-    let run_id_wait = run_id.clone();
-    let on_event_stdout = on_event.clone();
-    let on_event_stderr = on_event.clone();
-
-    // Drain stdout — forward every line to the IPC channel as a log event.
-    if let Some(s) = stdout {
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(s).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                let _ = on_event_stdout.send(
-                    serde_json::json!({ "event": "log", "line": &line, "run_id": &run_id_stdout }),
-                );
-            }
-        });
-    }
-
-    // Drain stderr (also forwarded so the UI shows errors inline).
-    if let Some(s) = stderr {
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(s).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                let _ = on_event_stderr.send(
-                    serde_json::json!({ "event": "log", "line": &line, "run_id": &run_id_stderr }),
-                );
-            }
-        });
-    }
-
-    // Wait for exit and emit a completion event so the frontend can show done/failed.
-    tokio::spawn(async move {
-        match child.wait().await {
-            Ok(status) => {
-                let _ = on_event.send(serde_json::json!({
-                    "event": if status.success() { "done" } else { "failed" },
-                    "run_id": &run_id_wait,
-                    "exit_code": status.code(),
-                }));
-                tracing::info!(run_id = %run_id_wait, exit = ?status, "oneshot subprocess exited");
-            }
-            Err(e) => {
-                let _ = on_event.send(serde_json::json!({
-                    "event": "failed",
-                    "run_id": &run_id_wait,
-                    "error": e.to_string(),
-                }));
-                tracing::error!(run_id = %run_id_wait, error = %e, "oneshot subprocess wait failed");
-            }
-        }
-    });
-
-    Ok(())
-}
-
-async fn run_pmetal_subprocess_to_completion(args: Vec<String>) -> Result<()> {
-    let binary = pmetal_binary();
-    let output = tokio::process::Command::new(&binary)
-        .args(&args)
-        .output()
-        .await
-        .map_err(|e| AppError(format!("Failed to run `{}`: {e}", binary.display())))?;
-
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let detail = if !stderr.trim().is_empty() {
-        stderr.trim()
-    } else {
-        stdout.trim()
-    };
-    Err(AppError(format!(
-        "pmetal {} failed with status {}{}",
-        args.join(" "),
-        output.status,
-        if detail.is_empty() {
-            String::new()
-        } else {
-            format!(": {detail}")
-        }
-    )))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{InferenceMessage, chat_message_from_inference_message};
-
-    #[test]
-    fn inference_message_mapping_preserves_supported_roles() {
-        let user = chat_message_from_inference_message(&InferenceMessage {
-            role: "user".into(),
-            content: "hello".into(),
-        })
-        .unwrap();
-        assert_eq!(user.role, "user");
-        assert_eq!(user.content, "hello");
-
-        let assistant = chat_message_from_inference_message(&InferenceMessage {
-            role: "assistant".into(),
-            content: "hi".into(),
-        })
-        .unwrap();
-        assert_eq!(assistant.role, "assistant");
-        assert_eq!(assistant.content, "hi");
-
-        let system = chat_message_from_inference_message(&InferenceMessage {
-            role: "system".into(),
-            content: "stay concise".into(),
-        })
-        .unwrap();
-        assert_eq!(system.role, "system");
-        assert_eq!(system.content, "stay concise");
-    }
-
-    #[test]
-    fn inference_message_mapping_rejects_unknown_roles() {
-        let err = chat_message_from_inference_message(&InferenceMessage {
-            role: "tool".into(),
-            content: "{}".into(),
-        })
-        .unwrap_err();
-
-        assert!(err.contains("unsupported chat role 'tool'"));
+    fn resync(&self) {
+        let _ = self.0.emit("jobs-resync", ());
     }
 }

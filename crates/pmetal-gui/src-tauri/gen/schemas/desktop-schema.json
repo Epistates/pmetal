@@ -135,174 +135,6 @@
           "type": "object",
           "allOf": [
             {
-              "if": {
-                "properties": {
-                  "identifier": {
-                    "anyOf": [
-                      {
-                        "description": "This permission set allows opening `mailto:`, `tel:`, `https://` and `http://` urls using their default application\nas well as reveal file in directories using default file explorer\n#### This default permission set includes:\n\n- `allow-open-url`\n- `allow-reveal-item-in-dir`\n- `allow-default-urls`",
-                        "type": "string",
-                        "const": "opener:default",
-                        "markdownDescription": "This permission set allows opening `mailto:`, `tel:`, `https://` and `http://` urls using their default application\nas well as reveal file in directories using default file explorer\n#### This default permission set includes:\n\n- `allow-open-url`\n- `allow-reveal-item-in-dir`\n- `allow-default-urls`"
-                      },
-                      {
-                        "description": "This enables opening `mailto:`, `tel:`, `https://` and `http://` urls using their default application.",
-                        "type": "string",
-                        "const": "opener:allow-default-urls",
-                        "markdownDescription": "This enables opening `mailto:`, `tel:`, `https://` and `http://` urls using their default application."
-                      },
-                      {
-                        "description": "Enables the open_path command without any pre-configured scope.",
-                        "type": "string",
-                        "const": "opener:allow-open-path",
-                        "markdownDescription": "Enables the open_path command without any pre-configured scope."
-                      },
-                      {
-                        "description": "Enables the open_url command without any pre-configured scope.",
-                        "type": "string",
-                        "const": "opener:allow-open-url",
-                        "markdownDescription": "Enables the open_url command without any pre-configured scope."
-                      },
-                      {
-                        "description": "Enables the reveal_item_in_dir command without any pre-configured scope.",
-                        "type": "string",
-                        "const": "opener:allow-reveal-item-in-dir",
-                        "markdownDescription": "Enables the reveal_item_in_dir command without any pre-configured scope."
-                      },
-                      {
-                        "description": "Denies the open_path command without any pre-configured scope.",
-                        "type": "string",
-                        "const": "opener:deny-open-path",
-                        "markdownDescription": "Denies the open_path command without any pre-configured scope."
-                      },
-                      {
-                        "description": "Denies the open_url command without any pre-configured scope.",
-                        "type": "string",
-                        "const": "opener:deny-open-url",
-                        "markdownDescription": "Denies the open_url command without any pre-configured scope."
-                      },
-                      {
-                        "description": "Denies the reveal_item_in_dir command without any pre-configured scope.",
-                        "type": "string",
-                        "const": "opener:deny-reveal-item-in-dir",
-                        "markdownDescription": "Denies the reveal_item_in_dir command without any pre-configured scope."
-                      }
-                    ]
-                  }
-                }
-              },
-              "then": {
-                "properties": {
-                  "allow": {
-                    "items": {
-                      "title": "OpenerScopeEntry",
-                      "description": "Opener scope entry.",
-                      "anyOf": [
-                        {
-                          "type": "object",
-                          "required": [
-                            "url"
-                          ],
-                          "properties": {
-                            "app": {
-                              "description": "An application to open this url with, for example: firefox.",
-                              "allOf": [
-                                {
-                                  "$ref": "#/definitions/Application"
-                                }
-                              ]
-                            },
-                            "url": {
-                              "description": "A URL that can be opened by the webview when using the Opener APIs.\n\nWildcards can be used following the UNIX glob pattern.\n\nExamples:\n\n- \"https://*\" : allows all HTTPS origin\n\n- \"https://*.github.com/tauri-apps/tauri\": allows any subdomain of \"github.com\" with the \"tauri-apps/api\" path\n\n- \"https://myapi.service.com/users/*\": allows access to any URLs that begins with \"https://myapi.service.com/users/\"",
-                              "type": "string"
-                            }
-                          }
-                        },
-                        {
-                          "type": "object",
-                          "required": [
-                            "path"
-                          ],
-                          "properties": {
-                            "app": {
-                              "description": "An application to open this path with, for example: xdg-open.",
-                              "allOf": [
-                                {
-                                  "$ref": "#/definitions/Application"
-                                }
-                              ]
-                            },
-                            "path": {
-                              "description": "A path that can be opened by the webview when using the Opener APIs.\n\nThe pattern can start with a variable that resolves to a system base directory. The variables are: `$AUDIO`, `$CACHE`, `$CONFIG`, `$DATA`, `$LOCALDATA`, `$DESKTOP`, `$DOCUMENT`, `$DOWNLOAD`, `$EXE`, `$FONT`, `$HOME`, `$PICTURE`, `$PUBLIC`, `$RUNTIME`, `$TEMPLATE`, `$VIDEO`, `$RESOURCE`, `$APP`, `$LOG`, `$TEMP`, `$APPCONFIG`, `$APPDATA`, `$APPLOCALDATA`, `$APPCACHE`, `$APPLOG`.",
-                              "type": "string"
-                            }
-                          }
-                        }
-                      ]
-                    }
-                  },
-                  "deny": {
-                    "items": {
-                      "title": "OpenerScopeEntry",
-                      "description": "Opener scope entry.",
-                      "anyOf": [
-                        {
-                          "type": "object",
-                          "required": [
-                            "url"
-                          ],
-                          "properties": {
-                            "app": {
-                              "description": "An application to open this url with, for example: firefox.",
-                              "allOf": [
-                                {
-                                  "$ref": "#/definitions/Application"
-                                }
-                              ]
-                            },
-                            "url": {
-                              "description": "A URL that can be opened by the webview when using the Opener APIs.\n\nWildcards can be used following the UNIX glob pattern.\n\nExamples:\n\n- \"https://*\" : allows all HTTPS origin\n\n- \"https://*.github.com/tauri-apps/tauri\": allows any subdomain of \"github.com\" with the \"tauri-apps/api\" path\n\n- \"https://myapi.service.com/users/*\": allows access to any URLs that begins with \"https://myapi.service.com/users/\"",
-                              "type": "string"
-                            }
-                          }
-                        },
-                        {
-                          "type": "object",
-                          "required": [
-                            "path"
-                          ],
-                          "properties": {
-                            "app": {
-                              "description": "An application to open this path with, for example: xdg-open.",
-                              "allOf": [
-                                {
-                                  "$ref": "#/definitions/Application"
-                                }
-                              ]
-                            },
-                            "path": {
-                              "description": "A path that can be opened by the webview when using the Opener APIs.\n\nThe pattern can start with a variable that resolves to a system base directory. The variables are: `$AUDIO`, `$CACHE`, `$CONFIG`, `$DATA`, `$LOCALDATA`, `$DESKTOP`, `$DOCUMENT`, `$DOWNLOAD`, `$EXE`, `$FONT`, `$HOME`, `$PICTURE`, `$PUBLIC`, `$RUNTIME`, `$TEMPLATE`, `$VIDEO`, `$RESOURCE`, `$APP`, `$LOG`, `$TEMP`, `$APPCONFIG`, `$APPDATA`, `$APPLOCALDATA`, `$APPCACHE`, `$APPLOG`.",
-                              "type": "string"
-                            }
-                          }
-                        }
-                      ]
-                    }
-                  }
-                }
-              },
-              "properties": {
-                "identifier": {
-                  "description": "Identifier of the permission or permission set.",
-                  "allOf": [
-                    {
-                      "$ref": "#/definitions/Identifier"
-                    }
-                  ]
-                }
-              }
-            },
-            {
               "properties": {
                 "identifier": {
                   "description": "Identifier of the permission or permission set.",
@@ -344,6 +176,438 @@
     "Identifier": {
       "description": "Permission identifier",
       "oneOf": [
+        {
+          "description": "Enables the add_model_directory command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-add-model-directory",
+          "markdownDescription": "Enables the add_model_directory command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cancel_download command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cancel-download",
+          "markdownDescription": "Enables the cancel_download command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the clear_finished_downloads command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-clear-finished-downloads",
+          "markdownDescription": "Enables the clear_finished_downloads command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the clear_hf_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-clear-hf-token",
+          "markdownDescription": "Enables the clear_hf_token command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the delete_model command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-delete-model",
+          "markdownDescription": "Enables the delete_model command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the download_dataset command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-download-dataset",
+          "markdownDescription": "Enables the download_dataset command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the download_model command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-download-model",
+          "markdownDescription": "Enables the download_model command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the forget_job command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-forget-job",
+          "markdownDescription": "Enables the forget_job command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_config command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-config",
+          "markdownDescription": "Enables the get_config command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_model_defaults command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-model-defaults",
+          "markdownDescription": "Enables the get_model_defaults command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_model_fit command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-model-fit",
+          "markdownDescription": "Enables the get_model_fit command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_model_info command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-model-info",
+          "markdownDescription": "Enables the get_model_info command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_system_info command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-system-info",
+          "markdownDescription": "Enables the get_system_info command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_trending_datasets command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-trending-datasets",
+          "markdownDescription": "Enables the get_trending_datasets command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_trending_models command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-trending-models",
+          "markdownDescription": "Enables the get_trending_models command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the job_output command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-job-output",
+          "markdownDescription": "Enables the job_output command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the job_steps command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-job-steps",
+          "markdownDescription": "Enables the job_steps command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_cached_datasets command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-cached-datasets",
+          "markdownDescription": "Enables the list_cached_datasets command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_downloads command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-downloads",
+          "markdownDescription": "Enables the list_downloads command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_job_forms command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-job-forms",
+          "markdownDescription": "Enables the list_job_forms command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_jobs command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-jobs",
+          "markdownDescription": "Enables the list_jobs command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_models command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-models",
+          "markdownDescription": "Enables the list_models command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_trained_adapters command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-trained-adapters",
+          "markdownDescription": "Enables the list_trained_adapters command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the peek_dataset_columns command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-peek-dataset-columns",
+          "markdownDescription": "Enables the peek_dataset_columns command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the pick_directory command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-pick-directory",
+          "markdownDescription": "Enables the pick_directory command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the pick_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-pick-file",
+          "markdownDescription": "Enables the pick_file command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the refresh_models command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-refresh-models",
+          "markdownDescription": "Enables the refresh_models command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the remove_model_directory command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-remove-model-directory",
+          "markdownDescription": "Enables the remove_model_directory command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the search_hub_datasets command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-search-hub-datasets",
+          "markdownDescription": "Enables the search_hub_datasets command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the search_hub_models command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-search-hub-models",
+          "markdownDescription": "Enables the search_hub_models command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_config command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-config",
+          "markdownDescription": "Enables the set_config command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_hf_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-hf-token",
+          "markdownDescription": "Enables the set_hf_token command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the start_chat command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-start-chat",
+          "markdownDescription": "Enables the start_chat command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the start_job command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-start-job",
+          "markdownDescription": "Enables the start_job command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the stop_chat command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-stop-chat",
+          "markdownDescription": "Enables the stop_chat command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the stop_job command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-stop-job",
+          "markdownDescription": "Enables the stop_job command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the add_model_directory command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-add-model-directory",
+          "markdownDescription": "Denies the add_model_directory command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cancel_download command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cancel-download",
+          "markdownDescription": "Denies the cancel_download command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the clear_finished_downloads command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-clear-finished-downloads",
+          "markdownDescription": "Denies the clear_finished_downloads command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the clear_hf_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-clear-hf-token",
+          "markdownDescription": "Denies the clear_hf_token command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the delete_model command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-delete-model",
+          "markdownDescription": "Denies the delete_model command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the download_dataset command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-download-dataset",
+          "markdownDescription": "Denies the download_dataset command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the download_model command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-download-model",
+          "markdownDescription": "Denies the download_model command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the forget_job command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-forget-job",
+          "markdownDescription": "Denies the forget_job command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_config command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-config",
+          "markdownDescription": "Denies the get_config command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_model_defaults command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-model-defaults",
+          "markdownDescription": "Denies the get_model_defaults command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_model_fit command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-model-fit",
+          "markdownDescription": "Denies the get_model_fit command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_model_info command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-model-info",
+          "markdownDescription": "Denies the get_model_info command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_system_info command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-system-info",
+          "markdownDescription": "Denies the get_system_info command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_trending_datasets command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-trending-datasets",
+          "markdownDescription": "Denies the get_trending_datasets command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_trending_models command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-trending-models",
+          "markdownDescription": "Denies the get_trending_models command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the job_output command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-job-output",
+          "markdownDescription": "Denies the job_output command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the job_steps command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-job-steps",
+          "markdownDescription": "Denies the job_steps command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_cached_datasets command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-cached-datasets",
+          "markdownDescription": "Denies the list_cached_datasets command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_downloads command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-downloads",
+          "markdownDescription": "Denies the list_downloads command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_job_forms command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-job-forms",
+          "markdownDescription": "Denies the list_job_forms command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_jobs command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-jobs",
+          "markdownDescription": "Denies the list_jobs command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_models command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-models",
+          "markdownDescription": "Denies the list_models command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_trained_adapters command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-trained-adapters",
+          "markdownDescription": "Denies the list_trained_adapters command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the peek_dataset_columns command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-peek-dataset-columns",
+          "markdownDescription": "Denies the peek_dataset_columns command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the pick_directory command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-pick-directory",
+          "markdownDescription": "Denies the pick_directory command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the pick_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-pick-file",
+          "markdownDescription": "Denies the pick_file command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the refresh_models command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-refresh-models",
+          "markdownDescription": "Denies the refresh_models command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the remove_model_directory command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-remove-model-directory",
+          "markdownDescription": "Denies the remove_model_directory command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the search_hub_datasets command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-search-hub-datasets",
+          "markdownDescription": "Denies the search_hub_datasets command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the search_hub_models command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-search-hub-models",
+          "markdownDescription": "Denies the search_hub_models command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_config command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-config",
+          "markdownDescription": "Denies the set_config command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_hf_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-hf-token",
+          "markdownDescription": "Denies the set_hf_token command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the start_chat command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-start-chat",
+          "markdownDescription": "Denies the start_chat command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the start_job command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-start-job",
+          "markdownDescription": "Denies the start_job command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the stop_chat command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-stop-chat",
+          "markdownDescription": "Denies the stop_chat command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the stop_job command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-stop-job",
+          "markdownDescription": "Denies the stop_job command without any pre-configured scope."
+        },
         {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",
           "type": "string",
@@ -2449,84 +2713,6 @@
           "type": "string",
           "const": "dialog:deny-save",
           "markdownDescription": "Denies the save command without any pre-configured scope."
-        },
-        {
-          "description": "This permission set allows opening `mailto:`, `tel:`, `https://` and `http://` urls using their default application\nas well as reveal file in directories using default file explorer\n#### This default permission set includes:\n\n- `allow-open-url`\n- `allow-reveal-item-in-dir`\n- `allow-default-urls`",
-          "type": "string",
-          "const": "opener:default",
-          "markdownDescription": "This permission set allows opening `mailto:`, `tel:`, `https://` and `http://` urls using their default application\nas well as reveal file in directories using default file explorer\n#### This default permission set includes:\n\n- `allow-open-url`\n- `allow-reveal-item-in-dir`\n- `allow-default-urls`"
-        },
-        {
-          "description": "This enables opening `mailto:`, `tel:`, `https://` and `http://` urls using their default application.",
-          "type": "string",
-          "const": "opener:allow-default-urls",
-          "markdownDescription": "This enables opening `mailto:`, `tel:`, `https://` and `http://` urls using their default application."
-        },
-        {
-          "description": "Enables the open_path command without any pre-configured scope.",
-          "type": "string",
-          "const": "opener:allow-open-path",
-          "markdownDescription": "Enables the open_path command without any pre-configured scope."
-        },
-        {
-          "description": "Enables the open_url command without any pre-configured scope.",
-          "type": "string",
-          "const": "opener:allow-open-url",
-          "markdownDescription": "Enables the open_url command without any pre-configured scope."
-        },
-        {
-          "description": "Enables the reveal_item_in_dir command without any pre-configured scope.",
-          "type": "string",
-          "const": "opener:allow-reveal-item-in-dir",
-          "markdownDescription": "Enables the reveal_item_in_dir command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the open_path command without any pre-configured scope.",
-          "type": "string",
-          "const": "opener:deny-open-path",
-          "markdownDescription": "Denies the open_path command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the open_url command without any pre-configured scope.",
-          "type": "string",
-          "const": "opener:deny-open-url",
-          "markdownDescription": "Denies the open_url command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the reveal_item_in_dir command without any pre-configured scope.",
-          "type": "string",
-          "const": "opener:deny-reveal-item-in-dir",
-          "markdownDescription": "Denies the reveal_item_in_dir command without any pre-configured scope."
-        },
-        {
-          "description": "This permission set configures which\nprocess features are by default exposed.\n\n#### Granted Permissions\n\nThis enables to quit via `allow-exit` and restart via `allow-restart`\nthe application.\n\n#### This default permission set includes:\n\n- `allow-exit`\n- `allow-restart`",
-          "type": "string",
-          "const": "process:default",
-          "markdownDescription": "This permission set configures which\nprocess features are by default exposed.\n\n#### Granted Permissions\n\nThis enables to quit via `allow-exit` and restart via `allow-restart`\nthe application.\n\n#### This default permission set includes:\n\n- `allow-exit`\n- `allow-restart`"
-        },
-        {
-          "description": "Enables the exit command without any pre-configured scope.",
-          "type": "string",
-          "const": "process:allow-exit",
-          "markdownDescription": "Enables the exit command without any pre-configured scope."
-        },
-        {
-          "description": "Enables the restart command without any pre-configured scope.",
-          "type": "string",
-          "const": "process:allow-restart",
-          "markdownDescription": "Enables the restart command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the exit command without any pre-configured scope.",
-          "type": "string",
-          "const": "process:deny-exit",
-          "markdownDescription": "Denies the exit command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the restart command without any pre-configured scope.",
-          "type": "string",
-          "const": "process:deny-restart",
-          "markdownDescription": "Denies the restart command without any pre-configured scope."
         }
       ]
     },
@@ -2621,23 +2807,6 @@
           "enum": [
             "iOS"
           ]
-        }
-      ]
-    },
-    "Application": {
-      "description": "Opener scope application.",
-      "anyOf": [
-        {
-          "description": "Open in default application.",
-          "type": "null"
-        },
-        {
-          "description": "If true, allow open with any application.",
-          "type": "boolean"
-        },
-        {
-          "description": "Allow specific application to open with.",
-          "type": "string"
         }
       ]
     }

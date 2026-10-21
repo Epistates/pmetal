@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-peek-dataset-columns"
+description = "Enables the peek_dataset_columns command without any pre-configured scope."
+commands.allow = ["peek_dataset_columns"]
+
+[[permission]]
+identifier = "deny-peek-dataset-columns"
+description = "Denies the peek_dataset_columns command without any pre-configured scope."
+commands.deny = ["peek_dataset_columns"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-add-model-directory"
+description = "Enables the add_model_directory command without any pre-configured scope."
+commands.allow = ["add_model_directory"]
+
+[[permission]]
+identifier = "deny-add-model-directory"
+description = "Denies the add_model_directory command without any pre-configured scope."
+commands.deny = ["add_model_directory"]
