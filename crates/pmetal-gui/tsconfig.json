@@ -2,7 +2,8 @@
   "extends": "$app/tsconfig",
   "compilerOptions": {
     "sourceMap": true,
-    "strict": true
+    "strict": true,
+    "types": ["$app/types", "bun"]
   },
   "include": [
     "src",

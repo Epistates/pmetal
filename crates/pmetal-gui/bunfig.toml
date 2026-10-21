@@ -1,0 +1,3 @@
+[test]
+# Compiles .svelte and .svelte.ts files, so a component can be rendered in a test.
+preload = ["./test/setup.ts"]

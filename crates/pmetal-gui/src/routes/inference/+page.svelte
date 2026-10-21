@@ -2,8 +2,8 @@
   import { onMount, onDestroy, tick } from 'svelte';
   import { page } from '$app/state';
   import { modelsStore } from '#lib/stores.svelte.js';
-  import { startInference, stopInference, onInferenceToken, onInferenceDone, onInferenceError, listTrainedAdapters, getModelDefaults } from '#lib/api.js';
-  import type { TrainedAdapter, ModelDefaults, InferenceMetrics } from '#lib/api.js';
+  import { startChat, stopChat, onChatToken, onChatDone, onChatError, listTrainedAdapters, getModelDefaults, errorMessage } from '#lib/api.js';
+  import type { TrainedAdapter, ChatMetrics } from '#lib/api.js';
   import { renderMarkdown } from '#lib/utils.js';
   import type { UnlistenFn } from '@tauri-apps/api/event';
 
@@ -14,7 +14,7 @@
     content: string;
     thinking?: string;
     isStreaming?: boolean;
-    metrics?: InferenceMetrics;
+    metrics?: ChatMetrics;
   }
 
   // Model config
@@ -108,6 +108,8 @@
   });
 
   onDestroy(() => {
+    // Leaving the page ends a reply nobody is reading.
+    if (session) void stopChat(session).catch(() => {});
     unlistenToken?.();
     unlistenDone?.();
     unlistenError?.();
@@ -138,82 +140,77 @@
     maxTokens = normalizeMaxTokensValue(maxTokens);
   }
 
+  /** The reply being generated, if any: events of other sessions are not ours. */
+  let session: string | null = null;
+
+  function finishLast(update: (m: ChatMessage) => ChatMessage) {
+    messages = messages.map((m, i) => (i === messages.length - 1 ? update(m) : m));
+  }
+
   async function handleSend() {
     if (!userInput.trim() || isGenerating) return;
-    if (!selectedModel) { error = 'Please select a model first'; return; }
+    if (!selectedModel) { error = 'Choose a model first.'; return; }
 
     error = null;
     const prompt = userInput.trim();
     userInput = '';
+    const history = messages
+      .filter((m) => m.role === 'user' || m.role === 'assistant')
+      .map((m) => ({ role: m.role, content: m.content }));
 
-    // Snapshot current history before adding new user message
-    const historySnapshot = [...messages];
-
-    // Add user message
-    messages = [...messages, { role: 'user', content: prompt }];
-
-    // Add placeholder assistant message
-    messages = [...messages, { role: 'assistant', content: '', isStreaming: true }];
+    messages = [
+      ...messages,
+      { role: 'user', content: prompt },
+      { role: 'assistant', content: '', isStreaming: true },
+    ];
     await scrollToBottom();
 
     isGenerating = true;
     inferenceStatus = 'loading';
-    let currentContent = '';
-    let firstTokenReceived = false;
+    const mine = crypto.randomUUID();
+    session = mine;
+    let content = '';
 
     try {
-      // Set up listeners before invoking
+      // Listening before starting, and for this session only, so a reply that
+      // was stopped cannot leak its last tokens into the next one.
       unlistenToken?.();
       unlistenDone?.();
       unlistenError?.();
-
-      unlistenToken = await onInferenceToken((token) => {
-        if (!firstTokenReceived) {
-          firstTokenReceived = true;
-          inferenceStatus = 'generating';
-        }
-        currentContent += token;
-        messages = messages.map((m, i) => {
-          if (i === messages.length - 1) {
-            return { ...m, content: currentContent };
-          }
-          return m;
-        });
+      unlistenToken = await onChatToken((e) => {
+        if (e.session_id !== mine) return;
+        inferenceStatus = 'generating';
+        content += e.text;
+        finishLast((m) => ({ ...m, content }));
         scrollToBottom();
       });
-
-      unlistenDone = await onInferenceDone((metrics) => {
-        const parsed = metrics?.response_text != null
-          ? {
-              thinking: metrics.thinking ?? null,
-              reply: metrics.truncated_thinking ? truncatedThinkingReply : metrics.response_text,
-            }
-          : parseThinking(currentContent);
-        messages = messages.map((m, i) => {
-          if (i === messages.length - 1) {
-            return {
-              ...m,
-              content: parsed.reply,
-              thinking: parsed.thinking ?? undefined,
-              isStreaming: false,
-              metrics: metrics ?? undefined,
-            };
-          }
-          return m;
-        });
+      unlistenDone = await onChatDone((metrics) => {
+        if (metrics.session_id !== mine) return;
+        const parsed = metrics.truncated_thinking
+          ? { thinking: metrics.thinking, reply: truncatedThinkingReply }
+          : { thinking: metrics.thinking, reply: metrics.response_text };
+        finishLast((m) => ({
+          ...m,
+          content: parsed.reply,
+          thinking: parsed.thinking ?? undefined,
+          isStreaming: false,
+          metrics,
+        }));
+        session = null;
         isGenerating = false;
         inferenceStatus = 'done';
         scrollToBottom();
       });
-
-      unlistenError = await onInferenceError((message) => {
-        error = message;
+      unlistenError = await onChatError((e) => {
+        if (e.session_id !== mine) return;
+        error = e.error;
         messages = messages.filter((m, i) => !(i === messages.length - 1 && m.isStreaming));
+        session = null;
         isGenerating = false;
         inferenceStatus = 'idle';
       });
 
-      await startInference(
+      await startChat(
         {
           model: selectedModel,
           lora: loraPath || undefined,
@@ -240,40 +237,29 @@
                 ? 8
                 : kvQuant === 'auto'
                   ? undefined
-                  : parseInt(kvQuant),
+                  : kvQuant.startsWith('tq')
+                    ? undefined
+                    : parseInt(kvQuant),
           no_kv_quant: kvQuant === '0' ? true : undefined,
           kv_turboquant: kvQuant === 'tq4' || kvQuant === 'tq8' ? true : undefined,
           kv_turboquant_preset:
-            kvQuant === 'tq2_5'
-              ? 'q2_5'
-              : kvQuant === 'tq3_5'
-                ? 'q3_5'
-                : undefined,
+            kvQuant === 'tq2_5' ? 'q2_5' : kvQuant === 'tq3_5' ? 'q3_5' : undefined,
         },
-        historySnapshot
-          .filter((m) => m.role === 'user' || m.role === 'assistant')
-          .map((m) => ({ role: m.role, content: m.content })),
+        history,
+        mine,
       );
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
-      // Remove the streaming placeholder on error
+      error = errorMessage(e);
       messages = messages.slice(0, -1);
+      session = null;
       isGenerating = false;
       inferenceStatus = 'idle';
     }
   }
 
   async function handleStop() {
-    await stopInference().catch(console.error);
-    messages = messages.map((m, i) => {
-      if (i === messages.length - 1 && m.isStreaming) {
-        const { thinking, reply } = parseThinking(m.content);
-        return { ...m, content: reply, thinking: thinking ?? undefined, isStreaming: false };
-      }
-      return m;
-    });
-    isGenerating = false;
-    inferenceStatus = 'idle';
+    await stopChat(session ?? undefined).catch(console.error);
+    // The reply stops at its next token; what was written is kept.
   }
 
   function clearChat() {
@@ -328,7 +314,7 @@
         <select id="inf-model" class="input text-sm" bind:value={selectedModel}>
           <option value="">Select a model...</option>
           {#each models as model}
-            <option value={model.id}>{model.id.split('/').pop()} ({model.size_formatted})</option>
+            <option value={model.reference}>{model.id.split('/').pop()} ({model.size_formatted})</option>
           {/each}
         </select>
       </div>
@@ -343,8 +329,8 @@
             // Auto-select matching base model when a LoRA adapter is chosen
             const adapter = trainedAdapters.find(a => a.path === selectedValue);
             if (adapter?.base_model) {
-              const match = models.find(m => m.id === adapter.base_model || m.id.endsWith('/' + adapter.base_model));
-              if (match) selectedModel = match.id;
+              const match = models.find(m => m.id === adapter.base_model || m.reference === adapter.base_model || m.id.endsWith('/' + adapter.base_model));
+              if (match) selectedModel = match.reference;
             }
           }}>
             <option value="">No adapter (base model)</option>

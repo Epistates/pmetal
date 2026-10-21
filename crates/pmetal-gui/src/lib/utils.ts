@@ -21,20 +21,46 @@ export function formatBytes(bytes: number | null): string {
 export function getStatusBadgeClass(status: string): string {
   switch (status) {
     case 'running':
-    case 'training':
-    case 'loading_models':
-    case 'generating_signals':
+    case 'downloading':
       return 'badge-primary';
+    case 'stopping':
+    case 'queued':
+      return 'badge-warning';
     case 'completed': return 'badge-success';
     case 'failed': return 'badge-danger';
-    case 'cancelled': return 'badge-warning';
+    case 'stopped':
+    case 'cancelled':
+      return 'badge-warning';
     default: return 'badge-neutral';
   }
 }
 
-export function runProgress(step: number, totalSteps: number): number {
-  if (!totalSteps) return 0;
-  return Math.min(100, (step / totalSteps) * 100);
+/** A short word for how a job stands. */
+export function stateLabel(state: string): string {
+  switch (state) {
+    case 'running': return 'Running';
+    case 'stopping': return 'Stopping';
+    case 'completed': return 'Completed';
+    case 'failed': return 'Failed';
+    case 'stopped': return 'Stopped';
+    default: return state;
+  }
+}
+
+/** Seconds as "1h 02m", "3m 05s" or "12s". */
+export function formatDuration(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`;
+  return `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}m`;
+}
+
+/** A number for a metrics grid: fixed digits, or a dash when it is absent. */
+export function formatMetric(value: number | null | undefined, digits = 4): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '--';
+  const abs = Math.abs(value);
+  if (abs !== 0 && (abs < 1e-3 || abs >= 1e6)) return value.toExponential(2);
+  return value.toFixed(digits);
 }
 
 /**

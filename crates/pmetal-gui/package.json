@@ -7,16 +7,14 @@
     "dev": "vite dev",
     "build": "vite build",
     "preview": "vite preview",
+    "test": "bun test",
     "check": "svelte-kit sync && svelte-check --tsgo --tsconfig ./tsconfig.json",
     "tauri": "tauri"
   },
   "license": "MIT OR Apache-2.0",
   "packageManager": "bun@1.4.2",
   "dependencies": {
-    "@tauri-apps/api": "^2.12.2",
-    "@tauri-apps/plugin-opener": "^2.7.0",
-    "@tauri-apps/plugin-process": "^2.4.0",
-    "@tauri-apps/plugin-updater": "^2.13.2"
+    "@tauri-apps/api": "^2.12.2"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^4.0.0",
@@ -24,8 +22,10 @@
     "@sveltejs/vite-plugin-svelte": "^7.3.1",
     "@tailwindcss/vite": "^4.3.3",
     "@tauri-apps/cli": "^2.12.1",
+    "@types/bun": "^1.4.3",
     "@types/node": "^26.6.4",
     "@typescript/native": "npm:typescript@^7.0.2",
+    "bun-plugin-svelte": "^0.0.6",
     "svelte": "^5.57.2",
     "svelte-check": "^4.7.6",
     "tailwindcss": "^4.3.3",
