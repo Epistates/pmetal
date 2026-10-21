@@ -39,7 +39,9 @@ const SIGNAL_POLL: Duration = Duration::from_millis(50);
 static LIVE: Mutex<Option<HashMap<JobId, Supervisor>>> = Mutex::new(None);
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn live<R>(f: impl FnOnce(&mut HashMap<JobId, Supervisor>) -> R) -> R {
@@ -156,7 +158,11 @@ impl PyJob {
     /// The command that runs, with credentials hidden.
     #[getter]
     fn command(&self) -> PyResult<Vec<String>> {
-        let summary = self.core.supervisor.summary(&self.core.id).map_err(config_err)?;
+        let summary = self
+            .core
+            .supervisor
+            .summary(&self.core.id)
+            .map_err(config_err)?;
         let mut command = vec![self.core.binary.display().to_string()];
         command.extend(summary.args);
         Ok(command)
@@ -166,7 +172,11 @@ impl PyJob {
     /// `completed`, `failed` or `stopped`; the exit code is -1 when a signal
     /// ended the process, and None while it runs or when it was stopped.
     fn status(&self) -> PyResult<(&'static str, Option<i32>, Option<String>)> {
-        let summary = self.core.supervisor.summary(&self.core.id).map_err(config_err)?;
+        let summary = self
+            .core
+            .supervisor
+            .summary(&self.core.id)
+            .map_err(config_err)?;
         Ok(status_parts(&summary.status))
     }
 
@@ -268,7 +278,11 @@ impl PyJob {
 
     /// What the job reported about its progress (last step, loss, ...), as a dict.
     fn metrics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let summary = self.core.supervisor.summary(&self.core.id).map_err(config_err)?;
+        let summary = self
+            .core
+            .supervisor
+            .summary(&self.core.id)
+            .map_err(config_err)?;
         to_py(py, &value_of(&summary.metrics).map_err(config_err)?)
     }
 
@@ -295,7 +309,11 @@ impl PyJob {
 
 impl PyJob {
     fn lines(&self, stream: Stream, limit: usize) -> String {
-        let Ok(page) = self.core.supervisor.logs(&self.core.id, usize::MAX, Some(0)) else {
+        let Ok(page) = self
+            .core
+            .supervisor
+            .logs(&self.core.id, usize::MAX, Some(0))
+        else {
             return String::new();
         };
         let mut text = page
