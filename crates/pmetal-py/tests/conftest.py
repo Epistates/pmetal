@@ -38,18 +38,18 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "real_model: needs a real model (PMETAL_TEST_MODEL_DIR)")
     config.addinivalue_line("markers", "needs_hub: needs network access to the Hugging Face Hub")
-    config.addinivalue_line("markers", "needs_cli: needs the real pmetal command line (PMETAL_CLI)")
+    config.addinivalue_line("markers", "needs_cli: needs the real pmetal command line (PMETAL_BIN)")
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     real = os.environ.get("PMETAL_TEST_MODEL_DIR")
     hub = os.environ.get("PMETAL_TEST_HUB") == "1"
-    cli = os.environ.get("PMETAL_CLI")
+    cli = os.environ.get("PMETAL_BIN")
     for item in items:
         if "real_model" in item.keywords and not (real and Path(real).is_dir()):
             item.add_marker(pytest.mark.skip(reason="set PMETAL_TEST_MODEL_DIR to a model directory"))
         if "needs_cli" in item.keywords and not (cli and Path(cli).is_file()):
-            item.add_marker(pytest.mark.skip(reason="set PMETAL_CLI to the pmetal command line"))
+            item.add_marker(pytest.mark.skip(reason="set PMETAL_BIN to the pmetal command line"))
         if "needs_hub" in item.keywords and not hub:
             item.add_marker(pytest.mark.skip(reason="set PMETAL_TEST_HUB=1 to use the network"))
 

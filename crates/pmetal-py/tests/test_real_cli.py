@@ -1,6 +1,6 @@
 """The Python surface against the real ``pmetal`` command line.
 
-Set ``PMETAL_CLI`` to a built ``pmetal``. These check that a spec and the
+Set ``PMETAL_BIN`` to a built ``pmetal``. These check that a spec and the
 command it stands for agree: what ``run`` does is what the in-process calls do.
 """
 
@@ -80,14 +80,15 @@ def test_a_failing_command_is_a_job_failed_error_with_its_message(tmp_path):
 
 def test_cancelling_a_training_job_stops_it_after_the_step_and_keeps_the_adapter(tiny_model, tiny_dataset, tmp_path):
     spec = train_spec(tiny_model, tiny_dataset, tmp_path / "out", max_steps=None, epochs=1000)
-    with pmetal.start(spec) as job:
+    with pmetal.start(spec, stop_grace=60) as job:
         first = next(iter(job))
         assert first["event"] == "started"
         time.sleep(0.5)
         started = time.perf_counter()
-        job.cancel(grace=60)
+        job.cancel()
         result = job.wait(check=False)
-    assert result.returncode == 130, result.stderr[-500:]
+    assert result.status == "stopped", result.stderr[-500:]
+    assert "stopping after this step" in result.stderr
     assert time.perf_counter() - started < 30
     assert (tmp_path / "out" / "adapter_model.safetensors").exists(), "the adapter was saved"
     with pytest.raises(pmetal.CancelledError):
@@ -97,4 +98,4 @@ def test_cancelling_a_training_job_stops_it_after_the_step_and_keeps_the_adapter
 def test_the_command_line_is_the_packages_version():
     with warnings.catch_warnings():
         warnings.simplefilter("error")  # a version mismatch is a RuntimeWarning
-        assert pmetal.find_cli() == Path(os.environ["PMETAL_CLI"])
+        assert pmetal.find_cli() == Path(os.environ["PMETAL_BIN"])

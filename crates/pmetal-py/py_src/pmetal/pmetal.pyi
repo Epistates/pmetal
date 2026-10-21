@@ -344,7 +344,7 @@ class TrainSpec(_Spec):
     config_path: str | None
     """config_path. Default: ``None``."""
     resume: bool
-    """resume. Default: ``False``."""
+    """Resume. Continue from the latest checkpoint in the output directory. Flag: ``--resume``. Default: ``False``."""
     log_metrics: str | None
     """log_metrics. Default: ``None``."""
 
@@ -706,7 +706,7 @@ class GrpoSpec(_Spec):
     log_metrics: str | None
     """Log Metrics Path. Flag: ``--log-metrics``. Default: ``None``."""
     resume: bool
-    """resume. Default: ``False``."""
+    """Resume. Continue the LoRA weights from the latest checkpoint in the output directory. Flag: ``--resume``. Default: ``False``."""
 
 @type_check_only
 class PreferenceOptions(TypedDict, total=False):
@@ -924,7 +924,7 @@ class DistillSpec(_Spec):
     log_metrics: str | None
     """Log Metrics Path. Flag: ``--log-metrics``. Default: ``None``."""
     resume: bool
-    """resume. Default: ``False``."""
+    """Resume. Continue from the latest checkpoint in the output directory. Flag: ``--resume``. Default: ``False``."""
 
 @type_check_only
 class RlkdOptions(TypedDict, total=False):
@@ -2349,6 +2349,43 @@ def infer_with_metrics(
         ConfigError: An option is invalid, or is one only the command line honours.
         KeyboardInterrupt: On Ctrl-C, after the token in flight.
     """
+
+# --------------------------------------------------------------------------
+# Jobs (internal: the package's Job wraps these; use pmetal.start and pmetal.run)
+# --------------------------------------------------------------------------
+
+@final
+class _Job:
+    """A job running under the supervisor."""
+
+    @property
+    def id(self) -> str: ...
+    @property
+    def command(self) -> list[str]: ...
+    def status(
+        self,
+    ) -> tuple[Literal["running", "stopping", "completed", "failed", "stopped"], int | None, str | None]: ...
+    def wait(self, timeout: float | None = None) -> bool: ...
+    def finished(self) -> bool: ...
+    def stop(self) -> None: ...
+    def stop_deadline(self) -> float: ...
+    def events(self, since: int = 0) -> list[dict[str, Any]]: ...
+    def stdout(self) -> str: ...
+    def stderr(self) -> str: ...
+    def logs(self, tail: int = 200, since: int = 0) -> list[tuple[Literal["stdout", "stderr"], str]]: ...
+    def metrics(self) -> dict[str, Any]: ...
+    def completion(self) -> dict[str, Any] | None: ...
+    def raise_callback_error(self) -> None: ...
+
+def _start_job(
+    binary: str | os.PathLike[str],
+    subcommand: str,
+    argv: Sequence[str],
+    log_events: bool = False,
+    stop_grace: float = 30.0,
+    on_event: Callable[[dict[str, Any]], object] | None = None,
+) -> _Job: ...
+def _stop_all_jobs() -> None: ...
 
 # --------------------------------------------------------------------------
 # Hub

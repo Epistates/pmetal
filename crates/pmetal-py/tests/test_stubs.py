@@ -134,7 +134,7 @@ def test_every_public_symbol_has_a_stub_docstring():
                     missing.append(prefix + node.name)
                 # A TypedDict's keys are documented by the class that has them as attributes.
                 is_typed_dict = any(getattr(b, "id", None) == "TypedDict" for b in node.bases)
-                if not is_typed_dict:
+                if not is_typed_dict and not node.name.startswith("_"):
                     visit(node.body, f"{prefix}{node.name}.", True)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 public = not node.name.startswith("_")

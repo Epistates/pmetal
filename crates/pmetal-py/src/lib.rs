@@ -23,6 +23,7 @@ mod error;
 mod hooks;
 mod hub;
 mod infer;
+mod jobs;
 mod json;
 mod metallib;
 mod model;
@@ -67,6 +68,11 @@ fn pmetal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add_function(wrap_pyfunction!(infer::infer, m)?)?;
     m.add_function(wrap_pyfunction!(infer::infer_with_metrics, m)?)?;
+
+    // Jobs (the package's `Job` wraps these)
+    m.add_class::<jobs::PyJob>()?;
+    m.add_function(wrap_pyfunction!(jobs::_start_job, m)?)?;
+    m.add_function(wrap_pyfunction!(jobs::_stop_all_jobs, m)?)?;
 
     // Hub
     m.add_class::<hub::PyDownloadPlan>()?;

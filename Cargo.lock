@@ -5541,11 +5541,13 @@ dependencies = [
  "pmetal-metal",
  "pmetal-models",
  "pmetal-runtime",
+ "pmetal-supervisor",
  "pmetal-trainer",
  "pyo3",
  "pyo3-build-config",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]

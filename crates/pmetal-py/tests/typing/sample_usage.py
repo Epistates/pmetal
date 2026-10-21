@@ -118,14 +118,17 @@ def jobs() -> None:
         print(event.get("event"))
 
     result: pmetal.JobResult = pmetal.run(spec, on_event=on_event, timeout=60.0, check=False)
-    code: int = result.returncode
+    code: int | None = result.returncode
+    status: str = result.status
     summary = result.summary
-    print(code, summary, result.json())
-    with pmetal.start(spec, output="inherit") as job:
+    print(code, status, summary, result.json(), result.metrics.get("last_loss"))
+    with pmetal.start(spec, stop_grace=5.0) as job:
         for event in job:
             print(event)
         done = job.wait()
-        print(done.stdout, job.pid, job.poll())
+        for stream, text in job.logs(tail=10):
+            print(stream, text)
+        print(done.stdout, job.id, job.poll(), job.status, job.command)
     cli: Path = pmetal.find_cli()
     print(cli)
     assert isinstance(spec, pmetal.JobSpec)
