@@ -177,40 +177,57 @@ fn pipeline_harness_two_process_smoke() {
     }
 
     let bin = std::env::current_exe().expect("current_exe");
-    let [port_0, port_1, result_port] = grab_free_ports::<3>();
-
-    eprintln!("parent: spawning ranks (act0={port_0}, act1={port_1}, result={result_port})");
 
     // One secret for the whole cluster, handed to both ranks the way an
     // operator would: through the environment.
     let secret = pmetal_distributed::ClusterSecret::generate().to_hex();
 
-    let mut child_0 = std::process::Command::new(&bin)
-        .env(ENV_RANK, "0")
-        .env(pmetal_distributed::secret::ENV_VAR, &secret)
-        .env(ENV_ACT0, port_0.to_string())
-        .env(ENV_ACT1, port_1.to_string())
-        .env(ENV_RESULT, result_port.to_string())
-        .arg("pipeline_harness_two_process_smoke")
-        .arg("--exact")
-        .arg("--nocapture")
-        .spawn()
-        .expect("spawn rank 0");
-
-    let mut child_1 = std::process::Command::new(&bin)
-        .env(ENV_RANK, "1")
-        .env(pmetal_distributed::secret::ENV_VAR, &secret)
-        .env(ENV_ACT0, port_0.to_string())
-        .env(ENV_ACT1, port_1.to_string())
-        .env(ENV_RESULT, result_port.to_string())
-        .arg("pipeline_harness_two_process_smoke")
-        .arg("--exact")
-        .arg("--nocapture")
-        .spawn()
-        .expect("spawn rank 1");
-
-    let s0 = child_0.wait().expect("wait rank 0");
-    let s1 = child_1.wait().expect("wait rank 1");
-    assert!(s0.success(), "rank 0 failed: {:?}", s0);
-    assert!(s1.success(), "rank 1 failed: {:?}", s1);
+    // The ranks are other processes, so the ports have to be released before
+    // they bind them, and in that instant another process could take one. A
+    // rank that finds its port taken says so and the run starts over on new
+    // ports; any other failure is the test's.
+    const ATTEMPTS: usize = 4;
+    for attempt in 1..=ATTEMPTS {
+        let [port_0, port_1, result_port] = grab_free_ports::<3>();
+        eprintln!(
+            "parent: attempt {attempt}, spawning ranks \
+             (act0={port_0}, act1={port_1}, result={result_port})"
+        );
+        let spawn = |rank: &str| {
+            std::process::Command::new(&bin)
+                .env(ENV_RANK, rank)
+                .env(pmetal_distributed::secret::ENV_VAR, &secret)
+                .env(ENV_ACT0, port_0.to_string())
+                .env(ENV_ACT1, port_1.to_string())
+                .env(ENV_RESULT, result_port.to_string())
+                .arg("pipeline_harness_two_process_smoke")
+                .arg("--exact")
+                .arg("--nocapture")
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn a rank")
+        };
+        let (rank_0, rank_1) = (spawn("0"), spawn("1"));
+        let (out_0, out_1) = (
+            rank_0.wait_with_output().expect("wait rank 0"),
+            rank_1.wait_with_output().expect("wait rank 1"),
+        );
+        let (log_0, log_1) = (
+            String::from_utf8_lossy(&out_0.stderr).into_owned(),
+            String::from_utf8_lossy(&out_1.stderr).into_owned(),
+        );
+        eprintln!("--- rank 0\n{log_0}\n--- rank 1\n{log_1}");
+        if out_0.status.success() && out_1.status.success() {
+            return;
+        }
+        let port_taken = [&log_0, &log_1]
+            .iter()
+            .any(|log| log.to_lowercase().contains("address already in use"));
+        assert!(
+            port_taken && attempt < ATTEMPTS,
+            "rank 0: {:?}, rank 1: {:?}",
+            out_0.status,
+            out_1.status
+        );
+    }
 }
