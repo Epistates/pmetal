@@ -2695,11 +2695,10 @@ mod tests {
                 .unwrap(),
             ),
         ];
-        let dir = std::env::temp_dir().join(format!("qwen4_exp_fp8_rows_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        safetensors::serialize_to_file(views, None, &dir.join("model.safetensors")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        safetensors::serialize_to_file(views, None, &dir.path().join("model.safetensors")).unwrap();
 
-        let mut files = CheckpointFiles::open(&dir).unwrap();
+        let mut files = CheckpointFiles::open(dir.path()).unwrap();
         let rows = ngram_row_source(&mut files, &config, 1, Dtype::Float32).unwrap();
         assert_eq!(rows.encoding, NgramRowEncoding::Fp8E4m3 { scale: 0.25 });
         let ids: Vec<i32> = vec![11, 0, 6, 5, 7];
@@ -2716,7 +2715,6 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect();
-        std::fs::remove_dir_all(&dir).ok();
         assert_eq!(got, expected);
     }
 

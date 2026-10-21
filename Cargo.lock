@@ -5280,6 +5280,7 @@ dependencies = [
  "serde-saphyr",
  "serde_json",
  "serde_path_to_error",
+ "tempfile",
  "thiserror 2.0.21",
  "trybuild",
 ]
@@ -5434,6 +5435,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",

@@ -180,6 +180,16 @@ fn validate_cache_for_generation(
     }
     Ok(())
 }
+
+/// A distillation run a stop request ended is a run that trained part of the
+/// way: its student is saved (see [`super::stop::unless_stopped`]).
+fn stopped_is_not_a_failure(
+    result: pmetal_trainer::sft::Result<()>,
+) -> pmetal_trainer::sft::Result<()> {
+    super::stop::unless_stopped(result, |e| matches!(e, pmetal_trainer::SftError::Cancelled))
+        .map(|_| ())
+}
+
 /// Run knowledge distillation.
 pub(crate) async fn run_distillation(spec: DistillSpec, ctx: RunContext) -> anyhow::Result<()> {
     let DistillSpec {
@@ -461,15 +471,14 @@ pub(crate) async fn run_distillation(spec: DistillSpec, ctx: RunContext) -> anyh
             tracing::info!("Loading teacher model (frozen)...");
             let mut teacher_model = pmetal_models::DynamicModel::load(&teacher_path)
                 .map_err(|e| anyhow::anyhow!("Failed to load teacher model: {}", e))?;
-            trainer
-                .run(
-                    &mut student_model,
-                    &mut teacher_model,
-                    train_dataset,
-                    eval_dataset.clone(),
-                    Some(&checkpoint_manager),
-                )
-                .map_err(|e| anyhow::anyhow!("Distillation failed: {}", e))?;
+            stopped_is_not_a_failure(trainer.run(
+                &mut student_model,
+                &mut teacher_model,
+                train_dataset,
+                eval_dataset.clone(),
+                Some(&checkpoint_manager),
+            ))
+            .map_err(|e| anyhow::anyhow!("Distillation failed: {}", e))?;
         }
         pmetal_distill::DistillMethod::Offline => {
             let offline_cfg = offline_config.expect("offline config required for offline mode");
@@ -509,15 +518,14 @@ pub(crate) async fn run_distillation(spec: DistillSpec, ctx: RunContext) -> anyh
             }
 
             validate_offline_cache(&cache, teacher_id, max_seq_len, train_dataset.len())?;
-            trainer
-                .run_offline(
-                    &mut student_model,
-                    &cache,
-                    train_dataset,
-                    eval_dataset.clone(),
-                    Some(&checkpoint_manager),
-                )
-                .map_err(|e| anyhow::anyhow!("Offline distillation failed: {}", e))?;
+            stopped_is_not_a_failure(trainer.run_offline(
+                &mut student_model,
+                &cache,
+                train_dataset,
+                eval_dataset.clone(),
+                Some(&checkpoint_manager),
+            ))
+            .map_err(|e| anyhow::anyhow!("Offline distillation failed: {}", e))?;
         }
     }
 

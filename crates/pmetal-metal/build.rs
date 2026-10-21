@@ -36,8 +36,11 @@ fn main() {
     }
 
     // Re-run if shaders change, or the toolchain they are built with moves
-    println!("cargo:rerun-if-changed=src/kernels/metal");
-    println!("cargo:rerun-if-changed=src/kernels/metal4");
+    // The kernels' parent directory, not each kernel directory: Cargo treats a
+    // watched path that does not exist as changed on every build, and
+    // `metal4` does not exist until the Metal 4 kernels are added. Watching
+    // the parent re-runs this script when that directory appears, too.
+    println!("cargo:rerun-if-changed=src/kernels");
     println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
     println!("cargo:rerun-if-env-changed=SDKROOT");
 

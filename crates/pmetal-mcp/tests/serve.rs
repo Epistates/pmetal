@@ -379,20 +379,41 @@ mod blocking {
 
     #[tokio::test]
     async fn a_long_command_sends_progress_to_a_client_that_asked() {
-        let h = Harness::new("sleep 1.2; echo done");
+        // The command runs until the test has seen three progress
+        // notifications, however long that takes on this machine, instead of
+        // for a fixed time that a slow start could shorten below three ticks.
+        let h = Harness::new(
+            "d=\"$(dirname \"$0\")\"\nwhile [ ! -f \"$d/enough\" ]; do sleep 0.05; done\necho done",
+        );
         let recorder = Arc::new(Recorder::default());
         let ctx = RequestContext::stdio()
             .with_progress_token(json!("tok-1"))
             .with_session(recorder.clone());
-        let out = run_command(
+        let argv = ["infer".to_string()];
+        let run = run_command(
             command(&h),
-            &["infer".to_string()],
+            &argv,
             &ctx,
-            Duration::from_secs(30),
+            Duration::from_secs(120),
             Duration::from_millis(200),
-        )
-        .await
-        .unwrap();
+        );
+        let release = async {
+            let progress = || {
+                recorder
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(method, _)| method == "notifications/progress")
+                    .count()
+            };
+            while progress() < 3 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            std::fs::write(h.dir.join("enough"), "").unwrap();
+        };
+        let (out, ()) = tokio::join!(run, release);
+        let out = out.unwrap();
         assert_eq!(out.trim(), "done");
 
         let sent = recorder.0.lock().unwrap();

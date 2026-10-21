@@ -48,6 +48,11 @@ pub struct PretrainConfig {
     pub eval_every: usize,
     /// Number of eval batches per evaluation round.
     pub eval_batches: usize,
+    /// A request to stop, from a signal handler or another thread: once it is
+    /// set the run ends after the step in flight and writes the final
+    /// checkpoint (when `checkpoint_dir` is set) as a finished run does.
+    /// `None` runs to `num_steps`.
+    pub stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Default for PretrainConfig {
@@ -72,6 +77,7 @@ impl Default for PretrainConfig {
             log_every: 10,
             eval_every: 0,
             eval_batches: 10,
+            stop: None,
         }
     }
 }

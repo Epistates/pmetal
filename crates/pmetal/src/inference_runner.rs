@@ -12,6 +12,7 @@ use std::{
 use pmetal_cache::kv_cache::{
     CacheMode, KVCache, KVCacheConfig, MambaCache, TurboQuantConfig, sanitize_cache_mode_for_config,
 };
+use pmetal_core::jobs::InferSpec;
 use pmetal_data::Tokenizer;
 use pmetal_data::chat_templates::{ChatTemplateKwargs, ChatTemplateType, Message, ToolDefinition};
 use pmetal_data::qwen_vl_processing::{ProcessedMedia, QwenVlProcessor};
@@ -193,6 +194,86 @@ impl Default for InferenceRunnerConfig {
             mode: pmetal_data::inference_config::SamplingMode::Auto,
             detect_repetition: false,
         }
+    }
+}
+
+impl InferenceRunnerConfig {
+    /// The runner's configuration for `spec`.
+    ///
+    /// The one place an `InferSpec` becomes a runner configuration, for the
+    /// command line and the Python bindings alike. The spec's own checks
+    /// ([`InferSpec::normalize`]) come first; this fails only on what they
+    /// cannot see (a malformed chat-template override), so a caller can run
+    /// it before fetching anything.
+    ///
+    /// What is left for the caller: the model paths (`model_path`,
+    /// `mtp_assistant_path`, `qwen_mtp_path`), which are resolved on the
+    /// caller's own terms (the command line on its async runtime, Python with
+    /// the interpreter lock released), and the tool list, a file only the
+    /// command line reads.
+    pub fn from_spec(spec: &InferSpec) -> Result<Self, String> {
+        let chat_template_kwargs = ChatTemplateKwargs::from_controls(
+            spec.chat_template_kwargs.as_deref(),
+            spec.no_thinking,
+            spec.reasoning_effort.as_deref(),
+            spec.no_preserve_thinking,
+        )?;
+        // `chat_template_kwargs='{"enable_thinking": false}'` is `no_thinking`.
+        let no_thinking = spec.no_thinking || chat_template_kwargs.enable_thinking() == Some(false);
+        let kv_turboquant_preset = spec
+            .kv_turboquant_preset
+            .as_deref()
+            .map(|name| {
+                name.parse::<TurboQuantPreset>()
+                    .map_err(|e| format!("kv_turboquant_preset: {e}"))
+            })
+            .transpose()?;
+        Ok(Self {
+            model_path: PathBuf::new(),
+            lora_path: spec.lora.clone(),
+            mtp_assistant_path: None,
+            qwen_mtp_path: None,
+            qwen_mtp: spec.mtp,
+            qwen_mtp_draft_tokens: spec.mtp_draft_tokens.max(1),
+            experts_dir: spec.experts_dir.clone(),
+            fp8: spec.fp8,
+            prompt: spec.prompt.clone(),
+            chat_messages: None,
+            system_message: spec.system.clone(),
+            chat: spec.chat,
+            no_thinking,
+            chat_template_kwargs,
+            tools: None,
+            images: spec.image.iter().map(PathBuf::from).collect(),
+            videos: spec
+                .video
+                .iter()
+                .map(|dir| VideoInput {
+                    frames_dir: dir.into(),
+                    fps: spec.video_fps,
+                })
+                .collect(),
+            temperature: spec.temperature,
+            top_k: spec.top_k,
+            top_p: spec.top_p,
+            min_p: spec.min_p,
+            max_tokens: spec.max_tokens,
+            repetition_penalty: spec.repetition_penalty,
+            frequency_penalty: spec.frequency_penalty,
+            presence_penalty: spec.presence_penalty,
+            seed: spec.seed,
+            kv_quant: spec.kv_quant,
+            kv_k_bits: spec.kv_k_bits,
+            kv_v_bits: spec.kv_v_bits,
+            kv_group_size: spec.kv_group_size,
+            kv_turboquant: spec.kv_turboquant,
+            kv_turboquant_preset,
+            kv_quant_preset: spec.kv_quant_preset.clone(),
+            no_kv_quant: spec.no_kv_quant,
+            kv_qjl: spec.kv_qjl,
+            mode: spec.mode.parse()?,
+            detect_repetition: spec.detect_repetition,
+        })
     }
 }
 
@@ -1658,6 +1739,18 @@ pub enum TurboQuantPreset {
     Q3_5,
 }
 
+impl std::str::FromStr for TurboQuantPreset {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, String> {
+        match name {
+            "q2_5" => Ok(Self::Q2_5),
+            "q3_5" => Ok(Self::Q3_5),
+            other => Err(format!("unknown preset '{other}'; valid: q2_5, q3_5")),
+        }
+    }
+}
+
 impl TurboQuantPreset {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -2120,6 +2213,136 @@ mod tests {
 
     fn qwen3_cache_config(max_seq_len: usize) -> KVCacheConfig {
         KVCacheConfig::new(28, max_seq_len, 8, 128)
+    }
+
+    fn spec() -> InferSpec {
+        InferSpec {
+            model: "org/model".into(),
+            prompt: "hello".into(),
+            ..InferSpec::default()
+        }
+    }
+
+    #[test]
+    fn a_spec_becomes_the_runner_configuration_it_describes() {
+        let spec = InferSpec {
+            lora: Some("adapter".into()),
+            system: Some("be brief".into()),
+            chat: true,
+            temperature: Some(0.3),
+            top_k: Some(40),
+            max_tokens: Some(64),
+            seed: Some(7),
+            mtp: true,
+            mtp_draft_tokens: 5,
+            kv_quant: Some(4),
+            kv_group_size: 32,
+            kv_turboquant: true,
+            kv_turboquant_preset: Some("q3_5".into()),
+            image: vec!["a.png".into(), "b.png".into()],
+            video: vec!["frames".into()],
+            video_fps: Some(12.0),
+            mode: "coding".into(),
+            detect_repetition: true,
+            ..spec()
+        };
+        let config = InferenceRunnerConfig::from_spec(&spec).unwrap();
+
+        assert_eq!(config.prompt, "hello");
+        assert_eq!(config.lora_path.as_deref(), Some("adapter"));
+        assert_eq!(config.system_message.as_deref(), Some("be brief"));
+        assert!(config.chat && config.qwen_mtp && config.detect_repetition);
+        assert_eq!(config.qwen_mtp_draft_tokens, 5);
+        assert_eq!(config.temperature, Some(0.3));
+        assert_eq!(
+            (config.top_k, config.max_tokens, config.seed),
+            (Some(40), Some(64), Some(7))
+        );
+        assert_eq!((config.kv_quant, config.kv_group_size), (Some(4), 32));
+        assert!(config.kv_turboquant);
+        assert_eq!(config.kv_turboquant_preset, Some(TurboQuantPreset::Q3_5));
+        assert_eq!(
+            config.mode,
+            pmetal_data::inference_config::SamplingMode::ThinkingCoding
+        );
+        assert_eq!(
+            config.images,
+            [PathBuf::from("a.png"), PathBuf::from("b.png")]
+        );
+        assert_eq!(config.videos.len(), 1);
+        assert_eq!(config.videos[0].frames_dir, PathBuf::from("frames"));
+        assert_eq!(config.videos[0].fps, Some(12.0));
+        // The caller resolves the models and sets the tools.
+        assert!(config.model_path.as_os_str().is_empty());
+        assert!(config.mtp_assistant_path.is_none() && config.qwen_mtp_path.is_none());
+        assert!(config.tools.is_none());
+    }
+
+    #[test]
+    fn disabling_thinking_by_kwargs_or_by_flag_is_the_same_thing() {
+        let by_flag = InferSpec {
+            no_thinking: true,
+            ..spec()
+        };
+        let by_kwargs = InferSpec {
+            chat_template_kwargs: Some(r#"{"enable_thinking": false}"#.into()),
+            ..spec()
+        };
+        for spec in [by_flag, by_kwargs] {
+            let config = InferenceRunnerConfig::from_spec(&spec).unwrap();
+            assert!(config.no_thinking);
+            assert_eq!(config.chat_template_kwargs.enable_thinking(), Some(false));
+        }
+        assert!(
+            !InferenceRunnerConfig::from_spec(&spec())
+                .unwrap()
+                .no_thinking
+        );
+    }
+
+    #[test]
+    fn a_draft_budget_of_zero_still_drafts_one_token() {
+        let spec = InferSpec {
+            mtp_draft_tokens: 0,
+            ..spec()
+        };
+        let config = InferenceRunnerConfig::from_spec(&spec).unwrap();
+        assert_eq!(config.qwen_mtp_draft_tokens, 1);
+    }
+
+    #[test]
+    fn options_the_runner_cannot_use_are_errors_not_defaults() {
+        let bad_preset = InferSpec {
+            kv_turboquant_preset: Some("q9_9".into()),
+            ..spec()
+        };
+        let err = InferenceRunnerConfig::from_spec(&bad_preset).unwrap_err();
+        assert!(
+            err.contains("kv_turboquant_preset") && err.contains("q9_9"),
+            "{err}"
+        );
+
+        let bad_kwargs = InferSpec {
+            chat_template_kwargs: Some("[1, 2]".into()),
+            ..spec()
+        };
+        assert!(InferenceRunnerConfig::from_spec(&bad_kwargs).is_err());
+
+        let bad_mode = InferSpec {
+            mode: "wild".into(),
+            ..spec()
+        };
+        assert!(InferenceRunnerConfig::from_spec(&bad_mode).is_err());
+    }
+
+    #[test]
+    fn presets_parse_by_the_name_the_command_line_uses() {
+        assert_eq!("q2_5".parse(), Ok(TurboQuantPreset::Q2_5));
+        assert_eq!("q3_5".parse(), Ok(TurboQuantPreset::Q3_5));
+        for preset in [TurboQuantPreset::Q2_5, TurboQuantPreset::Q3_5] {
+            assert_eq!(preset.as_str().parse(), Ok(preset));
+        }
+        assert!("Q2_5".parse::<TurboQuantPreset>().is_err());
     }
 
     /// A base model's raw prompt starts with the BOS its tokenizer adds; a

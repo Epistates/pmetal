@@ -19,7 +19,9 @@ metal = []
 # caller to check. Every workspace crate turns it on through its
 # `[dev-dependencies]`, so it reaches test, bench and example builds and
 # never a library or binary build. Code that expects an op to fail runs it
-# inside `expect_runtime_errors`.
+# inside `expect_runtime_errors`. The same feature seeds a thread's global
+# random key from the thread's name at its first unseeded draw, so a test
+# cannot take its inputs from the clock.
 strict-errors = []
 
 [dependencies]

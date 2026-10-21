@@ -40,6 +40,16 @@ pub trait ModuleParametersExt: ModuleParameters {
         out
     }
 
+    /// [`flatten_params_mut`](Self::flatten_params_mut) in name order.
+    ///
+    /// A `HashMap` iterates in an order that differs from run to run, so a
+    /// loop that draws a random value for each parameter gives each one a
+    /// different draw every time, whatever the seed. Anything that assigns
+    /// seeded random values to parameters goes through here.
+    fn flatten_params_mut_sorted(&mut self) -> Vec<(String, &mut Array)> {
+        super::in_key_order(self.flatten_params_mut())
+    }
+
     /// Evaluate all parameters (materialise lazy computation graph).
     fn eval(&self) -> Result<(), Exception> {
         let p = self.parameters();

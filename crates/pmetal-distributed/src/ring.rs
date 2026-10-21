@@ -35,6 +35,39 @@ impl RingBackend {
         })
     }
 
+    /// [`new`](Self::new) with the socket this rank listens on already bound.
+    ///
+    /// `listener` must be bound to the port `config` gives this rank. A caller
+    /// that picked a free port (a test binding port 0, an operator handing over
+    /// a socket it was given) keeps the port from the moment it is chosen,
+    /// instead of releasing it and hoping nothing takes it before the ring
+    /// binds it again.
+    ///
+    /// # Errors
+    /// As [`new`](Self::new), and if the socket cannot be handed to the
+    /// runtime.
+    pub async fn with_listener(
+        config: DistributedConfig,
+        listener: std::net::TcpListener,
+    ) -> Result<Self> {
+        config.validate()?;
+        listener.set_nonblocking(true)?;
+        let listener = tokio::net::TcpListener::from_std(listener)?;
+        let security = LinkSecurity::from_config(&config)?;
+        let membership = RingMembership::from_config(&config);
+        let (sender, receiver) = TcpTransport::connect_ring(
+            &config,
+            security,
+            membership,
+            Some(listener),
+            Channel::Ring,
+        )
+        .await?;
+        Ok(Self {
+            ring: RingCollective::new(config.rank, config.nodes.len(), sender, receiver),
+        })
+    }
+
     /// The collectives, for operations the [`DistributedBackend`] trait does
     /// not carry.
     pub fn collective(&self) -> &RingCollective {

@@ -499,6 +499,12 @@ impl InferSpec {
         if self.mtp_model.is_some() && !self.mtp {
             errs.push(FieldError::new("mtp_model", "needs --mtp"));
         }
+        if self.mtp && self.draft_model.is_some() {
+            errs.push(FieldError::new(
+                "draft_model",
+                "use either --mtp (bundled Qwen MTP) or --draft-model (Gemma 4 MTP), not both",
+            ));
+        }
         if errs.is_empty() { Ok(()) } else { Err(errs) }
     }
 }
@@ -536,6 +542,26 @@ mod tests {
         let argv = spec.to_argv();
         assert!(argv.contains(&"--model".to_string()));
         assert!(argv.contains(&"--prompt".to_string()));
+    }
+
+    #[test]
+    fn bundled_mtp_and_a_draft_model_are_one_or_the_other() {
+        let mut spec = InferSpec {
+            model: "m".into(),
+            prompt: "hi".into(),
+            mtp: true,
+            draft_model: Some("d".into()),
+            ..Default::default()
+        };
+        let errors = spec.normalize().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.field == "draft_model" && e.message.contains("not both")),
+            "{errors:?}"
+        );
+        spec.draft_model = None;
+        assert!(spec.normalize().is_ok());
     }
 
     #[test]

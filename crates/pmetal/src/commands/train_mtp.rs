@@ -16,13 +16,19 @@ use pmetal_trainer::{
 use crate::cli::train_mtp::{TrainMtpArgs, TrainMtpFamily};
 use crate::commands::resume::find_resume_point;
 
+/// Run `pmetal train-mtp`.
+///
+/// A request to stop (Ctrl-C, SIGTERM) ends the run after the step in flight,
+/// writes the final checkpoint and exits with status 130.
 pub(crate) async fn run_train_mtp(args: TrainMtpArgs) -> Result<()> {
+    let stop = crate::commands::stop::StopFlag::watch();
     let resume = args
         .resume
         .as_deref()
         .map(|dir| find_resume_point(Path::new(dir)))
         .transpose()?;
     let mut config = build_config(&args);
+    config.stop = Some(stop.handle());
     config.resume_from = resume.as_ref().map(|point| point.dir.clone());
     // The batches the interrupted run had already consumed are not repeated.
     let batches = shard_batches(
@@ -114,7 +120,7 @@ pub(crate) async fn run_train_mtp(args: TrainMtpArgs) -> Result<()> {
         }
         TrainMtpFamily::Auto => unreachable!("auto is resolved before dispatch"),
     }
-    Ok(())
+    stop.finish(Ok(()))
 }
 
 fn resolve_family(requested: TrainMtpFamily, arch: ModelArchitecture) -> Result<TrainMtpFamily> {

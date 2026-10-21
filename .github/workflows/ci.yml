@@ -92,6 +92,11 @@ jobs:
       - name: Workspace dependencies
         run: scripts/check-workspace-deps.sh
 
+      # The crate publish order covers every publishable crate, dependencies
+      # first (`just check-publish-order`); also manifests only.
+      - name: Publish order
+        run: scripts/check-publish-order.sh
+
       - uses: EmbarkStudios/cargo-deny-action@v2
 
       # The GUI is a separate workspace; same deny.toml, found by walking up.

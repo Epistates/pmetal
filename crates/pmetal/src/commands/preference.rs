@@ -61,6 +61,18 @@ fn training_config(spec: &PreferenceSpec) -> anyhow::Result<TrainingConfig> {
     })
 }
 
+/// The steps a run took. A run a stop request ended has no history (the
+/// trainer reports `Cancelled` instead of one) but has trained part of the
+/// way: its adapter is saved like a finished run's.
+fn stopped_run_history(
+    result: preference::PreferenceResult<Vec<PreferenceStepMetrics>>,
+) -> preference::PreferenceResult<Vec<PreferenceStepMetrics>> {
+    super::stop::unless_stopped(result, |e| {
+        matches!(e, pmetal_trainer::PreferenceError::Cancelled)
+    })
+    .map(Option::unwrap_or_default)
+}
+
 /// Run `pmetal preference` from a normalized spec.
 pub(crate) async fn run_preference(spec: PreferenceSpec, ctx: RunContext) -> anyhow::Result<()> {
     let RunContext {
@@ -136,7 +148,7 @@ pub(crate) async fn run_preference(spec: PreferenceSpec, ctx: RunContext) -> any
             for cb in callbacks {
                 trainer.add_callback(cb);
             }
-            trainer.train(&mut model, &pairs, &mut optimizer, set_lr)?
+            stopped_run_history(trainer.train(&mut model, &pairs, &mut optimizer, set_lr))?
         }
         Objective::Kto(kto) => {
             let samples = preference::load_kto_samples(
@@ -156,7 +168,7 @@ pub(crate) async fn run_preference(spec: PreferenceSpec, ctx: RunContext) -> any
             for cb in callbacks {
                 trainer.add_callback(cb);
             }
-            trainer.train(&mut model, &samples, &mut optimizer, set_lr)?
+            stopped_run_history(trainer.train(&mut model, &samples, &mut optimizer, set_lr))?
         }
     };
 

@@ -90,8 +90,8 @@ fn fusing_weight_norm_does_not_change_the_output() {
 fn a_fused_checkpoint_loads_back_into_a_fresh_model() {
     let (mut model, fx) = tiny("generator_v1_tiny");
     model.fuse_weight_norm();
-    let dir = tempdir();
-    let path = dir.join("fused.safetensors");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fused.safetensors");
     model.save_safetensors(&path).unwrap();
 
     let mut fresh = BigVGAN::new(model.config.clone()).unwrap();
@@ -105,7 +105,6 @@ fn a_fused_checkpoint_loads_back_into_a_fresh_model() {
         1e-5,
         "reloaded",
     );
-    std::fs::remove_dir_all(dir).ok();
 }
 
 #[test]
@@ -328,16 +327,6 @@ fn a_released_config_json_parses_including_null_fmax() {
     assert!(!config.use_tanh_at_final && !config.use_bias_at_final);
 }
 
-fn tempdir() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "pmetal-vocoder-test-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 /// A Hub id loads from the configured Hub cache: the config and the weights
 /// of one snapshot, found through `pmetal-hub` rather than a client of the
 /// crate's own, and a snapshot without weights is an error that names them.
@@ -347,8 +336,8 @@ fn a_hub_id_loads_from_the_hub_cache() {
     model.fuse_weight_norm();
     let want = model.forward(&fx.array("mel")).unwrap();
 
-    let cache = std::env::temp_dir().join(format!("pmetal_vocoder_hub_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&cache);
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache = cache_dir.path().to_path_buf();
     let commit = "0123456789abcdef0123456789abcdef01234567";
     let repo = cache.join("models--org--bigvgan");
     let snapshot = repo.join("snapshots").join(commit);
@@ -388,5 +377,4 @@ fn a_hub_id_loads_from_the_hub_cache() {
     let got = loaded.forward(&fx.array("mel")).unwrap();
     assert!(max_abs_diff(&to_vec(&got), &to_vec(&want)) < 1e-5);
     assert_runtime_ok();
-    std::fs::remove_dir_all(cache).ok();
 }

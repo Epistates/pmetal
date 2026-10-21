@@ -1421,7 +1421,7 @@ mod tests {
             ("gemma3", gemma3),
         ] {
             let mut model = GemmaForCausalLM::new(config).unwrap();
-            for (_, p) in model.flatten_params_mut() {
+            for (_, p) in model.flatten_params_mut_sorted() {
                 let w = random::uniform_range(-0.3, 0.3, p.shape(), Dtype::Float32);
                 *p = w.as_dtype(bf16);
             }
@@ -1464,7 +1464,7 @@ mod tests {
         for (label, config) in [("gemma2", gemma2), ("gemma3", gemma3)] {
             random::seed(3);
             let mut model = GemmaForCausalLM::new(config).unwrap();
-            for (_, p) in model.flatten_params_mut() {
+            for (_, p) in model.flatten_params_mut_sorted() {
                 *p = random::uniform_range(-0.5, 0.5, p.shape(), Dtype::Float32);
             }
             let tokens: Vec<i32> = (0..24).map(|i| (i * 37 + 11) % 1000).collect();
@@ -1543,7 +1543,7 @@ mod tests {
         for (label, config) in [("gemma2", gemma2), ("gemma3", gemma3)] {
             random::seed(5);
             let mut model = GemmaForCausalLM::new(config).unwrap();
-            for (_, p) in model.flatten_params_mut() {
+            for (_, p) in model.flatten_params_mut_sorted() {
                 *p = random::uniform_range(-0.5, 0.5, p.shape(), Dtype::Float32);
             }
             let packed = Array::from_slice(&tokens, &[1, n as i32]);

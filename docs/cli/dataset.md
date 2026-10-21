@@ -100,8 +100,13 @@ also written into the text.
 ### prepare
 
 The whole way from a dataset (Hub ID or local path) to `train.jsonl` and `val.jsonl`: format with the
-model's chat template, drop samples longer than `--max-seq-len` tokens (measured on the text as it
-will be trained on) and duplicates, shuffle with `--seed`, split, and report token percentiles.
+model's chat template, drop samples longer than `--max-seq-len` tokens (measured as they will be
+trained on) and duplicates, shuffle with `--seed`, split, and report token percentiles.
+
+A conversation is written as `{"prompt": ..., "completion": ...}` rows, one per assistant turn: the
+prompt is everything before the turn, and training learns only the completion, so the system prompt
+and the user's words are context, not something the model is taught to say. Plain text stays a
+`{"text": ...}` document, trained whole.
 
 ```bash
 pmetal dataset prepare tatsu-lab/alpaca --output-dir ./alpaca_prepared \

@@ -240,17 +240,20 @@ fn resolve(path: &Path, cwd: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("pmetal-mcp-policy-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.canonicalize().unwrap()
+    /// A fresh directory and its canonical path; the directory is removed when
+    /// the guard drops, so bind the guard for as long as the path is used.
+    fn scratch(name: &str) -> (tempfile::TempDir, PathBuf) {
+        let guard = tempfile::Builder::new()
+            .prefix(&format!("pmetal-mcp-policy-{name}-"))
+            .tempdir()
+            .unwrap();
+        let path = guard.path().canonicalize().unwrap();
+        (guard, path)
     }
 
     #[test]
     fn a_path_under_a_root_is_made_absolute() {
-        let root = scratch("under");
+        let (_guard, root) = scratch("under");
         let policy = PathPolicy::new(root.clone(), vec![root.clone()]);
         assert_eq!(
             policy.check_path("output", "out/run1").unwrap(),
@@ -270,7 +273,7 @@ mod tests {
 
     #[test]
     fn traversal_out_of_a_root_is_refused() {
-        let root = scratch("traversal");
+        let (_guard, root) = scratch("traversal");
         let policy = PathPolicy::new(root.clone(), vec![root.clone()]);
         for bad in [
             "../escape",
@@ -289,7 +292,7 @@ mod tests {
 
     #[test]
     fn a_sibling_with_the_root_as_a_name_prefix_is_outside() {
-        let parent = scratch("prefix");
+        let (_guard, parent) = scratch("prefix");
         let root = parent.join("data");
         std::fs::create_dir_all(&root).unwrap();
         let policy = PathPolicy::new(root.clone(), vec![root.clone()]);
@@ -303,8 +306,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_symlink_out_of_a_root_is_followed_and_refused() {
-        let root = scratch("symlink-root");
-        let outside = scratch("symlink-outside");
+        let (_root_guard, root) = scratch("symlink-root");
+        let (_outside_guard, outside) = scratch("symlink-outside");
         std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
         let policy = PathPolicy::new(root.clone(), vec![root.clone()]);
         // Both the link itself and a path that does not exist yet beneath it.
@@ -315,7 +318,7 @@ mod tests {
 
     #[test]
     fn hub_ids_pass_and_malformed_ones_do_not() {
-        let root = scratch("hub");
+        let (_guard, root) = scratch("hub");
         let policy = PathPolicy::new(root.clone(), vec![root]);
         for good in [
             "Qwen/Qwen3-0.6B",
@@ -344,9 +347,9 @@ mod tests {
 
     #[test]
     fn a_local_model_directory_is_checked_as_a_path() {
-        let root = scratch("local-model");
+        let (_root_guard, root) = scratch("local-model");
         std::fs::create_dir_all(root.join("models/qwen")).unwrap();
-        let outside = scratch("local-model-outside");
+        let (_outside_guard, outside) = scratch("local-model-outside");
         let policy = PathPolicy::new(root.clone(), vec![root.clone()]);
         // A relative path that exists is a path even though it looks like owner/name.
         assert_eq!(
@@ -389,8 +392,8 @@ mod tests {
 
     #[test]
     fn extra_roots_widen_the_policy() {
-        let root = scratch("extra-a");
-        let other = scratch("extra-b");
+        let (_root_guard, root) = scratch("extra-a");
+        let (_other_guard, other) = scratch("extra-b");
         let policy = PathPolicy::new(root.clone(), vec![root]);
         let target = other.join("run");
         assert!(policy.check_path("p", target.to_str().unwrap()).is_err());

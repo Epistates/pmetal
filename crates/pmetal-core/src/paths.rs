@@ -61,18 +61,12 @@ pub fn output_path(path: &str, what: &str) -> Result<PathBuf> {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("pmetal_paths_{name}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     /// `..` is a path like any other, and a directory that does not exist yet
     /// is created: what `--output ../models/out.gguf` means.
     #[test]
     fn parent_references_resolve_and_the_directory_is_created() {
-        let root = scratch("parent");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
         let given = root
             .join("a")
             .join("..")
@@ -86,7 +80,6 @@ mod tests {
             !root.join("a").exists(),
             "a directory the path only passes over is not made"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -98,7 +91,8 @@ mod tests {
 
     #[test]
     fn what_cannot_be_made_is_an_error_naming_the_option() {
-        let root = scratch("blocked");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
         let file = root.join("a-file");
         std::fs::write(&file, b"x").unwrap();
         let err = output_path(
@@ -116,6 +110,5 @@ mod tests {
             err.contains("config output") && err.contains("empty"),
             "{err}"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 }

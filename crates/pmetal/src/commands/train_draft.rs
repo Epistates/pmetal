@@ -11,7 +11,12 @@ use pmetal_trainer::{MtpTrainingConfig, batch_from_tokens, run_dflash_draft_trai
 use crate::cli::train_draft::TrainDraftArgs;
 use crate::commands::resume::find_resume_point;
 
+/// Run `pmetal train-draft`.
+///
+/// A request to stop (Ctrl-C, SIGTERM) ends the run after the step in flight,
+/// writes the final checkpoint and exits with status 130.
 pub(crate) async fn run_train_draft(args: TrainDraftArgs) -> Result<()> {
+    let stop = crate::commands::stop::StopFlag::watch();
     anyhow::ensure!(
         args.resume.is_some() || args.draft.is_some() || args.draft_config.is_some(),
         "train-draft requires --draft, --draft-config or --resume"
@@ -22,6 +27,7 @@ pub(crate) async fn run_train_draft(args: TrainDraftArgs) -> Result<()> {
         .map(|dir| find_resume_point(Path::new(dir)))
         .transpose()?;
     let mut config = build_config(&args);
+    config.stop = Some(stop.handle());
     config.resume_from = resume.as_ref().map(|point| point.dir.clone());
     // The batches the interrupted run had already consumed are not repeated.
     let batches = shard_batches(
@@ -82,7 +88,7 @@ pub(crate) async fn run_train_draft(args: TrainDraftArgs) -> Result<()> {
         result.output_dir.display(),
         result.final_loss.unwrap_or(f32::NAN)
     );
-    Ok(())
+    stop.finish(Ok(()))
 }
 
 fn build_config(args: &TrainDraftArgs) -> MtpTrainingConfig {

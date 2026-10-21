@@ -264,10 +264,25 @@ mod tests {
         for _ in 0..20_000 {
             log.push("x".repeat(1000), false);
         }
-        let started = std::time::Instant::now();
-        let rows = log.rows_for(40, 10);
-        assert_eq!(rows.len(), 10);
-        assert!(started.elapsed() < std::time::Duration::from_millis(250));
+        // Wrapping every line would take seconds; drawing the panel takes
+        // microseconds. A different width each time so nothing is reused, and
+        // the fastest of five, so a descheduled process on a loaded machine
+        // cannot fail the bound that a log which wrapped everything misses
+        // every time.
+        let fastest = (40..45)
+            .map(|width| {
+                let started = std::time::Instant::now();
+                let rows = log.rows_for(width, 10);
+                let took = started.elapsed();
+                assert_eq!(rows.len(), 10);
+                took
+            })
+            .min()
+            .unwrap();
+        assert!(
+            fastest < std::time::Duration::from_millis(250),
+            "{fastest:?}"
+        );
     }
 
     #[test]

@@ -11,17 +11,53 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-/// Two loopback addresses on free ports. The probe listeners stay open until
-/// both ports are chosen, so the two differ; the tests run one at a time
-/// (`#[serial]`) so none takes a port another has just let go of.
-fn addrs() -> Vec<SocketAddr> {
-    let probes: Vec<StdListener> = (0..2)
-        .map(|_| StdListener::bind("127.0.0.1:0").expect("bind"))
-        .collect();
-    probes
-        .iter()
-        .map(|probe| probe.local_addr().expect("addr"))
-        .collect()
+/// Two loopback ranks' sockets, bound on free ports and held until each rank
+/// takes its own. A port is never released and bound again, so nothing else
+/// (another test, another process) can take it in between.
+struct Sockets {
+    nodes: Vec<SocketAddr>,
+    held: Vec<Option<StdListener>>,
+}
+
+impl Sockets {
+    fn new() -> Self {
+        let held: Vec<StdListener> = (0..2)
+            .map(|_| StdListener::bind("127.0.0.1:0").expect("bind"))
+            .collect();
+        let nodes = held
+            .iter()
+            .map(|socket| socket.local_addr().expect("addr"))
+            .collect();
+        Self {
+            nodes,
+            held: held.into_iter().map(Some).collect(),
+        }
+    }
+
+    /// Rank `rank` joins the ring on its own socket, bound only now. Until
+    /// then its port refuses connections, as a rank that has not started does,
+    /// so the rank dialing it retries instead of waiting in the queue of a
+    /// socket nobody is serving. The port is released and bound again with
+    /// nothing in between, so no other test or process realistically takes it.
+    fn join_late(
+        &mut self,
+        config: DistributedConfig,
+        rank: usize,
+    ) -> impl Future<Output = anyhow::Result<RingBackend>> + use<> {
+        drop(self.held[rank].take().expect("a rank joins once"));
+        let socket = StdListener::bind(self.nodes[rank]).expect("rebind the rank's own port");
+        RingBackend::with_listener(config, socket)
+    }
+
+    /// Rank `rank` joins the ring on the socket held for it since the start.
+    fn join(
+        &mut self,
+        config: DistributedConfig,
+        rank: usize,
+    ) -> impl Future<Output = anyhow::Result<RingBackend>> + use<> {
+        let socket = self.held[rank].take().expect("a rank joins once");
+        RingBackend::with_listener(config, socket)
+    }
 }
 
 fn config(nodes: &[SocketAddr], rank: usize, secret: &ClusterSecret) -> DistributedConfig {
@@ -36,12 +72,12 @@ fn bytes_of(values: &[f32]) -> Vec<u8> {
 }
 
 /// The all-reduce an honest pair of ranks must compute.
-async fn honest_pair(nodes: &[SocketAddr], secret: &ClusterSecret) -> (Vec<f32>, Vec<f32>) {
+async fn honest_pair(sockets: &mut Sockets, secret: &ClusterSecret) -> (Vec<f32>, Vec<f32>) {
     let mut tasks = Vec::new();
     for rank in 0..2 {
-        let config = config(nodes, rank, secret);
+        let join = sockets.join(config(&sockets.nodes, rank, secret), rank);
         tasks.push(tokio::spawn(async move {
-            let ring = RingBackend::new(config).await.expect("ring");
+            let ring = join.await.expect("ring");
             let mut data: Vec<f32> = if rank == 0 {
                 vec![1.0, 2.0, 3.0, 4.0]
             } else {
@@ -63,7 +99,7 @@ async fn honest_pair(nodes: &[SocketAddr], secret: &ClusterSecret) -> (Vec<f32>,
 #[serial_test::serial]
 async fn two_ranks_average_their_gradients() {
     let secret = ClusterSecret::generate();
-    let (a, b) = honest_pair(&addrs(), &secret).await;
+    let (a, b) = honest_pair(&mut Sockets::new(), &secret).await;
     assert_eq!(a, vec![5.5, 11.0, 16.5, 22.0]);
     assert_eq!(a, b);
 }
@@ -75,14 +111,12 @@ async fn two_ranks_average_their_gradients() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn a_lan_peer_knowing_only_the_public_namespace_cannot_join_the_ring() {
-    let nodes = addrs();
+    let mut sockets = Sockets::new();
+    let nodes = sockets.nodes.clone();
     let secret = ClusterSecret::generate();
 
     // Rank 1 comes up first and waits for its predecessor.
-    let victim = tokio::spawn({
-        let config = config(&nodes, 1, &secret);
-        async move { RingBackend::new(config).await }
-    });
+    let victim = tokio::spawn(sockets.join(config(&nodes, 1, &secret), 1));
 
     // The attacker dials rank 1 and presents the namespace key that the
     // protocol used to accept as proof of membership: magic plus
@@ -109,9 +143,9 @@ async fn a_lan_peer_knowing_only_the_public_namespace_cannot_join_the_ring() {
 
     // The honest predecessor still gets in, and the average is untouched.
     let rank0 = tokio::spawn({
-        let config = config(&nodes, 0, &secret);
+        let join = sockets.join_late(config(&nodes, 0, &secret), 0);
         async move {
-            let ring = RingBackend::new(config).await.expect("rank 0");
+            let ring = join.await.expect("rank 0");
             let mut data = vec![1.0f32, 2.0, 3.0, 4.0];
             ring.all_reduce_f32(&mut data, ReduceOp::Mean)
                 .await
@@ -135,13 +169,14 @@ async fn a_lan_peer_knowing_only_the_public_namespace_cannot_join_the_ring() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn a_misaligned_byte_buffer_is_reduced_correctly() {
-    let nodes = addrs();
+    let mut sockets = Sockets::new();
+    let nodes = sockets.nodes.clone();
     let secret = ClusterSecret::generate();
     let mut tasks = Vec::new();
     for rank in 0..2 {
-        let config = config(&nodes, rank, &secret);
+        let join = sockets.join(config(&nodes, rank, &secret), rank);
         tasks.push(tokio::spawn(async move {
-            let ring = RingBackend::new(config).await.expect("ring");
+            let ring = join.await.expect("ring");
             let values: Vec<f32> = (0..9).map(|i| (i * (rank + 1)) as f32).collect();
             // Put the payload at every offset in turn, so some are surely
             // not 4-byte aligned.
@@ -170,20 +205,15 @@ async fn a_misaligned_byte_buffer_is_reduced_correctly() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn ranks_with_different_node_lists_refuse_to_form_a_ring() {
-    let nodes = addrs();
+    let mut sockets = Sockets::new();
+    let nodes = sockets.nodes.clone();
     // Rank 0 believes there is a third rank; rank 1 believes there are two.
     let mut three = nodes.clone();
     three.push("127.0.0.1:9".parse().unwrap());
     let secret = ClusterSecret::generate();
 
-    let a = tokio::spawn({
-        let config = config(&three, 0, &secret);
-        async move { RingBackend::new(config).await }
-    });
-    let b = tokio::spawn({
-        let config = config(&nodes, 1, &secret);
-        async move { RingBackend::new(config).await }
-    });
+    let a = tokio::spawn(sockets.join(config(&three, 0, &secret), 0));
+    let b = tokio::spawn(sockets.join(config(&nodes, 1, &secret), 1));
     let (a, b) = (a.await.unwrap(), b.await.unwrap());
     let (a, b) = (
         a.err().expect("rank 0 formed a ring"),
@@ -199,14 +229,15 @@ async fn ranks_with_different_node_lists_refuse_to_form_a_ring() {
 #[serial_test::serial]
 #[ignore = "allocates several GiB"]
 async fn a_buffer_whose_chunks_exceed_half_a_gibibyte() {
-    let nodes = addrs();
+    let mut sockets = Sockets::new();
+    let nodes = sockets.nodes.clone();
     let secret = ClusterSecret::generate();
     let len = 2 * (512 * 1024 * 1024 / 4) + 8; // two chunks just over 512 MiB
     let mut tasks = Vec::new();
     for rank in 0..2 {
-        let config = config(&nodes, rank, &secret);
+        let join = sockets.join(config(&nodes, rank, &secret), rank);
         tasks.push(tokio::spawn(async move {
-            let ring = RingBackend::new(config).await.expect("ring");
+            let ring = join.await.expect("ring");
             let mut data = vec![(rank + 1) as f32; len];
             ring.all_reduce_f32(&mut data, ReduceOp::Sum)
                 .await

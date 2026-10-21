@@ -25,6 +25,8 @@ thiserror = { workspace = true }
 [dev-dependencies]
 # Compile-fail snapshots for `#[derive(JobSpec)]` (tests/ui).
 trybuild = { workspace = true }
+# Scratch directories that clean up after themselves.
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

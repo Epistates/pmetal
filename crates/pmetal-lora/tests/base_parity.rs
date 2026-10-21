@@ -40,7 +40,7 @@ use pmetal_cache::test_utils::{
 use pmetal_core::LoraConfig;
 use pmetal_lora::{AdaptedModel, DynamicLoraModel, TrainableModel};
 use pmetal_models::dispatcher::DynamicModel;
-use pmetal_runtime::compat::{Array, ModuleParametersExt};
+use pmetal_runtime::compat::{Array, ModuleParametersExt, in_key_order};
 
 /// Both paths run the same ops in f32 over the same weights, so the only
 /// legitimate difference is op-ordering noise (a fused SDPA on one side and an
@@ -51,9 +51,7 @@ const TOLERANCE: Tolerance = Tolerance::new(1e-3, 1e-3);
 /// Run one architecture and return its report, or the reason it could not run.
 fn run_case(case: &ArchCase) -> Result<ParityReport, String> {
     let dir = stage(case)?;
-    let result = compare(case, &dir);
-    let _ = std::fs::remove_dir_all(&dir);
-    result
+    compare(case, dir.path())
 }
 
 fn compare(case: &ArchCase, dir: &Path) -> Result<ParityReport, String> {
@@ -176,9 +174,8 @@ fn fresh_adapters_contribute_nothing() {
         dropout: 0.0,
         ..Default::default()
     };
-    let lora = DynamicLoraModel::from_pretrained(&dir, lora_config).expect("load lora");
+    let lora = DynamicLoraModel::from_pretrained(dir.path(), lora_config).expect("load lora");
     let params = lora.lora_parameters();
-    let _ = std::fs::remove_dir_all(&dir);
 
     assert!(!params.is_empty(), "no adapter parameters were created");
 
@@ -208,9 +205,8 @@ fn fresh_adapters_contribute_nothing() {
 fn reference_forward_is_non_degenerate() {
     let case = &cases()[0];
     let dir = stage(case).expect("stage llama");
-    let mut model = DynamicModel::load(&dir).expect("load reference");
+    let mut model = DynamicModel::load(dir.path()).expect("load reference");
     let logits = model.forward(&input_ids(256), None).expect("forward");
-    let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
         max_abs_value(&logits) > 1e-3,
@@ -241,8 +237,7 @@ fn parameter_paths_do_not_collide() {
             dropout: 0.0,
             ..Default::default()
         };
-        let model = DynamicLoraModel::from_pretrained(&dir, lora_config);
-        let _ = std::fs::remove_dir_all(&dir);
+        let model = DynamicLoraModel::from_pretrained(dir.path(), lora_config);
         let Ok(model) = model else { continue };
 
         let params = model.flatten_params();
@@ -458,8 +453,8 @@ fn merging_preserves_the_adapted_output() {
     let mut adapted = AdaptedModel::attach(base, lora_config()).expect("attach");
 
     // Give the adapters something to contribute, as a training step would.
-    let trained: HashMap<Rc<str>, Array> = adapted
-        .lora_parameters()
+    // In name order: the draws go to the same adapters on every run.
+    let trained: HashMap<Rc<str>, Array> = in_key_order(adapted.lora_parameters())
         .into_iter()
         .map(|(k, v)| {
             let value = if k.ends_with("lora_b") {
@@ -526,8 +521,8 @@ fn adapters_round_trip_through_a_file() {
     let base = DynamicModel::from_config(case.config_json).expect("build");
     let mut adapted = AdaptedModel::attach(base, lora_config()).expect("attach");
 
-    let seeded: HashMap<Rc<str>, Array> = adapted
-        .lora_parameters()
+    // In name order: the draws go to the same adapters on every run.
+    let seeded: HashMap<Rc<str>, Array> = in_key_order(adapted.lora_parameters())
         .into_iter()
         .map(|(k, v)| {
             let value = pmetal_runtime::compat::random::uniform_range(
@@ -542,16 +537,14 @@ fn adapters_round_trip_through_a_file() {
     adapted.set_lora_parameters(&seeded);
     let written = adapted.lora_parameters();
 
-    let dir = std::env::temp_dir().join(format!("pmetal_adapter_rt_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let path = dir.join("adapters.safetensors");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("adapters.safetensors");
     adapted.save_lora_weights(&path).expect("save");
 
     // Re-attach from scratch, then load: the adapters must come back identical.
     let fresh = DynamicModel::from_config(case.config_json).expect("build");
     let mut reloaded = AdaptedModel::attach(fresh, lora_config()).expect("attach");
     reloaded.load_lora_weights(&path).expect("load");
-    let _ = std::fs::remove_dir_all(&dir);
 
     let recovered = reloaded.lora_parameters();
     assert_eq!(recovered.len(), written.len(), "adapter count changed");
@@ -691,9 +684,8 @@ fn an_adapter_the_model_has_no_slot_for_fails_to_load() {
         ..lora_config()
     };
     let trained = AdaptedModel::attach(base, every).expect("attach");
-    let dir = std::env::temp_dir().join(format!("pmetal_adapter_slot_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let file = dir.join("adapter.safetensors");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = dir.path().join("adapter.safetensors");
     trained.save_lora_weights(&file).expect("save");
 
     let empty = LoraConfig {
@@ -706,7 +698,6 @@ fn an_adapter_the_model_has_no_slot_for_fails_to_load() {
         .load_lora_weights(&file)
         .expect_err("the head's adapter has no slot");
     assert!(err.to_string().contains("lm_head.lora_"), "{err}");
-    std::fs::remove_dir_all(&dir).ok();
     pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
 }
 

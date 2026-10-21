@@ -70,14 +70,6 @@ pub fn write_lr_control(output_dir: &Path, command: &LrControlCommand) -> io::Re
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("pmetal-control-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn the_wire_format_is_the_tagged_snake_case_form_jobs_read() {
         for (command, json) in [
@@ -115,12 +107,13 @@ mod tests {
 
     #[test]
     fn a_command_is_written_whole_and_leaves_nothing_behind() {
-        let dir = scratch("whole");
-        write_lr_control(&dir, &LrControlCommand::SetLr { value: 0.001 }).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_lr_control(dir, &LrControlCommand::SetLr { value: 0.001 }).unwrap();
         let read: LrControlCommand =
-            serde_json::from_slice(&std::fs::read(lr_control_path(&dir)).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(lr_control_path(dir)).unwrap()).unwrap();
         assert_eq!(read, LrControlCommand::SetLr { value: 0.001 });
-        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        let leftovers: Vec<_> = std::fs::read_dir(dir)
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -131,16 +124,17 @@ mod tests {
 
     #[test]
     fn a_second_command_is_refused_until_the_first_is_read() {
-        let dir = scratch("pending");
-        write_lr_control(&dir, &LrControlCommand::SaveCheckpoint).unwrap();
-        let err = write_lr_control(&dir, &LrControlCommand::GracefulStop).unwrap_err();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_lr_control(dir, &LrControlCommand::SaveCheckpoint).unwrap();
+        let err = write_lr_control(dir, &LrControlCommand::GracefulStop).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         // The first command is untouched.
         let read: LrControlCommand =
-            serde_json::from_slice(&std::fs::read(lr_control_path(&dir)).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(lr_control_path(dir)).unwrap()).unwrap();
         assert_eq!(read, LrControlCommand::SaveCheckpoint);
         // The job claims it; the next one goes through.
-        std::fs::remove_file(lr_control_path(&dir)).unwrap();
-        write_lr_control(&dir, &LrControlCommand::GracefulStop).unwrap();
+        std::fs::remove_file(lr_control_path(dir)).unwrap();
+        write_lr_control(dir, &LrControlCommand::GracefulStop).unwrap();
     }
 }

@@ -582,7 +582,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             spec.normalize()
                 .map_err(|errors| commands::invalid_spec::<DistillSpec>(&errors))?;
             let job_id = format!("distill:{}", spec.student);
-            commands::with_event_log(log_events_path.as_deref(), &job_id, |ctx| {
+            commands::with_run_context(log_events_path.as_deref(), &job_id, |ctx| {
                 commands::distill::run_distillation(spec, ctx)
             })
             .await?;
@@ -595,7 +595,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             spec.normalize()
                 .map_err(|errors| commands::invalid_spec::<GrpoSpec>(&errors))?;
             let job_id = format!("grpo:{}", spec.model);
-            commands::with_event_log(log_events_path.as_deref(), &job_id, |ctx| {
+            commands::with_run_context(log_events_path.as_deref(), &job_id, |ctx| {
                 commands::grpo::run_grpo(spec, ctx)
             })
             .await?;
@@ -608,7 +608,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             spec.normalize()
                 .map_err(|errors| commands::invalid_spec::<RlkdSpec>(&errors))?;
             let job_id = format!("rlkd:{}", spec.model);
-            commands::with_event_log(log_events_path.as_deref(), &job_id, |ctx| {
+            commands::with_run_context(log_events_path.as_deref(), &job_id, |ctx| {
                 commands::rlkd::run_rlkd(spec, ctx)
             })
             .await?;
@@ -621,7 +621,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             spec.normalize()
                 .map_err(|errors| commands::invalid_spec::<PreferenceSpec>(&errors))?;
             let job_id = format!("{}:{}", spec.loss, spec.model);
-            commands::with_event_log(log_events_path.as_deref(), &job_id, |ctx| {
+            commands::with_run_context(log_events_path.as_deref(), &job_id, |ctx| {
                 commands::preference::run_preference(spec, ctx)
             })
             .await?;
@@ -799,6 +799,8 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
 
             random::seed(seed);
             let _output_dir = validate_output_path(&output, "pretrain output")?;
+            // Ctrl-C or SIGTERM ends the run after the step in flight and saves it.
+            let stop = commands::stop::StopFlag::watch();
 
             // Collect shard paths (each CLI value is a literal path)
             let shard_paths: Vec<std::path::PathBuf> =
@@ -853,6 +855,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 log_every,
                 eval_every,
                 eval_batches,
+                stop: Some(stop.handle()),
             };
 
             let mut optimizer =
@@ -951,11 +954,17 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             if !losses.is_empty() {
                 let last = losses.last().copied().unwrap_or(0.0);
                 println!(
-                    "Pretraining complete: {} steps, final loss {:.4}",
+                    "Pretraining {}: {} steps, final loss {:.4}",
+                    if stop.requested() {
+                        "stopped on request"
+                    } else {
+                        "complete"
+                    },
                     losses.len(),
                     last,
                 );
             }
+            stop.finish(Ok(()))?;
         }
 
         #[cfg(feature = "distributed")]

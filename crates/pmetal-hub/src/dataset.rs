@@ -126,8 +126,7 @@ pub async fn download_dataset_with(
         return find_cached_dataset_in(&cache_root, dataset_id, options.revision.as_deref(), split)
             .ok_or_else(|| offline_error(dataset_id, &cache_root));
     }
-    let client = options.hub.client()?;
-    let repo = RepoHandle::dataset(&client, dataset_id)?;
+    let repo = RepoHandle::dataset(&options.hub, dataset_id)?;
     let commit = match repo.resolve_commit(options.revision.as_deref()).await {
         Ok(commit) => commit,
         Err(e) if is_network_unavailable(&e) => {
@@ -141,7 +140,7 @@ pub async fn download_dataset_with(
         }
         Err(e) => return Err(repo.error(&e)),
     };
-    let files = repo.list_files(&commit).await.map_err(|e| repo.error(&e))?;
+    let files = repo.list_files(&commit).await.map_err(|e| e.error)?;
     let wanted = select_dataset_files(&files, split);
     if !wanted.iter().any(|f| is_data_file(&f.path)) {
         return Err(PMetalError::Hub(format!(
@@ -264,8 +263,7 @@ pub async fn download_dataset_parquet_with(
         .ok_or_else(|| offline_error(dataset_id, &cache_root))?;
         return parquet_in(&dir, split).ok_or_else(|| offline_error(dataset_id, &cache_root));
     }
-    let client = options.hub.client()?;
-    let repo = RepoHandle::dataset(&client, dataset_id)?;
+    let repo = RepoHandle::dataset(&options.hub, dataset_id)?;
 
     let primary = options.revision.as_deref();
     let mut revisions = vec![primary];
@@ -280,7 +278,7 @@ pub async fn download_dataset_parquet_with(
             Err(hf_hub::HFError::RevisionNotFound { .. }) if is_conversion => continue,
             Err(e) => return Err(repo.error(&e)),
         };
-        let files = repo.list_files(&commit).await.map_err(|e| repo.error(&e))?;
+        let files = repo.list_files(&commit).await.map_err(|e| e.error)?;
         let parquet = select_parquet_files(&files, split);
         if parquet.is_empty() {
             if is_conversion {
@@ -344,8 +342,7 @@ pub async fn download_dataset_file(
     token: Option<&SecretString>,
 ) -> Result<PathBuf> {
     let options = DownloadOptions::new(revision, token);
-    let client = options.hub.client()?;
-    let repo = RepoHandle::dataset(&client, dataset_id)?;
+    let repo = RepoHandle::dataset(&options.hub, dataset_id)?;
     repo.download_file(revision, filename, options.hub.is_offline())
         .await
         .map_err(|e| repo.error(&e))

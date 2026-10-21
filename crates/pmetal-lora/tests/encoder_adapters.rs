@@ -17,7 +17,7 @@ use pmetal_cache::test_utils::max_abs_diff;
 use pmetal_core::LoraConfig;
 use pmetal_lora::AdaptedModel;
 use pmetal_models::dispatcher::DynamicModel;
-use pmetal_runtime::compat::{Array, Dtype, random};
+use pmetal_runtime::compat::{Array, Dtype, in_key_order, random};
 use pmetal_runtime::inline_array::value_and_grad;
 
 const BERT: &str = r#"{"model_type": "bert", "vocab_size": 120, "hidden_size": 32,
@@ -122,7 +122,8 @@ fn encoder_adapters_reach_the_output_and_padding_stays_masked() {
         let reference = embed(&hidden, &mask);
 
         // Each adapter on its own: nudge B and the embedding must move.
-        let params = model.lora_parameters();
+        // In name order: the draws go to the same adapters on every run.
+        let params = in_key_order(model.lora_parameters());
         for (key, b) in params.iter().filter(|(k, _)| k.ends_with(".lora_b")) {
             let nudged = HashMap::from([(
                 key.clone(),

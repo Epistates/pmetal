@@ -443,6 +443,67 @@ async fn verification_can_hash_large_files_against_the_hubs_digest() {
 }
 
 #[tokio::test]
+async fn sha256_verification_catches_a_same_length_corruption() {
+    let (hub, cache) = hub_with_model("o/m").await;
+    hub.corrupt_downloads("o/m", "model.safetensors");
+
+    // The size check cannot see a flipped byte; that is what Sha256 is for.
+    let size_only = download_model_with("o/m", &options(&hub, cache.path())).await;
+    assert!(size_only.is_ok(), "{size_only:?}");
+
+    let cache = tempfile::tempdir().unwrap();
+    let mut opts = options(&hub, cache.path());
+    opts.verify = Verification::Sha256;
+    let err = download_model_with("o/m", &opts).await.unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("model.safetensors") && message.contains("SHA-256"),
+        "{message}"
+    );
+    // The bad file is not left behind to be taken for the real one.
+    assert!(find_cached_model_in(cache.path(), "o/m", None).is_none());
+}
+
+#[tokio::test]
+async fn digests_survive_a_paginated_listing() {
+    let (hub, cache) = hub_with_model("o/m").await;
+    hub.paginate_listings(1);
+    hub.corrupt_downloads("o/m", "model.safetensors");
+    let mut opts = options(&hub, cache.path());
+    opts.verify = Verification::Sha256;
+
+    // model.safetensors is the second of three entries: its digest comes from
+    // the page after the first.
+    let err = download_model_with("o/m", &opts).await.unwrap_err();
+    assert!(err.to_string().contains("SHA-256"), "{err}");
+    assert!(hub.requests_to("/tree/").len() >= 3);
+}
+
+#[tokio::test]
+async fn an_intact_download_passes_sha256_verification_across_pages() {
+    let (hub, cache) = hub_with_model("o/m").await;
+    hub.paginate_listings(2);
+    let mut opts = options(&hub, cache.path());
+    opts.verify = Verification::Sha256;
+    let dir = download_model_with("o/m", &opts).await.unwrap();
+    assert!(dir.join("model.safetensors").exists());
+    assert!(dir.join("tokenizer.json").exists());
+}
+
+#[tokio::test]
+async fn a_listing_cannot_send_the_client_to_another_host() {
+    let (hub, cache) = hub_with_model("o/m").await;
+    hub.paginate_listings(1);
+    hub.link_listings_to("http://listing-elsewhere.invalid");
+    let mut opts = options(&hub, cache.path());
+    opts.hub.token = Some(SecretString::new("hf_secret"));
+
+    let err = download_model_with("o/m", &opts).await.unwrap_err();
+    assert!(err.to_string().contains("another host"), "{err}");
+    assert!(!err.to_string().contains("hf_secret"));
+}
+
+#[tokio::test]
 async fn a_dataset_download_is_pinned_and_limited_to_its_split() {
     isolate_env();
     let hub = FakeHub::start().await;

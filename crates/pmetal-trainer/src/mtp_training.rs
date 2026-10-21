@@ -8,6 +8,8 @@
 //! - DFlash draft: `config.json`, `model.safetensors`
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use pmetal_cache::{
     kv_cache::{KVCache, KVCacheConfig},
@@ -55,6 +57,12 @@ pub struct MtpTrainingConfig {
     /// checkpoint's weights, and `batches` must supply the batches from that
     /// step on; the data position is not recorded.
     pub resume_from: Option<PathBuf>,
+    /// A request to stop, from a signal handler or another thread: once it is
+    /// set the run ends after the step in flight and writes its final
+    /// checkpoint as a finished run does (`num_steps` is the plan, not a
+    /// promise; resume continues from where it stopped). `None` runs to
+    /// `num_steps`.
+    pub stop: Option<Arc<AtomicBool>>,
 }
 
 impl MtpTrainingConfig {
@@ -132,6 +140,7 @@ impl Default for MtpTrainingConfig {
             dflash_blocks_per_step: 4,
             seed: 42,
             resume_from: None,
+            stop: None,
         }
     }
 }
@@ -519,11 +528,25 @@ where
             )?;
             eprintln!("checkpoint saved: {}", dir.display());
         }
+
+        if config
+            .stop
+            .as_ref()
+            .is_some_and(|s| s.load(Ordering::SeqCst))
+        {
+            eprintln!(
+                "stop requested: ending after step {} of {}",
+                step + 1,
+                config.num_steps
+            );
+            break;
+        }
     }
 
     let final_loss = losses.last().copied();
     if let Some(loss) = final_loss {
-        let lr = scheduler.get_lr(config.num_steps.saturating_sub(1)) as f32;
+        let last_step = first_step + losses.len() - 1;
+        let lr = scheduler.get_lr(last_step) as f32;
         save_fn(
             &config.checkpoint_dir,
             model,
@@ -965,6 +988,72 @@ mod tests {
                 8 + i
             );
         }
+    }
+
+    /// A stop request ends the run after the step in flight, with the final
+    /// checkpoint written as for a finished run, and the run resumes from it
+    /// where it stopped. Without this a supervisor's SIGTERM lost everything
+    /// since the last periodic checkpoint.
+    #[test]
+    fn a_stop_request_ends_the_run_after_its_step_and_saves_it() {
+        let config = tiny_qwen_config();
+        let tokens: Vec<u32> = (0..16).map(|i| (i * 7 % 23) as u32 + 1).collect();
+        let batch = batch_from_tokens(&[tokens]).unwrap();
+        pmetal_runtime::compat::random::seed(9);
+        let mut target = Qwen3NextForCausalLM::new(config.clone()).unwrap();
+        let mut mtp = Qwen3NextMtpForCausalLM::new(config.clone()).unwrap();
+        initialize_qwen3_next_mtp_from_target(&target, &mut mtp);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let dir = tempfile::tempdir().unwrap();
+        let settings = |steps: usize, resume: Option<PathBuf>, stop: Option<Arc<AtomicBool>>| {
+            MtpTrainingConfig {
+                num_steps: steps,
+                learning_rate: 5e-3,
+                warmup_steps: 0,
+                lr_schedule: LrSchedulerType::Constant,
+                checkpoint_every: None,
+                checkpoint_dir: dir.path().to_path_buf(),
+                log_every: 0,
+                resume_from: resume,
+                stop,
+                ..Default::default()
+            }
+        };
+        // The request arrives while the third step's batch is being fetched:
+        // that step finishes and is the last.
+        let requesting = {
+            let stop = Arc::clone(&stop);
+            let batch = batch.clone();
+            (0..).map(move |i| {
+                if i == 2 {
+                    stop.store(true, Ordering::SeqCst);
+                }
+                batch.clone()
+            })
+        };
+        let stopped = run_qwen3_next_mtp_training(
+            &mut target,
+            &mut mtp,
+            &settings(16, None, Some(Arc::clone(&stop))),
+            requesting,
+        )
+        .unwrap();
+        pmetal_runtime::check_unobserved_error().unwrap();
+
+        assert_eq!(stopped.losses.len(), 3, "the step in flight finished");
+        assert!(dir.path().join("model.safetensors").exists(), "saved");
+        assert!(dir.path().join("optimizer.safetensors").exists());
+
+        // Resuming picks up at step 3 of the 16, not at 0.
+        let resumed = run_qwen3_next_mtp_training(
+            &mut target,
+            &mut mtp,
+            &settings(6, Some(dir.path().to_path_buf()), None),
+            std::iter::repeat_n(batch, 3),
+        )
+        .unwrap();
+        assert_eq!(resumed.losses.len(), 3);
     }
 
     /// The predictor trains: against the target's own next-next choices the

@@ -21,6 +21,7 @@
 mod bridge_extern;
 
 mod callback;
+mod strict_seed;
 
 pub mod inline_array;
 pub use inline_array::{InlineArray, MetalKernel, QuantizedMode, TemplateArg};

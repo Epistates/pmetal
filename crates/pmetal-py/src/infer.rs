@@ -16,9 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pmetal_core::jobs::InferSpec;
-use pmetal_data::chat_templates::ChatTemplateKwargs;
-use pmetal_data::inference_config::SamplingMode;
-use pmetal_lib::inference_runner::{InferenceRunner, InferenceRunnerConfig, TurboQuantPreset};
+use pmetal_lib::inference_runner::{InferenceRunner, InferenceRunnerConfig};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -169,24 +167,10 @@ fn command_line_only_fields_set(spec: &InferSpec) -> PyResult<Vec<&'static str>>
         .collect())
 }
 
-fn turboquant_preset(name: Option<&str>) -> PyResult<Option<TurboQuantPreset>> {
-    match name {
-        None => Ok(None),
-        Some("q2_5") => Ok(Some(TurboQuantPreset::Q2_5)),
-        Some("q3_5") => Ok(Some(TurboQuantPreset::Q3_5)),
-        Some(other) => Err(config_err(format!(
-            "kv_turboquant_preset: unknown preset '{other}'; valid: q2_5, q3_5"
-        ))),
-    }
-}
-
 /// The runner's configuration for `spec`, with the model paths resolved.
 fn runner_config(py: Python<'_>, spec: &InferSpec) -> PyResult<InferenceRunnerConfig> {
-    if spec.mtp && spec.draft_model.is_some() {
-        return Err(config_err(
-            "use either mtp (bundled Qwen MTP) or draft_model (Gemma 4 MTP), not both",
-        ));
-    }
+    // The shared mapping first, so a bad option fails before a download.
+    let mut config = InferenceRunnerConfig::from_spec(spec).map_err(config_err)?;
     let hub = HubArgs::default();
     let model_path = resolve_model(py, &spec.model, &hub)?;
     let draft_path = spec
@@ -208,57 +192,10 @@ fn runner_config(py: Python<'_>, spec: &InferSpec) -> PyResult<InferenceRunnerCo
         .as_deref()
         .map(|path| resolve_model(py, path, &hub))
         .transpose()?;
-
-    let chat_template_kwargs = ChatTemplateKwargs::from_controls(
-        spec.chat_template_kwargs.as_deref(),
-        spec.no_thinking,
-        spec.reasoning_effort.as_deref(),
-        spec.no_preserve_thinking,
-    )
-    .map_err(config_err)?;
-    // `chat_template_kwargs='{"enable_thinking": false}'` is `no_thinking`.
-    let no_thinking = spec.no_thinking || chat_template_kwargs.enable_thinking() == Some(false);
-    let mode: SamplingMode = spec.mode.parse().map_err(config_err)?;
-
-    Ok(InferenceRunnerConfig {
-        model_path,
-        lora_path: spec.lora.clone(),
-        mtp_assistant_path: draft_path,
-        qwen_mtp_path,
-        qwen_mtp: spec.mtp,
-        qwen_mtp_draft_tokens: spec.mtp_draft_tokens.max(1),
-        experts_dir: spec.experts_dir.clone(),
-        fp8: spec.fp8,
-        prompt: spec.prompt.clone(),
-        chat_messages: None,
-        system_message: spec.system.clone(),
-        chat: spec.chat,
-        no_thinking,
-        chat_template_kwargs,
-        tools: None,
-        images: Vec::new(),
-        videos: Vec::new(),
-        temperature: spec.temperature,
-        top_k: spec.top_k,
-        top_p: spec.top_p,
-        min_p: spec.min_p,
-        max_tokens: spec.max_tokens,
-        repetition_penalty: spec.repetition_penalty,
-        frequency_penalty: spec.frequency_penalty,
-        presence_penalty: spec.presence_penalty,
-        seed: spec.seed,
-        kv_quant: spec.kv_quant,
-        kv_k_bits: spec.kv_k_bits,
-        kv_v_bits: spec.kv_v_bits,
-        kv_group_size: spec.kv_group_size,
-        kv_turboquant: spec.kv_turboquant,
-        kv_turboquant_preset: turboquant_preset(spec.kv_turboquant_preset.as_deref())?,
-        kv_quant_preset: spec.kv_quant_preset.clone(),
-        no_kv_quant: spec.no_kv_quant,
-        mode,
-        detect_repetition: spec.detect_repetition,
-        kv_qjl: spec.kv_qjl,
-    })
+    config.model_path = model_path;
+    config.mtp_assistant_path = draft_path;
+    config.qwen_mtp_path = qwen_mtp_path;
+    Ok(config)
 }
 
 /// How often a generating thread looks for Ctrl-C.

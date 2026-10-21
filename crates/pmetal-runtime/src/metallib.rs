@@ -283,13 +283,12 @@ mod tests {
         bytes
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "pmetal-metallib-cache-{name}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
+    /// A cache in a directory that does not exist yet, and the guard that
+    /// removes it.
+    fn scratch() -> (tempfile::TempDir, Cache) {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::at(tmp.path().join("cache"));
+        (tmp, cache)
     }
 
     /// The regression this module exists for: MLX must be pointed at the
@@ -317,7 +316,7 @@ mod tests {
 
     #[test]
     fn versions_are_cached_side_by_side() {
-        let cache = Cache::at(scratch("side-by-side"));
+        let (_tmp, cache) = scratch();
         let a = fake_metallib(4096, 1);
         let b = fake_metallib(8192, 2);
         let (sha_a, sha_b) = (sha256_hex(&a), sha256_hex(&b));
@@ -343,12 +342,11 @@ mod tests {
             })
             .count();
         assert_eq!(leftovers, 0);
-        std::fs::remove_dir_all(cache.dir()).unwrap();
     }
 
     #[test]
     fn install_rejects_bytes_that_are_not_the_expected_file() {
-        let cache = Cache::at(scratch("reject"));
+        let (_tmp, cache) = scratch();
         let good = fake_metallib(4096, 3);
         let sha = sha256_hex(&good);
 
@@ -359,12 +357,11 @@ mod tests {
 
         let truncated = &good[..2048];
         assert!(cache.install(truncated, &sha256_hex(truncated)).is_err());
-        let _ = std::fs::remove_dir_all(cache.dir());
     }
 
     #[test]
     fn a_damaged_entry_is_dropped_so_it_is_installed_again() {
-        let cache = Cache::at(scratch("damaged"));
+        let (_tmp, cache) = scratch();
         let good = fake_metallib(4096, 4);
         let sha = sha256_hex(&good);
         let path = cache.install(&good, &sha).unwrap();
@@ -373,12 +370,11 @@ mod tests {
         assert_eq!(cache.get(&sha), None);
         assert!(!path.exists());
         assert_eq!(cache.install(&good, &sha).unwrap(), path);
-        std::fs::remove_dir_all(cache.dir()).unwrap();
     }
 
     #[test]
     fn prune_drops_what_has_gone_unused() {
-        let cache = Cache::at(scratch("prune"));
+        let (_tmp, cache) = scratch();
         let kept = cache
             .install(
                 &fake_metallib(4096, 5),
@@ -422,6 +418,5 @@ mod tests {
         assert!(!legacy.exists());
         assert!(!abandoned.exists());
         assert!(unrelated.exists());
-        std::fs::remove_dir_all(cache.dir()).unwrap();
     }
 }

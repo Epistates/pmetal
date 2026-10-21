@@ -436,8 +436,7 @@ pub async fn fetch_model_meta(model_id: &str, token: Option<&SecretString>) -> R
 /// (GGUF-only ones) yields empty config fields, not an error.
 pub async fn fetch_model_meta_with(model_id: &str, options: &HubOptions) -> Result<HfModelMeta> {
     validate_repo_id(model_id)?;
-    let client = options.client()?;
-    let repo = RepoHandle::model(&client, model_id)?;
+    let repo = RepoHandle::model(options, model_id)?;
     let expand = [
         "sha",
         "safetensors",
@@ -529,13 +528,12 @@ pub async fn fetch_model_meta_with(model_id: &str, options: &HubOptions) -> Resu
 /// sizes: what to choose from to pull one quant out of a multi-quant
 /// repository. A split model counts once, with all its shards.
 pub async fn list_gguf_variants(model_id: &str, options: &HubOptions) -> Result<Vec<GgufVariant>> {
-    let client = options.client()?;
-    let repo = RepoHandle::model(&client, model_id)?;
+    let repo = RepoHandle::model(options, model_id)?;
     let commit = repo
         .resolve_commit(None)
         .await
         .map_err(|e| repo.error(&e))?;
-    let files = repo.list_files(&commit).await.map_err(|e| repo.error(&e))?;
+    let files = repo.list_files(&commit).await.map_err(|e| e.error)?;
     Ok(gguf_variants(&files))
 }
 
@@ -601,8 +599,7 @@ fn split_front_matter(readme: &str) -> (Option<&str>, &str) {
 
 /// Fetch and parse a model's README.md at its default branch.
 pub async fn fetch_model_card(model_id: &str, options: &HubOptions) -> Result<ModelCard> {
-    let client = options.client()?;
-    let repo = RepoHandle::model(&client, model_id)?;
+    let repo = RepoHandle::model(options, model_id)?;
     let commit = repo
         .resolve_commit(None)
         .await

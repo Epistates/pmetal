@@ -789,8 +789,8 @@ mod tests {
     /// pmetal's own loaders use, so the two can't drift apart.
     #[test]
     fn config_overrides_are_mlx_module_keys() {
-        let dir = std::env::temp_dir().join(format!("pmetal-quant-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let source = dir.join("source.json");
         std::fs::write(&source, r#"{"model_type": "qwen3"}"#).unwrap();
 
@@ -798,7 +798,7 @@ mod tests {
             ("model.layers.0.mlp.down_proj.weight".to_string(), 8),
             ("model.layers.1.mlp.up_proj.weight".to_string(), 4),
         ]);
-        write_quantization_config(&source, &dir, 4, 64, &overrides).unwrap();
+        write_quantization_config(&source, dir, 4, 64, &overrides).unwrap();
 
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
@@ -831,7 +831,6 @@ mod tests {
                 .bits,
             4
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── is_critical_tensor ────────────────────────────────────────────────────
