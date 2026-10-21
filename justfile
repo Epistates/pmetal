@@ -14,7 +14,7 @@ default:
 # Runs every check that CI performs. If this passes, publish is safe.
 
 # Full pre-publish validation (mirrors CI + release pipelines)
-preflight: fmt-check check-workspace-deps lint lint-all-features lint-min-features doc-check test test-release check-gui lint-gui check-version check-lockfile deny
+preflight: fmt-check check-workspace-deps lint lint-all-features lint-min-features doc-check test test-release check-gui lint-gui test-gui check-version check-lockfile deny
     @echo ""
     @echo "All preflight checks passed -- safe to publish {{ version }}"
 
@@ -82,7 +82,7 @@ build-cli:
 # `check-gui` used to pass only on a checkout where someone had already built
 # the frontend.
 gui-frontend:
-    cd crates/pmetal-gui && bun install --frozen-lockfile && bun run check && bun run build
+    cd crates/pmetal-gui && bun install --frozen-lockfile && bun run check && bun test && bun run build
 
 # Check GUI compiles (mirrors release CI -- catches cfg mismatches)
 check-gui: gui-frontend
@@ -91,6 +91,11 @@ check-gui: gui-frontend
 # Clippy for the GUI crate, which `--workspace` does not reach (see `fmt`).
 lint-gui: gui-frontend
     cargo clippy --manifest-path crates/pmetal-gui/src-tauri/Cargo.toml --all-targets -- -D warnings
+
+# The GUI's own tests, which `--workspace` does not reach either: the job
+# runner, the keychain token, path checks, and the Tauri security configuration.
+test-gui: gui-frontend
+    cargo test --manifest-path crates/pmetal-gui/src-tauri/Cargo.toml
 
 # Stage the CLI sidecar + metallib the release bundle expects.
 #
