@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-job-steps"
+description = "Enables the job_steps command without any pre-configured scope."
+commands.allow = ["job_steps"]
+
+[[permission]]
+identifier = "deny-job-steps"
+description = "Denies the job_steps command without any pre-configured scope."
+commands.deny = ["job_steps"]

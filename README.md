@@ -22,7 +22,7 @@ cd crates/pmetal-gui
 bun install && bun tauri dev
 ```
 
-20 pages: Dashboard, Training, GRPO, Distillation, Pretrain, Inference, DFlash, Models, Datasets, Merging, Quantize, Embed Train, RLKD, Preference, Ollama, Serve, Bench, Eval, Jobs, and Settings. Download models from HuggingFace, configure LoRA training with live loss metrics, chat with models, merge weights, and quantize — all from the GUI. Training, inference, distillation and GRPO run in-process with real-time progress updates; the remaining pages drive the `pmetal` CLI as a subprocess, which the app bundles.
+Every `pmetal` command has a form, built from the same job specs as the CLI, the TUI and the MCP server (fine-tuning, GRPO, RLKD, preference tuning, distillation, embeddings, pretraining, serving, DFlash, merge, fuse, quantize, evaluation, benchmarks and more), plus Chat, Models, Datasets, a Jobs page and Settings. Download models from HuggingFace, watch live loss and progress, chat with models, merge weights, and quantize — all from the GUI. Jobs run as `pmetal` processes under the shared job supervisor (the app bundles the CLI), carry on while you use other pages, and are stopped when you quit; a Hugging Face token is kept in the macOS Keychain.
 
 ### Terminal TUI
 

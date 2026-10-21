@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-model-fit"
+description = "Enables the get_model_fit command without any pre-configured scope."
+commands.allow = ["get_model_fit"]
+
+[[permission]]
+identifier = "deny-get-model-fit"
+description = "Denies the get_model_fit command without any pre-configured scope."
+commands.deny = ["get_model_fit"]

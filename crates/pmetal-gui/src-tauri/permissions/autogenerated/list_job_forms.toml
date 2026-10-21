@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-job-forms"
+description = "Enables the list_job_forms command without any pre-configured scope."
+commands.allow = ["list_job_forms"]
+
+[[permission]]
+identifier = "deny-list-job-forms"
+description = "Denies the list_job_forms command without any pre-configured scope."
+commands.deny = ["list_job_forms"]

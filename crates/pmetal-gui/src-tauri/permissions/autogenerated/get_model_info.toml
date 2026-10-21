@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-model-info"
+description = "Enables the get_model_info command without any pre-configured scope."
+commands.allow = ["get_model_info"]
+
+[[permission]]
+identifier = "deny-get-model-info"
+description = "Denies the get_model_info command without any pre-configured scope."
+commands.deny = ["get_model_info"]

@@ -1,390 +1,242 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-  import { configStore, modelsStore, deviceStore } from '#lib/stores.svelte.js';
-  import { getSystemInfo } from '#lib/api.js';
-  import type { SystemInfo, AppConfig } from '#lib/api.js';
-  import { check, type Update } from '@tauri-apps/plugin-updater';
-  import { relaunch } from '@tauri-apps/plugin-process';
+  import { configStore, deviceStore, modelsStore } from '#lib/stores.svelte.js';
+  import { errorMessage } from '#lib/api.js';
+  import type { Theme } from '#lib/api.js';
+  import ConfirmDialog from '#lib/components/ConfirmDialog.svelte';
 
-  let config = $derived(configStore.config);
-  let models = $derived(modelsStore.models);
-  let loading = $derived(configStore.loading);
-  let deviceInfo = $derived(deviceStore.info);
+  const config = $derived(configStore.config);
+  const device = $derived(deviceStore.info);
 
-  // Local form state
-  let cacheDir = $state('');
-  let hfToken = $state('');
+  let tokenInput = $state('');
+  let tokenBusy = $state(false);
+  let tokenMessage = $state<{ kind: 'ok' | 'error'; text: string } | null>(null);
+  let confirmRemove = $state(false);
+
   let defaultModel = $state('');
-  let theme = $state('system');
+  let defaultsFor: string | null = null;
+  let saveMessage = $state<{ kind: 'ok' | 'error'; text: string } | null>(null);
 
-  // System info
-  let systemInfo = $state<SystemInfo | null>(null);
-  let loadingSystemInfo = $state(true);
-
-  // UI state
-  let saveError = $state<string | null>(null);
-  let saveSuccess = $state(false);
-  let isSaving = $state(false);
-  let showToken = $state(false);
-
-  // Update state
-  let updateAvailable = $state<Update | null>(null);
-  let checkingUpdate = $state(false);
-  let installingUpdate = $state(false);
-  let updateError = $state<string | null>(null);
-  let updateUpToDate = $state(false);
-
-  // Sync local state with store when config loads
+  // Start the default-model box from what is saved, once.
   $effect(() => {
-    if (config) {
-      cacheDir = config.cache_dir;
-      hfToken = config.hf_token ?? '';
-      defaultModel = config.default_model ?? '';
-      theme = config.theme;
+    if (config && defaultsFor === null) {
+      defaultsFor = config.default_model ?? '';
+      defaultModel = defaultsFor;
     }
   });
 
-  onMount(async () => {
-    try {
-      systemInfo = await getSystemInfo();
-    } catch (e) {
-      console.error('Failed to load system info:', e);
-    } finally {
-      loadingSystemInfo = false;
-    }
-    // deviceStore is already populated by initializeStores in layout
-    // Only refresh if it's somehow empty
-    if (!deviceStore.info) {
-      deviceStore.refresh();
-    }
-  });
-
-  async function handleSave(e: Event) {
-    e.preventDefault();
-    saveError = null;
-    saveSuccess = false;
-    isSaving = true;
-
-    try {
-      const newConfig: AppConfig = {
-        cache_dir: cacheDir,
-        hf_token: hfToken || null,
-        default_model: defaultModel || null,
-        theme,
-      };
-      await configStore.save(newConfig);
-      saveSuccess = true;
-      setTimeout(() => { saveSuccess = false; }, 3000);
-    } catch (e) {
-      saveError = e instanceof Error ? e.message : String(e);
-    } finally {
-      isSaving = false;
-    }
-  }
-
-  function resetForm() {
-    if (config) {
-      cacheDir = config.cache_dir;
-      hfToken = config.hf_token ?? '';
-      defaultModel = config.default_model ?? '';
-      theme = config.theme;
-    }
-    saveError = null;
-    saveSuccess = false;
-  }
-
-  async function checkForUpdate() {
-    checkingUpdate = true;
-    updateError = null;
-    updateUpToDate = false;
-    try {
-      const result = await check();
-      if (result) {
-        updateAvailable = result;
-      } else {
-        updateUpToDate = true;
-        setTimeout(() => { updateUpToDate = false; }, 5000);
-      }
-    } catch (e) {
-      updateError = e instanceof Error ? e.message : String(e);
-    } finally {
-      checkingUpdate = false;
-    }
-  }
-
-  async function installUpdate() {
-    if (!updateAvailable) return;
-    installingUpdate = true;
-    updateError = null;
-    try {
-      await updateAvailable.downloadAndInstall();
-      await relaunch();
-    } catch (e) {
-      updateError = e instanceof Error ? e.message : String(e);
-      installingUpdate = false;
-    }
-  }
-
-  const themes = [
-    { value: 'system', label: 'System', description: 'Follow system preference' },
-    { value: 'light', label: 'Light', description: 'Always use light mode' },
-    { value: 'dark', label: 'Dark', description: 'Always use dark mode' },
+  const themes: { value: Theme; label: string; description: string }[] = [
+    { value: 'system', label: 'System', description: 'Follow the system setting' },
+    { value: 'light', label: 'Light', description: 'Always light' },
+    { value: 'dark', label: 'Dark', description: 'Always dark' },
   ];
+
+  async function setTheme(theme: Theme) {
+    saveMessage = null;
+    try {
+      await configStore.save({ theme });
+    } catch (e) {
+      saveMessage = { kind: 'error', text: errorMessage(e) };
+    }
+  }
+
+  async function saveDefaultModel(e: Event) {
+    e.preventDefault();
+    saveMessage = null;
+    try {
+      await configStore.save({ default_model: defaultModel });
+      saveMessage = { kind: 'ok', text: 'Saved.' };
+    } catch (err) {
+      saveMessage = { kind: 'error', text: errorMessage(err) };
+    }
+  }
+
+  async function saveToken(e: Event) {
+    e.preventDefault();
+    tokenBusy = true;
+    tokenMessage = null;
+    try {
+      await configStore.setToken(tokenInput);
+      tokenInput = '';
+      tokenMessage = { kind: 'ok', text: 'Saved in the macOS Keychain.' };
+    } catch (err) {
+      tokenMessage = { kind: 'error', text: errorMessage(err) };
+    } finally {
+      tokenBusy = false;
+    }
+  }
+
+  async function removeToken() {
+    tokenBusy = true;
+    try {
+      await configStore.clearToken();
+      confirmRemove = false;
+      tokenMessage = { kind: 'ok', text: 'Removed from the Keychain.' };
+    } catch (err) {
+      tokenMessage = { kind: 'error', text: errorMessage(err) };
+    } finally {
+      tokenBusy = false;
+    }
+  }
+
+  async function removeDirectory(path: string) {
+    try {
+      await modelsStore.removeDirectory(path);
+    } catch (e) {
+      saveMessage = { kind: 'error', text: errorMessage(e) };
+    }
+  }
 </script>
 
 <div class="space-y-6 max-w-3xl">
-  <!-- Header -->
   <div>
     <h1 class="text-2xl font-bold text-surface-900 dark:text-surface-100">Settings</h1>
-    <p class="text-surface-500 dark:text-surface-400 mt-1">Configure PMetal preferences</p>
+    <p class="text-surface-500 dark:text-surface-400 mt-1">Preferences for PMetal on this Mac</p>
   </div>
 
-  <form onsubmit={handleSave} class="space-y-6">
-    <!-- Appearance -->
-    <div class="card">
-      <div class="card-header">
-        <h2 class="font-semibold text-surface-900 dark:text-surface-100">Appearance</h2>
+  {#if !config}
+    <p class="text-surface-500" role="status">{configStore.error ?? 'Loading…'}</p>
+  {:else}
+    {#each config.notes as note}
+      <div class="rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-200" role="alert">
+        {note}
       </div>
+    {/each}
+
+    {#if saveMessage}
+      <p role={saveMessage.kind === 'error' ? 'alert' : 'status'} class={saveMessage.kind === 'error' ? 'text-sm text-red-600 dark:text-red-400' : 'text-sm text-green-700 dark:text-green-400'}>
+        {saveMessage.text}
+      </p>
+    {/if}
+
+    <section class="card" aria-labelledby="appearance">
+      <div class="card-header"><h2 id="appearance" class="font-semibold">Appearance</h2></div>
       <div class="card-body">
-        <p class="label">Theme</p>
-        <div class="grid grid-cols-3 gap-3">
-          {#each themes as t}
+        <div class="grid grid-cols-3 gap-3" role="radiogroup" aria-label="Theme">
+          {#each themes as theme}
             <button
               type="button"
-              class="p-3 rounded-lg border text-center transition-all {theme === t.value
-                ? 'border-primary-500 bg-primary-50 dark:bg-primary-900/30'
-                : 'border-surface-200 dark:border-surface-700 hover:border-surface-300 dark:hover:border-surface-600'}"
-              onclick={() => (theme = t.value)}
+              role="radio"
+              aria-checked={config.theme === theme.value}
+              class="rounded-lg border p-3 text-left {config.theme === theme.value ? 'border-primary-500 bg-primary-50 dark:bg-primary-900/30' : 'border-surface-200 dark:border-surface-700'}"
+              onclick={() => setTheme(theme.value)}
             >
-              <p class="text-sm font-semibold text-surface-900 dark:text-surface-100">{t.label}</p>
-              <p class="text-xs text-surface-500 mt-0.5">{t.description}</p>
+              <span class="block text-sm font-medium">{theme.label}</span>
+              <span class="block text-xs text-surface-500">{theme.description}</span>
             </button>
           {/each}
         </div>
       </div>
-    </div>
+    </section>
 
-    <!-- Storage -->
-    <div class="card">
-      <div class="card-header">
-        <h2 class="font-semibold text-surface-900 dark:text-surface-100">Storage</h2>
-      </div>
-      <div class="card-body space-y-4">
+    <section class="card" aria-labelledby="hf">
+      <div class="card-header"><h2 id="hf" class="font-semibold">Hugging Face</h2></div>
+      <form class="card-body space-y-4" onsubmit={saveToken}>
         <div>
-          <label class="label" for="cache-dir">Cache Directory</label>
-          <input
-            id="cache-dir"
-            type="text"
-            class="input"
-            placeholder="~/.cache/pmetal"
-            bind:value={cacheDir}
-          />
-          <p class="text-xs text-surface-500 mt-1">Where downloaded models and datasets are stored</p>
-        </div>
-        <div>
-          <label class="label" for="default-model">Default Model</label>
-          <select id="default-model" class="input" bind:value={defaultModel}>
-            <option value="">None</option>
-            {#each models as model}
-              <option value={model.id}>{model.id}</option>
-            {/each}
-          </select>
-          <p class="text-xs text-surface-500 mt-1">Pre-selected model in training and inference pages</p>
-        </div>
-      </div>
-    </div>
-
-    <!-- HuggingFace -->
-    <div class="card">
-      <div class="card-header">
-        <h2 class="font-semibold text-surface-900 dark:text-surface-100">HuggingFace</h2>
-      </div>
-      <div class="card-body space-y-4">
-        <div>
-          <label class="label" for="hf-token">Access Token</label>
-          <div class="relative">
+          <label for="hf-token" class="label">Access token</label>
+          <div class="flex gap-2">
             <input
               id="hf-token"
-              type={showToken ? 'text' : 'password'}
-              class="input pr-12"
-              placeholder="hf_..."
-              bind:value={hfToken}
+              class="input"
+              type="password"
               autocomplete="off"
+              autocapitalize="off"
+              spellcheck="false"
+              placeholder={config.hf_token_set ? 'A token is saved. Paste a new one to replace it.' : 'hf_…'}
+              bind:value={tokenInput}
+              aria-describedby="hf-token-help"
             />
-            <button
-              type="button"
-              class="absolute right-3 top-1/2 -translate-y-1/2 text-surface-400 hover:text-surface-600 dark:hover:text-surface-300"
-              onclick={() => (showToken = !showToken)}
-            >
-              {#if showToken}
-                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" />
-                </svg>
-              {:else}
-                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
-                </svg>
-              {/if}
-            </button>
+            <button type="submit" class="btn-primary shrink-0" disabled={tokenBusy || !tokenInput.trim()}>Save</button>
+            {#if config.hf_token_set}
+              <button type="button" class="btn-secondary shrink-0" disabled={tokenBusy} onclick={() => (confirmRemove = true)}>Remove</button>
+            {/if}
           </div>
-          <p class="text-xs text-surface-500 mt-1">
-            Required for gated models (Llama, Gemma, etc.). Get your token at
-            <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener" class="text-primary-600 dark:text-primary-400 hover:underline">
-              huggingface.co/settings/tokens
-            </a>
+          <p id="hf-token-help" class="mt-1 text-xs text-surface-500">
+            Needed for private and gated models and datasets. It is kept in the macOS Keychain, never in a file,
+            and is not shown again after you save it.
+            {#if config.hf_token_set}<span class="badge-success ml-1">Saved</span>{/if}
           </p>
+          {#if tokenMessage}
+            <p role={tokenMessage.kind === 'error' ? 'alert' : 'status'} class="mt-1 text-xs {tokenMessage.kind === 'error' ? 'text-red-600 dark:text-red-400' : 'text-green-700 dark:text-green-400'}">{tokenMessage.text}</p>
+          {/if}
+        </div>
+        <dl class="text-sm">
+          <dt class="text-surface-500">Model cache</dt>
+          <dd class="break-all font-mono text-xs">{config.hf_cache_dir}</dd>
+          <dd class="mt-1 text-xs text-surface-500">Set with the HF_HOME or HF_HUB_CACHE environment variable, as for every Hugging Face tool.</dd>
+        </dl>
+      </form>
+    </section>
+
+    <section class="card" aria-labelledby="models">
+      <div class="card-header"><h2 id="models" class="font-semibold">Models and output</h2></div>
+      <div class="card-body space-y-4">
+        <form onsubmit={saveDefaultModel}>
+          <label for="default-model" class="label">Default model</label>
+          <div class="flex gap-2">
+            <input id="default-model" class="input" placeholder="Qwen/Qwen3-0.6B" bind:value={defaultModel} />
+            <button type="submit" class="btn-secondary shrink-0">Save</button>
+          </div>
+        </form>
+        <dl class="text-sm">
+          <dt class="text-surface-500">Jobs write to</dt>
+          <dd class="break-all font-mono text-xs">{config.output_dir}</dd>
+        </dl>
+        <div>
+          <p class="text-sm text-surface-500">Extra model folders</p>
+          {#if config.custom_model_dirs.length === 0}
+            <p class="text-xs text-surface-500">None. Add one on the Models page.</p>
+          {:else}
+            <ul class="mt-1 space-y-1">
+              {#each config.custom_model_dirs as dir}
+                <li class="flex items-center justify-between gap-2 text-xs font-mono">
+                  <span class="break-all">{dir}</span>
+                  <button type="button" class="btn-ghost btn-sm shrink-0" onclick={() => removeDirectory(dir)}>Remove</button>
+                </li>
+              {/each}
+            </ul>
+          {/if}
         </div>
       </div>
-    </div>
+    </section>
 
-    <!-- Error / Success -->
-    {#if saveError}
-      <div class="p-4 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 text-sm">
-        {saveError}
-      </div>
-    {/if}
-    {#if saveSuccess}
-      <div class="p-4 rounded-lg bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 text-green-700 dark:text-green-300 text-sm flex items-center gap-2">
-        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
-        </svg>
-        Settings saved successfully
-      </div>
-    {/if}
-
-    <div class="flex gap-3">
-      <button type="submit" class="btn-primary" disabled={isSaving || loading}>
-        {#if isSaving}
-          <div class="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
-          Saving...
+    <section class="card" aria-labelledby="cli">
+      <div class="card-header"><h2 id="cli" class="font-semibold">Command-line tool</h2></div>
+      <div class="card-body text-sm">
+        {#if config.pmetal_binary}
+          <p>Jobs run <code class="font-mono text-xs break-all">{config.pmetal_binary}</code>.</p>
+          <p class="mt-1 text-xs text-surface-500">Set PMETAL_BIN before opening PMetal to use a different one.</p>
         {:else}
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
-          </svg>
-          Save Settings
-        {/if}
-      </button>
-      <button type="button" class="btn-secondary" onclick={resetForm} disabled={isSaving}>
-        Reset
-      </button>
-    </div>
-  </form>
-
-  <!-- Updates -->
-  <div class="card">
-    <div class="card-header">
-      <h2 class="font-semibold text-surface-900 dark:text-surface-100">Updates</h2>
-    </div>
-    <div class="card-body space-y-3">
-      {#if updateAvailable}
-        <div class="p-3 rounded-lg bg-primary-50 dark:bg-primary-900/20 border border-primary-200 dark:border-primary-800">
-          <p class="text-sm font-medium text-primary-700 dark:text-primary-300">
-            Version {updateAvailable.version} is available
-          </p>
-          {#if updateAvailable.body}
-            <p class="text-xs text-primary-600 dark:text-primary-400 mt-1">{updateAvailable.body}</p>
-          {/if}
-          <button
-            class="btn-primary btn-sm mt-2"
-            onclick={installUpdate}
-            disabled={installingUpdate}
-          >
-            {#if installingUpdate}
-              <div class="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
-              Installing...
-            {:else}
-              Download & Install
-            {/if}
-          </button>
-        </div>
-      {:else}
-        <div class="flex items-center gap-3">
-          <button
-            class="btn-secondary btn-sm"
-            onclick={checkForUpdate}
-            disabled={checkingUpdate}
-          >
-            {#if checkingUpdate}
-              <div class="w-4 h-4 border-2 border-surface-400 border-t-transparent rounded-full animate-spin"></div>
-              Checking...
-            {:else}
-              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-              </svg>
-              Check for Updates
-            {/if}
-          </button>
-          {#if updateUpToDate}
-            <span class="text-sm text-green-600 dark:text-green-400">You're up to date!</span>
-          {/if}
-        </div>
-      {/if}
-      {#if updateError}
-        <p class="text-xs text-red-600 dark:text-red-400">{updateError}</p>
-      {/if}
-    </div>
-  </div>
-
-  <!-- About -->
-  <div class="card">
-    <div class="card-header">
-      <h2 class="font-semibold text-surface-900 dark:text-surface-100">About PMetal</h2>
-    </div>
-    <div class="card-body space-y-4">
-      <div class="flex items-center gap-4">
-        <div class="w-12 h-12 rounded-xl bg-gradient-to-br from-accent-500 to-orange-600 flex items-center justify-center">
-          <span class="text-white font-bold text-xl">P</span>
-        </div>
-        <div>
-          <p class="font-semibold text-surface-900 dark:text-surface-100">PMetal v{systemInfo?.version ?? '...'}</p>
-          <p class="text-sm text-surface-500">Apple Silicon ML Training Suite</p>
-        </div>
-      </div>
-
-      <div class="grid grid-cols-2 gap-4 text-sm pt-2 border-t border-surface-200 dark:border-surface-700">
-        <div>
-          <p class="text-surface-500">Platform</p>
-          <p class="font-medium text-surface-900 dark:text-surface-100">
-            {systemInfo?.platform ?? 'Loading...'}
-          </p>
-        </div>
-        <div>
-          <p class="text-surface-500">Architecture</p>
-          <p class="font-medium text-surface-900 dark:text-surface-100">
-            {systemInfo?.arch ?? 'Loading...'}
-          </p>
-        </div>
-
-        {#if deviceInfo}
-          <div>
-            <p class="text-surface-500">GPU</p>
-            <p class="font-medium text-surface-900 dark:text-surface-100">{deviceInfo.gpu_name}</p>
-          </div>
-          <div>
-            <p class="text-surface-500">Memory</p>
-            <p class="font-medium text-surface-900 dark:text-surface-100">{deviceInfo.total_memory_formatted}</p>
-          </div>
-          {#if deviceInfo.has_ane}
-            <div>
-              <p class="text-surface-500">ANE</p>
-              <p class="font-medium text-green-600 dark:text-green-400">Available</p>
-            </div>
-          {/if}
-          {#if deviceInfo.has_nax}
-            <div>
-              <p class="text-surface-500">NAX (Apple10+)</p>
-              <p class="font-medium text-accent-600 dark:text-accent-400">Available</p>
-            </div>
-          {/if}
+          <p class="text-red-600 dark:text-red-400" role="alert">{config.pmetal_binary_error}</p>
         {/if}
       </div>
+    </section>
 
-      <div class="pt-2 border-t border-surface-200 dark:border-surface-700">
-        <p class="text-xs text-surface-500">
-          PMetal is licensed under MIT OR Apache-2.0. Built for Apple Silicon — M1 through M5 (including Pro/Max/Ultra/Ultra Max).
-        </p>
+    <section class="card" aria-labelledby="about">
+      <div class="card-header"><h2 id="about" class="font-semibold">About this Mac</h2></div>
+      <div class="card-body">
+        {#if device}
+          <dl class="grid grid-cols-2 gap-4 text-sm">
+            <div><dt class="text-surface-500">PMetal</dt><dd class="font-medium">v{device.version}</dd></div>
+            <div><dt class="text-surface-500">Chip</dt><dd class="font-medium">{device.gpu_name}</dd></div>
+            <div><dt class="text-surface-500">Memory</dt><dd class="font-medium">{device.total_memory_formatted} ({device.available_memory_formatted} free)</dd></div>
+            <div><dt class="text-surface-500">Neural Engine</dt><dd class="font-medium">{device.has_ane ? 'Yes' : 'No'}</dd></div>
+          </dl>
+        {:else}
+          <p class="text-sm text-surface-500" role="status">{deviceStore.error ?? 'Detecting…'}</p>
+        {/if}
       </div>
-    </div>
-  </div>
+    </section>
+  {/if}
 </div>
+
+<ConfirmDialog
+  open={confirmRemove}
+  title="Remove the saved token?"
+  confirmLabel="Remove"
+  danger
+  busy={tokenBusy}
+  onconfirm={removeToken}
+  oncancel={() => (confirmRemove = false)}
+>
+  <p>Private and gated downloads stop working until you save a token again.</p>
+</ConfirmDialog>

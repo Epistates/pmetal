@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-hf-token"
+description = "Enables the set_hf_token command without any pre-configured scope."
+commands.allow = ["set_hf_token"]
+
+[[permission]]
+identifier = "deny-set-hf-token"
+description = "Denies the set_hf_token command without any pre-configured scope."
+commands.deny = ["set_hf_token"]

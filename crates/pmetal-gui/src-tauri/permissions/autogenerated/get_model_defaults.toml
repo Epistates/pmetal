@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-model-defaults"
+description = "Enables the get_model_defaults command without any pre-configured scope."
+commands.allow = ["get_model_defaults"]
+
+[[permission]]
+identifier = "deny-get-model-defaults"
+description = "Denies the get_model_defaults command without any pre-configured scope."
+commands.deny = ["get_model_defaults"]

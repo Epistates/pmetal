@@ -1,12 +1,57 @@
 /**
- * PMetal API - TypeScript wrappers for Tauri commands
+ * The app's backend, as TypeScript.
+ *
+ * Job forms, their defaults and their ranges are not here: the backend reads
+ * them from the job specs and sends them (`listJobForms`). What this file
+ * types is the contract of the commands and events; the names of the fields a
+ * job may be given come from `specs.generated.ts`, which a test keeps equal to
+ * the specs.
  */
 
-import { invoke, Channel } from '@tauri-apps/api/core';
+import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import type { InferSpec, JobFields, JobKey } from './specs.generated';
+
+export type { InferSpec, JobFields, JobKey } from './specs.generated';
 
 // =============================================================================
-// Types
+// Errors
+// =============================================================================
+
+/** Why a job did not start; `issues` name the fields of the form that are wrong. */
+export interface StartFailure {
+  message: string;
+  issues: FieldIssue[];
+}
+
+export interface FieldIssue {
+  field: string;
+  message: string;
+}
+
+/** The text of whatever a command rejected with. */
+export function errorMessage(e: unknown): string {
+  if (typeof e === 'string') return e;
+  if (e instanceof Error) return e.message;
+  if (e && typeof e === 'object' && 'message' in e && typeof e.message === 'string') {
+    return e.message;
+  }
+  return String(e);
+}
+
+/** The field-level problems in a rejection, if it carries any. */
+export function issuesOf(e: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (e && typeof e === 'object' && 'issues' in e && Array.isArray(e.issues)) {
+    for (const issue of e.issues as FieldIssue[]) {
+      if (issue.field && !(issue.field in out)) out[issue.field] = issue.message;
+    }
+  }
+  return out;
+}
+
+// =============================================================================
+// System and settings
 // =============================================================================
 
 export interface SystemInfo {
@@ -27,22 +72,51 @@ export interface SystemInfo {
   has_nax: boolean;
 }
 
+export type Theme = 'system' | 'light' | 'dark';
+
+/** The settings. The Hugging Face token is not in it: only whether one is saved. */
 export interface AppConfig {
-  cache_dir: string;
-  hf_token: string | null;
   default_model: string | null;
-  theme: string;
+  theme: Theme;
+  custom_model_dirs: string[];
+  /** The Hub cache in use; set by HF_HOME or HF_HUB_CACHE. */
+  hf_cache_dir: string;
+  /** Where jobs write what they produce. */
+  output_dir: string;
+  hf_token_set: boolean;
+  notes: string[];
+  pmetal_binary: string | null;
+  pmetal_binary_error: string | null;
 }
+
+export const getSystemInfo = () => invoke<SystemInfo>('get_system_info');
+export const getConfig = () => invoke<AppConfig>('get_config');
+export const setConfig = (patch: { default_model?: string; theme?: Theme }) =>
+  invoke<AppConfig>('set_config', { patch });
+export const setHfToken = (token: string) => invoke<AppConfig>('set_hf_token', { token });
+export const clearHfToken = () => invoke<AppConfig>('clear_hf_token');
+
+/** Let the person choose a folder; `null` if they cancel. */
+export const pickDirectory = (title?: string) =>
+  invoke<string | null>('pick_directory', { title: title ?? null });
+export const pickFile = (title?: string) =>
+  invoke<string | null>('pick_file', { title: title ?? null });
+
+// =============================================================================
+// Models
+// =============================================================================
 
 export type ModelSource = 'hf_cache' | 'trained' | 'custom';
 
 export interface CachedModel {
   id: string;
   path: string;
+  /** What to give a job to use it: the Hub id, or a full path. */
+  reference: string;
   size: number;
   size_formatted: string;
-  downloaded_at: string;
-  model_type: string | null;
+  downloaded_at: string | null;
+  model_type: string;
   source: ModelSource;
 }
 
@@ -59,281 +133,27 @@ export interface ModelInfo {
 }
 
 export interface ModelFitInfo {
-  inference_fit: string; // "fits" | "tight" | "too_large"
-  training_fit: string;
+  inference_fit: 'fits' | 'tight' | 'too_large';
+  training_fit: 'fits' | 'tight' | 'too_large';
   weights_gb: number;
   inference_memory_gb: number;
   training_memory_gb: number;
   available_memory_gb: number;
   estimated_tps: number | null;
   recommended_batch_size: number;
+  notes: string[];
 }
 
-export type TrainingStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
-
-export interface TrainingRun {
-  id: string;
-  status: TrainingStatus;
-  model: string;
-  method: string;
-  dataset: string | null;
-  epoch: number;
-  total_epochs: number;
-  step: number;
-  total_steps: number;
-  loss: number | null;
-  best_loss: number | null;
-  learning_rate: number | null;
-  grad_norm: number | null;
-  tokens_per_second: number | null;
-  eta_seconds: number | null;
-  started_at: string;
-  ended_at: string | null;
-  output_dir: string | null;
-  error_message: string | null;
-  status_message: string | null;
-  config_summary: TrainingConfigSummary | null;
-}
-
-export interface TrainingConfigSummary {
-  learning_rate: number;
-  batch_size: number;
-  max_seq_len: number;
-  lora_rank: number | null;
-  lora_alpha: number | null;
-  sequence_packing: boolean;
-  gradient_checkpointing: boolean;
-}
-
-/** Optimizers every training job accepts; `adamw` is the default. */
-export const OPTIMIZERS = [
-  'adamw',
-  'sgd',
-  'lion',
-  'adafactor',
-  'muon',
-  'adamw_schedule_free',
-  'adamw_8bit',
-] as const;
-export type OptimizerName = (typeof OPTIMIZERS)[number];
-/** Shown beside every optimizer picker. */
-export const OPTIMIZER_HINT =
-  'Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW. Schedule-free AdamW wants a constant learning rate.';
-
-export interface TrainSpec {
-  model: string;
-  dataset: string;
-  eval_dataset?: string | null;
-  output_dir?: string;
-  learning_rate?: number;
-  embedding_lr?: number | null;
-  label_smoothing?: number;
-  z_loss?: number;
-  neftune_alpha?: number | null;
-  batch_size?: number;
-  epochs?: number;
-  max_seq_len?: number;
-  gradient_accumulation_steps?: number;
-  no_gradient_checkpointing?: boolean;
-  max_grad_norm?: number;
-  warmup_steps?: number;
-  warmup_ratio?: number | null;
-  min_lr?: number | null;
-  wsd_stable_ratio?: number | null;
-  wsd_decay_style?: string | null;
-  cosine_num_restarts?: number | null;
-  polynomial_power?: number | null;
-  max_steps?: number | null;
-  logging_steps?: number;
-  eval_steps?: number | null;
-  save_steps?: number | null;
-  lora_targets?: string[];
-  weight_decay?: number;
-  optimizer?: OptimizerName;
-  lr_schedule?: string;
-  seed?: number;
-  loss_scale?: number;
-  lora_r?: number;
-  lora_alpha?: number;
-  lora_dropout?: number;
-  rslora?: boolean;
-  dora?: boolean;
-  quantization?: string | null;
-  quant_block_size?: number;
-  double_quant?: boolean;
-  text_column?: string | null;
-  text_columns?: string | null;
-  column_separator?: string | null;
-  prompt_column?: string | null;
-  response_column?: string | null;
-  no_sequence_packing?: boolean;
-  cut_cross_entropy?: boolean;
-  no_adaptive_lr?: boolean;
-  ane?: boolean;
-  pack_max_seq_len?: number | null;
-  distributed_peers?: string | null;
-  distributed_auto?: boolean;
-  compression_strategy?: string | null;
-  config_path?: string | null;
-  resume?: boolean;
-}
-
-export interface GrpoRun {
-  id: string;
-  status: TrainingStatus;
-  model: string;
-  dataset: string | null;
-  step: number;
-  total_steps: number;
-  reward_mean: number | null;
-  reward_std: number | null;
-  kl_div: number | null;
-  loss: number | null;
-  learning_rate: number | null;
-  tokens_per_second: number | null;
-  eta_seconds: number | null;
-  started_at: string;
-  ended_at: string | null;
-  output_dir: string | null;
-  error_message: string | null;
-}
-
-/** GRPO loss types: dapo (token-level, default), grpo, dr_grpo, gspo. */
-export const GRPO_LOSS_TYPES = ['dapo', 'grpo', 'dr_grpo', 'gspo'] as const;
-export type GrpoLossType = (typeof GRPO_LOSS_TYPES)[number];
-
-export interface GrpoSpec {
-  model: string;
-  dataset: string;
-  output_dir?: string;
-  num_generations?: number;
-  beta?: number;
-  learning_rate?: number;
-  optimizer?: OptimizerName;
-  epochs?: number;
-  lora_r?: number;
-  lora_alpha?: number;
-  max_seq_len?: number;
-  max_completion_length?: number;
-  seed?: number;
-  dapo?: boolean;
-  loss_type?: GrpoLossType;
-  num_iterations?: number;
-  reasoning_rewards?: boolean;
-  vlm?: boolean;
-  max_image_size?: number;
-  reward_model?: string | null;
-  reward_model_max_length?: number;
-  reward_model_weight?: number;
-  reward_model_template?: string | null;
-  async_rewards?: boolean;
-  text_column?: string | null;
-  text_columns?: string | null;
-  column_separator?: string | null;
-  prompt_column?: string | null;
-  response_column?: string | null;
-  grpo_kv_bits?: number | null;
-  log_metrics?: string | null;
-}
-
-export type DistillationStatus =
-  | 'pending'
-  | 'loading_models'
-  | 'generating_signals'
-  | 'training'
-  | 'completed'
-  | 'failed'
-  | 'cancelled';
-
-export interface DistillationRun {
-  id: string;
-  status: DistillationStatus;
-  student_model: string;
-  teacher_model: string;
-  dataset: string | null;
-  loss_type: string;
-  epoch: number;
-  total_epochs: number;
-  step: number;
-  total_steps: number;
-  loss: number | null;
-  best_loss: number | null;
-  learning_rate: number | null;
-  tokens_per_second: number | null;
-  eta_seconds: number | null;
-  started_at: string;
-  ended_at: string | null;
-  output_dir: string | null;
-  error_message: string | null;
-}
-
-export interface DistillSpec {
-  teacher: string;
-  student: string;
-  dataset: string;
-  output_dir?: string;
-  method?: string;
-  offline?: boolean;
-  offline_cache?: string | null;
-  offline_generate?: boolean;
-  offline_compression?: string;
-  offline_top_k?: number;
-  loss_type?: string;
-  temperature?: number;
-  alpha?: number;
-  rationale?: boolean;
-  rationale_weight?: number;
-  lora_r?: number;
-  lora_alpha?: number;
-  learning_rate?: number;
-  optimizer?: OptimizerName;
-  batch_size?: number;
-  epochs?: number;
-  max_seq_len?: number;
-  seed?: number;
-  text_column?: string | null;
-  text_columns?: string | null;
-  column_separator?: string | null;
-  prompt_column?: string | null;
-  response_column?: string | null;
-  log_metrics?: string | null;
-}
-
-export interface InferSpec {
-  model: string;
-  lora?: string | null;
-  prompt?: string;
-  max_tokens?: number;
-  temperature?: number | null;
-  top_k?: number | null;
-  top_p?: number | null;
-  min_p?: number | null;
-  repetition_penalty?: number | null;
-  frequency_penalty?: number | null;
-  presence_penalty?: number | null;
-  seed?: number | null;
-  system?: string | null;
-  no_thinking?: boolean;
-  /** For chat templates with a reasoning_effort control (Qwen3.8, gpt-oss). */
-  reasoning_effort?: string | null;
-  /** Drop the thinking of earlier turns (chat templates with preserve_thinking). */
-  no_preserve_thinking?: boolean;
-  /** Extra chat template keyword arguments, as a JSON object string. */
-  chat_template_kwargs?: string | null;
-  fp8?: boolean;
-  experts_dir?: string | null;
-  kv_quant?: number | null;
-  kv_k_bits?: number | null;
-  kv_v_bits?: number | null;
-  kv_group_size?: number;
-  no_kv_quant?: boolean;
-  kv_turboquant?: boolean;
-  kv_turboquant_preset?: 'q2_5' | 'q3_5' | null;
-}
-
-export interface InferenceMessage {
-  role: 'user' | 'assistant';
-  content: string;
+export interface ModelDefaults {
+  temperature: number | null;
+  top_k: number | null;
+  top_p: number | null;
+  max_new_tokens: number | null;
+  repetition_penalty: number | null;
+  max_position_embeddings: number | null;
+  hidden_size: number | null;
+  num_hidden_layers: number | null;
+  vocab_size: number | null;
 }
 
 export interface HubSearchResult {
@@ -346,7 +166,41 @@ export interface HubSearchResult {
   is_gated: boolean;
   library_name: string | null;
   tags: string[];
+  params_b: number | null;
+  size_bytes: number | null;
+  fit: 'fits' | 'tight' | 'too_large' | null;
 }
+
+export interface TrainedAdapter {
+  path: string;
+  name: string;
+  base_model: string | null;
+  rank: number | null;
+  alpha: number | null;
+  size_bytes: number;
+}
+
+export const listModels = () => invoke<CachedModel[]>('list_models');
+export const refreshModels = () => invoke<CachedModel[]>('refresh_models');
+export const getModelInfo = (modelId: string) =>
+  invoke<ModelInfo | null>('get_model_info', { modelId });
+export const getModelDefaults = (modelId: string) =>
+  invoke<ModelDefaults>('get_model_defaults', { modelId });
+export const getModelFit = (modelId: string) => invoke<ModelFitInfo>('get_model_fit', { modelId });
+export const deleteModel = (modelId: string) => invoke<void>('delete_model', { modelId });
+export const addModelDirectory = (path: string) =>
+  invoke<CachedModel[]>('add_model_directory', { path });
+export const removeModelDirectory = (path: string) =>
+  invoke<CachedModel[]>('remove_model_directory', { path });
+export const searchHubModels = (query: string, limit?: number) =>
+  invoke<HubSearchResult[]>('search_hub_models', { query, limit });
+export const getTrendingModels = (limit?: number) =>
+  invoke<HubSearchResult[]>('get_trending_models', { limit });
+export const listTrainedAdapters = () => invoke<TrainedAdapter[]>('list_trained_adapters');
+
+// =============================================================================
+// Datasets
+// =============================================================================
 
 export interface DatasetSearchResult {
   id: string;
@@ -365,183 +219,6 @@ export interface CachedDatasetInfo {
   size_formatted: string;
 }
 
-export interface MergeSpec {
-  model_a: string;
-  model_b: string;
-  output: string;
-  method?: string;
-  base?: string | null;
-  t?: number;
-  weight_a?: number;
-  weight_b?: number;
-  density?: number;
-  dtype?: string;
-}
-
-export interface MergeStrategy {
-  name: string;
-  description: string;
-  supports_weights: boolean;
-}
-
-export interface DashboardStats {
-  models_count: number;
-  total_model_size: string;
-  active_training_runs: number;
-  completed_training_runs: number;
-  total_training_runs: number;
-  active_grpo_runs: number;
-  active_distillation_runs: number;
-}
-
-export interface FuseResult {
-  output_dir: string;
-  model_size_bytes: number;
-}
-
-export interface ModelDefaults {
-  temperature: number | null;
-  top_k: number | null;
-  top_p: number | null;
-  max_new_tokens: number | null;
-  repetition_penalty: number | null;
-  max_position_embeddings: number | null;
-  hidden_size: number | null;
-  num_hidden_layers: number | null;
-  vocab_size: number | null;
-}
-
-export interface TrainedAdapter {
-  path: string;
-  name: string;
-  base_model: string | null;
-  rank: number | null;
-  alpha: number | null;
-  size_bytes: number;
-}
-
-export interface DeviceInfo {
-  gpu_name: string;
-  arch: string;
-  platform: string;
-  total_memory: number;
-  available_memory: number;
-  total_memory_formatted: string;
-  available_memory_formatted: string;
-  gpu_cores: number | null;
-  ane_cores: number | null;
-  memory_bandwidth_gbps: number | null;
-  is_apple_silicon: boolean;
-  has_ane: boolean;
-  has_nax: boolean;
-  chip_tier: string | null;
-}
-
-// =============================================================================
-// System API
-// =============================================================================
-
-export async function getConfig(): Promise<AppConfig> {
-  return await invoke('get_config');
-}
-
-export async function setConfig(config: AppConfig): Promise<void> {
-  return await invoke('set_config', { config });
-}
-
-export async function getSystemInfo(): Promise<SystemInfo> {
-  return await invoke('get_system_info');
-}
-
-export async function getDeviceInfo(): Promise<DeviceInfo> {
-  return await invoke('get_device_info');
-}
-
-// =============================================================================
-// Model API
-// =============================================================================
-
-export async function listModels(): Promise<CachedModel[]> {
-  return await invoke('list_models');
-}
-
-export async function getModelInfo(modelId: string): Promise<ModelInfo> {
-  return await invoke('get_model_info', { modelId });
-}
-
-export async function downloadModel(
-  modelId: string,
-  revision?: string,
-  onProgress?: (progress: number) => void
-): Promise<string> {
-  let unlistenStart: UnlistenFn | undefined;
-  let unlistenComplete: UnlistenFn | undefined;
-
-  try {
-    if (onProgress) {
-      unlistenStart = await listen<string>('download-started', () => {
-        onProgress(0);
-      });
-      unlistenComplete = await listen<string>('download-completed', () => {
-        onProgress(100);
-      });
-    }
-
-    return await invoke('download_model', { modelId, revision });
-  } finally {
-    unlistenStart?.();
-    unlistenComplete?.();
-  }
-}
-
-export async function deleteModel(modelId: string): Promise<void> {
-  return await invoke('delete_model', { modelId });
-}
-
-export async function addModelDirectory(path: string): Promise<CachedModel[]> {
-  return await invoke('add_model_directory', { path });
-}
-
-export async function removeModelDirectory(path: string): Promise<CachedModel[]> {
-  return await invoke('remove_model_directory', { path });
-}
-
-export async function listModelDirectories(): Promise<string[]> {
-  return await invoke('list_model_directories');
-}
-
-export async function searchHubModels(query: string, limit?: number): Promise<HubSearchResult[]> {
-  return await invoke('search_hub_models', { query, limit });
-}
-
-export async function getTrendingModels(limit?: number): Promise<HubSearchResult[]> {
-  return await invoke('get_trending_models', { limit });
-}
-
-export async function getModelFit(modelId: string): Promise<ModelFitInfo> {
-  return await invoke('get_model_fit', { modelId });
-}
-
-// =============================================================================
-// Dataset API
-// =============================================================================
-
-export async function searchHubDatasets(query: string, limit?: number): Promise<DatasetSearchResult[]> {
-  return await invoke('search_hub_datasets', { query, limit });
-}
-
-export async function getTrendingDatasets(limit?: number): Promise<DatasetSearchResult[]> {
-  return await invoke('get_trending_datasets', { limit });
-}
-
-export async function listCachedDatasets(): Promise<CachedDatasetInfo[]> {
-  return await invoke('list_cached_datasets');
-}
-
-export async function downloadDataset(datasetId: string): Promise<string> {
-  return await invoke('download_dataset', { datasetId });
-}
-
 export interface DatasetPeek {
   columns: string[];
   avg_tokens_estimate: number;
@@ -550,731 +227,215 @@ export interface DatasetPeek {
   rows_sampled: number;
 }
 
-export async function peekDatasetColumns(path: string, limit?: number): Promise<DatasetPeek> {
-  return await invoke('peek_dataset_columns', { path, limit: limit ?? null });
-}
+export const searchHubDatasets = (query: string, limit?: number) =>
+  invoke<DatasetSearchResult[]>('search_hub_datasets', { query, limit });
+export const getTrendingDatasets = (limit?: number) =>
+  invoke<DatasetSearchResult[]>('get_trending_datasets', { limit });
+export const listCachedDatasets = () => invoke<CachedDatasetInfo[]>('list_cached_datasets');
+export const peekDatasetColumns = (path: string, limit?: number) =>
+  invoke<DatasetPeek>('peek_dataset_columns', { path, limit: limit ?? null });
 
 // =============================================================================
-// Training API
+// Downloads
 // =============================================================================
 
-export async function startTraining(
-  spec: TrainSpec,
-  onMetrics?: (data: Record<string, unknown>) => void,
-): Promise<string> {
-  const channel = new Channel<Record<string, unknown>>();
-  if (onMetrics) {
-    channel.onmessage = onMetrics;
-  }
-  return await invoke('start_training', { spec, onMetrics: channel });
-}
+export type DownloadState = 'queued' | 'downloading' | 'completed' | 'failed' | 'cancelled';
 
-export async function getTrainingStatus(runId: string): Promise<TrainingRun> {
-  return await invoke('get_training_status', { runId });
-}
-
-export async function listTrainingRuns(): Promise<TrainingRun[]> {
-  return await invoke('list_training_runs');
-}
-
-export async function stopTraining(runId: string): Promise<void> {
-  return await invoke('stop_training', { runId });
-}
-
-export function onTrainingStarted(callback: (run: TrainingRun) => void): Promise<UnlistenFn> {
-  return listen<TrainingRun>('training-started', (event) => {
-    callback(event.payload);
-  });
-}
-
-export function onTrainingStopped(callback: (runId: string) => void): Promise<UnlistenFn> {
-  return listen<string>('training-stopped', (event) => {
-    callback(event.payload);
-  });
-}
-
-export function onTrainingUpdate(callback: (run: TrainingRun) => void): Promise<UnlistenFn> {
-  return listen<TrainingRun>('training-update', (event) => {
-    callback(event.payload);
-  });
-}
-
-// =============================================================================
-// Serve API
-// =============================================================================
-
-export type ServeStatus = 'starting' | 'running' | 'stopped' | 'failed';
-
-export interface ServeInstance {
+export interface DownloadView {
   id: string;
-  status: ServeStatus;
-  model: string;
-  host: string;
-  port: number;
-  bind_url: string;
-  max_seq_len: number;
-  fp8: boolean;
-  kv_cache: string;
+  kind: 'model' | 'dataset';
+  model_id: string;
+  state: DownloadState;
+  files_done: number;
+  total_files: number;
+  bytes_done: number;
+  total_bytes: number;
+  bytes_per_sec: number | null;
+  eta_seconds: number | null;
+  current_file: string | null;
+  path: string | null;
+  error: string | null;
   started_at: string;
-  ready_at: string | null;
-  stopped_at: string | null;
-  error_message: string | null;
-  status_message: string | null;
-  log_tail: string[];
 }
 
-export interface ServeSpec {
-  model: string;
-  host?: string;
-  port?: number;
-  max_seq_len?: number;
-  experts_dir?: string | null;
-  fp8?: boolean;
-  kv_quant?: number | null;
-  no_kv_quant?: boolean;
-  kv_group_size?: number;
-  kv_turboquant?: boolean;
-  kv_turboquant_preset?: string | null;
-  ane?: boolean;
-  ane_max_seq_len?: number;
-  draft_model?: string | null;
-  continuous_batch?: boolean;
-  cb_max_slots?: number;
-  cb_max_queue_depth?: number;
-}
-
-export async function startServe(spec: ServeSpec): Promise<string> {
-  return await invoke('start_serve', { spec });
-}
-
-export async function stopServe(instanceId: string): Promise<void> {
-  return await invoke('stop_serve', { instanceId });
-}
-
-export async function listServeInstances(): Promise<ServeInstance[]> {
-  return await invoke('list_serve_instances');
-}
-
-export function onServeStarted(
-  callback: (instance: ServeInstance) => void,
-): Promise<UnlistenFn> {
-  return listen<ServeInstance>('serve-started', (event) => {
-    callback(event.payload);
-  });
-}
-
-export function onServeUpdate(
-  callback: (instance: ServeInstance) => void,
-): Promise<UnlistenFn> {
-  return listen<ServeInstance>('serve-update', (event) => {
-    callback(event.payload);
-  });
-}
-
-export function onServeStopped(callback: (instanceId: string) => void): Promise<UnlistenFn> {
-  return listen<string>('serve-stopped', (event) => {
-    callback(event.payload);
-  });
-}
+export const downloadModel = (modelId: string, revision?: string) =>
+  invoke<DownloadView>('download_model', { modelId, revision: revision || null });
+export const downloadDataset = (datasetId: string) =>
+  invoke<DownloadView>('download_dataset', { datasetId });
+export const listDownloads = () => invoke<DownloadView[]>('list_downloads');
+export const cancelDownload = (downloadId: string) =>
+  invoke<void>('cancel_download', { downloadId });
+export const clearFinishedDownloads = () => invoke<void>('clear_finished_downloads');
 
 // =============================================================================
-// Bench API
+// Jobs
 // =============================================================================
 
-export type JobStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
+export type FieldInput =
+  | { type: 'text' }
+  | { type: 'number'; min: number | null; max: number | null }
+  | { type: 'integer'; min: number | null; max: number | null }
+  | { type: 'choice'; options: string[] }
+  | { type: 'toggle' }
+  | { type: 'model' }
+  | { type: 'dataset' }
+  | { type: 'path' }
+  | { type: 'readonly' };
 
-export interface BenchTrial {
-  index: number;
-  prompt_tps: number;
-  generation_tps: number;
-  peak_memory_gb: number;
+export interface FieldInfo {
+  name: string;
+  label: string;
+  help: string | null;
+  group: string;
+  input: FieldInput;
+  required: boolean;
+  /** Entered as comma-separated values. */
+  list: boolean;
+  /** May be left empty. */
+  optional: boolean;
+  /** The text the form starts with: the command line's own default. */
+  default: string;
 }
 
-export interface BenchRun {
+export interface FormInfo {
+  key: JobKey;
+  label: string;
+  description: string;
+  subcommand: string;
+  fields: FieldInfo[];
+}
+
+export type JobState = 'running' | 'stopping' | 'completed' | 'failed' | 'stopped';
+
+export interface JobView {
   id: string;
-  status: JobStatus;
-  mode: string;
-  model: string;
-  preset: string | null;
-  started_at: string;
-  ended_at: string | null;
-  trials: BenchTrial[];
-  error_message: string | null;
-  log_tail: string[];
-}
-
-export interface BenchSpec {
-  mode?: 'basic' | 'workload';
-  model: string;
-  dataset?: string | null;
-  preset?: string | null;
-  experts_dir?: string | null;
-  inference_context?: string;
-  prompt_samples?: number;
-  max_prompt_tokens?: number;
-  decode_steps?: number;
-  inference_warmup_passes?: number;
-  inference_session_repeats?: number;
-  inference_repeats?: number;
-  train_samples?: number;
-  train_steps?: number;
-  batch_size?: number;
-  seq_len?: number;
-  max_seq_len?: number;
-  json?: boolean;
-  output?: string | null;
-}
-
-export async function startBench(
-  spec: BenchSpec,
-  onEvent?: (e: Record<string, unknown>) => void,
-): Promise<string> {
-  const channel = new Channel<Record<string, unknown>>();
-  if (onEvent) channel.onmessage = onEvent;
-  return await invoke('start_bench', { spec, onEvent: channel });
-}
-
-export async function stopBench(runId: string): Promise<void> {
-  return await invoke('stop_bench', { runId });
-}
-
-export async function listBenchRuns(): Promise<BenchRun[]> {
-  return await invoke('list_bench_runs');
-}
-
-export function onBenchStarted(callback: (run: BenchRun) => void): Promise<UnlistenFn> {
-  return listen<BenchRun>('bench-started', (event) => {
-    callback(event.payload);
-  });
-}
-
-export function onBenchUpdate(callback: (run: BenchRun) => void): Promise<UnlistenFn> {
-  return listen<BenchRun>('bench-update', (event) => {
-    callback(event.payload);
-  });
-}
-
-export function onBenchStopped(callback: (runId: string) => void): Promise<UnlistenFn> {
-  return listen<string>('bench-stopped', (event) => {
-    callback(event.payload);
-  });
-}
-
-// =============================================================================
-// Eval API
-// =============================================================================
-
-export interface EvalMetrics {
-  samples_done: number;
-  samples_total: number;
-  perplexity: number | null;
-  accuracy: number | null;
+  kind: JobKey;
+  label: string;
+  title: string;
+  command: string;
+  state: JobState;
+  error: string | null;
+  exit_code: number | null;
+  phase: string | null;
+  step: number | null;
+  total_steps: number | null;
+  epoch: number | null;
+  total_epochs: number | null;
   loss: number | null;
-}
-
-export interface EvalRun {
-  id: string;
-  status: JobStatus;
-  model: string;
-  dataset: string;
+  best_loss: number | null;
+  eval_loss: number | null;
+  learning_rate: number | null;
+  grad_norm: number | null;
+  tokens_per_second: number | null;
+  progress: number | null;
+  eta_seconds: number | null;
   started_at: string;
-  ended_at: string | null;
-  metrics: EvalMetrics;
-  error_message: string | null;
-  log_tail: string[];
+  finished_at: string | null;
+  elapsed_seconds: number;
+  output: string | null;
+  serve: { url: string; reachable: boolean } | null;
+  result: {
+    output_path: string | null;
+    final_loss: number | null;
+    total_steps: number | null;
+    extra: Record<string, string>;
+  } | null;
 }
 
-export interface EvalSpec {
-  model: string;
-  dataset: string;
-  lora?: string | null;
-  max_seq_len?: number;
-  num_samples?: number;
-  json?: boolean;
+export interface OutputLine {
+  seq: number;
+  stream: 'stdout' | 'stderr';
+  text: string;
 }
 
-export async function startEval(
-  spec: EvalSpec,
-  onEvent?: (e: Record<string, unknown>) => void,
-): Promise<string> {
-  const channel = new Channel<Record<string, unknown>>();
-  if (onEvent) channel.onmessage = onEvent;
-  return await invoke('start_eval', { spec, onEvent: channel });
+export interface OutputPage {
+  lines: OutputLine[];
+  next_since: number;
+  dropped_lines: number;
 }
 
-export async function stopEval(runId: string): Promise<void> {
-  return await invoke('stop_eval', { runId });
+export interface StepPoint {
+  step: number;
+  loss: number;
+  learning_rate: number;
+  tokens_per_second: number;
 }
 
-export async function listEvalRuns(): Promise<EvalRun[]> {
-  return await invoke('list_eval_runs');
+export interface StepPage {
+  steps: StepPoint[];
+  next_since: number;
 }
 
-export function onEvalStarted(callback: (run: EvalRun) => void): Promise<UnlistenFn> {
-  return listen<EvalRun>('eval-started', (event) => {
-    callback(event.payload);
-  });
-}
+/** The text entered for fields of job `K`, by the spec's own field names. */
+export type JobValues<K extends JobKey> = Partial<Record<JobFields[K], string>>;
 
-export function onEvalUpdate(callback: (run: EvalRun) => void): Promise<UnlistenFn> {
-  return listen<EvalRun>('eval-update', (event) => {
-    callback(event.payload);
-  });
-}
+export const listJobForms = () => invoke<FormInfo[]>('list_job_forms');
+export const listJobs = () => invoke<JobView[]>('list_jobs');
+export const stopJob = (jobId: string) => invoke<void>('stop_job', { jobId });
+export const forgetJob = (jobId: string) => invoke<void>('forget_job', { jobId });
+export const jobOutput = (jobId: string, tail?: number, since?: number) =>
+  invoke<OutputPage>('job_output', { jobId, tail: tail ?? null, since: since ?? null });
+export const jobSteps = (jobId: string, since?: number) =>
+  invoke<StepPage>('job_steps', { jobId, since: since ?? null });
 
-export function onEvalStopped(callback: (runId: string) => void): Promise<UnlistenFn> {
-  return listen<string>('eval-stopped', (event) => {
-    callback(event.payload);
-  });
-}
-
-// =============================================================================
-// GRPO API
-// =============================================================================
-
-export async function startGrpo(
-  spec: GrpoSpec,
-  onEvent?: (e: Record<string, unknown>) => void,
-): Promise<string> {
-  const channel = new Channel<Record<string, unknown>>();
-  if (onEvent) channel.onmessage = onEvent;
-  return await invoke('start_grpo', { spec, onEvent: channel });
-}
-
-export async function getGrpoStatus(runId: string): Promise<GrpoRun> {
-  return await invoke('get_grpo_status', { runId });
-}
-
-export async function listGrpoRuns(): Promise<GrpoRun[]> {
-  return await invoke('list_grpo_runs');
-}
-
-export async function stopGrpo(runId: string): Promise<void> {
-  return await invoke('stop_grpo', { runId });
-}
-
-export function onGrpoStarted(callback: (run: GrpoRun) => void): Promise<UnlistenFn> {
-  return listen<GrpoRun>('grpo-started', (event) => {
-    callback(event.payload);
-  });
-}
-
-export function onGrpoStopped(callback: (runId: string) => void): Promise<UnlistenFn> {
-  return listen<string>('grpo-stopped', (event) => {
-    callback(event.payload);
-  });
-}
-
-export function onGrpoUpdate(callback: (run: GrpoRun) => void): Promise<UnlistenFn> {
-  return listen<GrpoRun>('grpo-update', (event) => {
-    callback(event.payload);
-  });
+/**
+ * Start job `kind` from the text entered in its form. Rejects with a
+ * {@link StartFailure} whose `issues` name the fields that are wrong.
+ */
+export function startJob<K extends JobKey>(kind: K, values: JobValues<K>): Promise<JobView> {
+  return invoke<JobView>('start_job', { kind, values });
 }
 
 // =============================================================================
-// Distillation API
+// Chat
 // =============================================================================
 
-export async function startDistillation(
-  spec: DistillSpec,
-  onEvent?: (e: Record<string, unknown>) => void,
-): Promise<string> {
-  const channel = new Channel<Record<string, unknown>>();
-  if (onEvent) channel.onmessage = onEvent;
-  return await invoke('start_distillation', { spec, onEvent: channel });
+export interface ChatTurn {
+  role: 'user' | 'assistant' | 'system';
+  content: string;
 }
 
-export async function getDistillationStatus(runId: string): Promise<DistillationRun> {
-  return await invoke('get_distillation_status', { runId });
-}
-
-export async function listDistillationRuns(): Promise<DistillationRun[]> {
-  return await invoke('list_distillation_runs');
-}
-
-export async function stopDistillation(runId: string): Promise<void> {
-  return await invoke('stop_distillation', { runId });
-}
-
-export function onDistillationStarted(callback: (run: DistillationRun) => void): Promise<UnlistenFn> {
-  return listen<DistillationRun>('distillation-started', (event) => {
-    callback(event.payload);
-  });
-}
-
-export function onDistillationStopped(callback: (runId: string) => void): Promise<UnlistenFn> {
-  return listen<string>('distillation-stopped', (event) => {
-    callback(event.payload);
-  });
-}
-
-export function onDistillationUpdate(callback: (run: DistillationRun) => void): Promise<UnlistenFn> {
-  return listen<DistillationRun>('distillation-update', (event) => {
-    callback(event.payload);
-  });
-}
-
-// =============================================================================
-// Inference API
-// =============================================================================
-
-export async function startInference(spec: InferSpec, messages?: InferenceMessage[] | null): Promise<void> {
-  return await invoke('start_inference', { spec, messages: messages ?? null });
-}
-
-export async function stopInference(): Promise<void> {
-  return await invoke('stop_inference');
-}
-
-export function onInferenceToken(callback: (token: string) => void): Promise<UnlistenFn> {
-  return listen<string>('inference-token', (event) => {
-    callback(event.payload);
-  });
-}
-
-export interface InferenceMetrics {
+export interface ChatMetrics {
+  session_id: string;
   prompt_tokens: number;
   generated_tokens: number;
   total_ms: number;
   ttft_ms: number | null;
   tok_per_sec: number | null;
-  response_text?: string | null;
-  thinking?: string | null;
-  truncated_thinking?: boolean | null;
+  avg_step_ms: number | null;
+  p50_step_ms: number | null;
+  response_text: string;
+  thinking: string | null;
+  truncated_thinking: boolean;
+  stopped: boolean;
 }
 
-export function onInferenceDone(callback: (metrics: InferenceMetrics | null) => void): Promise<UnlistenFn> {
-  return listen<InferenceMetrics | null>('inference-done', (event) => {
-    callback(event.payload);
-  });
-}
-
-export function onInferenceError(callback: (message: string) => void): Promise<UnlistenFn> {
-  return listen<{ session_id?: string; error?: string }>('inference-error', (event) => {
-    callback(event.payload?.error ?? 'Inference failed');
-  });
-}
+/**
+ * Start a reply. The events it produces carry `sessionId`, which the page
+ * chooses so it can recognise them before this resolves.
+ */
+export const startChat = (spec: InferSpec, messages: ChatTurn[] | null, sessionId: string) =>
+  invoke<void>('start_chat', { spec, messages, sessionId });
+export const stopChat = (sessionId?: string) =>
+  invoke<void>('stop_chat', { sessionId: sessionId ?? null });
 
 // =============================================================================
-// Merge API
+// Events
 // =============================================================================
 
-export async function mergeModels(spec: MergeSpec): Promise<string> {
-  return await invoke('merge_models', { spec });
-}
+const on = <T>(event: string, callback: (payload: T) => void): Promise<UnlistenFn> =>
+  listen<T>(event, (e) => callback(e.payload));
 
-export async function getMergeStrategies(): Promise<MergeStrategy[]> {
-  return await invoke('get_merge_strategies');
-}
-
-// =============================================================================
-// Model Defaults API
-// =============================================================================
-
-export async function getModelDefaults(modelId: string): Promise<ModelDefaults> {
-  return await invoke('get_model_defaults', { modelId });
-}
-
-// =============================================================================
-// Adapters API
-// =============================================================================
-
-export async function listTrainedAdapters(): Promise<TrainedAdapter[]> {
-  return await invoke('list_trained_adapters');
-}
-
-// =============================================================================
-// Fuse / Quantize API
-// =============================================================================
-
-export async function fuseLora(
-  baseModel: string,
-  loraPath: string,
-  outputDir: string
-): Promise<FuseResult> {
-  return await invoke('fuse_lora', { baseModel, loraPath, outputDir });
-}
-
-export async function quantizeModel(
-  modelId: string,
-  quantType: string,
-  outputPath: string,
-  options?: {
-    imatrix?: string | null;
-    format?: string;
-    bits?: number;
-    groupSize?: number;
-    klCalibrate?: boolean;
-    targetBpw?: number | null;
-    klThreshold?: number;
-  },
-): Promise<string> {
-  return await invoke('quantize_model', {
-    modelId,
-    quantType,
-    outputPath,
-    imatrix: options?.imatrix ?? null,
-    format: options?.format ?? 'gguf',
-    bits: options?.bits ?? 4,
-    groupSize: options?.groupSize ?? 64,
-    klCalibrate: options?.klCalibrate ?? false,
-    targetBpw: options?.targetBpw ?? null,
-    klThreshold: options?.klThreshold ?? 0.01,
-  });
-}
-
-// =============================================================================
-// Dashboard API
-// =============================================================================
-
-export async function getDashboardStats(): Promise<DashboardStats> {
-  return await invoke('get_dashboard_stats');
-}
-
-// =============================================================================
-// Pretrain API
-// =============================================================================
-
-export interface PretrainMetrics {
-  step: number;
-  total_steps: number;
-  loss: number | null;
-  best_loss: number | null;
-  tokens_per_second: number | null;
-  learning_rate: number | null;
-  eta_seconds: number | null;
-}
-
-export interface PretrainRun {
-  id: string;
-  status: JobStatus;
-  arch: string;
-  output_dir: string;
-  started_at: string;
-  ended_at: string | null;
-  metrics: PretrainMetrics;
-  error_message: string | null;
-  log_tail: string[];
-}
-
-export interface PretrainSpec {
-  arch: string;
-  shards?: string | null;
-  seq_len?: number;
-  batch_size?: number;
-  steps?: number;
-  learning_rate?: number;
-  min_lr?: number;
-  warmup_steps?: number;
-  lr_schedule?: string;
-  weight_decay?: number;
-  max_grad_norm?: number;
-  eos_token_id?: number;
-  output_dir?: string;
-  checkpoint_every?: number;
-  resume?: string | null;
-  model_config?: string | null;
-  z_loss?: number;
-  document_mask?: boolean;
-  gradient_accumulation_steps?: number;
-  log_every?: number;
-  eval_every?: number;
-  eval_batches?: number;
-  seed?: number;
-}
-
-export async function startPretrain(
-  spec: PretrainSpec,
-  onEvent?: (e: Record<string, unknown>) => void,
-): Promise<string> {
-  const channel = new Channel<Record<string, unknown>>();
-  if (onEvent) channel.onmessage = onEvent;
-  return await invoke('start_pretrain', { spec, onEvent: channel });
-}
-
-export async function listPretrainRuns(): Promise<PretrainRun[]> {
-  return await invoke('list_pretrain_runs');
-}
-
-export async function stopPretrain(runId: string): Promise<void> {
-  return await invoke('stop_pretrain', { runId });
-}
-
-export function onPretrainStarted(callback: (run: PretrainRun) => void): Promise<UnlistenFn> {
-  return listen<PretrainRun>('pretrain-started', (event) => {
-    callback(event.payload);
-  });
-}
-
-export function onPretrainUpdate(callback: (run: PretrainRun) => void): Promise<UnlistenFn> {
-  return listen<PretrainRun>('pretrain-update', (event) => {
-    callback(event.payload);
-  });
-}
-
-export function onPretrainStopped(callback: (runId: string) => void): Promise<UnlistenFn> {
-  return listen<string>('pretrain-stopped', (event) => {
-    callback(event.payload);
-  });
-}
-
-// =============================================================================
-// Embed-Train API
-// =============================================================================
-
-export interface EmbedTrainConfig {
-  model: string;
-  dataset: string;
-  output_dir?: string | null;
-  loss?: string | null;
-  pooling?: string | null;
-  temperature?: number | null;
-  margin?: number | null;
-  learning_rate?: number | null;
-  batch_size?: number | null;
-  epochs?: number | null;
-  max_seq_len?: number | null;
-  weight_decay?: number | null;
-  no_normalize?: boolean | null;
-  log_every?: number | null;
-  seed?: number | null;
-}
-
-export async function startEmbedTrain(
-  config: EmbedTrainConfig,
-  onEvent?: (e: Record<string, unknown>) => void,
-): Promise<string> {
-  const channel = new Channel<Record<string, unknown>>();
-  if (onEvent) channel.onmessage = onEvent;
-  return await invoke('start_embed_train', { config, onEvent: channel });
-}
-
-// =============================================================================
-// RLKD API
-// =============================================================================
-
-export interface RlkdConfig {
-  model: string;
-  teacher_model: string;
-  dataset: string;
-  output_dir?: string | null;
-  distill_alpha?: number | null;
-  final_alpha?: number | null;
-  anneal_alpha?: boolean | null;
-  distill_temperature?: number | null;
-  num_generations?: number | null;
-  beta?: number | null;
-  learning_rate?: number | null;
-  epochs?: number | null;
-  lora_r?: number | null;
-  lora_alpha?: number | null;
-  max_seq_len?: number | null;
-  max_completion_length?: number | null;
-  seed?: number | null;
-  reasoning_rewards?: boolean | null;
-  prompt_column?: string | null;
-  response_column?: string | null;
-}
-
-export async function startRlkd(
-  config: RlkdConfig,
-  onEvent?: (e: Record<string, unknown>) => void,
-): Promise<string> {
-  const channel = new Channel<Record<string, unknown>>();
-  if (onEvent) channel.onmessage = onEvent;
-  return await invoke('start_rlkd', { config, onEvent: channel });
-}
-
-// =============================================================================
-// Preference optimization API
-// =============================================================================
-
-/** Mirrors `PreferenceSpec` (pmetal-core); omitted fields take its defaults. */
-export interface PreferenceSpec {
-  model: string;
-  dataset: string;
-  output_dir?: string;
-  loss?: 'dpo' | 'ipo' | 'hinge' | 'simpo' | 'orpo' | 'kto';
-  beta?: number | null;
-  simpo_gamma_ratio?: number;
-  label_smoothing?: number;
-  desirable_weight?: number;
-  undesirable_weight?: number;
-  learning_rate?: number;
-  batch_size?: number;
-  gradient_accumulation_steps?: number;
-  epochs?: number;
-  max_steps?: number | null;
-  warmup_ratio?: number;
-  max_grad_norm?: number;
-  weight_decay?: number;
-  optimizer?: OptimizerName;
-  lora_r?: number;
-  lora_alpha?: number;
-  max_prompt_length?: number;
-  max_length?: number;
-  seed?: number;
-  log_metrics?: string | null;
-}
-
-export async function startPreference(
-  spec: PreferenceSpec,
-  onEvent?: (e: Record<string, unknown>) => void,
-): Promise<string> {
-  const channel = new Channel<Record<string, unknown>>();
-  if (onEvent) channel.onmessage = onEvent;
-  return await invoke('start_preference', { spec, onEvent: channel });
-}
-
-// =============================================================================
-// DFlash API
-// =============================================================================
-
-export interface DflashConfig {
-  target: string;
-  draft: string;
-  prompt: string;
-  max_new_tokens?: number | null;
-  temperature?: number | null;
-  speculative_tokens?: number | null;
-  draft_fp8?: boolean | null;
-  json?: boolean | null;
-  no_chat?: boolean | null;
-  tree_budget?: number | null;
-  compare_greedy?: boolean | null;
-}
-
-export async function startDflash(
-  config: DflashConfig,
-  onEvent?: (e: Record<string, unknown>) => void,
-): Promise<string> {
-  const channel = new Channel<Record<string, unknown>>();
-  if (onEvent) channel.onmessage = onEvent;
-  return await invoke('start_dflash', { config, onEvent: channel });
-}
-
-// =============================================================================
-// Modelfile Export API
-// =============================================================================
-
-export interface ModelfileExportConfig {
-  base: string;
-  lora?: string | null;
-  output: string;
-  template?: string | null;
-  system?: string | null;
-  temperature?: number | null;
-  num_ctx?: number | null;
-  top_k?: number | null;
-  top_p?: number | null;
-  license?: string | null;
-}
-
-export async function exportModelfile(
-  config: ModelfileExportConfig,
-  onEvent?: (e: Record<string, unknown>) => void,
-): Promise<string> {
-  const channel = new Channel<Record<string, unknown>>();
-  if (onEvent) channel.onmessage = onEvent;
-  return await invoke('start_ollama', { config, onEvent: channel });
-}
+export const onJobUpdate = (cb: (job: JobView) => void) => on<JobView>('job-update', cb);
+export const onJobOutput = (cb: (e: { job_id: string; lines: OutputLine[] }) => void) =>
+  on('job-output', cb);
+export const onJobsResync = (cb: () => void) => on<null>('jobs-resync', () => cb());
+export const onDownloadUpdate = (cb: (d: DownloadView) => void) =>
+  on<DownloadView>('download-update', cb);
+export const onModelsUpdated = (cb: () => void) => on<null>('models-updated', () => cb());
+export const onAppQuitting = (cb: () => void) => on<null>('app-quitting', () => cb());
+export const onChatToken = (cb: (e: { session_id: string; text: string }) => void) =>
+  on('chat-token', cb);
+export const onChatDone = (cb: (m: ChatMetrics) => void) => on<ChatMetrics>('chat-done', cb);
+export const onChatError = (cb: (e: { session_id: string; error: string }) => void) =>
+  on('chat-error', cb);
