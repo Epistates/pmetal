@@ -524,6 +524,12 @@ impl EmbeddingTrainer {
                 for cb in &mut self.callbacks {
                     cb.on_step_end_with_metrics(&metrics);
                 }
+                // A callback's request to stop ends the run after this step;
+                // what is trained so far is the caller's to save.
+                if self.callbacks.iter().any(|cb| cb.should_stop()) {
+                    tracing::info!("stop requested: ending after step {}", self.step);
+                    break 'epochs;
+                }
             }
 
             let avg_loss = epoch_loss / epoch_steps.max(1) as f64;
@@ -861,6 +867,32 @@ mod tests {
         assert!(lrs[0] < lrs[1], "warmup: {lrs:?}");
         assert!(lrs[3] < lrs[2], "decay: {lrs:?}");
         assert!(seen.iter().all(|s| s.1.is_some_and(f64::is_finite)));
+    }
+
+    /// A callback's request to stop ends the run after the step in flight,
+    /// cleanly, so the command saves what was trained.
+    #[test]
+    fn a_stop_request_ends_the_run_after_its_step() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct StopAfter(usize, std::sync::Arc<AtomicUsize>);
+        impl TrainingCallback for StopAfter {
+            fn on_step_end_with_metrics(&mut self, _: &pmetal_core::StepMetrics) {
+                self.1.fetch_add(1, Ordering::SeqCst);
+            }
+            fn should_stop(&self) -> bool {
+                self.1.load(Ordering::SeqCst) >= self.0
+            }
+        }
+        let steps = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut trainer = EmbeddingTrainer::new(config(3)).unwrap();
+        trainer.add_callback(Box::new(StopAfter(2, steps.clone())));
+        pmetal_runtime::compat::random::seed(31);
+        let mut encoder = EncoderModel::from_config_str(BERT).unwrap();
+        let losses = trainer
+            .run(&mut encoder, &bert_tokenizer(), &pairs())
+            .unwrap();
+        assert_eq!(losses.len(), 2, "stopped after the second step of 3 epochs");
+        assert_eq!(steps.load(Ordering::SeqCst), 2);
     }
 
     #[test]

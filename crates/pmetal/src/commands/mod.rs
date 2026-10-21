@@ -39,6 +39,8 @@ pub(crate) mod rlkd;
 pub(crate) mod search;
 #[cfg(feature = "serve")]
 pub(crate) mod serve;
+#[cfg(feature = "trainer")]
+pub(crate) mod stop;
 pub(crate) mod tokenize;
 #[cfg(feature = "trainer")]
 pub(crate) mod train;
@@ -100,10 +102,13 @@ impl RunContext {
     }
 }
 
-/// Run a trainer command with `--log-events` applied: the run gets the event
-/// log's callback, and a failed log write is reported when it ends.
+/// Run a trainer command the way the command line does: `--log-events`
+/// applied (the run gets the event log's callback, and a failed log write is
+/// reported when it ends), and a request to stop honoured (Ctrl-C or SIGTERM
+/// ends the run after the step in flight, which saves what it has; the command
+/// then exits with the interrupted status).
 #[cfg(feature = "trainer")]
-pub(crate) async fn with_event_log<F, Fut>(
+pub(crate) async fn with_run_context<F, Fut>(
     events: Option<&std::path::Path>,
     job_id: &str,
     run: F,
@@ -113,12 +118,15 @@ where
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
     let log = events.map(events::EventLog::create).transpose()?;
+    let stop = stop::StopFlag::watch();
     let mut ctx = RunContext::console();
     ctx.callbacks
         .extend(log.iter().map(|log| log.callback(job_id)));
+    ctx.callbacks.push(Box::new(stop.clone()));
     let result = run(ctx).await;
-    match log {
+    let result = match log {
         Some(log) => log.finish(result),
         None => result,
-    }
+    };
+    stop.finish(result)
 }

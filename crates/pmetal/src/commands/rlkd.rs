@@ -224,8 +224,10 @@ pub(crate) async fn run_rlkd(spec: RlkdSpec, ctx: RunContext) -> anyhow::Result<
         println!("Starting RLKD training loop...");
     }
 
-    trainer
-        .run(
+    // A run a stop request ended has trained part of the way; the policy is
+    // saved below like a finished one.
+    super::stop::unless_stopped(
+        trainer.run(
             &mut policy_model,
             &mut teacher_model,
             ref_model.as_mut(),
@@ -234,8 +236,10 @@ pub(crate) async fn run_rlkd(spec: RlkdSpec, ctx: RunContext) -> anyhow::Result<
             &rewards,
             &mut optimizer,
             |opt, lr| opt.set_lr(lr),
-        )
-        .map_err(|e| anyhow::anyhow!("RLKD training error: {}", e))?;
+        ),
+        |e| matches!(e, pmetal_trainer::GrpoError::Cancelled),
+    )
+    .map_err(|e| anyhow::anyhow!("RLKD training error: {}", e))?;
 
     // 13. Save LoRA weights
     pmetal_trainer::orchestrator::save_adapter(

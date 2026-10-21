@@ -565,6 +565,9 @@ where
             }
             history.push(metrics);
             if callbacks.iter().any(|cb| cb.should_stop()) {
+                for cb in callbacks.iter_mut() {
+                    cb.on_train_end();
+                }
                 return Err(PreferenceError::Cancelled);
             }
         }

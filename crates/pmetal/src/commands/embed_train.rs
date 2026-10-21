@@ -142,6 +142,10 @@ pub(crate) async fn run_embed_train(
         shuffle: true,
     };
     let mut trainer = EmbeddingTrainer::new(config)?;
+    // A request to stop (Ctrl-C, SIGTERM) ends the run after the step in flight;
+    // what is trained so far is saved below, and the command exits as interrupted.
+    let stop = super::stop::StopFlag::watch();
+    trainer.add_callback(Box::new(stop.clone()));
     tracing::info!(
         "Starting embedding training: loss={loss_str}, pooling={pooling_mode:?}, T={temperature}, \
          batch={batch_size}, epochs={epochs}, {}",
@@ -168,7 +172,7 @@ pub(crate) async fn run_embed_train(
         trainer.run(&mut model, &tokenizer, &dataset)?;
         tracing::info!("Saving the trained adapters to '{}'", output_dir);
         pmetal_trainer::orchestrator::save_adapter(&model, output, &lora_config, Some(model_path))?;
-        return Ok(());
+        return stop.finish(Ok(()));
     }
 
     tracing::info!("Loading the encoder from '{}'", encoder_dir.display());
@@ -254,5 +258,5 @@ pub(crate) async fn run_embed_train(
         "Embedding training complete. Model saved to '{}'",
         output_dir
     );
-    Ok(())
+    stop.finish(Ok(()))
 }

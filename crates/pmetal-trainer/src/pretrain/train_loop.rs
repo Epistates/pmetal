@@ -311,11 +311,28 @@ where
                 eprintln!("checkpoint saved: {}", step_dir.display());
             }
         }
+
+        if config
+            .stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            eprintln!(
+                "stop requested: ending after step {} of {}",
+                step + 1,
+                config.num_steps
+            );
+            break;
+        }
     }
 
     if let (Some(dir), Some(&loss)) = (config.checkpoint_dir.as_ref(), losses.last()) {
+        // The step the run ended on: `num_steps` for a finished run, earlier
+        // for one a stop request ended. A periodic checkpoint already holds
+        // that step when it is a multiple of the interval.
+        let last_step = start_step + losses.len();
         let should_save_final = match config.checkpoint_every {
-            Some(every) if every > 0 => config.num_steps % every != 0,
+            Some(every) if every > 0 => last_step % every != 0,
             _ => true,
         };
         if should_save_final {
@@ -327,7 +344,7 @@ where
                 &super::CheckpointMeta {
                     step: optimizer.step_count(),
                     loss,
-                    learning_rate: scheduler.get_lr(config.num_steps.saturating_sub(1)) as f32,
+                    learning_rate: scheduler.get_lr(last_step.saturating_sub(1)) as f32,
                     stream_position: last_stream_position,
                 },
             )?;

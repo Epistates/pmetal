@@ -315,8 +315,8 @@ pub(crate) async fn run_grpo(spec: GrpoSpec, ctx: RunContext) -> anyhow::Result<
         if emit_console_output {
             println!("Async rewards enabled — reward scoring will pipeline with GPU training.");
         }
-        trainer
-            .run_async(
+        super::stop::unless_stopped(
+            trainer.run_async(
                 &mut model,
                 ref_model.as_mut(),
                 &tokenizer,
@@ -324,11 +324,15 @@ pub(crate) async fn run_grpo(spec: GrpoSpec, ctx: RunContext) -> anyhow::Result<
                 Box::new(rewards),
                 &mut optimizer,
                 |opt, lr| opt.set_lr(lr),
-            )
-            .map_err(|e| anyhow::anyhow!("GRPO training error: {}", e))?;
+            ),
+            |e| matches!(e, pmetal_trainer::GrpoError::Cancelled),
+        )
+        .map_err(|e| anyhow::anyhow!("GRPO training error: {}", e))?;
     } else {
-        trainer
-            .run(
+        // A run a stop request ended has trained part of the way; the policy
+        // is saved below like a finished one.
+        super::stop::unless_stopped(
+            trainer.run(
                 &mut model,
                 ref_model.as_mut(),
                 &tokenizer,
@@ -336,8 +340,10 @@ pub(crate) async fn run_grpo(spec: GrpoSpec, ctx: RunContext) -> anyhow::Result<
                 &rewards,
                 &mut optimizer,
                 |opt, lr| opt.set_lr(lr),
-            )
-            .map_err(|e| anyhow::anyhow!("GRPO training error: {}", e))?;
+            ),
+            |e| matches!(e, pmetal_trainer::GrpoError::Cancelled),
+        )
+        .map_err(|e| anyhow::anyhow!("GRPO training error: {}", e))?;
     }
 
     pmetal_trainer::orchestrator::save_adapter(

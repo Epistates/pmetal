@@ -23,7 +23,12 @@ use pmetal_trainer::{
     DiffusionGemmaTrainConfig, DiffusionGemmaTrainer, quantize_diffusion_gemma_base,
 };
 
+/// Run `pmetal train-diffusion`.
+///
+/// A request to stop (Ctrl-C, SIGTERM) ends the loop after the step in flight,
+/// saves the adapters and exits with status 130.
 pub(crate) async fn run_train_diffusion(args: TrainDiffusionSpec) -> Result<()> {
+    let stop = super::stop::StopFlag::watch();
     // 1. Resolve + load the model through the inference dispatcher.
     let model_path = pmetal_hub::resolve_model_path(&args.model, None, None)
         .await
@@ -158,6 +163,15 @@ pub(crate) async fn run_train_diffusion(args: TrainDiffusionSpec) -> Result<()> 
                 .with_context(|| "checkpoint save")?;
             tracing::info!("checkpoint at step {step} → {}", output_dir.display());
         }
+
+        if stop.requested() {
+            tracing::info!(
+                "stop requested: ending after step {} of {}",
+                step + 1,
+                args.steps
+            );
+            break;
+        }
     }
 
     // 7. Save the final adapters: a PEFT directory, which `infer --lora`,
@@ -169,7 +183,7 @@ pub(crate) async fn run_train_diffusion(args: TrainDiffusionSpec) -> Result<()> 
         final_path.display(),
         running_loss
     );
-    Ok(())
+    stop.finish(Ok(()))
 }
 
 /// Build the encoder context `[1, ctx]` from a prompt's token ids, truncated to

@@ -36,5 +36,5 @@ in `CLI_ONLY` in `parity.rs` with its reason.
 ## Event log
 
 `--log-events <file>` (global) writes the run's `JobEvent`s as JSONL; it is
-wired to every trainer command through `commands::with_event_log`. A write that
+wired to every trainer command through `commands::with_run_context`. A write that
 fails is reported when the run ends (`commands/events.rs`).
