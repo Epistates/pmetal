@@ -298,6 +298,9 @@ impl InlineArray {
     /// function of it alone; without one it takes the calling thread's
     /// default key, which every unkeyed draw advances.
     pub fn random_normal_keyed(shape: &[i32], dtype: impl IntoDtype, key: Option<&Self>) -> Self {
+        if key.is_none() {
+            crate::strict_seed::ensure_seeded();
+        }
         let dtype = dtype.dtype_code();
         let key = key.map_or(std::ptr::null(), |k| &k.raw as *const RawBuf);
         let mut dst = MaybeUninit::<RawBuf>::uninit();
@@ -324,6 +327,9 @@ impl InlineArray {
     /// function of it alone; without one it takes the calling thread's
     /// default key, which every unkeyed draw advances.
     pub fn random_uniform_keyed(shape: &[i32], dtype: impl IntoDtype, key: Option<&Self>) -> Self {
+        if key.is_none() {
+            crate::strict_seed::ensure_seeded();
+        }
         let dtype = dtype.dtype_code();
         let key = key.map_or(std::ptr::null(), |k| &k.raw as *const RawBuf);
         let mut dst = MaybeUninit::<RawBuf>::uninit();
@@ -343,6 +349,7 @@ impl InlineArray {
 
     /// Sample Bernoulli with given probability and shape.
     pub fn random_bernoulli(p: &Self, shape: &[i32]) -> Self {
+        crate::strict_seed::ensure_seeded();
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_random_bernoulli(
@@ -369,6 +376,9 @@ impl InlineArray {
         dtype: impl IntoDtype,
         key: Option<&Self>,
     ) -> Self {
+        if key.is_none() {
+            crate::strict_seed::ensure_seeded();
+        }
         let dtype = dtype.dtype_code();
         let key = key.map_or(std::ptr::null(), |k| &k.raw as *const RawBuf);
         let mut dst = MaybeUninit::<RawBuf>::uninit();

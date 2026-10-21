@@ -170,8 +170,8 @@ fn every_architecture_trains_with_a_packed_base() {
         random::seed(11);
         DynamicModel::from_config(config_json).expect("build")
     };
-    let dir = std::env::temp_dir().join(format!("pmetal_qlora_train_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path();
 
     let mut failures = Vec::new();
     for case in cases() {
@@ -213,7 +213,6 @@ fn every_architecture_trains_with_a_packed_base() {
             }
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
     assert!(
         failures.is_empty(),
         "QLoRA didn't train:\n  {}",

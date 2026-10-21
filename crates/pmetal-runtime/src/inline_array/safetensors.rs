@@ -336,6 +336,7 @@ impl InlineArray {
 
 /// Set the global MLX random seed for reproducibility.
 pub fn random_seed(seed: u64) {
+    crate::strict_seed::mark_seeded();
     unsafe { mlx_inline_random_seed(seed) }
 }
 
@@ -353,9 +354,8 @@ mod tests {
     fn a_shard_with_more_tensors_than_the_old_cap_loads_every_one() {
         const ENTRIES: usize = 2770;
 
-        let dir = std::env::temp_dir().join("pmetal-safetensors-cap-test");
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let path = dir.join("many.safetensors");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("many.safetensors");
         let path_str = path.to_str().expect("utf-8 path");
 
         let arrays: Vec<InlineArray> = (0..ENTRIES)
@@ -375,7 +375,5 @@ mod tests {
             loaded.iter().any(|(k, _)| k == "tensor.2769.weight"),
             "the last tensor is present, not truncated away"
         );
-
-        let _ = std::fs::remove_file(&path);
     }
 }

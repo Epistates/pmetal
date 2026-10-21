@@ -71,6 +71,9 @@ impl InlineArray {
     /// calling thread's default key, which every unkeyed draw advances.
     #[inline]
     pub fn categorical(&self, axis: i32, key: Option<&Self>) -> Self {
+        if key.is_none() {
+            crate::strict_seed::ensure_seeded();
+        }
         let key = key.map_or(std::ptr::null(), |k| &k.raw as *const RawBuf);
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {

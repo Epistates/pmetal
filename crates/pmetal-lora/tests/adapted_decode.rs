@@ -21,7 +21,7 @@ use std::rc::Rc;
 use common::{cases, every_projection_lora};
 use pmetal_lora::{AdaptedModel, QLoraConfig, quantize_base};
 use pmetal_models::dispatcher::DynamicModel;
-use pmetal_runtime::compat::{Array, Dtype, random};
+use pmetal_runtime::compat::{Array, Dtype, in_key_order, random};
 
 const PROMPT: [i32; 6] = [3, 11, 7, 2, 9, 5];
 const STEPS: usize = 3;
@@ -59,8 +59,8 @@ fn nudged_model(config_json: &str, scale_b: f32, packed: bool) -> AdaptedModel {
     }
     let lora = every_projection_lora(&mut base);
     let mut model = AdaptedModel::attach(base, lora).expect("attach");
-    let nudged: HashMap<Rc<str>, Array> = model
-        .lora_parameters()
+    // In name order: the draws go to the same adapters on every run.
+    let nudged: HashMap<Rc<str>, Array> = in_key_order(model.lora_parameters())
         .into_iter()
         .map(|(key, p)| {
             let value = random::uniform_range(-0.1, 0.1, p.shape(), Dtype::Float32).multiply(

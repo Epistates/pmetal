@@ -22,7 +22,7 @@ use std::rc::Rc;
 use pmetal_core::LoraConfig;
 use pmetal_lora::{AdaptedModel, QLoraConfig, TrainableModel, quantize_base};
 use pmetal_models::dispatcher::DynamicModel;
-use pmetal_runtime::compat::{Array, Dtype, random};
+use pmetal_runtime::compat::{Array, Dtype, in_key_order, random};
 use pmetal_runtime::inline_array::value_and_grad;
 use pmetal_runtime::nn::with_training_mode;
 
@@ -97,8 +97,8 @@ fn drain() {
 /// both factors of every adapter have a gradient.
 fn randomize_adapters(model: &mut impl TrainableModel) {
     random::seed(11);
-    let params: HashMap<Rc<str>, Array> = model
-        .lora_parameters()
+    // In name order: the draws go to the same adapters on every run.
+    let params: HashMap<Rc<str>, Array> = in_key_order(model.lora_parameters())
         .into_iter()
         .map(|(name, p)| {
             let r = random::uniform_range(-0.05, 0.05, p.shape(), Dtype::Float32)

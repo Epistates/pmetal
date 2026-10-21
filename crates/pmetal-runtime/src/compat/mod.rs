@@ -400,6 +400,18 @@ pub fn eval_params(params: ModuleParamRef<'_>) -> Result<(), Exception> {
     Ok(())
 }
 
+/// The entries of a map in key order.
+///
+/// A `HashMap` iterates in an order that differs from run to run, so a loop
+/// that draws a random value for each entry gives each one a different draw
+/// every time, whatever the seed. Anything that assigns seeded random values
+/// to named parameters (a test's adapters, say) walks them in this order.
+pub fn in_key_order<K: Ord, V>(entries: impl IntoIterator<Item = (K, V)>) -> Vec<(K, V)> {
+    let mut entries: Vec<(K, V)> = entries.into_iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
+}
+
 // ── random sub-module ─────────────────────────────────────────────────────────
 
 /// Random sampling. Draws take the thread's global MLX key ([`random::seed`]
@@ -459,6 +471,7 @@ pub mod random {
     /// stream from where the block's forward started, so the recompute draws
     /// the masks the forward did. [`seed`] resets it.
     pub fn dropout_mask(keep: f32, shape: &[i32]) -> Array {
+        crate::strict_seed::ensure_seeded();
         let (seed, n) = DROPOUT_STREAM.with(|stream| {
             let (seed, n) = stream.get();
             stream.set((seed, n + 1));

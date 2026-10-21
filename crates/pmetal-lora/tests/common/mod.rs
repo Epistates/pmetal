@@ -11,7 +11,6 @@
 )]
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::rc::Rc;
 
 use pmetal_cache::test_utils::max_abs_diff;
@@ -515,15 +514,13 @@ pub fn config_int(case: &ArchCase, key: &str) -> Result<i32, String> {
 /// Stage `config.json` and a placeholder checkpoint, then materialise a real
 /// one from the architecture's own random init.
 ///
-/// Returns the staged directory. The caller removes it.
-pub fn stage(case: &ArchCase) -> Result<PathBuf, String> {
-    let dir = std::env::temp_dir().join(format!(
-        "pmetal_lora_base_parity_{}_{}",
-        case.name,
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create temp dir: {e}"))?;
+/// Returns the staged directory, which is removed when the guard drops.
+pub fn stage(case: &ArchCase) -> Result<tempfile::TempDir, String> {
+    let tmp = tempfile::Builder::new()
+        .prefix(&format!("pmetal_lora_base_parity_{}_", case.name))
+        .tempdir()
+        .map_err(|e| format!("create temp dir: {e}"))?;
+    let dir = tmp.path();
     std::fs::write(dir.join("config.json"), case.config_json)
         .map_err(|e| format!("write config.json: {e}"))?;
 
@@ -545,7 +542,7 @@ pub fn stage(case: &ArchCase) -> Result<PathBuf, String> {
     save_safetensors_map(dir.join("model.safetensors"), &checkpoint)
         .map_err(|e| format!("write checkpoint: {e}"))?;
 
-    Ok(dir)
+    Ok(tmp)
 }
 
 /// Rewrite a pmetal parameter path into the key a checkpoint would use.
