@@ -109,14 +109,11 @@ pub(crate) async fn run_serve(spec: ServeSpec, api_keys: Vec<String>) -> anyhow:
     let tokenizer = pmetal_data::Tokenizer::from_model_dir(&model_path)
         .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?;
 
-    let kv_turboquant_preset = match kv_turboquant_preset.as_deref() {
-        Some("q2_5") => Some(TurboQuantPreset::Q2_5),
-        Some("q3_5") => Some(TurboQuantPreset::Q3_5),
-        Some(other) => {
-            anyhow::bail!("unsupported TurboQuant preset `{other}`");
-        }
-        None => None,
-    };
+    let kv_turboquant_preset = kv_turboquant_preset
+        .as_deref()
+        .map(|name| name.parse::<TurboQuantPreset>())
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("--kv-turboquant-preset: {e}"))?;
     let cache_mode_request = CacheModeRequest {
         kv_quant,
         kv_k_bits: None,

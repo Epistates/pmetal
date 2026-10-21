@@ -265,7 +265,8 @@ fn run_qwen3_next_layer_profile(
 /// template, sampling config, and cache creation. CLI-specific features
 /// (ANE, benchmark) use the runner's prepared state.
 pub(crate) async fn run_inference(spec: InferSpec) -> anyhow::Result<()> {
-    use pmetal_data::inference_config::{InferenceBackend, SamplingMode};
+    use pmetal::inference_runner::{InferenceRunner, InferenceRunnerConfig};
+    use pmetal_data::inference_config::InferenceBackend;
 
     let tool_defs: Option<Vec<pmetal_data::chat_templates::ToolDefinition>> =
         match spec.tools.as_deref() {
@@ -286,44 +287,21 @@ pub(crate) async fn run_inference(spec: InferSpec) -> anyhow::Result<()> {
         .as_deref()
         .map(|path| crate::validate_output_path(path, "infer profile output"))
         .transpose()?;
-    let chat_template_kwargs = pmetal_data::chat_templates::ChatTemplateKwargs::from_controls(
-        spec.chat_template_kwargs.as_deref(),
-        spec.no_thinking,
-        spec.reasoning_effort.as_deref(),
-        spec.no_preserve_thinking,
-    )
-    .map_err(anyhow::Error::msg)?;
-    let mode: SamplingMode = spec.mode.parse().map_err(anyhow::Error::msg)?;
+    // The runner's configuration comes from the spec before anything is
+    // fetched, so a bad option fails at once; the model paths are filled in
+    // once they are resolved.
+    let mut runner_config = InferenceRunnerConfig::from_spec(&spec).map_err(anyhow::Error::msg)?;
+    runner_config.tools = tool_defs;
     let backend: InferenceBackend = spec.backend.parse().map_err(anyhow::Error::msg)?;
-    let kv_turboquant_preset = match spec.kv_turboquant_preset.as_deref() {
-        None => None,
-        Some("q2_5") => Some(pmetal::inference_runner::TurboQuantPreset::Q2_5),
-        Some("q3_5") => Some(pmetal::inference_runner::TurboQuantPreset::Q3_5),
-        Some(other) => {
-            anyhow::bail!("--kv-turboquant-preset: unknown preset '{other}'; valid: q2_5, q3_5")
-        }
-    };
 
     let InferSpec {
         model: ref model_id,
         lora: ref lora_path,
-        ref prompt,
         image: ref images,
         video: ref videos,
-        video_fps,
         json,
         max_tokens,
-        temperature,
-        top_k,
-        top_p,
-        min_p,
-        repetition_penalty,
-        frequency_penalty,
-        presence_penalty,
         seed,
-        chat,
-        ref system,
-        no_thinking,
         hide_thinking,
         ref draft_model,
         mtp,
@@ -337,26 +315,13 @@ pub(crate) async fn run_inference(spec: InferSpec) -> anyhow::Result<()> {
         benchmark_iters,
         benchmark_prompt_tokens,
         profile_layers,
-        kv_quant,
-        kv_k_bits,
-        kv_v_bits,
-        kv_group_size,
-        kv_turboquant,
-        ref kv_quant_preset,
-        no_kv_quant,
-        kv_qjl,
-        detect_repetition,
         ..
     } = spec;
     let model_id = model_id.as_str();
     let lora_path = lora_path.as_deref();
-    let prompt = prompt.as_str();
-    let system = system.as_deref();
     let draft_model = draft_model.as_deref();
     let mtp_model = mtp_model.as_deref();
     let experts_dir = experts_dir.as_deref();
-    let kv_quant_preset = kv_quant_preset.clone();
-    let tools = tool_defs.as_deref();
     let profile_output = validated_profile_output.as_deref();
     // With --json, stdout is the one JSON object; everything a person reads
     // (the banner, the statistics) goes to stderr.
@@ -374,8 +339,11 @@ pub(crate) async fn run_inference(spec: InferSpec) -> anyhow::Result<()> {
         }
     }
     // `--chat-template-kwargs '{"enable_thinking": false}'` is --no-thinking.
-    let no_thinking = no_thinking || chat_template_kwargs.enable_thinking() == Some(false);
-    let reasoning_effort = chat_template_kwargs.reasoning_effort().map(str::to_string);
+    let no_thinking = runner_config.no_thinking;
+    let reasoning_effort = runner_config
+        .chat_template_kwargs
+        .reasoning_effort()
+        .map(str::to_string);
     use pmetal_models::GenerationOutput;
 
     // ── Resolve --backend into the generation path ────────────────────────
@@ -482,53 +450,9 @@ pub(crate) async fn run_inference(spec: InferSpec) -> anyhow::Result<()> {
     };
 
     // ── Prepare inference via shared runner ──────────────────────────────
-    use pmetal::inference_runner::{InferenceRunner, InferenceRunnerConfig};
-
-    let runner_config = InferenceRunnerConfig {
-        model_path: model_path.clone(),
-        lora_path: lora_path.map(|s| s.to_string()),
-        mtp_assistant_path: mtp_assistant_path.clone(),
-        qwen_mtp_path: qwen_mtp_path.clone(),
-        qwen_mtp: mtp,
-        qwen_mtp_draft_tokens: mtp_draft_tokens.max(1),
-        experts_dir: experts_dir.map(|s| s.to_string()),
-        fp8,
-        prompt: prompt.to_string(),
-        chat_messages: None,
-        system_message: system.map(|s| s.to_string()),
-        chat,
-        no_thinking,
-        chat_template_kwargs,
-        tools: tools.map(|t| t.to_vec()),
-        images: images.iter().map(std::path::PathBuf::from).collect(),
-        videos: videos
-            .iter()
-            .map(|dir| pmetal::inference_runner::VideoInput {
-                frames_dir: dir.into(),
-                fps: video_fps,
-            })
-            .collect(),
-        temperature,
-        top_k,
-        top_p,
-        min_p,
-        max_tokens,
-        repetition_penalty,
-        frequency_penalty,
-        presence_penalty,
-        seed,
-        kv_quant,
-        kv_k_bits,
-        kv_v_bits,
-        kv_group_size,
-        kv_turboquant,
-        kv_turboquant_preset,
-        kv_quant_preset,
-        no_kv_quant,
-        kv_qjl,
-        mode,
-        detect_repetition,
-    };
+    runner_config.model_path = model_path.clone();
+    runner_config.mtp_assistant_path = mtp_assistant_path.clone();
+    runner_config.qwen_mtp_path = qwen_mtp_path.clone();
 
     let mut runner = InferenceRunner::prepare(runner_config)?;
     let use_chat = runner.is_chat();
