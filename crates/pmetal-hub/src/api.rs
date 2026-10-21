@@ -17,6 +17,32 @@ const MAX_WAIT: Duration = Duration::from_secs(10);
 /// The first backoff; each retry doubles it.
 const BASE_WAIT: Duration = Duration::from_millis(200);
 
+/// A failed Hub request: the user-facing error, and whether the failure says
+/// the Hub could not be reached (a dropped connection, a timeout, an overload)
+/// as opposed to a definite answer such as "no such repository". Only the
+/// first kind is worth serving from the cache instead.
+#[derive(Debug)]
+pub(crate) struct ApiError {
+    pub(crate) error: PMetalError,
+    pub(crate) unreachable: bool,
+}
+
+impl ApiError {
+    pub(crate) fn definite(error: PMetalError) -> Self {
+        Self {
+            error,
+            unreachable: false,
+        }
+    }
+}
+
+/// One answer from the Hub: the body, and the next page when the Hub says
+/// there is one (`Link: <url>; rel="next"`).
+pub(crate) struct Page {
+    pub(crate) body: Vec<u8>,
+    pub(crate) next: Option<String>,
+}
+
 /// GET `path` (starting with `/`) on the Hub with `query` and return the body,
 /// at most `max_bytes` of it.
 ///
@@ -30,18 +56,32 @@ pub(crate) async fn get_json(
     max_bytes: usize,
     subject: Option<&str>,
 ) -> Result<Vec<u8>> {
-    if options.is_offline() {
-        return Err(PMetalError::Hub(
-            "the network is off (offline mode); this needs the Hub".into(),
-        ));
-    }
-    let client = options.http_client()?;
     let url = format!("{}{path}", options.resolved_endpoint());
+    get_page(options, &url, query, max_bytes, subject)
+        .await
+        .map(|page| page.body)
+        .map_err(|e| e.error)
+}
+
+/// [`get_json`] for a full `url`, keeping the pagination link.
+pub(crate) async fn get_page(
+    options: &HubOptions,
+    url: &str,
+    query: &[(String, String)],
+    max_bytes: usize,
+    subject: Option<&str>,
+) -> std::result::Result<Page, ApiError> {
+    if options.is_offline() {
+        return Err(ApiError::definite(PMetalError::Hub(
+            "the network is off (offline mode); this needs the Hub".into(),
+        )));
+    }
+    let client = options.http_client().map_err(ApiError::definite)?;
     let token = resolve_token(options.token.as_ref());
 
     let mut attempt = 0usize;
     loop {
-        let mut request = client.get(&url).query(query);
+        let mut request = client.get(url).query(query);
         if let Some(token) = &token {
             request = request.bearer_auth(token.expose_secret());
         }
@@ -49,7 +89,16 @@ pub(crate) async fn get_json(
         let last = attempt >= options.retries();
         match outcome {
             Ok(response) if response.status().is_success() => {
-                return read_bounded(response, max_bytes).await;
+                let next = response
+                    .headers()
+                    .get_all(reqwest::header::LINK)
+                    .iter()
+                    .filter_map(|v| v.to_str().ok())
+                    .find_map(next_link);
+                let body = read_bounded(response, max_bytes)
+                    .await
+                    .map_err(ApiError::definite)?;
+                return Ok(Page { body, next });
             }
             Ok(response) => {
                 let status = response.status();
@@ -66,7 +115,10 @@ pub(crate) async fn get_json(
                     continue;
                 }
                 let detail = server_message(response).await;
-                return Err(status_error(status.as_u16(), subject, retry_after, &detail));
+                return Err(ApiError {
+                    error: status_error(status.as_u16(), subject, retry_after, &detail),
+                    unreachable: matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504),
+                });
             }
             Err(e) => {
                 let transient = e.is_timeout() || e.is_connect();
@@ -76,12 +128,29 @@ pub(crate) async fn get_json(
                     continue;
                 }
                 // The URL carries the query, never a credential, but scrub anyway.
-                return Err(PMetalError::Hub(redact_secrets(&format!(
-                    "request to the Hub failed: {e}"
-                ))));
+                return Err(ApiError {
+                    error: PMetalError::Hub(redact_secrets(&format!(
+                        "request to the Hub failed: {e}"
+                    ))),
+                    unreachable: transient,
+                });
             }
         }
     }
+}
+
+/// The `rel="next"` target of a `Link` header value, if it names one.
+fn next_link(header: &str) -> Option<String> {
+    header.split(',').find_map(|part| {
+        let (target, params) = part.split_once(';')?;
+        let is_next = params.split(';').any(|p| {
+            let p = p.trim();
+            p.strip_prefix("rel=")
+                .is_some_and(|rel| rel.trim_matches('"').eq_ignore_ascii_case("next"))
+        });
+        let target = target.trim().strip_prefix('<')?.strip_suffix('>')?;
+        is_next.then(|| target.to_owned())
+    })
 }
 
 fn wait_for(attempt: usize, retry_after: Option<Duration>) -> Duration {
@@ -178,6 +247,20 @@ mod tests {
             Duration::from_secs(3)
         );
         assert_eq!(wait_for(0, Some(Duration::from_secs(600))), MAX_WAIT);
+    }
+
+    #[test]
+    fn the_next_page_is_the_link_marked_next() {
+        assert_eq!(
+            next_link(r#"<https://h/api/x?cursor=a>; rel="next""#).as_deref(),
+            Some("https://h/api/x?cursor=a")
+        );
+        assert_eq!(
+            next_link(r#"<https://h/p>; rel="prev", <https://h/n>; rel="next""#).as_deref(),
+            Some("https://h/n")
+        );
+        assert_eq!(next_link(r#"<https://h/p>; rel="prev""#), None);
+        assert_eq!(next_link("garbage"), None);
     }
 
     #[test]

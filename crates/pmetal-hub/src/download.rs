@@ -183,8 +183,7 @@ async fn fetch_model(model_id: &str, options: &DownloadOptions) -> Result<PathBu
         }
     }
 
-    let client = options.hub.client()?;
-    let repo = RepoHandle::model(&client, model_id)?;
+    let repo = RepoHandle::model(&options.hub, model_id)?;
     let plan = match plan_for(&repo, options).await {
         Ok(plan) => plan,
         Err(PlanError::Unreachable(e)) => {
@@ -261,8 +260,7 @@ pub async fn plan_model_download(
             "cannot plan a download in offline mode: the file listing comes from the Hub".into(),
         ));
     }
-    let client = options.hub.client()?;
-    let repo = RepoHandle::model(&client, model_id)?;
+    let repo = RepoHandle::model(&options.hub, model_id)?;
     plan_for(&repo, options).await.map_err(|e| match e {
         PlanError::Unreachable(e) | PlanError::Failed(e) => e,
     })
@@ -291,7 +289,13 @@ async fn plan_for(
         .resolve_commit(options.revision.as_deref())
         .await
         .map_err(classify)?;
-    let files = repo.list_files(&commit).await.map_err(classify)?;
+    let files = repo.list_files(&commit).await.map_err(|e| {
+        if e.unreachable {
+            PlanError::Unreachable(e.error)
+        } else {
+            PlanError::Failed(e.error)
+        }
+    })?;
 
     // Which shards belong to the model is written in the weight indexes.
     let mut indexes = std::collections::HashMap::new();
@@ -500,8 +504,7 @@ pub async fn download_file_with(
     filename: &str,
     options: &DownloadOptions,
 ) -> Result<PathBuf> {
-    let client = options.hub.client()?;
-    let repo = RepoHandle::model(&client, model_id)?;
+    let repo = RepoHandle::model(&options.hub, model_id)?;
     repo.download_file(
         options.revision.as_deref(),
         filename,
@@ -558,21 +561,27 @@ pub async fn download_tokenizer_with(model_id: &str, options: &DownloadOptions) 
         }
     }
 
-    let client = options.hub.client()?;
-    let repo = RepoHandle::model(&client, model_id)?;
+    let repo = RepoHandle::model(&options.hub, model_id)?;
+    // The error, and whether it means the Hub could not be reached.
     let listed = async {
-        let commit = repo.resolve_commit(revision).await?;
-        let files = repo.list_files(&commit).await?;
-        Ok::<_, hf_hub::HFError>((commit, files))
+        let commit = repo
+            .resolve_commit(revision)
+            .await
+            .map_err(|e| (repo.error(&e), is_network_unavailable(&e)))?;
+        let files = repo
+            .list_files(&commit)
+            .await
+            .map_err(|e| (e.error, e.unreachable))?;
+        Ok::<_, (PMetalError, bool)>((commit, files))
     }
     .await;
     let (commit, files) = match listed {
         Ok(listed) => listed,
-        Err(e) if is_network_unavailable(&e) => {
+        Err((e, true)) => {
             // The Hub cannot be reached: a tokenizer already cached beats failing.
-            return cached().ok_or_else(|| repo.error(&e));
+            return cached().ok_or(e);
         }
-        Err(e) => return Err(repo.error(&e)),
+        Err((e, false)) => return Err(e),
     };
     let wanted: Vec<RepoFile> = files
         .into_iter()

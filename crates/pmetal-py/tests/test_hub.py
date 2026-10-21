@@ -144,12 +144,6 @@ def test_a_size_check_passes_a_same_length_corruption(hub, cache):
     assert Path(download(hub, cache, verify="size")).is_dir()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="pmetal-hub reads the LFS digest from hf-hub's BlobLfsInfo.sha256, but the Hub's tree "
-    "lists it as lfs.oid, so it is always None and verify='sha256' checks nothing. Remove this "
-    "marker when pmetal-hub takes the digest from where the Hub puts it.",
-)
 def test_sha256_verification_catches_a_same_length_corruption(hub, cache):
     hub.corrupt.add("model.safetensors")
     with pytest.raises(pmetal.HubError, match="(?i)sha|hash|digest|checksum"):

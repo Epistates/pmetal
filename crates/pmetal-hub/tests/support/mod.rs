@@ -121,6 +121,17 @@ struct Inner {
     /// `resolve` GETs whose path contains the first and ends with the second
     /// answer with half the body and then end the connection.
     truncate: Vec<(String, String)>,
+    /// `resolve` GETs matching like `truncate` answer with the right length
+    /// and one byte changed: what a bit flip on the wire or on a disk does.
+    corrupt: Vec<(String, String)>,
+    /// File listings come in pages of this many entries, linked with
+    /// `Link: <...>; rel="next"` like the real Hub's.
+    tree_page_size: Option<usize>,
+    /// What the `Link` of a listing page names as its origin; the address of
+    /// this server when `None`.
+    link_origin: Option<String>,
+    /// The address this server answers on.
+    base: String,
 }
 
 #[derive(Clone)]
@@ -133,7 +144,10 @@ impl FakeHub {
     pub async fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let inner = Arc::new(Mutex::new(Inner::default()));
+        let inner = Arc::new(Mutex::new(Inner {
+            base: base.clone(),
+            ..Inner::default()
+        }));
         tokio::spawn(serve(listener, inner.clone()));
         Self { base, inner }
     }
@@ -204,6 +218,26 @@ impl FakeHub {
             .unwrap()
             .truncate
             .push((format!("/{repo_id}/resolve/"), format!("/{file}")));
+    }
+
+    /// Serve GETs of `file` in the repository `repo_id` with one byte
+    /// changed and the length intact.
+    pub fn corrupt_downloads(&self, repo_id: &str, file: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .corrupt
+            .push((format!("/{repo_id}/resolve/"), format!("/{file}")));
+    }
+
+    /// List files `size` entries at a time, linking the next page.
+    pub fn paginate_listings(&self, size: usize) {
+        self.inner.lock().unwrap().tree_page_size = Some(size);
+    }
+
+    /// Make the pagination links point at `origin` instead of this server.
+    pub fn link_listings_to(&self, origin: &str) {
+        self.inner.lock().unwrap().link_origin = Some(origin.to_owned());
     }
 
     pub fn log(&self) -> Vec<Recorded> {
@@ -489,7 +523,25 @@ fn handle(
                 for d in dirs {
                     entries.push(json!({ "type": "directory", "oid": "0".repeat(40), "path": d }));
                 }
-                Response::json(200, Value::Array(entries))
+                let Some(size) = inner.tree_page_size else {
+                    return Response::json(200, Value::Array(entries));
+                };
+                let start: usize = query
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix("cursor="))
+                    .and_then(|c| c.parse().ok())
+                    .unwrap_or(0);
+                let end = (start + size).min(entries.len());
+                let mut response =
+                    Response::json(200, Value::Array(entries[start.min(end)..end].to_vec()));
+                if end < entries.len() {
+                    let origin = inner.link_origin.as_deref().unwrap_or(&inner.base);
+                    response.headers.push((
+                        "Link".into(),
+                        format!("<{origin}{path}?recursive=true&cursor={end}>; rel=\"next\""),
+                    ));
+                }
+                response
             }
         };
     }
@@ -533,10 +585,21 @@ fn handle(
                 .truncate
                 .iter()
                 .any(|(repo, file)| path.contains(repo.as_str()) && path.ends_with(file.as_str()));
+        let corrupted = method == "GET"
+            && inner
+                .corrupt
+                .iter()
+                .any(|(repo, file)| path.contains(repo.as_str()) && path.ends_with(file.as_str()));
         let body = if method == "HEAD" {
             Vec::new()
         } else if truncated {
             bytes[..bytes.len() / 2].to_vec()
+        } else if corrupted {
+            let mut bad = bytes.clone();
+            if let Some(last) = bad.last_mut() {
+                *last ^= 0x01;
+            }
+            bad
         } else {
             bytes.clone()
         };
