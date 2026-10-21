@@ -206,18 +206,89 @@ pub(super) struct PrepareReport {
     pub(super) first_problem: Option<String>,
 }
 
-/// The prepared samples: each text and the tokens it has in training.
+/// What a prepared row says to training: a document, trained whole, or a
+/// prompt (context, not trained) and the completion that follows it (the
+/// only part trained).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) enum PreparedRow {
+    Document(String),
+    Completion { prompt: String, completion: String },
+}
+
+impl PreparedRow {
+    /// The row as it is written: the columns training reads back.
+    pub(super) fn to_row(&self) -> Row {
+        match self {
+            Self::Document(text) => text_row(text.clone()),
+            Self::Completion { prompt, completion } => {
+                let mut row = Row::new();
+                row.insert("prompt".into(), prompt.clone().into());
+                row.insert("completion".into(), completion.clone().into());
+                row
+            }
+        }
+    }
+
+    /// The sample training makes of this row.
+    fn sample(&self) -> TextSample {
+        match self {
+            Self::Document(text) => TextSample::document(text.clone()),
+            Self::Completion { prompt, completion } => {
+                TextSample::completion(prompt.clone(), completion)
+            }
+        }
+    }
+}
+
+/// The prepared samples: each row and the tokens it has in training.
 pub(super) struct Prepared {
-    pub(super) samples: Vec<(String, usize)>,
+    pub(super) samples: Vec<(PreparedRow, usize)>,
     pub(super) report: PrepareReport,
+}
+
+/// The rows that train what `sample` says to train.
+///
+/// A conversation trains on its assistant turns and nothing else; written as
+/// one `{"text"}` row it would be read back as a document and trained whole,
+/// the user's words and the system prompt included. So each assistant turn
+/// becomes a prompt (everything before it) and a completion (the turn). The
+/// turns of one conversation are separate rows because a prompt and completion
+/// are one turn; the gradient is the same as the conversation's, since a turn
+/// only reads the tokens before it.
+///
+/// Text with no trained span of its own is a document.
+fn training_rows(
+    sample: TextSample,
+    model: &ModelText,
+    template: Option<&ChatTemplate>,
+) -> Vec<PreparedRow> {
+    let stored = |text: &str| match template {
+        Some(template) => model.for_training(text, template),
+        None => text.to_string(),
+    };
+    let spans = match (&sample.trained, &sample.prompt) {
+        (Some(spans), _) => spans.clone(),
+        (None, Some(prompt)) if sample.text.starts_with(prompt.as_str()) => {
+            std::iter::once(prompt.len()..sample.text.len()).collect()
+        }
+        (None, _) => return vec![PreparedRow::Document(stored(&sample.text))],
+    };
+    spans
+        .into_iter()
+        .filter(|span| span.start < span.end && span.end <= sample.text.len())
+        .map(|span| PreparedRow::Completion {
+            prompt: stored(&sample.text[..span.start]),
+            completion: sample.text[span.start..span.end].to_string(),
+        })
+        .collect()
 }
 
 /// Format every row for the model, and keep what fits `max_seq_len` tokens
 /// and, unless `dedup` is off, what is not a repeat.
 ///
-/// Length is measured on the text as it will be trained on: the prepared
-/// `{"text": ...}` rows are read back as documents, which the tokenizer
-/// brackets with its special tokens.
+/// Length is measured as training will see each prepared row: a document or a
+/// prompt and completion, which the tokenizer brackets with its special
+/// tokens.
 pub(super) fn prepare_rows(
     rows: impl IntoIterator<Item = DataResult<Row>>,
     columns: Option<&std::collections::HashMap<String, String>>,
@@ -226,7 +297,7 @@ pub(super) fn prepare_rows(
     max_seq_len: usize,
     dedup: bool,
 ) -> anyhow::Result<Prepared> {
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: HashSet<PreparedRow> = HashSet::new();
     let mut report = PrepareReport::default();
     let mut samples = Vec::new();
     for item in rows {
@@ -248,22 +319,30 @@ pub(super) fn prepare_rows(
                 continue;
             }
         };
+        let mut trains_something = false;
         for sample in rendered {
-            let text = match template {
-                Some(template) => model.for_training(&sample.text, template),
-                None => sample.text,
-            };
-            let tokens = TextSample::document(text.clone()).token_len(&model.tokenizer)?;
-            if tokens > max_seq_len {
-                report.too_long += 1;
-                continue;
+            for prepared in training_rows(sample, model, template) {
+                trains_something = true;
+                let tokens = prepared.sample().token_len(&model.tokenizer)?;
+                if tokens > max_seq_len {
+                    report.too_long += 1;
+                    continue;
+                }
+                if dedup && !seen.insert(prepared.clone()) {
+                    report.duplicate += 1;
+                    continue;
+                }
+                samples.push((prepared, tokens));
+                report.kept += 1;
             }
-            if dedup && !seen.insert(text.clone()) {
-                report.duplicate += 1;
-                continue;
-            }
-            samples.push((text, tokens));
-            report.kept += 1;
+        }
+        if !trains_something {
+            // A conversation with no assistant turn has nothing to learn from.
+            report.skipped += 1;
+            report.first_problem.get_or_insert(format!(
+                "row {}: no assistant turn to train on",
+                report.total
+            ));
         }
     }
     Ok(Prepared { samples, report })
@@ -347,12 +426,12 @@ pub(super) async fn prepare(
     let val_count = (samples.len() as f64 * val_ratio).round() as usize;
     let train_count = samples.len() - val_count;
     let mut lengths: Vec<usize> = Vec::with_capacity(train_count);
-    for (i, (text, tokens)) in samples.iter().enumerate() {
+    for (i, (prepared, tokens)) in samples.iter().enumerate() {
         if i < train_count {
-            train_out.write(&text_row(text.clone()))?;
+            train_out.write(&prepared.to_row())?;
             lengths.push(*tokens);
         } else {
-            val_out.write(&text_row(text.clone()))?;
+            val_out.write(&prepared.to_row())?;
         }
     }
     train_out.finish()?;
@@ -617,10 +696,137 @@ mod tests {
         )
         .unwrap();
         assert_eq!(prepared.report.kept, 1);
+        // The question is context; the reply is what is trained.
+        let PreparedRow::Completion { prompt, completion } = &prepared.samples[0].0 else {
+            panic!("an instruction and its reply are a prompt and a completion");
+        };
         assert!(
-            prepared.samples[0]
-                .0
-                .contains("<|im_start|>user\na<|im_end|>")
+            prompt.contains("<|im_start|>user\na<|im_end|>"),
+            "{prompt:?}"
+        );
+        assert!(completion.starts_with('b'), "{completion:?}");
+    }
+
+    fn byte_model() -> ModelText {
+        ModelText {
+            tokenizer: pmetal_data::tokenizer::testing::byte_level_bpe(
+                &[],
+                &["<|im_start|>", "<|im_end|>"],
+                None,
+            ),
+            template: ChatTemplate::chatml(),
+            adds_bos: false,
+        }
+    }
+
+    /// What training takes a prepared file for: the text of the tokens that
+    /// carry loss in each sample.
+    fn trained_text_of(rows: &[Row], model: &ModelText) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("train.jsonl");
+        let mut out = JsonlWriter::new(Vec::new());
+        let prepared = prepare_rows(ok(rows), None, model, Some(&model.template), 4096, true)
+            .unwrap()
+            .samples;
+        for (prepared, _) in &prepared {
+            out.write(&prepared.to_row()).unwrap();
+        }
+        std::fs::write(&path, out.into_inner().unwrap()).unwrap();
+
+        let dataset = pmetal_data::TrainingDataset::from_jsonl_tokenized(
+            &path,
+            &model.tokenizer,
+            DatasetFormat::Auto,
+            4096,
+            Some(&model.template),
+            None,
+        )
+        .unwrap();
+        dataset
+            .samples()
+            .iter()
+            .map(|sample| {
+                let labels = sample
+                    .labels
+                    .as_ref()
+                    .expect("a prepared sample is labeled");
+                let trained: Vec<u32> = sample
+                    .input_ids
+                    .iter()
+                    .zip(labels)
+                    .filter(|&(_, &label)| label != pmetal_data::dataset::IGNORE_INDEX)
+                    .map(|(&id, _)| id)
+                    .collect();
+                model.tokenizer.decode(&trained).unwrap()
+            })
+            .collect()
+    }
+
+    /// A prepared conversation was written as `{"text": ...}`, which training
+    /// reads as a document and trains whole: the system prompt, the user's
+    /// words and the template's own markers were all learned as if the model
+    /// had written them.
+    #[test]
+    fn a_prepared_conversation_trains_the_assistants_words_and_nothing_else() {
+        let model = byte_model();
+        let rows = vec![
+            row(json!({"messages": [
+                {"role": "system", "content": "SYSTEMPROMPT"},
+                {"role": "user", "content": "FIRSTQUESTION"},
+                {"role": "assistant", "content": "FIRSTANSWER"},
+                {"role": "user", "content": "SECONDQUESTION"},
+                {"role": "assistant", "content": "SECONDANSWER"},
+            ]})),
+            row(json!({"instruction": "INSTRUCTION", "input": "INPUT", "output": "OUTPUT"})),
+        ];
+        let trained = trained_text_of(&rows, &model);
+
+        for text in &trained {
+            for context in [
+                "SYSTEMPROMPT",
+                "FIRSTQUESTION",
+                "SECONDQUESTION",
+                "INSTRUCTION",
+                "INPUT",
+                "<|im_start|>",
+                "user",
+            ] {
+                assert!(
+                    !text.contains(context),
+                    "{context:?} is context, not something to learn: {text:?}"
+                );
+            }
+        }
+        // Every assistant turn is trained, each exactly once, and nothing
+        // beyond it but the end of the turn (a special token the decoder
+        // drops, which is how the model learns where it stops).
+        assert_eq!(trained, ["FIRSTANSWER\n", "SECONDANSWER\n", "OUTPUT\n"]);
+    }
+
+    /// A document has no one to mask: it stays a document.
+    #[test]
+    fn plain_text_stays_a_document_and_is_trained_whole() {
+        let model = byte_model();
+        let trained = trained_text_of(&[row(json!({"text": "just some prose"}))], &model);
+        assert_eq!(trained, ["just some prose"]);
+    }
+
+    #[test]
+    fn a_conversation_with_no_assistant_turn_is_skipped_and_said_so() {
+        let model = byte_model();
+        let rows = vec![row(
+            json!({"messages": [{"role": "user", "content": "anyone there?"}]}),
+        )];
+        let prepared =
+            prepare_rows(ok(&rows), None, &model, Some(&model.template), 4096, true).unwrap();
+        assert!(prepared.samples.is_empty());
+        assert_eq!(prepared.report.skipped, 1);
+        assert!(
+            prepared
+                .report
+                .first_problem
+                .unwrap()
+                .contains("no assistant turn")
         );
     }
 
