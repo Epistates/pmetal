@@ -9,25 +9,21 @@
 //! a field added to a spec reaches Python with no change in this crate (the
 //! type stubs are generated from the same data, see `stub.py`).
 
-use pmetal_core::{FieldDescriptor, FieldError, FieldKind, JobFields};
+use pmetal_core::jobs::Spec;
+use pmetal_core::{FieldDescriptor, FieldKind, FieldShape};
 use pyo3::exceptions::{PyAttributeError, PyKeyError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
 use crate::error::{config_err, validation_err};
 use crate::json::{to_py, to_value, value_of};
 
-/// What the Python class needs of a job spec.
-pub trait SpecType:
-    JobFields + Serialize + DeserializeOwned + Default + Clone + Send + Sync + 'static
-{
+/// What the Python class needs of a job spec: `pmetal_core::jobs::Spec` (fields,
+/// defaults, serde, `normalize_spec`), a copy, and a class name.
+pub trait SpecType: Spec + Clone {
     /// The class name.
     const NAME: &'static str;
-    /// The spec's own `normalize`.
-    fn normalize_spec(&mut self) -> Result<(), Vec<FieldError>>;
 }
 
 /// The spec's fields as a JSON object.
@@ -315,24 +311,37 @@ fn literal(options: &[&str]) -> String {
     format!("Literal[{}]", quoted.join(", "))
 }
 
-/// The annotation of a field: what its default is, or for an empty (`None`)
-/// default, what its descriptor says it holds.
+/// The annotation of a field. What it holds comes from its descriptor (a number
+/// or integer bound, a toggle, a set of options) and, failing that, from its
+/// default; how many it holds (one, one that may be absent, a list) from the
+/// descriptor's shape, and for the few fields without a descriptor from the
+/// default (`None` is optional, an array a list).
 fn annotation(default: &Value, descriptor: Option<&FieldDescriptor>) -> String {
     let kind = descriptor.map(|d| &d.kind);
-    let base = match default {
-        Value::Bool(_) => "bool".to_string(),
-        Value::Number(n) if n.is_f64() => "float".to_string(),
-        Value::Number(_) => "int".to_string(),
-        Value::String(_) | Value::Null | Value::Object(_) => match kind {
-            Some(FieldKind::Enum { options }) => literal(options),
-            Some(FieldKind::Number { .. }) => "float".to_string(),
-            Some(FieldKind::Integer { .. }) => "int".to_string(),
-            Some(FieldKind::Toggle) => "bool".to_string(),
+    let shape = descriptor.map_or_else(
+        || match default {
+            Value::Null => FieldShape::Optional,
+            Value::Array(_) => FieldShape::List,
+            _ => FieldShape::Scalar,
+        },
+        |d| d.shape,
+    );
+    if shape == FieldShape::List {
+        return "list[str]".to_string();
+    }
+    let base = match kind {
+        Some(FieldKind::Enum { options }) => literal(options),
+        Some(FieldKind::Number { .. }) => "float".to_string(),
+        Some(FieldKind::Integer { .. }) => "int".to_string(),
+        Some(FieldKind::Toggle) => "bool".to_string(),
+        _ => match default {
+            Value::Bool(_) => "bool".to_string(),
+            Value::Number(n) if n.is_f64() => "float".to_string(),
+            Value::Number(_) => "int".to_string(),
             _ => "str".to_string(),
         },
-        Value::Array(_) => "list[str]".to_string(),
     };
-    if default.is_null() {
+    if shape == FieldShape::Optional {
         format!("{base} | None")
     } else {
         base
@@ -419,9 +428,6 @@ macro_rules! py_spec {
 
         impl $crate::spec::SpecType for $spec {
             const NAME: &'static str = $name;
-            fn normalize_spec(&mut self) -> Result<(), Vec<::pmetal_core::FieldError>> {
-                self.normalize()
-            }
         }
 
         const _: () = {
@@ -556,6 +562,7 @@ pub(crate) use py_spec;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pmetal_core::JobFields;
     use pmetal_core::jobs::TrainSpec;
     use serde_json::json;
 
