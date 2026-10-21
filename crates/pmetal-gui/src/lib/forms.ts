@@ -61,6 +61,11 @@ export function seqLenField(form: FormInfo): string | null {
   return null;
 }
 
+/** Whether `text` is shaped like a Hub repository id (`owner/name`). */
+export function looksLikeHubId(text: string): boolean {
+  return /^[\w.-]+\/[\w.-]+(:[\w.-]+)?$/.test(text.trim());
+}
+
 /** Whether `text` is a full path on disk (as opposed to a Hub id). */
 export function isLocalPath(text: string): boolean {
   return text.trim().startsWith('/');

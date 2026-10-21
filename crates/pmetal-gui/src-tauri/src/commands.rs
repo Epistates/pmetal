@@ -589,3 +589,72 @@ impl EventSink for TauriJobEvents {
         let _ = self.0.emit("jobs-resync", ());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_refused_start_names_the_fields_and_keeps_them_for_the_form() {
+        let failure = StartFailure::from(StartError::Invalid(vec![
+            FieldIssue::new("learning_rate", "must be at most 1"),
+            FieldIssue::new("", "the job could not be built"),
+        ]));
+        assert_eq!(
+            failure.message,
+            "learning rate: must be at most 1; the job could not be built"
+        );
+        assert_eq!(failure.issues.len(), 2);
+        let json = serde_json::to_value(&failure).unwrap();
+        assert_eq!(json["issues"][0]["field"], "learning_rate");
+    }
+
+    #[test]
+    fn a_refused_start_without_fields_is_just_a_message() {
+        let failure = StartFailure::from(StartError::Message(AppError::new(
+            "3 jobs are already running.",
+        )));
+        assert_eq!(failure.message, "3 jobs are already running.");
+        assert!(failure.issues.is_empty());
+    }
+
+    #[test]
+    fn a_failed_download_says_what_to_try() {
+        assert!(download_error("a/b", "HTTP 401").contains("Settings"));
+        assert!(download_error("a/b", "repository not found (404)").contains("spelling"));
+        let plain = download_error("a/b", "disk full");
+        assert!(plain.starts_with("Could not download a/b: disk full."));
+    }
+
+    #[test]
+    fn a_model_recommends_what_its_own_files_say() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            r#"{"temperature":0.6,"top_k":20,"top_p":0.95,"repetition_penalty":1.05}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"max_position_embeddings":8192,"hidden_size":64,"num_hidden_layers":2,"vocab_size":100}"#,
+        )
+        .unwrap();
+        let d = model_defaults(dir.path(), "acme/tiny");
+        assert_eq!(d.temperature, Some(0.6));
+        assert_eq!((d.top_k, d.top_p), (Some(20), Some(0.95)));
+        assert_eq!(d.repetition_penalty, Some(1.05));
+        assert_eq!(d.max_position_embeddings, Some(8192));
+        assert_eq!(
+            (d.hidden_size, d.num_hidden_layers, d.vocab_size),
+            (Some(64), Some(2), Some(100))
+        );
+        assert!(d.max_new_tokens.is_some_and(|n| n > 0));
+    }
+
+    #[test]
+    fn a_model_with_no_files_recommends_nothing_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = model_defaults(dir.path(), "acme/tiny");
+        assert_eq!((d.temperature, d.top_k, d.hidden_size), (None, None, None));
+    }
+}

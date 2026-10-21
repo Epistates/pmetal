@@ -32,7 +32,7 @@ fn quote(name: &str) -> String {
 /// The TypeScript type of a field of `S`, from its descriptor when it has one
 /// and from the value of the default spec when it does not.
 fn type_of(descriptor: Option<&pmetal::core::FieldDescriptor>, default: Option<&Value>) -> String {
-    let base = match descriptor.map(|d| (d.kind, d.shape)) {
+    match descriptor.map(|d| (d.kind, d.shape)) {
         Some((kind, shape)) => {
             let one = match kind {
                 FieldKind::Number { .. } | FieldKind::Integer { .. } => "number".to_string(),
@@ -45,8 +45,8 @@ fn type_of(descriptor: Option<&pmetal::core::FieldDescriptor>, default: Option<&
                 _ => "string".to_string(),
             };
             match shape {
-                FieldShape::List => return "string[]".to_string(),
-                FieldShape::Optional => return format!("{one} | null"),
+                FieldShape::List => "string[]".to_string(),
+                FieldShape::Optional => format!("{one} | null"),
                 FieldShape::Scalar => one,
             }
         }
@@ -57,8 +57,7 @@ fn type_of(descriptor: Option<&pmetal::core::FieldDescriptor>, default: Option<&
             Some(Value::Array(_)) => "string[]".to_string(),
             _ => "unknown".to_string(),
         },
-    };
-    base
+    }
 }
 
 /// The whole file.

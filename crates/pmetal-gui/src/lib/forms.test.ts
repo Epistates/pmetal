@@ -1,6 +1,15 @@
 import { describe, expect, test } from 'bun:test';
 import type { FieldInfo, FormInfo } from './api';
-import { changedFields, defaultsOf, groupsOf, isColumnField, isLocalPath, matchesFilter, seqLenField } from './forms';
+import {
+  changedFields,
+  defaultsOf,
+  groupsOf,
+  isColumnField,
+  isLocalPath,
+  looksLikeHubId,
+  matchesFilter,
+  seqLenField,
+} from './forms';
 
 function field(name: string, over: Partial<FieldInfo> = {}): FieldInfo {
   return {
@@ -90,6 +99,14 @@ describe('helpers', () => {
     expect(seqLenField(form)).toBe('max_seq_len');
     expect(seqLenField({ ...form, fields: [field('seq_len')] })).toBe('seq_len');
     expect(seqLenField({ ...form, fields: [field('epochs')] })).toBeNull();
+  });
+
+  test('a Hub id is owner/name, optionally with a quantization after a colon', () => {
+    expect(looksLikeHubId('Qwen/Qwen3-0.6B')).toBe(true);
+    expect(looksLikeHubId('unsloth/gemma-3-GGUF:Q4_K_M')).toBe(true);
+    expect(looksLikeHubId('Qwen/')).toBe(false);
+    expect(looksLikeHubId('Qwen')).toBe(false);
+    expect(looksLikeHubId('/Users/me/model')).toBe(false);
   });
 
   test('only a full path is a path on disk', () => {

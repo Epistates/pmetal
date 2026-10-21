@@ -2,7 +2,7 @@
   import type { DatasetPeek, FormInfo, ModelFitInfo } from '#lib/api.js';
   import { getModelFit, peekDatasetColumns, errorMessage } from '#lib/api.js';
   import { datasetsStore, modelsStore } from '#lib/stores.svelte.js';
-  import { defaultsOf, groupsOf, isColumnField, isLocalPath, matchesFilter, seqLenField } from '#lib/forms.js';
+  import { defaultsOf, groupsOf, isColumnField, isLocalPath, looksLikeHubId, matchesFilter, seqLenField } from '#lib/forms.js';
   import Field from './Field.svelte';
 
   interface Props {
@@ -68,7 +68,9 @@
   $effect(() => {
     const model = modelField ? values[modelField]?.trim() : '';
     clearTimeout(fitTimer);
-    if (!model) {
+    // A model on this Mac, or something shaped like a Hub id: not every
+    // keystroke on the way to one is worth a request.
+    if (!model || !(isLocalPath(model) || looksLikeHubId(model) || modelsStore.byReference(model))) {
       fit = null;
       fitFor = '';
       return;
