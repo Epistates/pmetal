@@ -103,14 +103,14 @@ describe('helpers', () => {
 
   test('a Hub id is owner/name, optionally with a quantization after a colon', () => {
     expect(looksLikeHubId('Qwen/Qwen3-0.6B')).toBe(true);
-    expect(looksLikeHubId('unsloth/gemma-3-GGUF:Q4_K_M')).toBe(true);
+    expect(looksLikeHubId('acme/gemma-3-GGUF:Q4_K_M')).toBe(true);
     expect(looksLikeHubId('Qwen/')).toBe(false);
     expect(looksLikeHubId('Qwen')).toBe(false);
-    expect(looksLikeHubId('/Users/me/model')).toBe(false);
+    expect(looksLikeHubId('/models/mine')).toBe(false);
   });
 
   test('only a full path is a path on disk', () => {
-    expect(isLocalPath('/Users/me/data.jsonl')).toBe(true);
+    expect(isLocalPath('/data/train.jsonl')).toBe(true);
     expect(isLocalPath('  /data ')).toBe(true);
     expect(isLocalPath('tatsu-lab/alpaca')).toBe(false);
     expect(isLocalPath('~/data')).toBe(false);

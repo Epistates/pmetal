@@ -159,7 +159,7 @@ mod tests {
     use super::*;
 
     fn root() -> PathBuf {
-        PathBuf::from("/Users/someone/pmetal-output")
+        PathBuf::from("/work/pmetal-output")
     }
 
     #[test]

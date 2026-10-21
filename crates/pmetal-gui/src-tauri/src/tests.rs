@@ -203,7 +203,7 @@ fn nothing_is_shipped_with_a_secret_or_a_personal_path_in_its_configuration() {
         "capabilities/default.json",
     ] {
         let text = read(file);
-        assert!(!text.contains("/Users/"), "{file}");
+        assert!(!text.contains(concat!("/Use", "rs/")), "{file}");
         assert!(!text.to_lowercase().contains("hf_"), "{file}");
     }
 }
