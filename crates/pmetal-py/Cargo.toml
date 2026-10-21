@@ -6,6 +6,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# Shipped to PyPI as a wheel (maturin), never as a crate.
+publish = false
 
 [lib]
 name = "pmetal"

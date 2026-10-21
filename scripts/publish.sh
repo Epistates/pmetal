@@ -42,25 +42,16 @@ if $DRY_RUN; then
     echo "=== DRY RUN MODE ==="
 fi
 
-# Topological publish order (respects internal dependency graph)
-CRATES=(
-    pmetal-core          #  1. no internal deps
-    pmetal-distributed   #  2. no internal deps
-    pmetal-gguf          #  3. depends on: core
-    pmetal-metal         #  4. depends on: core
-    pmetal-hub           #  5. depends on: core
-    pmetal-data          #  6. depends on: core, mlx
-    pmetal-cache         #  7. depends on: runtime
-    pmetal-mhc           #  8. depends on: core, metal
-    pmetal-models        #  9. depends on: core, gguf, metal, mlx
-    pmetal-vocoder       # 10. depends on: core, mlx
-    pmetal-merge         # 11. depends on: core, mlx
-    pmetal-distill       # 12. depends on: core, mlx, metal
-    pmetal-lora          # 13. depends on: core, gguf, metal, mlx, models
-    pmetal-trainer       # 14. depends on: core, data, distill, lora, metal, mlx, models
-    pmetal               # 15. facade; optionally re-exports all crates
-    pmetal-cli           # 16. binary
-)
+# The order is derived from the manifests (scripts/publish-order.sh), so it
+# follows the workspace instead of a list that can go stale. Check it first:
+# a crate missing from it, or one published before a crate it needs, would
+# only show up halfway through a release.
+scripts/check-publish-order.sh
+
+CRATES=()
+while IFS= read -r crate; do
+    CRATES+=("$crate")
+done < <(scripts/publish-order.sh)
 
 TOTAL=${#CRATES[@]}
 SUCCEEDED=0

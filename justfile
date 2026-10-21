@@ -14,7 +14,7 @@ default:
 # Runs every check that CI performs. If this passes, publish is safe.
 
 # Full pre-publish validation (mirrors CI + release pipelines)
-preflight: fmt-check check-workspace-deps lint lint-all-features lint-min-features doc-check test test-release check-gui lint-gui check-version check-lockfile deny
+preflight: fmt-check check-workspace-deps check-publish-order lint lint-all-features lint-min-features doc-check test test-release check-gui lint-gui check-version check-lockfile deny
     @echo ""
     @echo "All preflight checks passed -- safe to publish {{ version }}"
 
@@ -279,6 +279,11 @@ alias outdated := deps-check
 # requirement for every crate they share with it (CI: deny job).
 check-workspace-deps:
     scripts/check-workspace-deps.sh
+
+# The crates are published in dependency order, and none is left out: the list
+# is derived from the manifests and checked against them (CI: deny job).
+check-publish-order:
+    scripts/check-publish-order.sh
 
 # ─── Utilities ──────────────────────────────────────────────────────
 
