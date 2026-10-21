@@ -304,7 +304,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pmetal-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "pmetal-core-derive",
  "secrecy",
@@ -317,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-core-derive"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -326,7 +326,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-gguf"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "byteorder",
  "half",

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-21
+
 ### Added
 
 - **The GUI draws every `pmetal` command's form from its job spec, so a field, its default and its range are the command line's, and a field added to a spec appears with no change to the app.** The GUI had a hand-built page per job with defaults of its own (training started at 3 epochs, a 1e-4 learning rate, 4 accumulation steps and 100 warmup steps) and no way to reach most spec fields (the serve page had no CORS origins or request timeout, embedding training no LoRA options). One page, `/run/<job>`, renders the descriptors the backend sends (every spec but `infer`, which is the chat page, plus `bench-workload` and `ollama modelfile`, which have no spec yet), shows the server's per-field problems beside the field, suggests columns and a sequence length from the dataset and whether the model fits this Mac, and remembers the last start. `start_job` refuses a field name the spec does not have instead of dropping it. `src/lib/specs.generated.ts` lists the fields of every job and is generated from the specs by a test that fails when it is stale; the sidebar is checked against it. 105 Rust tests (stub `pmetal` scripts for the job runner) and 33 `bun test` tests (component renders included).

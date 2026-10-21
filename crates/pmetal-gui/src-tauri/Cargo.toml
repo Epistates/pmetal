@@ -1,6 +1,6 @@
 [package]
 name = "pmetal-gui"
-version = "0.6.0"
+version = "0.7.0"
 description = "PMetal - Apple Silicon ML Training Suite"
 edition = "2024"
 license = "MIT OR Apache-2.0"
