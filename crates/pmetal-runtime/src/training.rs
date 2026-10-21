@@ -329,13 +329,13 @@ pub fn clip_grad_norm(grads: &mut crate::optimizer::ParamSet, max_norm: f32) -> 
 /// lazy GPU expression in trainer crates. See [`clip_grad_norm`].
 pub fn clip_grad_norm_map<K>(grads: &mut HashMap<K, InlineArray>, max_norm: f32) -> InlineArray
 where
-    K: Eq + Hash,
+    K: Eq + Hash + Ord,
 {
     if max_norm <= 0.0 {
         return InlineArray::from_f32(0.0);
     }
 
-    let norm = global_grad_norm(grads.values());
+    let norm = global_grad_norm_of(grads);
 
     // scale = max_norm / max(norm, max_norm)  ∈ (0, 1]
     let max_norm_arr = InlineArray::from_f32(max_norm);
@@ -348,8 +348,22 @@ where
     norm
 }
 
+/// The global L2 norm of a map of gradients ([`global_grad_norm`]), summed in
+/// key order.
+///
+/// An f32 sum depends on its order, and a `HashMap` iterates in an order that
+/// is different every time one is built, so summing in the map's order gave
+/// the same gradients a norm (and a clipping factor) that differed in its last
+/// bits from run to run. Key order is the same on every run.
+pub fn global_grad_norm_of<K: Ord>(grads: &HashMap<K, InlineArray>) -> InlineArray {
+    let mut ordered: Vec<(&K, &InlineArray)> = grads.iter().collect();
+    ordered.sort_by(|a, b| a.0.cmp(b.0));
+    global_grad_norm(ordered.into_iter().map(|(_, grad)| grad))
+}
+
 /// The global L2 norm of a set of gradients, an f32 scalar: the square root
-/// of the sum of every element's square, summed in f32.
+/// of the sum of every element's square, summed in f32, in the order given.
+/// For a map, [`global_grad_norm_of`] gives the order.
 pub fn global_grad_norm<'a>(grads: impl IntoIterator<Item = &'a InlineArray>) -> InlineArray {
     let f32_ = Dtype::Float32.as_i32();
     let mut norm_sq = InlineArray::from_f32(0.0);
@@ -608,6 +622,38 @@ mod tests {
                 "{dtype:?}: {g:?}"
             );
         }
+    }
+
+    /// The global norm is a sum of f32 squares, and an f32 sum depends on its
+    /// order. A `HashMap` iterates in a different order every time one is
+    /// built, so the norm (and the clip it scales by) changed in its last bits
+    /// from run to run on the same gradients.
+    #[test]
+    fn the_global_norm_does_not_depend_on_the_order_a_map_iterates_in() {
+        // Magnitudes across many binades, so different orders round differently.
+        let values: Vec<f32> = (0..32)
+            .map(|i| 1.7f32.powi((i * 7 % 23) - 9) * if i % 3 == 0 { -1.0 } else { 1.0 })
+            .collect();
+        let norms: Vec<u32> = (0..64)
+            .map(|_| {
+                let grads: HashMap<String, InlineArray> = values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        (
+                            format!("layer.{i:02}.weight"),
+                            InlineArray::from_f32_slice(&[*v, *v * 0.37], &[2]),
+                        )
+                    })
+                    .collect();
+                read(&global_grad_norm_of(&grads))[0].to_bits()
+            })
+            .collect();
+        assert!(
+            norms.windows(2).all(|pair| pair[0] == pair[1]),
+            "the norm took {} different values: {norms:?}",
+            norms.iter().collect::<std::collections::HashSet<_>>().len()
+        );
     }
 
     #[test]

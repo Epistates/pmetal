@@ -15,7 +15,7 @@ use pmetal_lora::TrainableModel;
 use pmetal_models::dispatcher::CceLoss;
 use pmetal_runtime::compat::{Array, Dtype, Exception, FlattenedModuleParam, nn, transforms};
 use pmetal_runtime::nn::with_training_mode;
-use pmetal_runtime::training::{CrossEntropy, global_grad_norm};
+use pmetal_runtime::training::{CrossEntropy, global_grad_norm_of};
 
 use super::source::BatchView;
 use crate::Result;
@@ -296,7 +296,7 @@ impl GradAccumulator {
             // the mean to `max_norm` scales by `min(1, max_norm / norm_mean)`
             // and the division by the count is another `inv`, so the one
             // factor is `min(inv, max_norm / norm_sum)`.
-            let norm_sum = global_grad_norm(grads.values());
+            let norm_sum = global_grad_norm_of(&grads);
             let clip = Array::from_f32(max_norm).divide(&norm_sum);
             (inv.minimum(&clip), Some(norm_sum.multiply(&inv)))
         } else {
