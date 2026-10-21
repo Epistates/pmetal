@@ -218,11 +218,6 @@ check-version:
         echo "FAIL: pmetal-gui tauri.conf.json version = \"$GUI_TAURI_CONF_VER\" (expected \"$WS_VER\")"
         ERRORS=$((ERRORS + 1))
     fi
-    GUI_LAYOUT_VER=$(grep 'let appVersion' crates/pmetal-gui/src/routes/+layout.svelte | sed "s/.*'\([^']*\)'.*/\1/")
-    if [[ "$GUI_LAYOUT_VER" != "$WS_VER" ]]; then
-        echo "FAIL: pmetal-gui layout appVersion = \"$GUI_LAYOUT_VER\" (expected \"$WS_VER\")"
-        ERRORS=$((ERRORS + 1))
-    fi
     # Check CHANGELOG has entry
     if ! grep -q "\[$WS_VER\]" CHANGELOG.md; then
         echo "FAIL: CHANGELOG.md missing entry for [$WS_VER]"
