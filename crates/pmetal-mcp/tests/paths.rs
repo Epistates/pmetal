@@ -183,7 +183,7 @@ mod client_roots {
         }
     }
 
-    fn workspace() -> std::path::PathBuf {
+    fn workspace() -> common::Scratch {
         let dir = common::scratch_dir("client-root");
         std::fs::write(dir.join("adapter_config.json"), r#"{"r": 8}"#).unwrap();
         dir

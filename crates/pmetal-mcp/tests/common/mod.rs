@@ -14,18 +14,37 @@ use serde_json::{Value, json};
 use turbomcp::McpHandlerExt as _;
 use turbomcp::RequestContext;
 
-static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+/// A fresh directory that is removed when this is dropped. It derefs to the
+/// canonical path, so it compares equal to what the policy returns.
+pub struct Scratch {
+    path: PathBuf,
+    _guard: tempfile::TempDir,
+}
 
-/// A fresh directory, canonical so it compares equal to what the policy returns.
-pub fn scratch_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "pmetal-mcp-test-{}-{}-{name}",
-        std::process::id(),
-        NEXT_DIR.fetch_add(1, Ordering::SeqCst)
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir.canonicalize().unwrap()
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for Scratch {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+pub fn scratch_dir(name: &str) -> Scratch {
+    let guard = tempfile::Builder::new()
+        .prefix(&format!("pmetal-mcp-test-{name}-"))
+        .tempdir()
+        .unwrap();
+    let path = guard.path().canonicalize().unwrap();
+    Scratch {
+        path,
+        _guard: guard,
+    }
 }
 
 /// A script that stands in for `pmetal`: `body` runs with the subcommand and its
@@ -43,6 +62,8 @@ pub struct Harness {
     /// The directory the policy allows.
     pub dir: PathBuf,
     next_id: AtomicU64,
+    /// The directories above, removed when the harness drops (after the server).
+    _scratch: Vec<Scratch>,
 }
 
 impl Harness {
@@ -53,26 +74,30 @@ impl Harness {
     }
 
     pub fn with_limits(body: &str, limits: JobLimits) -> Self {
-        let dir = scratch_dir("harness");
-        let policy = PathPolicy::new(dir.clone(), vec![dir.clone()]);
-        Self::build(body, limits, dir, policy)
+        let scratch = scratch_dir("harness");
+        let dir = scratch.to_path_buf();
+        let policy = PathPolicy::new(dir.clone(), vec![dir]);
+        Self::build(body, limits, vec![scratch], policy)
     }
 
     /// As `new`, but the server's working directory is not an allowed root, as
     /// when a launcher starts it in `/`.
     pub fn with_cwd_outside_the_roots(body: &str) -> Self {
-        let dir = scratch_dir("harness");
+        let scratch = scratch_dir("harness");
         let cwd = scratch_dir("cwd");
-        let policy = PathPolicy::new(cwd, vec![dir.clone()]);
-        Self::build(body, JobLimits::default(), dir, policy)
+        let policy = PathPolicy::new(cwd.to_path_buf(), vec![scratch.to_path_buf()]);
+        Self::build(body, JobLimits::default(), vec![scratch, cwd], policy)
     }
 
-    fn build(body: &str, limits: JobLimits, dir: PathBuf, policy: PathPolicy) -> Self {
+    /// `scratch[0]` is the directory the policy allows.
+    fn build(body: &str, limits: JobLimits, scratch: Vec<Scratch>, policy: PathPolicy) -> Self {
+        let dir = scratch[0].to_path_buf();
         let binary = fake_pmetal(&dir, body);
         Self {
             server: PmetalMcpServer::with(JobManager::with_binary(binary, limits), policy),
             dir,
             next_id: AtomicU64::new(1),
+            _scratch: scratch,
         }
     }
 

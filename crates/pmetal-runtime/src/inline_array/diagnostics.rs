@@ -480,8 +480,8 @@ mod tests {
 
     #[test]
     fn a_wrong_empty_or_truncated_file_is_rejected() {
-        let dir = std::env::temp_dir().join(format!("pmetal-metallib-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let write = |name: &str, bytes: &[u8]| {
             let p = dir.join(name);
             std::fs::write(&p, bytes).unwrap();
@@ -504,8 +504,6 @@ mod tests {
         assert!(validate_metallib(&write("empty", b"")).is_err());
         assert!(validate_metallib(&write("text", b"not a metallib, just some text")).is_err());
         assert!(validate_metallib(&dir.join("missing")).is_err());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ⚠️ The regression this exists for: `get_max_recommended_size` returned

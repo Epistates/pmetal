@@ -193,32 +193,24 @@ pub fn load_native_runtime_info(model_path: &Path) -> Result<Option<NativeRuntim
 mod tests {
     use super::{NativeArch, detect_arch, load_native_runtime_info};
     use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::TempDir;
 
-    fn write_temp_config(json: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("pmetal-native-inference-{unique}"));
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("config.json"), json).unwrap();
+    fn write_temp_config(json: &str) -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), json).unwrap();
         dir
     }
 
     #[test]
     fn detects_qwen3_moe_as_the_qwen3_engine() {
         let dir = write_temp_config(r#"{"model_type":"qwen3_moe"}"#);
-        assert_eq!(detect_arch(&dir), Some(NativeArch::Qwen3));
-        let _ = fs::remove_dir_all(dir);
+        assert_eq!(detect_arch(dir.path()), Some(NativeArch::Qwen3));
     }
 
     #[test]
     fn detects_qwen35_moe_from_top_level_model_type() {
         let dir = write_temp_config(r#"{"model_type":"qwen3_5_moe"}"#);
-        assert_eq!(detect_arch(&dir), Some(NativeArch::Qwen3_5));
-        let _ = fs::remove_dir_all(dir);
+        assert_eq!(detect_arch(dir.path()), Some(NativeArch::Qwen3_5));
     }
 
     #[test]
@@ -226,8 +218,7 @@ mod tests {
         let dir = write_temp_config(
             r#"{"model_type":"qwen3_5_moe","text_config":{"model_type":"qwen3_5_moe_text"}}"#,
         );
-        assert_eq!(detect_arch(&dir), Some(NativeArch::Qwen3_5));
-        let _ = fs::remove_dir_all(dir);
+        assert_eq!(detect_arch(dir.path()), Some(NativeArch::Qwen3_5));
     }
 
     #[test]
@@ -235,8 +226,7 @@ mod tests {
         let dir = write_temp_config(
             r#"{"model_type":"qwen3_6_moe","text_config":{"model_type":"qwen3_6_moe_text"}}"#,
         );
-        assert_eq!(detect_arch(&dir), Some(NativeArch::Qwen3_5));
-        let _ = fs::remove_dir_all(dir);
+        assert_eq!(detect_arch(dir.path()), Some(NativeArch::Qwen3_5));
     }
 
     /// `mlx-community/gemma-4-12B-it-bf16` states `gemma4_unified_text`, which
@@ -247,8 +237,7 @@ mod tests {
         let dir = write_temp_config(
             r#"{"model_type":"gemma4_unified","text_config":{"model_type":"gemma4_unified_text"}}"#,
         );
-        assert_eq!(detect_arch(&dir), Some(NativeArch::Gemma4));
-        let _ = fs::remove_dir_all(dir);
+        assert_eq!(detect_arch(dir.path()), Some(NativeArch::Gemma4));
     }
 
     /// `mlx-community/gemma-4-12B-it-qat-4bit` stores every projection and the
@@ -269,8 +258,7 @@ mod tests {
                 }
             }"#,
         );
-        assert_eq!(detect_arch(&dir), Some(NativeArch::Gemma4));
-        let _ = fs::remove_dir_all(dir);
+        assert_eq!(detect_arch(dir.path()), Some(NativeArch::Gemma4));
     }
 
     /// Every native architecture reads `.scales`/`.biases` itself, so
@@ -280,8 +268,7 @@ mod tests {
         let dir = write_temp_config(
             r#"{"model_type":"qwen3","quantization":{"group_size":64,"bits":4}}"#,
         );
-        assert_eq!(detect_arch(&dir), Some(NativeArch::Qwen3));
-        let _ = fs::remove_dir_all(dir);
+        assert_eq!(detect_arch(dir.path()), Some(NativeArch::Qwen3));
     }
 
     /// `mlx-community/Qwen3.8-27B-MTP-4bit` states `qwen3_5_mtp` and carries no
@@ -291,12 +278,10 @@ mod tests {
     #[test]
     fn a_bundled_mtp_checkpoint_runs_as_its_target_architecture() {
         let dir = write_temp_config(r#"{"model_type":"qwen3_5_mtp"}"#);
-        assert_eq!(detect_arch(&dir), Some(NativeArch::Qwen3_5));
-        let _ = fs::remove_dir_all(dir);
+        assert_eq!(detect_arch(dir.path()), Some(NativeArch::Qwen3_5));
 
         let moe = write_temp_config(r#"{"model_type":"qwen3_6_moe_mtp"}"#);
-        assert_eq!(detect_arch(&moe), Some(NativeArch::Qwen3_5));
-        let _ = fs::remove_dir_all(moe);
+        assert_eq!(detect_arch(moe.path()), Some(NativeArch::Qwen3_5));
     }
 
     #[test]
@@ -314,14 +299,13 @@ mod tests {
                 }
             }"#,
         );
-        let info = load_native_runtime_info(&dir).unwrap().unwrap();
+        let info = load_native_runtime_info(dir.path()).unwrap().unwrap();
         assert_eq!(info.arch, NativeArch::Qwen3_5);
         assert_eq!(info.num_layers, 28);
         assert_eq!(info.num_kv_heads, 2);
         assert_eq!(info.head_dim, 128);
         assert_eq!(info.value_head_dim, 128);
         assert!(info.supports_turboquant);
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -341,14 +325,13 @@ mod tests {
                 }
             }"#,
         );
-        let info = load_native_runtime_info(&dir).unwrap().unwrap();
+        let info = load_native_runtime_info(dir.path()).unwrap().unwrap();
         assert_eq!(info.arch, NativeArch::Qwen3_5);
         assert_eq!(info.num_layers, 40);
         assert_eq!(info.num_kv_heads, 2);
         assert_eq!(info.head_dim, 256);
         assert_eq!(info.value_head_dim, 256);
         assert!(info.supports_turboquant);
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -368,12 +351,11 @@ mod tests {
                 "intermediate_size":2880
             }"#,
         );
-        let info = load_native_runtime_info(&dir).unwrap().unwrap();
+        let info = load_native_runtime_info(dir.path()).unwrap().unwrap();
         assert_eq!(info.arch, NativeArch::GptOss);
         // Its attention sinks have no place in TurboQuant's kernels.
         assert!(!info.supports_turboquant);
         assert!(!NativeArch::GptOss.supports_turboquant());
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -396,10 +378,9 @@ mod tests {
                 "use_qk_norm":true
             }"#,
         );
-        let info = load_native_runtime_info(&dir).unwrap().unwrap();
+        let info = load_native_runtime_info(dir.path()).unwrap().unwrap();
         assert_eq!(info.arch, NativeArch::Llama4);
         assert!(info.supports_turboquant);
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -418,14 +399,13 @@ mod tests {
                 "qk_nope_head_dim":128
             }"#,
         );
-        let info = load_native_runtime_info(&dir).unwrap().unwrap();
+        let info = load_native_runtime_info(dir.path()).unwrap().unwrap();
         assert_eq!(info.arch, NativeArch::DeepSeek);
         assert_eq!(info.num_layers, 61);
         assert_eq!(info.num_kv_heads, 128);
         assert_eq!(info.head_dim, 192);
         assert_eq!(info.value_head_dim, 128);
         assert!(!info.supports_turboquant);
-        let _ = fs::remove_dir_all(dir);
     }
 }
 

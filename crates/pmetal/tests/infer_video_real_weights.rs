@@ -75,8 +75,11 @@ fn the_model_sees_which_way_the_ball_moves() {
         eprintln!("PMETAL_QWEN3_5_DIR is not set; skipping");
         return;
     };
-    let root = std::env::temp_dir().join(format!("pmetal-video-{}", std::process::id()));
-    let (rightwards, leftwards) = (root.join("rightwards"), root.join("leftwards"));
+    let root = tempfile::tempdir().unwrap();
+    let (rightwards, leftwards) = (
+        root.path().join("rightwards"),
+        root.path().join("leftwards"),
+    );
     write_ball_video(&rightwards, true);
     write_ball_video(&leftwards, false);
 
@@ -90,6 +93,4 @@ fn the_model_sees_which_way_the_ball_moves() {
     let answer = describe(&model, leftwards);
     eprintln!("right to left: {answer}");
     assert_eq!(order(&answer), Some(false), "{answer}");
-
-    std::fs::remove_dir_all(root).unwrap();
 }

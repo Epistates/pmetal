@@ -50,17 +50,15 @@ fn gemma2_synthetic_parity() {
 
     // Stage a synthetic model dir (config.json + model.safetensors) and load
     // it through the production dispatcher.
-    let tmp = std::env::temp_dir().join(format!("pmetal_gemma2_parity_{}", std::process::id()));
-    std::fs::create_dir_all(&tmp).expect("temp dir");
-    std::fs::write(tmp.join("config.json"), synthetic_config_json()).expect("write config");
+    let tmp = tempfile::tempdir().expect("temp dir");
+    std::fs::write(tmp.path().join("config.json"), synthetic_config_json()).expect("write config");
     std::fs::copy(
         fixture_path("gemma2_synth_weights.safetensors"),
-        tmp.join("model.safetensors"),
+        tmp.path().join("model.safetensors"),
     )
     .expect("copy weights");
 
-    let dyn_model = DynamicModel::load(&tmp).expect("dispatcher loads gemma2");
-    let _ = std::fs::remove_dir_all(&tmp);
+    let dyn_model = DynamicModel::load(tmp.path()).expect("dispatcher loads gemma2");
     let mut model = match dyn_model {
         DynamicModel::Gemma(m) => m,
         other => panic!("expected DynamicModel::Gemma, got {other:?}"),

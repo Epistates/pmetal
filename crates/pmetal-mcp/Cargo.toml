@@ -47,6 +47,8 @@ uuid = { workspace = true, features = ["v4"] }
 [dev-dependencies]
 # The cancellation token a transport hands a request, to cancel one in a test
 tokio-util = { workspace = true }
+# Scratch directories that clean up after themselves
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

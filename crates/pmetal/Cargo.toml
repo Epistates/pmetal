@@ -137,6 +137,8 @@ pmetal-runtime = { workspace = true, features = ["strict-errors"] }
 tracing-subscriber = { workspace = true }
 base64 = { workspace = true }
 image = { workspace = true }
+# Test scratch directories; the library carries it only behind `cli`.
+tempfile = { workspace = true }
 
 [[example]]
 name = "device_info"

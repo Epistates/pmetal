@@ -513,7 +513,6 @@ fn broadcasts_to_2d(scale_m: i32, scale_n: i32, weight_m: i32, weight_n: i32) ->
 mod tests {
     use super::{discover_safetensors_shards, quantization_block};
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn the_quantization_block_is_found_under_either_key_and_in_text_config() {
@@ -636,16 +635,6 @@ mod tests {
         }
     }
 
-    fn temp_dir() -> std::path::PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("pmetal-native-loader-{unique}"));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     /// macOS writes an AppleDouble sidecar named `._<file>` beside every file
     /// on a volume without native extended attributes, which is every external
     /// or network drive people keep checkpoints on. A directory glob picks
@@ -653,7 +642,8 @@ mod tests {
     /// names only the real shards.
     #[test]
     fn apple_double_sidecars_are_not_mistaken_for_shards() {
-        let dir = temp_dir();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         for name in [
             "model-00001-of-00002.safetensors",
             "model-00002-of-00002.safetensors",
@@ -671,7 +661,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut shards = discover_safetensors_shards(&dir).unwrap();
+        let mut shards = discover_safetensors_shards(dir).unwrap();
         shards.sort();
         let names: Vec<String> = shards
             .iter()
@@ -684,6 +674,5 @@ mod tests {
                 "model-00002-of-00002.safetensors".to_string(),
             ]
         );
-        let _ = fs::remove_dir_all(dir);
     }
 }

@@ -137,7 +137,7 @@ fn a_tool_takes_exactly_the_fields_of_its_spec() {
 #[test]
 fn leaving_a_parameter_out_gives_the_specs_default() {
     let dir = scratch_dir("defaults");
-    let policy = PathPolicy::new(dir.clone(), vec![dir.clone()]);
+    let policy = PathPolicy::new(dir.to_path_buf(), vec![dir.to_path_buf()]);
     for tool in pmetal_mcp::spec_tool_list() {
         let (properties, required) = definitions(tool.as_ref());
         let mut args = Map::new();
@@ -182,7 +182,7 @@ fn leaving_a_parameter_out_gives_the_specs_default() {
 #[test]
 fn omitting_a_required_parameter_names_it() {
     let dir = scratch_dir("required");
-    let policy = PathPolicy::new(dir.clone(), vec![dir]);
+    let policy = PathPolicy::new(dir.to_path_buf(), vec![dir.to_path_buf()]);
     for tool in pmetal_mcp::spec_tool_list() {
         let (_, required) = definitions(tool.as_ref());
         if required.is_empty() {

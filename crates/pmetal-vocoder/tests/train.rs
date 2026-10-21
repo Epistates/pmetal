@@ -208,9 +208,8 @@ fn multi_scale_mel_loss_trains_too() {
 
 #[test]
 fn a_checkpoint_resumes_training_exactly() {
-    let dir = std::env::temp_dir().join(format!("pmetal-vocoder-train-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("ckpt.safetensors");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ckpt.safetensors");
 
     let mut a = trainer(TrainingConfig::default());
     let (mel, wav) = batch(&a.generator.config, 24);
@@ -242,7 +241,6 @@ fn a_checkpoint_resumes_training_exactly() {
         assert!((c.mel_error - r.mel_error).abs() < 1e-4 * c.mel_error.max(1e-3));
         assert_eq!(c.learning_rate, r.learning_rate);
     }
-    std::fs::remove_dir_all(dir).ok();
 }
 
 #[test]

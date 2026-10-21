@@ -192,9 +192,8 @@ mod tests {
 
     #[test]
     fn scalars_round_trip_through_the_record_format() {
-        let dir = std::env::temp_dir().join(format!("pmetal-tb-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut writer = EventWriter::new(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = EventWriter::new(dir.path()).unwrap();
         writer
             .add_scalars(&[("train/loss", 2.5), ("train/epoch", 0.0)], 7)
             .unwrap();
@@ -210,6 +209,5 @@ mod tests {
         assert_eq!(summary.value[0].simple_value, Some(2.5));
         // A zero still carries its payload.
         assert_eq!(summary.value[1].simple_value, Some(0.0));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -58,13 +58,15 @@ fn build_model_via_production_loader() -> CohereForCausalLM {
         json5::from_str(synthetic_config_json()).expect("synthetic config parses");
     let mut model = CohereForCausalLM::new(config).expect("cohere model builds");
 
-    let tmp = std::env::temp_dir().join(format!("pmetal_cohere_parity_{}", std::process::id()));
-    std::fs::create_dir_all(&tmp).expect("temp dir");
-    let dst = tmp.join("model.safetensors");
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dst = tmp.path().join("model.safetensors");
     std::fs::copy(fixture_path("cohere_synth_weights.safetensors"), &dst).expect("copy weights");
-    load_generic_weights_with(&mut model, &tmp, &ModelArchitecture::Cohere.load_policy())
-        .expect("production loader runs");
-    let _ = std::fs::remove_dir_all(&tmp);
+    load_generic_weights_with(
+        &mut model,
+        tmp.path(),
+        &ModelArchitecture::Cohere.load_policy(),
+    )
+    .expect("production loader runs");
     model
 }
 
