@@ -64,8 +64,9 @@ ends the run after the current step with the weights saved, and is raised from `
 
 ## Running any command
 
-`pmetal.run(spec)` runs the `pmetal` command a spec stands for as a subprocess, so everything the
-command line does is reachable:
+`pmetal.run(spec)` runs the `pmetal` command a spec stands for under the job supervisor the TUI, MCP
+server and GUI share (its own process group, credentials redacted from its output, a stop that reaches
+what the job spawned), so everything the command line does is reachable:
 
 ```python
 pmetal.run(pmetal.MergeSpec(model_a="a", model_b="b", output="merged"))
@@ -79,8 +80,9 @@ for event in job:          # training commands stream their events
 result = job.wait()        # JobFailedError if the command fails; job.cancel() to stop it
 ```
 
-The command line is found from `cli=`, then `PMETAL_CLI`, then the copy shipped in the package, then
-`PATH`.
+`job.cancel()` sends SIGTERM to the job's process group and SIGKILL after `stop_grace` seconds;
+`pmetal train` finishes its step and saves the adapter first. The command line is found from `cli=`,
+then `PMETAL_BIN`, then the copy shipped in the package, then `PATH`.
 
 ## Model loading and generation
 

@@ -62,7 +62,7 @@ addopts = "-ra"
 markers = [
     "real_model: needs a real model (set PMETAL_TEST_MODEL_DIR)",
     "needs_hub: needs network access to the Hugging Face Hub (set PMETAL_TEST_HUB=1)",
-    "needs_cli: needs the real pmetal command line (set PMETAL_CLI)",
+    "needs_cli: needs the real pmetal command line (set PMETAL_BIN)",
 ]
 
 [tool.mypy]

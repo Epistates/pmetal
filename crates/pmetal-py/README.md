@@ -77,8 +77,11 @@ with the weights saved, and is raised from `train()`.
 
 ## Every other command
 
-`run` and `start` run the `pmetal` command a spec stands for, as a subprocess:
-the command line's own behaviour, with a process of its own to fail in.
+`run` and `start` run the `pmetal` command a spec stands for, under
+`pmetal-supervisor`, the runner the terminal UI, the MCP server and the desktop
+app share: the command line's own behaviour, in a process group of its own (a
+stop reaches what the job spawned, and no job outlives this program), with its
+output redacted of credentials and bounded.
 
 ```python
 pmetal.run(pmetal.MergeSpec(model_a="a", model_b="b", output="merged"))
@@ -91,8 +94,14 @@ for event in job:  # events as the job writes them
 job.wait()  # or job.cancel()
 ```
 
-The command line is found from `cli=`, `PMETAL_CLI`, the one shipped in the
-package, then `PATH`. Failures are `JobFailedError`.
+`job.cancel()` is SIGTERM to the process group, then SIGKILL after `stop_grace`
+seconds (30 by default); `pmetal train` finishes its step and saves the adapter.
+The job inherits the environment and working directory of the program.
+`job.logs()` is the last lines it printed, `job.metrics` what it reported of its
+progress, and `JobResult.stdout` its whole standard output (a `--json` result is
+not cut at a log line's limit). The command line is found from `cli=`,
+`PMETAL_BIN`, the one shipped in the package, then `PATH`. Failures are
+`JobFailedError`; a stopped job is `CancelledError`.
 
 ## Inference
 
