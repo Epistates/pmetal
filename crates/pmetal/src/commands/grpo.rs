@@ -255,11 +255,7 @@ pub(crate) async fn run_grpo(spec: GrpoSpec, ctx: RunContext) -> anyhow::Result<
     // Wire metrics callback if --log-metrics was provided
     if let Some(metrics_path) = _log_metrics {
         use pmetal_trainer::callbacks::MetricsJsonCallback;
-        let path = if metrics_path.contains('/') || metrics_path.contains('\\') {
-            PathBuf::from(metrics_path)
-        } else {
-            PathBuf::from(output_dir).join(metrics_path)
-        };
+        let path = pmetal_core::paths::resolve_in(std::path::Path::new(output_dir), metrics_path);
         let callback = MetricsJsonCallback::new(&path)?.with_run_name(format!(
             "grpo-{}",
             model_id.split('/').next_back().unwrap_or(model_id)

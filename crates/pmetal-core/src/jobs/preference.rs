@@ -355,7 +355,7 @@ fn default_grad_accum() -> usize {
     8
 }
 fn default_epochs() -> usize {
-    1
+    crate::defaults::EPOCHS
 }
 fn default_warmup_ratio() -> f64 {
     0.1

@@ -105,7 +105,7 @@ pub struct PreferenceArgs {
     #[arg(long = "seed", default_value = "42")]
     pub seed: u64,
 
-    /// Write per-step metrics as JSONL to this path (relative to --output).
+    /// Write per-step metrics as JSONL to this file (a relative path is relative to --output).
     #[arg(long = "log-metrics")]
     pub log_metrics: Option<String>,
 }

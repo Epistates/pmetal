@@ -62,6 +62,49 @@ pub struct Cli {
     pub command: Commands,
 }
 
+impl Cli {
+    /// Parse `args`, and say which flags of the chosen subcommand were given
+    /// (spelled `--like-this`), as opposed to left at their defaults.
+    ///
+    /// A setting has three sources: a flag given, a config file, the default.
+    /// A default must not override the file, and a flag given its default's
+    /// value must; only the parser knows which is which (`clap`'s
+    /// `value_source`), so it says so here for the commands that merge a file.
+    pub fn parse_with_given_flags(
+        args: impl IntoIterator<Item = std::ffi::OsString>,
+    ) -> Result<(Self, std::collections::BTreeSet<String>), clap::Error> {
+        use clap::{CommandFactory, FromArgMatches, parser::ValueSource};
+        let command = Self::command();
+        let matches = command.clone().try_get_matches_from(args)?;
+        let cli = Self::from_arg_matches(&matches)?;
+        let given = matches
+            .subcommand()
+            .and_then(|(name, sub)| Some((command.find_subcommand(name)?, sub)))
+            .map(|(definition, sub)| {
+                sub.ids()
+                    .filter(|id| {
+                        sub.value_source(id.as_str())
+                            .is_some_and(|source| source != ValueSource::DefaultValue)
+                    })
+                    .filter_map(|id| {
+                        let argument = definition.get_arguments().find(|a| a.get_id() == id)?;
+                        Some(format!("--{}", argument.get_long()?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok((cli, given))
+    }
+
+    /// [`parse_with_given_flags`](Self::parse_with_given_flags) on the process's
+    /// own arguments; a usage error or `--help` ends the process as clap does.
+    pub fn parse_from_env() -> (Self, std::collections::BTreeSet<String>) {
+        use clap::CommandFactory;
+        Self::parse_with_given_flags(std::env::args_os())
+            .unwrap_or_else(|e| e.format(&mut Self::command()).exit())
+    }
+}
+
 #[derive(Subcommand, Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum Commands {
@@ -444,6 +487,53 @@ impl Commands {
 
 #[cfg(test)]
 mod doc_examples;
+
+#[cfg(all(test, feature = "trainer"))]
+mod given_flags_tests {
+    use super::Cli;
+
+    fn given(args: &[&str]) -> Vec<String> {
+        let mut full = vec!["pmetal"];
+        full.extend_from_slice(args);
+        let (_, flags) =
+            Cli::parse_with_given_flags(full.into_iter().map(Into::into)).expect("parses");
+        flags.into_iter().collect()
+    }
+
+    /// What the parser says was given is what the config file yields to:
+    /// a flag given its default's value counts, a default does not.
+    #[test]
+    fn a_flag_given_is_told_from_a_default() {
+        assert_eq!(
+            given(&["train", "-m", "m", "-d", "d"]),
+            ["--dataset", "--model"]
+        );
+        assert_eq!(
+            given(&["train", "-m", "m", "-d", "d", "--epochs", "1", "--dora"]),
+            ["--dataset", "--dora", "--epochs", "--model"]
+        );
+        // Whatever the subcommand has none of is nothing, and so is no subcommand.
+        assert!(given(&["info"]).is_empty());
+    }
+
+    /// Every flag of `train` that `FILE_KEYS` names is a real flag the parser
+    /// reports when given, so a key can never be waiting on a flag that does
+    /// not exist.
+    #[test]
+    fn every_file_key_flag_is_a_flag_of_train() {
+        use clap::CommandFactory;
+        let command = Cli::command();
+        let train = command.find_subcommand("train").unwrap();
+        for (flag, _, _) in pmetal_core::jobs::FILE_KEYS {
+            assert!(
+                train
+                    .get_arguments()
+                    .any(|a| a.get_long().map(|l| format!("--{l}")).as_deref() == Some(*flag)),
+                "{flag}"
+            );
+        }
+    }
+}
 
 #[cfg(all(test, feature = "trainer"))]
 mod event_log_tests {

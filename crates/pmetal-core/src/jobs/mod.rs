@@ -56,11 +56,40 @@ pub use quantize::QuantizeSpec;
 pub use rlkd::RlkdSpec;
 pub use serve::ServeSpec;
 pub use tokenize::TokenizeSpec;
-pub use train::TrainSpec;
+pub use train::{FILE_KEYS, FileSection, TrainSpec, file_key_flag};
 pub use train_diffusion::TrainDiffusionSpec;
 pub use train_draft::TrainDraftSpec;
 pub use train_mtp::TrainMtpSpec;
 pub use vocode::VocodeSpec;
+
+/// Which of a command's flags were given, as opposed to left at their defaults.
+///
+/// A setting has three sources, in this order of precedence: a flag given
+/// explicitly, a config file, the default. A default is not a statement, so a
+/// flag left at its default must not override the file; and a flag given with
+/// the very value that happens to be the default must, which a comparison with
+/// the default cannot tell. The command line's parser knows which is which
+/// (`clap`'s `value_source`) and says so here.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Explicit {
+    /// Every flag counts as given: the spec was built on purpose (a form, a
+    /// Python object, the argv another surface wrote), so each of its values is
+    /// a statement.
+    #[default]
+    All,
+    /// Only these flags, spelled `--like-this`, were given.
+    Only(std::collections::BTreeSet<String>),
+}
+
+impl Explicit {
+    /// Whether `flag` (`--epochs`) was given.
+    pub fn is_set(&self, flag: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(flags) => flags.contains(flag),
+        }
+    }
+}
 
 /// Default of every spec's `seed` field.
 pub(crate) fn default_seed() -> u64 {

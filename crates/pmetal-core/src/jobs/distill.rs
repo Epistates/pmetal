@@ -469,7 +469,7 @@ fn default_batch_size() -> usize {
     1
 }
 fn default_epochs() -> usize {
-    1
+    crate::defaults::EPOCHS
 }
 fn default_checkpoint_every() -> usize {
     100

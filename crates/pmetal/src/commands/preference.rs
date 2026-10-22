@@ -126,11 +126,7 @@ pub(crate) async fn run_preference(spec: PreferenceSpec, ctx: RunContext) -> any
 
     let mut callbacks = extra_callbacks;
     if let Some(metrics_path) = &spec.log_metrics {
-        let path = if metrics_path.contains('/') || metrics_path.contains('\\') {
-            PathBuf::from(metrics_path)
-        } else {
-            output_dir.join(metrics_path)
-        };
+        let path = pmetal_core::paths::resolve_in(&output_dir, metrics_path);
         let model_name = spec.model.rsplit('/').next().unwrap_or(&spec.model);
         callbacks.push(Box::new(
             pmetal_trainer::MetricsJsonCallback::new(&path)?

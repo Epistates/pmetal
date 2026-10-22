@@ -363,7 +363,7 @@ fn default_lr() -> f64 {
     5e-6
 }
 fn default_epochs() -> usize {
-    1
+    crate::defaults::EPOCHS
 }
 fn default_max_seq_len() -> usize {
     512

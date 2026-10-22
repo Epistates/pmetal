@@ -441,11 +441,7 @@ pub(crate) async fn run_distillation(spec: DistillSpec, ctx: RunContext) -> anyh
 
     if let Some(metrics_path) = log_metrics {
         use pmetal_trainer::callbacks::MetricsJsonCallback;
-        let path = if metrics_path.contains('/') || metrics_path.contains('\\') {
-            PathBuf::from(metrics_path)
-        } else {
-            validated_distill_output.join(metrics_path)
-        };
+        let path = pmetal_core::paths::resolve_in(&validated_distill_output, metrics_path);
         let callback =
             MetricsJsonCallback::new(&path)?.with_run_name(format!("distill-{}", student_id));
         trainer.add_callback(Box::new(callback));

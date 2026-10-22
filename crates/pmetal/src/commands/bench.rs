@@ -2619,6 +2619,7 @@ async fn benchmark_real_training(
                 distributed: None,
             },
             config_path: None,
+            explicit: pmetal_core::jobs::Explicit::All,
             log_metrics: None,
             resume: false,
             seed: 42,

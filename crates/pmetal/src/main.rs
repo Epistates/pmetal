@@ -10,7 +10,6 @@ mod tui;
 
 use std::path::{Path, PathBuf};
 
-use clap::Parser;
 use cli::{Cli, Commands};
 
 /// The gzip-compressed `mlx.metallib` built with the MLX this binary links,
@@ -141,7 +140,7 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let (cli, given_flags) = Cli::parse_from_env();
 
     // A command that writes no event log must not take the flag: the caller
     // would wait on a file that never fills.
@@ -176,7 +175,7 @@ fn run() -> anyhow::Result<()> {
         #[cfg(feature = "metal")]
         let _ = pmetal_metal::context::MetalContext::device_available();
     }
-    tokio_main(cli)
+    tokio_main(cli, given_flags)
 }
 
 // ---------------------------------------------------------------------------
@@ -201,7 +200,11 @@ fn init_logging(component: &str, suppress_stderr: bool) {
 }
 
 #[tokio::main]
-async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
+async fn tokio_main(
+    cli: Cli,
+    #[cfg_attr(not(feature = "trainer"), allow(unused_variables))]
+    given_flags: std::collections::BTreeSet<String>,
+) -> anyhow::Result<()> {
     // Capture global flags before `cli` is moved into the `match` below.
     #[cfg(feature = "trainer")]
     let log_events_path = cli.log_events.clone();
@@ -209,7 +212,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         #[cfg(feature = "trainer")]
         Commands::Train(args) => {
-            commands::train::run_train(args, log_events_path.as_deref()).await?;
+            commands::train::run_train(args, log_events_path.as_deref(), given_flags).await?;
         }
 
         #[cfg(feature = "trainer")]
