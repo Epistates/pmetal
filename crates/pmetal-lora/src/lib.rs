@@ -1,22 +1,27 @@
 //! LoRA and QLoRA implementations for PMetal.
 //!
 //! This crate provides:
-//! - LoRA (Low-Rank Adaptation) and DoRA adapters on any architecture the
-//!   dispatcher loads ([`AdaptedModel`])
+//! - LoRA (Low-Rank Adaptation), rsLoRA and DoRA adapters on any architecture
+//!   the dispatcher loads ([`AdaptedModel`])
 //! - QLoRA: the same, over a base packed to NF4, NVFP4 or 8-bit integers
 //!   ([`quantize_base`])
+//! - Adapters saved and read in the PEFT layout ([`peft`])
 //!
 //! # Architecture-Agnostic Training
 //!
 //! Use [`DynamicLoraModel`] to automatically detect and load the correct
 //! model architecture for training:
 //!
-//! ```ignore
+//! ```no_run
 //! use pmetal_lora::DynamicLoraModel;
 //! use pmetal_core::LoraConfig;
 //!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! // Auto-detects Llama, Qwen2, Qwen3, etc.
-//! let model = DynamicLoraModel::from_pretrained("/path/to/model", lora_config)?;
+//! let model = DynamicLoraModel::from_pretrained("/path/to/model", LoraConfig::default())?;
+//! # let _ = model;
+//! # Ok(())
+//! # }
 //! ```
 
 pub mod adapted;
