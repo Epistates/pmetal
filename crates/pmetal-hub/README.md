@@ -4,6 +4,8 @@ HuggingFace Hub integration for PMetal: download, verify, search, size for this 
 
 ## Overview
 
+`pmetal-models`, `pmetal-trainer`, `pmetal-merge`, `pmetal-vocoder`, `pmetal-mcp`, the `pmetal` CLI and the Python bindings resolve model references through it, so a repository id works wherever a path does. It depends on `pmetal-core` and `pmetal-gguf`, and needs no GPU or runtime.
+
 - **Downloads from one commit.** A revision is resolved to a commit, that commit's file list is read
   once, and exactly the files the model needs are fetched concurrently into the standard Hub cache
   (`models--owner--name/{blobs,refs,snapshots}`), shared with the Hub's own tools.
@@ -12,7 +14,7 @@ HuggingFace Hub integration for PMetal: download, verify, search, size for this 
   a last resort, PyTorch pickles. Pickles are read with a restricted unpickler that cannot run
   code (`torch`) and written as safetensors next to them, so what comes back always loads.
 - **Verified.** Every file is checked against the size the Hub lists (optionally its SHA-256), and
-  the result must pass [`verify_model_dir`], which reads headers only: safetensors files exactly as
+  the result must pass `verify_model_dir`, which reads headers only: safetensors files exactly as
   long as their headers say, GGUF sets complete.
 - **Offline and flaky networks.** `HF_HUB_OFFLINE` (or `HubOptions::offline`) never touches the
   network; a named branch falls back to the copy last cached for it when the Hub is unreachable.
@@ -22,6 +24,13 @@ HuggingFace Hub integration for PMetal: download, verify, search, size for this 
   decode speed estimate from memory bandwidth.
 - **Publishing.** `upload_model` creates the repository if needed and commits the directory
   atomically, with progress; credential files, `.git` and Finder droppings are never sent.
+
+## Installation
+
+```toml
+[dependencies]
+pmetal-hub = "0.7"
+```
 
 ## Usage
 
@@ -80,9 +89,9 @@ async fn pull_one_quant() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
     // What would be fetched, and how big is it?
-    let plan = plan_model_download("bartowski/Qwen_Qwen3-0.6B-GGUF", &options).await?;
+    let plan = plan_model_download("Qwen/Qwen3-0.6B-GGUF", &options).await?;
     println!("{} files, {} bytes", plan.model.files.len(), plan.model.total_bytes());
-    let dir = download_model_with("bartowski/Qwen_Qwen3-0.6B-GGUF", &options).await?;
+    let dir = download_model_with("Qwen/Qwen3-0.6B-GGUF", &options).await?;
     println!("{}", dir.display());
     Ok(())
 }
@@ -113,18 +122,33 @@ async fn search() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+The same estimate works without the network, from a parameter count and a quantization:
+
+```rust
+use pmetal_hub::{DeviceSpec, FitLevel, ModelSpec, estimate_fit, split_quant_selector};
+
+// An 8B model at 4 bits on a Mac with a 48 GB working set and 546 GB/s.
+let device = DeviceSpec::from_device(48_000_000_000, 546.0, true);
+let fit = estimate_fit(&ModelSpec::new(8.0, "q4_k_m").with_context(8192), &device);
+assert_ne!(fit.fit_level, FitLevel::TooLarge);
+
+// `org/repo:QUANT` names one quantization of a GGUF repository.
+assert_eq!(
+    split_quant_selector("Qwen/Qwen3-8B-GGUF:Q4_K_M"),
+    ("Qwen/Qwen3-8B-GGUF", Some("Q4_K_M")),
+);
+```
+
 ### Check a Local Model Directory
 
-```rust,no_run
+```rust
 use pmetal_hub::verify_model_dir;
 
-fn check() {
-    let report = verify_model_dir(std::path::Path::new("./my-model"));
-    if !report.is_complete() {
-        for problem in &report.problems {
-            eprintln!("{problem}");
-        }
-    }
+// A directory that is not there is a report with a problem, not a panic.
+let report = verify_model_dir(std::path::Path::new("./no-such-model"));
+assert!(!report.is_complete());
+for problem in &report.problems {
+    eprintln!("{problem}");
 }
 ```
 
@@ -194,6 +218,18 @@ fn manage() -> Result<(), Box<dyn std::error::Error>> {
 | `torch` | Memory-mapped, restricted reading of PyTorch checkpoints; conversion to safetensors |
 | `cache` | Local cache management |
 | `upload` | Publishing a model directory |
+| `resolve` | `resolve_model_path`, `is_hf_id` and the `org/repo:QUANT` selector: a repository id or a local path to a directory on disk |
+
+## Feature flags
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `testing` | no | Builders for PyTorch checkpoints, for this crate's own tests. Not part of the supported API |
+
+## Requirements
+
+- Rust 1.95 or later
+- Network access to the Hub for downloads, search and uploads (or `HF_HUB_OFFLINE=1` and a populated cache)
 
 ## License
 
