@@ -296,7 +296,7 @@ impl std::str::FromStr for InferenceBackend {
 /// `model_type`: Qwen3.5, 3.6 and 3.8 are all `qwen3_5`.
 ///
 /// Families whose makers publish nothing (Llama, Gemma 2/3, Phi-3/4,
-/// Mistral 7B, Mixtral, Cohere, Granite, SmolLM2, Qwen2.5) are absent: their
+/// Mistral 7B, Cohere, Granite, SmolLM2, Qwen2.5) are absent: their
 /// `generation_config.json` and transformers' defaults apply
 /// ([`load_sampling_from_generation_config`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
