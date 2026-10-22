@@ -6,12 +6,13 @@ GGUF and MLX quantization, importance matrices and KL-calibrated per-tensor type
 
 ## GGUF Methods
 
-24 methods:
+26 methods:
 
 | Group | `--method` values |
 |-------|-------------------|
-| Adaptive | `dynamic` (default): mixed precision, with the type of each tensor chosen per layer (guided by `--imatrix` when given) |
+| Adaptive | `dynamic` (default): mixed precision, with the type of each tensor chosen per layer (guided by an importance matrix when given) |
 | K-quants | `q2_k`, `q3_k_s`, `q3_k_m`, `q3_k_l`, `q4_k_s`, `q4_k_m`, `q5_k_s`, `q5_k_m`, `q6_k` |
+| Non-linear 4-bit | `iq4_nl` (about 4.5 bits per weight), `iq4_xs` (about 4.25) |
 | Legacy | `q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0`, `q8_1` |
 | Low-bit | `q1_0`, `tq1_0`, `tq2_0` |
 | Block floating point | `mxfp4`, `nvfp4` |
@@ -23,13 +24,26 @@ pmetal quantize --model ./output --output model.gguf --method q4_k_m
 
 The size suffixes follow GGUF naming: `s` small, `m` medium (the usual choice), `l` large. `pmetal quantize --help` lists every value.
 
+`iq4_nl` and `iq4_xs` store four-bit indices into a fixed non-linear table of 16 values, spaced more finely near zero where most weights are. At a similar size they usually reconstruct a tensor more closely than the linear 4-bit formats, and they benefit most from an importance matrix.
+
 ## Importance Matrix
 
-`--imatrix` takes an importance-matrix file: the legacy `imatrix.dat` format or a GGUF imatrix, as other tools write them. The matrix weights the quantization error toward the activations that matter, and steers which tensors get more bits under `dynamic`. PMetal reads these files; it does not compute one from a dataset.
+An importance matrix records, for each weight matrix, how large the activations in each input channel are on representative text. The quantization error of a weight matters in proportion to the activations it meets, so the quantizers (legacy and K-quants and the non-linear 4-bit formats) choose their scales to minimise the error weighted by it, and under `dynamic` it also steers which tensors get more bits.
+
+`pmetal imatrix` measures one, as a GGUF imatrix file (or the legacy `.dat` format for a `.dat` path), by running the model over calibration data in chunks of `--ctx-size` tokens:
 
 ```bash
-pmetal quantize --model ./output --output model.gguf --method q4_k_m --imatrix imatrix.dat
+pmetal imatrix --model ./output --dataset calibration.txt --output imatrix.gguf
+pmetal quantize --model ./output --output model.gguf --method q4_k_m --imatrix imatrix.gguf
 ```
+
+The calibration data is a text file (one document), or a JSONL or Parquet dataset (local or a Hub id), rendered as for training: conversations through the model's chat template. Use a few hundred chunks of text like what the model will run on. For a one-off quantization, `--calibration-dataset` does the same measurement in the same run, on the model being quantized:
+
+```bash
+pmetal quantize --model ./output --output model.gguf --method iq4_xs --calibration-dataset calibration.txt
+```
+
+A measured matrix is reusable: it depends on the model and the data, not on the quantization method, so one file serves every quantization of that model. `--imatrix` also reads the files other tools write, in either format. Mixture-of-experts layers are measured per expert, counting only the tokens routed to each. A weight matrix the measurement could not reach is reported and quantized without importance.
 
 ## KL-Calibrated Quantization
 
@@ -68,4 +82,5 @@ Separately from weights, `pmetal infer` and `pmetal serve` can compress the KV c
 ## See Also
 
 - [pmetal quantize](/cli/quantize/): CLI reference
+- [pmetal imatrix](/cli/imatrix/): Measure an importance matrix
 - [Supported Models](/models/supported/): Compatible architectures
