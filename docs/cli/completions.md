@@ -11,9 +11,13 @@ installed build is completed, and a flag added in a later version is in the next
 pmetal completions <SHELL>
 ```
 
-`SHELL` is `bash`, `zsh`, `fish`, `elvish` or `powershell`.
+## Options
 
-## Installing
+| Option | Default | Description |
+|--------|---------|-------------|
+| `<SHELL>` | required | `bash`, `zsh`, `fish`, `elvish` or `powershell` |
+
+## Examples
 
 ```bash
 # zsh: put the script on your fpath
@@ -27,3 +31,7 @@ pmetal completions fish > ~/.config/fish/completions/pmetal.fish
 ```
 
 Restart the shell (or run `compinit` for zsh) to pick it up.
+
+## See Also
+
+- [Installation](/installation/): Installing pmetal

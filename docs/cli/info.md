@@ -1,31 +1,44 @@
 # pmetal info
 
-Show device information — GPU, ANE, bandwidth, and NAX capabilities.
+Show device information: GPU, ANE, bandwidth and NAX capabilities.
 
-Display detailed information about your Apple Silicon hardware.
+Displays detailed information about your Apple Silicon hardware and about this build of PMetal.
 
 ## Usage
 
 ```bash
-pmetal info
+pmetal info [--json]
 ```
+
+## Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--json` | `false` | Print the report as JSON |
 
 ## Output
 
 Shows:
 
-- **GPU family** (Apple7–Apple10)
+- **GPU family** (Apple7 to Apple10)
 - **Device tier** (Base/Pro/Max/Ultra)
 - **GPU core count**
 - **ANE core count** and availability
-- **NAX support** (M5+)
+- **NAX support** (M5 and later)
 - **Memory bandwidth** (GB/s, with measured-vs-fallback source)
 - **Metal features** (dynamic caching, mesh shaders)
 - **UltraFusion topology** (Ultra chips)
 - **UltraFusion local executor scaffold** (Ultra chips): per-die slices, local stage count, and heuristic interconnect bandwidth
 - **Environment**: the Hub cache directory, whether Hub offline mode is on (`HF_HUB_OFFLINE`), the log directory, and the optional features this build was compiled with (`--json` carries them under `environment`)
 
+## Examples
+
+```bash
+pmetal info
+pmetal info --json
+```
+
 ## See Also
 
-- [pmetal memory](/cli/memory/) — Memory usage details
-- [Hardware Support](/hardware/apple-silicon/) — Full hardware matrix
+- [pmetal memory](/cli/memory/): Memory usage details
+- [Hardware Support](/hardware/apple-silicon/): Full hardware matrix

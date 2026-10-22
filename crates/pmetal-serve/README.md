@@ -6,6 +6,15 @@ OpenAI-compatible inference server for PMetal.
 
 This crate provides a drop-in local inference backend compatible with the OpenAI API. Built on Axum, it serves PMetal models via standard OpenAI-format HTTP endpoints with streaming SSE support.
 
+It builds on `pmetal-models`, `pmetal-data`, `pmetal-cache`, `pmetal-metal` and `pmetal-runtime`, and the `pmetal` CLI (`pmetal serve`, behind that crate's `serve` feature) is its main user. The `pmetal serve` flags that shape the engine (ANE, a DFlash draft model, quantized and TurboQuant KV caches, the continuous-batching knobs) are fields of `pmetal_core::jobs::ServeSpec`.
+
+## Installation
+
+```toml
+[dependencies]
+pmetal-serve = "0.7"
+```
+
 ## Endpoints
 
 | Endpoint | Method | Description |
@@ -68,7 +77,7 @@ answers typed questions about a state, beside `GET /v1/models` and `GET /health`
 ### Via CLI
 
 ```bash
-# Start server (requires pmetal-cli built with --features serve)
+# Start server (the release binary includes it; a source build needs --features serve)
 pmetal serve --model Qwen/Qwen3-0.6B --port 8080
 
 # Query with curl
@@ -78,6 +87,22 @@ curl http://localhost:8080/v1/chat/completions \
 ```
 
 ### As a Library
+
+The server's defaults are loopback, no keys and a 30 minute request limit; the settings are
+`ServeConfig` fields (see Configuration below):
+
+```rust
+use std::time::Duration;
+
+use pmetal_serve::ServeConfig;
+
+let config = ServeConfig::default();
+assert_eq!((config.host.as_str(), config.port), ("127.0.0.1", 8080));
+assert_eq!(config.request_timeout, Some(Duration::from_secs(30 * 60)));
+assert!(config.api_keys.is_empty() && config.cors_allowed_origins.is_empty());
+```
+
+Serving a model:
 
 ```rust,no_run
 use std::path::Path;
@@ -175,7 +200,8 @@ frees a request's slot the moment its client hangs up.
 
 | Module | Description |
 |--------|-------------|
-| `engine` | `InferenceEngine` — model loading and generation |
+| `engine` | `InferenceEngine`: model loading and generation |
+| `decision` | `DecisionEngine` and the `/v1/systemone` router for decision models |
 | `continuous_batch` | The scheduler: slots, fair admission by KV memory, the iteration plan |
 | `continuous_driver` | Per-slot and fused KV caches, batched sampling, the decode step |
 | `continuous_pump` | The pump that runs the scheduler against the model, per request events |
@@ -197,11 +223,20 @@ frees a request's slot the moment its client hangs up.
 
 ## Dependencies
 
-- **axum** 0.8 — HTTP framework
-- **tower-http** — CORS and tracing middleware
-- **tokio** — async runtime
-- **tokio-stream** — SSE streaming
-- **prometheus-client** — the metrics registry and OpenMetrics encoding
+- **axum** 0.8: HTTP framework
+- **tower-http**: CORS and tracing middleware
+- **tokio**: async runtime
+- **tokio-stream**: SSE streaming
+- **prometheus-client**: the metrics registry and OpenMetrics encoding
+
+## Feature flags
+
+None.
+
+## Requirements
+
+- Rust 1.95 or later
+- macOS 14 or later on Apple Silicon
 
 ## License
 

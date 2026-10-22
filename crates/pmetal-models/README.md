@@ -6,6 +6,8 @@ LLM architecture implementations with dynamic dispatch.
 
 This crate provides implementations of popular LLM architectures optimized for Apple Silicon. It includes a dynamic dispatch system that automatically detects and loads models based on their configuration.
 
+It sits between the runtime and the training and serving crates: it builds on `pmetal-runtime`, `pmetal-cache`, `pmetal-data`, `pmetal-gguf`, `pmetal-hub` and `pmetal-metal`, and `pmetal-lora`, `pmetal-trainer`, `pmetal-serve`, the `pmetal` CLI and the Python bindings load and run models through it. The fastest decode paths for Qwen 3 / 3.5, Gemma 4, DeepSeek, GPT-OSS and Llama 4 are standalone engines in `pmetal-runtime`, which the `pmetal` CLI selects where they apply; the architectures here are the ones training, adapters and the general path run on.
+
 ## Supported Architectures
 
 ### Dispatched Models (via `DynamicModel`)
@@ -48,16 +50,53 @@ These are loaded by the Flux pipeline rather than by `DynamicModel`:
 
 ## Features
 
-- **Dynamic Model Loading**: Auto-detect architecture from `config.json`
-- **Unified Generation API**: Common interface for all models
-- **Advanced Sampling**: Temperature, top-k, top-p, repetition penalty
-- **Metal-Accelerated Sampling**: Fused GPU sampler kernel
-- **KV Cache Management**: Efficient inference with caching
+- **Dynamic Model Loading**: Auto-detect architecture from `config.json`; safetensors, PyTorch and GGUF checkpoints, MLX-quantized and NVIDIA ModelOpt (NVFP4, FP8) weights
+- **Unified Generation API**: `generate`, `generate_cached` and pipelined streaming decode for every `CausalLMModel`
+- **Sampling**: temperature, top-k, top-p, min-p, repetition, frequency and presence penalties, logit bias, seeded draws
+- **Speculative decoding**: DFlash block-diffusion drafters (both generations), tree verification (`ddtree`), and multi-token-prediction heads (Qwen 3.5's bundled predictor, Gemma 4's assistant)
+- **Decision models**: Clef and Clef-flash answer typed questions about a state in one forward pass (`decision`)
+- **SSD-offloaded experts**: routed experts of a sparse layer read from packed per-layer files, for MoE models larger than memory
+- **ModelThread**: one thread that owns a model and its arrays, for callers (a server) that must not touch them from several threads
+- **Diffusion**: DiffusionGemma sampling, and the Flux pipeline with CLIP, T5 and VAE
+- **Vision**: Llama 3.2 Vision, Gemma 4 and Qwen 3.5 vision towers
+- **Ollama Modelfile** generation and parsing, for exporting a trained model
+
+## Installation
+
+```toml
+[dependencies]
+pmetal-models = "0.7"
+```
 
 ## Usage
 
-`DynamicModel::load` detects the architecture from `config.json`. It takes a **local directory**;
-resolve HuggingFace ids with `pmetal_hub::download_model` first.
+A generation loop needs only a function from token ids to logits, so it runs without weights.
+This toy "model" always predicts the next id:
+
+```rust
+use pmetal_models::{GenerationConfig, generate};
+use pmetal_runtime::compat::{Array, Exception};
+
+fn main() -> Result<(), Exception> {
+    const VOCAB: usize = 8;
+    let counting = |input: &Array| -> Result<Array, Exception> {
+        let seq = input.dim(1) as usize; // input is [1, seq]
+        let mut logits = vec![0.0f32; seq * VOCAB];
+        for t in 0..seq {
+            logits[t * VOCAB + (t + 1) % VOCAB] = 10.0;
+        }
+        Ok(Array::from_f32_slice(&logits, &[1, seq as i32, VOCAB as i32]))
+    };
+
+    let output = generate(counting, &[0, 1], GenerationConfig::greedy(4))?;
+    // The prompt, then the four generated ids.
+    assert_eq!(output.token_ids, [0, 1, 2, 3, 4, 5]);
+    Ok(())
+}
+```
+
+With a real model, `DynamicModel::load` detects the architecture from `config.json`. It takes a
+**local directory**; resolve HuggingFace ids with `pmetal_hub::download_model` first.
 
 ```rust,no_run
 use pmetal_runtime::compat::Exception;
@@ -70,6 +109,7 @@ fn run(model_dir: &str, input_tokens: &[u32]) -> Result<Vec<u32>, Exception> {
         .with_top_k(40)
         .with_top_p(0.95);
 
+    // `token_ids` is the prompt followed by what was generated.
     let output = generate(|input| model.forward(input, None), input_tokens, config)?;
     Ok(output.token_ids)
 }
@@ -105,14 +145,22 @@ fn detect(model_dir: &str) -> Result<ModelArchitecture, Exception> {
 
 ## Generation Configuration
 
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `max_tokens` | Maximum tokens to generate | Required |
-| `temperature` | Sampling temperature (0 = greedy) | Model default |
-| `top_k` | Top-k sampling (0 = disabled) | Model default |
-| `top_p` | Nucleus sampling threshold | Model default |
-| `repetition_penalty` | Penalty for repeated tokens | 1.0 |
-| `stop_tokens` | Tokens that stop generation | EOS |
+`GenerationConfig::default()` samples; `greedy(n)`, `sampling(n, temperature)`, `creative(n)`,
+`precise(n)` and the Qwen 3 presets start from other defaults, and
+`GenerationConfig::from_model_dir` reads the model's own `generation_config.json`.
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `max_new_tokens` | Maximum tokens to generate | 256 |
+| `temperature` | Sampling temperature (0 = greedy) | 0.7 |
+| `top_k` | Top-k sampling (0 = disabled) | 40 |
+| `top_p` | Nucleus sampling threshold (1.0 = disabled) | 0.95 |
+| `min_p` | Drop tokens below `min_p` times the top token's probability (0 = disabled) | 0.05 |
+| `repetition_penalty` | Penalty for repeated tokens (1.0 = disabled) | 1.1 |
+| `frequency_penalty`, `presence_penalty` | OpenAI-style penalties (0 = disabled) | 0.0 |
+| `logit_bias` | `(token, bias)` pairs added to the logits | none |
+| `stop_tokens` | Tokens that stop generation | none |
+| `seed` | Seed for reproducible draws | unseeded |
 
 ## Modules
 
@@ -125,8 +173,26 @@ fn detect(model_dir: &str) -> Result<ModelArchitecture, Exception> {
 | `loader` | Reading checkpoints, unpacking quantization, assigning and auditing weights |
 | `pooling` | Sentence-embedding pooling over hidden states |
 | `weight_format` | GGUF weight loading and tensor-name mapping |
-| `sampling/` | Sampling strategy implementations |
+| `sampling/` | Diffusion sampling strategies |
 | `traits` | `CausalLMModel` and `ModelConfig` |
+| `dflash_*`, `ddtree`, `mtp`, `speculative` | Speculative decoding: DFlash drafters, tree verification, MTP heads, the shared rejection-sampling correction |
+| `expert_layout`, `expert_io`, `expert_offload` | SSD-offloaded routed experts |
+| `model_thread` | A thread that owns a model and its arrays |
+| `rl_generation` | Batched group sampling for GRPO-style training |
+| `shard` | Splitting a forward pass into stages for pipeline inference |
+| `ollama` | Ollama Modelfile generation and parsing |
+| `pipelines` | The Flux diffusion pipeline |
+
+## Feature flags
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `ane` | yes | Apple Neural Engine inference (`generate_cached_ane_streaming`, the ANE worker thread); turns on `pmetal-metal/ane` |
+
+## Requirements
+
+- Rust 1.95 or later
+- macOS 14 or later on Apple Silicon
 
 ## License
 

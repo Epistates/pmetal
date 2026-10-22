@@ -228,7 +228,7 @@ pub enum DatasetAction {
         #[arg(long, value_enum)]
         template: Option<TemplateName>,
 
-        /// System message that replaces the template's default
+        /// System message for the conversations that have none
         #[arg(long)]
         system: Option<String>,
 

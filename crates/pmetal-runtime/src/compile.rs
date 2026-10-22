@@ -1,22 +1,21 @@
 //! Generic `mlx::core::compile()` wrapper.
 //!
 //! mlx::core::compile traces a callable into a single fused graph on first
-//! invocation and replays that trace on every subsequent call. The perf
-//! memory (`project_perf_gap_mlxlm.md` / `project_mlxrs_perf_findings.md`)
-//! explicitly calls out compiled graphs as the dominant remaining lever
-//! for inference throughput — measured ~7× over the uncompiled path on
-//! Qwen3.5 decode.
+//! invocation and replays that trace on every subsequent call. Compiled
+//! graphs are the dominant lever for decode throughput: measured about 7x over
+//! the uncompiled path on Qwen3.5 decode.
 //!
-//! The pmetal bridge already uses `compile()` internally for specific
-//! fused ops (`bridge_compiled.cpp::make_compiled`). This module exposes
-//! it *generically* so any Rust caller can compile an arbitrary closure
-//! and call it repeatedly.
+//! The runtime already uses `compile()` internally for specific fused ops
+//! (`bridge_compiled.cpp::make_compiled`). This module exposes it
+//! *generically* so any Rust caller can compile an arbitrary closure and call
+//! it repeatedly.
 //!
 //! ## Usage
 //!
-//! ```ignore
+//! ```
 //! use pmetal_runtime::{CompiledFn, InlineArray};
 //!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! // Compile a SwiGLU(gate, up) closure once.
 //! let mut swiglu = CompiledFn::new(1, /* shapeless= */ true, |inputs| {
 //!     let g = &inputs[0];
@@ -25,10 +24,13 @@
 //!     vec![activated.multiply(u)]
 //! })?;
 //!
-//! // Call it as many times as you like — the trace is re-used.
+//! // Call it as many times as you like: the trace is re-used.
 //! let gate = InlineArray::from_f32_slice(&[1.0, 2.0], &[2]);
 //! let up   = InlineArray::from_f32_slice(&[0.5, 0.5], &[2]);
 //! let outs = swiglu.call(&[&gate, &up])?;
+//! assert_eq!(outs.len(), 1);
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ## Ownership + lifetime

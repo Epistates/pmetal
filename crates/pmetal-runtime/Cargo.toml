@@ -6,8 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "PMetal's tensor runtime for Apple Silicon: arrays, ops, compiled graphs, native inference engines and custom Metal kernels"
 repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["tensor", "autodiff", "apple-silicon", "mlx", "metal"]
+categories = ["science", "hardware-support"]
 links = "pmetal_runtime"
 
 [features]

@@ -42,3 +42,4 @@ echo ""
 
 echo ""
 echo "Training complete! Adapter saved to: $OUTPUT"
+echo "Run inference with: LORA_PATH=\"$OUTPUT\" ./examples/inference_lora.sh"

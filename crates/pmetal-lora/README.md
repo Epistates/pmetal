@@ -6,16 +6,54 @@ LoRA and QLoRA training implementations with Metal acceleration.
 
 This crate provides Low-Rank Adaptation (LoRA) and Quantized LoRA (QLoRA) training for LLMs on Apple Silicon. Adapters attach to the projections of the same model the inference path loads, so every architecture it loads can be fine-tuned.
 
+`pmetal-trainer` trains the models built here, and the `pmetal` CLI and the Python bindings reach it through the trainer. It builds on `pmetal-models` (the `DynamicModel` it adapts), `pmetal-cache` and `pmetal-runtime`, where the adapter itself lives as a property of `Linear`.
+
 ## Features
 
-- **Standard LoRA**: Low-rank adaptation with configurable rank and alpha
-- **QLoRA**: base weights packed to NF4, NVFP4 or 8-bit integers, adapters in full precision
-- **Dynamic Architecture**: Auto-detect and load any supported model
-- **Fused Training**: Metal-accelerated forward/backward passes (~2x speedup)
-- **Gradient Checkpointing**: Memory-efficient training for large models
-- **Sequence Packing**: Efficient training on variable-length data
+- **LoRA, rsLoRA and DoRA**: configurable rank, alpha and target modules; the default adapts every linear layer (attention and MLP)
+- **Initializations**: standard, PiSSA, OLoRA and LoftQ, each tested against its paper's definition
+- **Routed experts**: one adapter per expert on Qwen3-MoE, DeepSeek and Nemotron-H
+- **QLoRA**: base weights packed to NF4, NVFP4 or 8-bit integers, adapters in full precision; a checkpoint already packed (NVIDIA ModelOpt NVFP4 or FP8) trains with no dense copy of its base
+- **Any architecture the dispatcher loads**, encoders included (the embedding trainer takes an adapted BERT-family model)
+- **PEFT layout**: adapters are written and read as `adapter_config.json` and `adapter_model.safetensors`, in both directions
+- **Packed sequences**: `forward_with_positions` takes explicit positions, so documents packed into one row stay apart
+- **Merge and unmerge** of the adapter into the base weights
+
+## Installation
+
+```toml
+[dependencies]
+pmetal-lora = "0.7"
+```
 
 ## Usage
+
+The adapter's configuration round-trips through the PEFT layout without any weights:
+
+```rust
+use pmetal_core::LoraConfig;
+use pmetal_lora::peft::{adapter_base_model, lora_config_from_peft, peft_config};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = LoraConfig {
+        r: 8,
+        alpha: 16.0,
+        use_rslora: true,
+        target_modules: vec!["q_proj".into(), "v_proj".into()],
+        ..Default::default()
+    };
+
+    // What goes in `adapter_config.json`...
+    let json = peft_config(&config, &config.target_modules, Some("Qwen/Qwen3-0.6B"));
+    assert_eq!(json["peft_type"], "LORA");
+    assert_eq!(adapter_base_model(&json).as_deref(), Some("Qwen/Qwen3-0.6B"));
+
+    // ...and what reading it back gives.
+    let back = lora_config_from_peft(&json)?;
+    assert_eq!((back.r, back.alpha, back.use_rslora), (8, 16.0, true));
+    Ok(())
+}
+```
 
 ### Basic LoRA Training
 
@@ -135,6 +173,15 @@ are left alone.
 | `peft` | The PEFT adapter layout: `adapter_config.json`, tensor names, `lora_config_from_peft` |
 | `lora` | `LoraError` and adapter-file IO |
 | `trainable` | `TrainableModel` trait definition |
+
+## Feature flags
+
+None.
+
+## Requirements
+
+- Rust 1.95 or later
+- macOS 14 or later on Apple Silicon
 
 ## License
 
