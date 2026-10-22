@@ -526,6 +526,40 @@ fn preference_stops_after_its_step_and_keeps_the_adapter() {
     );
 }
 
+#[test]
+fn full_preference_stops_after_its_step_and_keeps_the_model() {
+    let (dir, model) = workspace();
+    let data = dir.path().join("data.jsonl");
+    fixtures::write_preference_dataset(&data);
+    let out = dir.path().join("out");
+    let run = Run::start(
+        dir.path(),
+        &[
+            "preference",
+            "--model",
+            s(&model),
+            "--dataset",
+            s(&data),
+            "--output",
+            s(&out),
+            "--full",
+            "--loss",
+            "dpo",
+            "--epochs",
+            "1000",
+            "--batch-size",
+            "2",
+            "--max-length",
+            "32",
+            "--max-prompt-length",
+            "16",
+        ],
+    );
+    stops_gracefully(run, event_log_has_a_step, &out.join("model.safetensors"));
+    assert!(out.join("config.json").exists());
+    assert!(!out.join("adapter_model.safetensors").exists());
+}
+
 /// Tokenize the text dataset into shards with the real `pmetal tokenize`.
 fn shards(dir: &Path, model: &Path) -> PathBuf {
     let data = dir.join("shard-source.jsonl");

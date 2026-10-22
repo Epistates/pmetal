@@ -215,6 +215,54 @@ fn config_number(config: &Value, key: &str) -> Option<u64> {
         .as_u64()
 }
 
+/// The settings of a run that its memory depends on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RunShape {
+    /// The optimizer.
+    pub optimizer: OptimizerType,
+    /// Sequences per micro-batch.
+    pub batch_size: usize,
+    /// Tokens per sequence.
+    pub seq_len: usize,
+    /// Whether activations are recomputed in the backward pass.
+    pub gradient_checkpointing: bool,
+    /// Whether the loss is cut cross-entropy.
+    pub cut_cross_entropy: bool,
+}
+
+/// Refuse a full fine-tune of the checkpoint in `model_dir` that would not fit
+/// the device, before the model loads; log the estimate either way.
+/// `config.skip_memory_check` logs it and runs.
+///
+/// # Errors
+///
+/// [`FullFineTuneError::WontFit`] with the breakdown, or
+/// [`FullFineTuneError::Unsupported`] for a checkpoint it cannot read.
+pub fn check_memory(
+    config: &FullFineTuneConfig,
+    model_dir: &Path,
+    run: &RunShape,
+) -> Result<(), FullFineTuneError> {
+    let request = memory_request(model_dir, config.freeze_embeddings, run)?;
+    let estimate = estimate_memory(&request);
+    let budget = device_budget();
+    tracing::info!(
+        "Full fine-tune memory estimate: {:.1} GB (weights {:.1}, gradients {:.1}, optimizer \
+         {:.1}, activations {:.1}) of a {:.1} GB working set",
+        estimate.total() as f64 / 1e9,
+        estimate.weights as f64 / 1e9,
+        estimate.gradients as f64 / 1e9,
+        estimate.optimizer as f64 / 1e9,
+        estimate.activations as f64 / 1e9,
+        budget as f64 / 1e9,
+    );
+    if config.skip_memory_check {
+        tracing::warn!("--no-memory-check: running a full fine-tune without checking it fits");
+        return Ok(());
+    }
+    estimate.check(budget, &request)
+}
+
 /// The memory request for fully fine-tuning the checkpoint in `model_dir`,
 /// read from its tensor headers and `config.json`: no weight is loaded.
 ///
@@ -224,13 +272,16 @@ fn config_number(config: &Value, key: &str) -> Option<u64> {
 /// or has no `config.json`.
 pub fn memory_request(
     model_dir: &Path,
-    optimizer: OptimizerType,
-    batch_size: usize,
-    seq_len: usize,
     freeze_embeddings: bool,
-    gradient_checkpointing: bool,
-    cut_cross_entropy: bool,
+    run: &RunShape,
 ) -> Result<MemoryRequest, FullFineTuneError> {
+    let RunShape {
+        optimizer,
+        batch_size,
+        seq_len,
+        gradient_checkpointing,
+        cut_cross_entropy,
+    } = *run;
     let source = SafetensorsLoader::new(model_dir).map_err(|e| {
         FullFineTuneError::Unsupported(format!(
             "full fine-tuning reads a safetensors checkpoint: {e}"

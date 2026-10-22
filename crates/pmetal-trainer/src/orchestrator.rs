@@ -808,7 +808,17 @@ pub async fn run_training(
         .with_max_checkpoints(if config.full.is_some() { 1 } else { 3 });
 
     if let Some(full) = &config.full {
-        check_full_finetune(full, &model_path, &full_config.training, &config.dispatch)?;
+        full_finetune::check_memory(
+            full,
+            &model_path,
+            &full_finetune::RunShape {
+                optimizer: full_config.training.optimizer,
+                batch_size: full_config.training.batch_size,
+                seq_len: full_config.training.max_seq_len,
+                gradient_checkpointing: config.dispatch.gradient_checkpointing,
+                cut_cross_entropy: config.dispatch.cut_cross_entropy,
+            },
+        )?;
     }
 
     let dataloader_config = DataLoaderConfig {
@@ -1015,43 +1025,6 @@ fn qlora_config(config: &TrainingJobConfig) -> Option<QLoraConfig> {
         group_size: qlora.block_size as i32,
         double_quant: qlora.double_quant,
     })
-}
-
-/// Refuse a full fine-tune that would not fit the device, before the model
-/// loads (see [`full_finetune::estimate_memory`]).
-fn check_full_finetune(
-    full: &FullFineTuneConfig,
-    model_path: &Path,
-    training: &TrainingConfig,
-    dispatch: &DispatchConfig,
-) -> anyhow::Result<()> {
-    let request = full_finetune::memory_request(
-        model_path,
-        training.optimizer,
-        training.batch_size,
-        training.max_seq_len,
-        full.freeze_embeddings,
-        dispatch.gradient_checkpointing,
-        dispatch.cut_cross_entropy,
-    )?;
-    let estimate = full_finetune::estimate_memory(&request);
-    let budget = full_finetune::device_budget();
-    tracing::info!(
-        "Full fine-tune memory estimate: {:.1} GB (weights {:.1}, gradients {:.1}, optimizer \
-         {:.1}, activations {:.1}) of a {:.1} GB working set",
-        estimate.total() as f64 / 1e9,
-        estimate.weights as f64 / 1e9,
-        estimate.gradients as f64 / 1e9,
-        estimate.optimizer as f64 / 1e9,
-        estimate.activations as f64 / 1e9,
-        budget as f64 / 1e9,
-    );
-    if full.skip_memory_check {
-        tracing::warn!("--no-memory-check: running a full fine-tune without checking it fits");
-        return Ok(());
-    }
-    estimate.check(budget, &request)?;
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -338,6 +338,9 @@ fn preference_spec_round_trip() {
         beta: Some(0.3),
         max_steps: Some(12),
         undesirable_weight: 1.5,
+        full_finetune: true,
+        freeze_embeddings: true,
+        no_memory_check: true,
         log_metrics: Some("m.jsonl".into()),
         ..defaults.clone()
     };

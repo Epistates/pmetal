@@ -7,10 +7,6 @@ use crate::{
 use pmetal_core_derive::JobSpec;
 use serde::{Deserialize, Serialize};
 
-/// The highest learning rate `--full` accepts: above it a full fine-tune of a
-/// pretrained model diverges, and LoRA's default (2e-4) is above it.
-const FULL_FINETUNE_MAX_LEARNING_RATE: f64 = 1e-4;
-
 /// Spec for `pmetal train`.
 ///
 /// Holds the user-facing input fields. Conversion to the trainer's internal
@@ -713,13 +709,15 @@ impl TrainSpec {
         }
         // The default rate is LoRA's: at it a full fine-tune diverges. (A config
         // file may set the rate, which this spec does not see.)
-        if self.config_path.is_none() && self.learning_rate > FULL_FINETUNE_MAX_LEARNING_RATE {
+        if self.config_path.is_none() && self.learning_rate > super::FULL_FINETUNE_MAX_LEARNING_RATE
+        {
             errs.push(FieldError::new(
                 "learning_rate",
                 format!(
                     "{} is a LoRA rate and would diverge a full fine-tune; use 1e-5 to 5e-5 \
-                     (the most --full accepts is {FULL_FINETUNE_MAX_LEARNING_RATE})",
-                    self.learning_rate
+                     (the most --full accepts is {})",
+                    self.learning_rate,
+                    super::FULL_FINETUNE_MAX_LEARNING_RATE
                 ),
             ));
         }

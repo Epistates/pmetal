@@ -83,12 +83,26 @@ The last shape is KTO's. KTO also reads paired rows, taking the chosen completio
 | `--optimizer` | `adamw` | `adamw`, `sgd` (momentum 0.9), `lion`, `adafactor`, `muon`, `adamw_schedule_free`, `adamw_8bit`. Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW; schedule-free AdamW wants a constant rate |
 | `--lora-r` | `16` | LoRA rank |
 | `--lora-alpha` | `32` | LoRA alpha |
+| `--full` | `false` | Train every weight and save a whole model instead of an adapter (see below) |
+| `--freeze-embeddings` | `false` | With `--full`, keep the input token embedding as loaded |
+| `--no-memory-check` | `false` | With `--full`, skip the check of the memory estimate against the device |
 | `--max-prompt-length` | `512` | Prompt tokens kept |
 | `--max-length` | `1024` | Prompt plus completion tokens kept |
 | `--seed` | `42` | Adapter initialization and shuffling |
 | `--log-metrics` | — | Per-step metrics as JSONL |
 
 Each step logs the loss, the mean implicit reward of chosen and rejected completions, their margin, the share of pairs ranked correctly, and for KTO the KL estimate.
+
+## Full-parameter preference tuning
+
+`--full` trains every weight instead of an adapter and saves a whole model (sharded safetensors with
+the checkpoint's config, tokenizer and chat template) that `infer` and `serve` load. The reference
+still costs no memory: it is the model as it starts, scored once before the first update, exactly as
+with LoRA's zero adapters. Everything else about full fine-tuning is as for
+[`pmetal train --full`](train.md#full-parameter-fine-tuning): the run is refused before the model
+loads if its memory estimate does not fit the device's working set (a pair is two sequences, and
+activations are not recomputed here), a learning rate above `1e-4` is refused (use `1e-6` to `1e-5`),
+and a quantized or GGUF checkpoint cannot be used.
 
 ## Choosing settings
 
