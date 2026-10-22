@@ -5,35 +5,53 @@
 //!
 //! # Supported Merge Methods
 //!
-//! - **Linear**: Simple weighted averaging of parameters
-//! - **SLERP**: Spherical linear interpolation for smooth blending
-//! - **TIES**: Task arithmetic with sparsification and sign consensus
-//! - **DARE**: Random pruning with rescaling
-//! - **DELLA**: Adaptive magnitude-based pruning
-//! - **Model Stock**: Geometric interpolation based on task vector similarity
+//! - **Linear** and **Task Arithmetic**: weighted averaging of parameters or
+//!   task vectors
+//! - **SLERP** and **Multi-SLERP**: spherical interpolation for smooth blending
+//! - **TIES**: task arithmetic with sparsification and sign consensus
+//! - **DARE**, **DELLA**, **Breadcrumbs**, **Consensus**: sparsified task
+//!   vectors
+//! - **Model Stock**: geometric interpolation based on task vector similarity
+//! - **Fisher**, **RegMean**, **RAM**, **Nearswap**, and **Passthrough**
+//!   (frankenmerges with `slices`)
+//!
+//! Every method is a [`MergeMethod`] over [`Array`](pmetal_runtime::compat::Array)s,
+//! and a configuration picks one with [`MergeMethodConfig`].
 //!
 //! # Memory Efficiency
 //!
 //! All operations use lazy tensor loading and streaming to enable merging
 //! large models on memory-constrained macOS devices.
-
+//!
 //! # Example
 //!
-//! ```ignore
-//! use pmetal_merge::{MergeConfig, MergeMethod, run_merge};
+//! A method merges the same tensor from several models. SLERP halfway between
+//! two orthogonal unit vectors lands at 45 degrees:
 //!
-//! let config = MergeConfig {
-//!     method: MergeMethod::Slerp { t: 0.5 },
-//!     models: vec![
-//!         ModelSource::from_path("model_a"),
-//!         ModelSource::from_path("model_b"),
-//!     ],
-//!     output_path: "merged_model".into(),
+//! ```
+//! use pmetal_merge::{MergeMethod, MergeParameters, ParameterSetting, SlerpMerge};
+//! use pmetal_runtime::compat::Array;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let a = Array::from_f32_slice(&[1.0, 0.0], &[2]);
+//! let b = Array::from_f32_slice(&[0.0, 1.0], &[2]);
+//! let global = MergeParameters {
+//!     t: Some(ParameterSetting::Scalar(0.5)),
 //!     ..Default::default()
 //! };
 //!
-//! run_merge(&config)?;
+//! let per_model = [MergeParameters::default(), MergeParameters::default()];
+//! let mut merged = SlerpMerge::new().merge(&[a, b], None, &per_model, &global)?;
+//!
+//! let half = std::f32::consts::FRAC_1_SQRT_2;
+//! let values = merged.to_f32_vec(2).unwrap();
+//! assert!((values[0] - half).abs() < 1e-4 && (values[1] - half).abs() < 1e-4);
+//! # Ok(())
+//! # }
 //! ```
+//!
+//! Whole models are merged with [`run_merge`] (or [`MergeBuilder`]); the crate
+//! README shows one end to end.
 
 #![warn(missing_docs)]
 
