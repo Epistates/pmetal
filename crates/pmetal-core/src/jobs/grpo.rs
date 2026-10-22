@@ -1,5 +1,6 @@
 //! `pmetal grpo` — Group Relative Policy Optimization.
 
+use super::{default_lora_alpha, default_lora_r, default_seed};
 use crate::{FieldError, JobFields};
 use pmetal_core_derive::JobSpec;
 use serde::{Deserialize, Serialize};
@@ -364,20 +365,11 @@ fn default_lr() -> f64 {
 fn default_epochs() -> usize {
     1
 }
-fn default_lora_r() -> usize {
-    16
-}
-fn default_lora_alpha() -> f32 {
-    32.0
-}
 fn default_max_seq_len() -> usize {
     512
 }
 fn default_max_completion() -> usize {
     512
-}
-fn default_seed() -> u64 {
-    42
 }
 fn default_checkpoint_every() -> usize {
     50

@@ -1,5 +1,6 @@
 //! `pmetal train` — supervised fine-tuning / LoRA / QLoRA / ANE.
 
+use super::{default_lora_alpha, default_lora_r, default_seed};
 use crate::{
     DistributedCompression, DistributedTrainingConfig, FieldError, JobFields, LoraConfig,
     TrainingConfig, defaults,
@@ -744,17 +745,8 @@ fn default_weight_decay() -> f64 {
 fn default_lr_schedule() -> String {
     "cosine".to_string()
 }
-fn default_seed() -> u64 {
-    defaults::SEED
-}
 fn default_loss_scale() -> f32 {
     defaults::LOSS_SCALE as f32
-}
-fn default_lora_r() -> usize {
-    defaults::LORA_R
-}
-fn default_lora_alpha() -> f32 {
-    defaults::LORA_ALPHA
 }
 fn default_logging_steps() -> usize {
     defaults::LOGGING_STEPS

@@ -62,6 +62,21 @@ pub use train_draft::TrainDraftSpec;
 pub use train_mtp::TrainMtpSpec;
 pub use vocode::VocodeSpec;
 
+/// Default of every spec's `seed` field.
+pub(crate) fn default_seed() -> u64 {
+    crate::defaults::SEED
+}
+
+/// Default of every spec's `lora_r` field.
+pub(crate) fn default_lora_r() -> usize {
+    crate::defaults::LORA_R
+}
+
+/// Default of every spec's `lora_alpha` field.
+pub(crate) fn default_lora_alpha() -> f32 {
+    crate::defaults::LORA_ALPHA
+}
+
 /// Default of every spec's `optimizer` field.
 pub(crate) fn default_optimizer() -> String {
     crate::OptimizerType::default().as_str().to_string()
