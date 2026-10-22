@@ -5,8 +5,18 @@ Launch the terminal control center: 21 tabs for monitoring, configuring and runn
 ## Usage
 
 ```bash
+pmetal tui [OPTIONS]
+```
+
+## Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-m`, `--metrics-file` | none | Training metrics JSONL file to follow on the Monitor tab |
+
+```bash
 pmetal tui
-pmetal tui --metrics-file training_metrics.jsonl
+pmetal tui --metrics-file metrics.jsonl
 ```
 
 Every job tab is a form built from the same job spec the CLI, the MCP server and the desktop app use, so a field's name, default, range and the command it launches are the spec's. Starting a job shows the exact `pmetal` command first. Jobs run as child processes under the shared job supervisor, each in its own process group, with a bounded, scrollable, secret-redacted log. Leaving the TUI, by `q`, a closed terminal or a signal, stops every job it started.
