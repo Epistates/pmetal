@@ -37,9 +37,51 @@ pmetal train \
   --dataset train.jsonl \
   --lr-schedule cosine_with_restarts
 
+# Full-parameter fine-tuning: every weight trains, and the result is a whole model
+pmetal train \
+  --model Qwen/Qwen3-0.6B \
+  --dataset train.jsonl \
+  --output ./tuned \
+  --full --learning-rate 2e-5 --optimizer adamw_8bit
+
 # From a config file
 pmetal train --config training.yaml
 ```
+
+## Full-parameter fine-tuning
+
+`--full` trains every weight of the model, not adapters, through the same training loop, optimizers,
+gradient checkpointing and sequence packing as LoRA. The model is the one `pmetal infer` and `serve`
+run, with nothing attached, so what trains is what is served.
+
+- **Result.** `--output` holds a complete Hugging Face-layout model: sharded `model-0000N-of-0000M.safetensors`
+  with `model.safetensors.index.json` (one `model.safetensors` when it fits in one file) under the
+  checkpoint's own tensor names, and the checkpoint's `config.json`, tokenizer and chat template.
+  `pmetal infer --model ./tuned` and `pmetal serve --model ./tuned` load it, as does any other tool
+  that reads the format. The weights are written in the dtype the model trained in. The output
+  directory must not be the model's own.
+- **Memory.** It holds the weights, an f32 gradient per weight and the optimizer's state, several
+  times the model's size where LoRA needs little more than the model. Before anything loads, the
+  run's estimate (weights, gradients, optimizer moments and f32 master copies of half-precision
+  weights, activations) is checked against the device's recommended working set, and the run is
+  refused when it will not fit, with the breakdown and what would shrink it:
+  `--optimizer adamw_8bit` (one byte per moment), `--freeze-embeddings`, `--cut-cross-entropy`,
+  a smaller `--batch-size` or `--max-seq-len`. `--no-memory-check` runs it anyway.
+- **Learning rate.** LoRA's default `2e-4` diverges a full fine-tune, so `--full` refuses a
+  `--learning-rate` above `1e-4`. Use `1e-5` to `5e-5`.
+- **Optimizers.** AdamW keeps f32 master weights for a bf16 model; `adamw_8bit` and `muon` work as in
+  LoRA runs (Muon trains the embedding, head and norms with AdamW).
+- **Frozen embedding.** `--freeze-embeddings` keeps the input token embedding as loaded, saving its
+  gradient and optimizer state. A model that ties its output head to the embedding (Qwen3-0.6B does)
+  keeps the head too; an untied head still trains.
+- **Checkpoints and resume.** `--save-steps` and `--resume` work as in LoRA runs; a checkpoint is the
+  whole model and its optimizer's state, so only the latest is kept. The adaptive learning-rate
+  rollback, which holds a second copy of the weights, is off.
+- **What it does not do.** `--quantization` (a packed base cannot take gradients), `--ane`
+  (the Neural Engine path already trains every weight), `--dora`, `--rslora` and `--lora-targets` are
+  refused with `--full`, and so is a quantized or GGUF checkpoint. A checkpoint whose tensors the
+  model does not read under their own names (fused or stacked layouts) is refused before training,
+  since the result could not be saved.
 
 ## Parameters
 
@@ -48,6 +90,9 @@ pmetal train --config training.yaml
 | `--model` | *required* | HuggingFace model ID or local path |
 | `--dataset` | *required* | Path to training dataset (JSONL, Parquet, CSV) |
 | `--output` | `./output` | Output directory for weights and logs |
+| `--full` | `false` | Train every weight and save a whole model (see [Full-parameter fine-tuning](#full-parameter-fine-tuning)) |
+| `--freeze-embeddings` | `false` | With `--full`, keep the input token embedding as loaded |
+| `--no-memory-check` | `false` | With `--full`, skip the check of the memory estimate against the device |
 | `--lora-r` | `16` | LoRA rank |
 | `--lora-alpha` | `32.0` | LoRA scaling factor (2× rank) |
 | `--batch-size` | `1` | Micro-batch size |
@@ -125,7 +170,7 @@ pmetal train --model ... --dataset data.jsonl \
 
 Training produces:
 
-- `adapter_model.safetensors` and `adapter_config.json` — the LoRA adapter, in the layout `peft` reads (`PeftModel.from_pretrained(base, "./output")` loads it; adapters from earlier releases, `lora_weights.safetensors`, still load here)
+- `adapter_model.safetensors` and `adapter_config.json` — the LoRA adapter, in the layout `peft` reads (`PeftModel.from_pretrained(base, "./output")` loads it; adapters from earlier releases, `lora_weights.safetensors`, still load here). With `--full`, a whole model instead: see [Full-parameter fine-tuning](#full-parameter-fine-tuning)
 - `training_metrics.jsonl` — Per-step metrics log
 - `checkpoint/` — Resumable checkpoints (if training is interrupted)
 

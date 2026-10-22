@@ -14,11 +14,12 @@ Every command is a job spec shared by the CLI, TUI, GUI, MCP server and Python b
 | LoRA | `train` | `orchestrator::run_training()` |
 | QLoRA (NF4, NVFP4 or int8 base) | `train --quantization nf4\|fp4\|int8` | `orchestrator::run_training()` |
 | DoRA, rsLoRA | `train --dora`, `train --rslora` | `LoraConfig { use_dora, use_rslora }` |
+| Full-parameter fine-tuning | `train --full` | `orchestrator::run_training()` (`TrainingJobConfig::full`) |
 | DPO / Robust DPO, IPO, hinge | `preference --loss dpo\|ipo\|hinge` | `PreferenceTrainer` |
 | SimPO | `preference --loss simpo` | `PreferenceTrainer` |
 | ORPO | `preference --loss orpo` | `PreferenceTrainer` |
 | KTO | `preference --loss kto` | `KtoTrainer` |
-| GRPO (Reasoning) | `grpo --loss-type grpo` | `GrpoTrainer` |
+| GRPO (Reasoning) | `grpo --loss-type grpo` (rewards: `--reward-cmd`, `--reward-regex`, `--reward-json-schema`, Python callables) | `GrpoTrainer`, `grpo::run_grpo_job` |
 | DAPO | `grpo --dapo` (the default `--loss-type`) | `GrpoConfig::for_dapo` |
 | Dr. GRPO | `grpo --loss-type dr_grpo` | `GrpoConfig::for_dr_grpo` |
 | GSPO | `grpo --loss-type gspo --num-iterations 2` | `GrpoConfig::for_gspo` |
