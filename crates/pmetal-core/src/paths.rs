@@ -72,6 +72,21 @@ pub fn resolve_in(dir: &Path, path: &str) -> PathBuf {
     }
 }
 
+/// The folder name the Hub's cache gives a repository: `models--owner--name`
+/// (`kind` is the prefix, `models` or `datasets`; the `/` of the id is written
+/// `--`). The one place the encoding is spelled.
+pub fn hub_repo_folder(kind: &str, repo_id: &str) -> String {
+    format!("{kind}--{}", repo_id.replace('/', "--"))
+}
+
+/// The repository id of a cache folder of `kind` (`models--owner--name` is
+/// `owner/name`), or `None` for a folder of another kind. Only the first `--`
+/// is the owner's: names may contain `--`.
+pub fn hub_repo_id(kind: &str, folder: &str) -> Option<String> {
+    let encoded = folder.strip_prefix(kind)?.strip_prefix("--")?;
+    Some(encoded.replacen("--", "/", 1))
+}
+
 /// `~` and `~/x` spelled out against the home directory; anything else (a
 /// `~user` path included) as it was.
 pub fn expand_home(text: &str) -> PathBuf {
@@ -105,6 +120,30 @@ mod tests {
             resolve_in(dir, "/elsewhere/m.jsonl"),
             PathBuf::from("/elsewhere/m.jsonl")
         );
+    }
+
+    #[test]
+    fn a_hub_cache_folder_and_its_repository_id_are_each_others_encoding() {
+        assert_eq!(
+            hub_repo_folder("models", "Qwen/Qwen3-0.6B"),
+            "models--Qwen--Qwen3-0.6B"
+        );
+        assert_eq!(hub_repo_folder("datasets", "gpt2"), "datasets--gpt2");
+        assert_eq!(
+            hub_repo_id("models", "models--Qwen--Qwen3-0.6B").as_deref(),
+            Some("Qwen/Qwen3-0.6B")
+        );
+        // A bare name has no owner; a name with `--` in it keeps it.
+        assert_eq!(
+            hub_repo_id("models", "models--gpt2").as_deref(),
+            Some("gpt2")
+        );
+        assert_eq!(
+            hub_repo_id("models", "models--o--a--b").as_deref(),
+            Some("o/a--b")
+        );
+        assert_eq!(hub_repo_id("models", "datasets--o--d"), None);
+        assert_eq!(hub_repo_id("models", "modelsx--o"), None);
     }
 
     #[test]
