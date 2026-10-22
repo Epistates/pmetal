@@ -68,6 +68,7 @@ pub mod rl_generation;
 pub mod sampling;
 pub mod shard;
 pub mod speculative;
+pub mod speculator;
 pub mod traits;
 pub mod weight_format;
 
