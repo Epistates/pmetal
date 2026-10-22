@@ -4917,15 +4917,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ordered-float"
-version = "5.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c7c9e0d9b23589f26070720bac724174bfec1083e82f7854cdd0267518343c0"
-dependencies = [
- "num-traits",
-]
-
-[[package]]
 name = "os_str_bytes"
 version = "6.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5407,7 +5398,6 @@ dependencies = [
  "half",
  "if-addrs",
  "libp2p",
- "ordered-float 5.5.0",
  "parking_lot 0.13.0",
  "petgraph",
  "pmetal-runtime",
@@ -5440,7 +5430,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
- "zerocopy",
 ]
 
 [[package]]
@@ -5514,7 +5503,6 @@ dependencies = [
  "ndarray",
  "pmetal-hub",
  "pmetal-runtime",
- "rand 0.10.3",
  "regex",
  "safetensors",
  "serde",
@@ -5524,7 +5512,6 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
- "zerocopy",
 ]
 
 [[package]]
@@ -5599,7 +5586,6 @@ dependencies = [
  "pmetal-core",
  "pmetal-data",
  "pmetal-hub",
- "pmetal-lora",
  "pmetal-metal",
  "pmetal-models",
  "pmetal-runtime",
@@ -5611,7 +5597,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -5657,7 +5642,6 @@ dependencies = [
  "thiserror 2.0.21",
  "tokenizers",
  "tokio",
- "tokio-stream",
  "tower",
  "tower-http 0.7.1",
  "tracing",
@@ -5678,7 +5662,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
- "tracing",
  "uuid",
 ]
 
@@ -5689,7 +5672,6 @@ dependencies = [
  "anyhow",
  "chrono",
  "crc",
- "dirs 7.0.0",
  "image",
  "indicatif",
  "pmetal-cache",
@@ -5707,7 +5689,6 @@ dependencies = [
  "rand 0.10.3",
  "safetensors",
  "serde",
- "serde-saphyr",
  "serde_json",
  "serial_test",
  "tempfile",
@@ -7644,7 +7625,7 @@ dependencies = [
  "nix 0.29.0",
  "num-derive",
  "num-traits",
- "ordered-float 4.6.0",
+ "ordered-float",
  "pest",
  "pest_derive",
  "phf",
@@ -7875,17 +7856,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9cc2678c2cdd569ef8215e2afd7954ada2ae20b4fdd2c5fe6139a3b02d105db"
 dependencies = [
  "rustls",
- "tokio",
-]
-
-[[package]]
-name = "tokio-stream"
-version = "0.1.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b"
-dependencies = [
- "futures-core",
- "pin-project-lite",
  "tokio",
 ]
 
@@ -8746,7 +8716,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f2ab60e120fd6eaa68d9567f3226e876684639d22a4219b313ff69ec0ccd5ac"
 dependencies = [
  "log",
- "ordered-float 4.6.0",
+ "ordered-float",
  "strsim",
  "thiserror 1.0.69",
  "wezterm-dynamic-derive",

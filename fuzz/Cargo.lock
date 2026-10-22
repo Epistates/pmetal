@@ -337,7 +337,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
- "zerocopy",
 ]
 
 [[package]]

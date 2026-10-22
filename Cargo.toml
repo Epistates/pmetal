@@ -67,7 +67,6 @@ pmetal-lib = { package = "pmetal", path = "crates/pmetal", version = "0.7.0", de
 
 # Async runtime
 tokio = { version = "1.54", features = ["full"] }
-tokio-stream = "0.1"
 tokio-util = "0.7"
 futures = "0.3.34"
 async-trait = "0.1"
@@ -168,7 +167,6 @@ rayon = "1"
 # so a library consumer can't resolve below them.
 rand = "0.10.3"
 rand_distr = "0.6"
-ordered-float = "5"
 byteorder = "1.5"
 indicatif = "0.18"
 dirs = "7"

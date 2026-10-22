@@ -16,7 +16,6 @@ half = { workspace = true }
 memmap2 = { workspace = true }
 rayon = { workspace = true }
 serde_json = { workspace = true }
-zerocopy = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tempfile = { workspace = true }

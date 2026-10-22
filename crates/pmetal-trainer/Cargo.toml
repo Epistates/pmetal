@@ -39,8 +39,6 @@ tracing = { workspace = true }
 indicatif = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }
-dirs = { workspace = true }
-serde-saphyr = { workspace = true }
 anyhow = { workspace = true }
 image = { workspace = true }
 

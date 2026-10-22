@@ -69,7 +69,6 @@ parking_lot = { workspace = true }
 # Seals and opens a batch of frames on several cores.
 rayon = { workspace = true }
 half = { workspace = true }
-ordered-float = { workspace = true }
 
 # Local NIC enumeration for fabric detection (Thunderbolt / Ethernet / WiFi).
 if-addrs = { workspace = true }
