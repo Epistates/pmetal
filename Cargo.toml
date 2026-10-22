@@ -200,8 +200,8 @@ cc = "1.9"
 cmake = "0.1"
 
 # Python bindings
-pyo3 = "0.29"
-pyo3-build-config = "0.29"
+pyo3 = "0.30"
+pyo3-build-config = "0.30"
 
 # Testing
 criterion = "0.8"

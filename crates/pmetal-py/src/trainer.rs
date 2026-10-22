@@ -21,7 +21,7 @@ use crate::spec;
 use crate::specs::PyTrainSpec;
 
 /// What a finished training run produced.
-#[pyclass(name = "TrainResult", module = "pmetal", frozen, skip_from_py_object)]
+#[pyclass(name = "TrainResult", module = "pmetal", frozen)]
 pub struct PyTrainResult {
     /// The loss of the last step.
     #[pyo3(get)]
