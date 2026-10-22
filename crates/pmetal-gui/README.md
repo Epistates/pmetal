@@ -25,6 +25,14 @@ field, its default and its range are the command line's own.
 
 A job page is `/run/<job>` (`/run/train`, `/run/serve`, ...), one component for all of them.
 
+The app is not published to crates.io (`publish = false`); it ships as the `PMetal.app` bundle,
+built from this crate's own Cargo workspace.
+
+## Requirements
+
+- macOS 14 or later on Apple Silicon
+- To build: Rust 1.95 or later, [bun](https://bun.sh), and the Tauri prerequisites
+
 ## Tech Stack
 
 - **Tauri 2**: native desktop framework (Rust backend)
@@ -60,8 +68,8 @@ bun tauri build
 ```text
 pmetal-gui/
 ├── src/                    # Svelte frontend
-│   ├── routes/             # Dashboard, Jobs, Models, Datasets, Chat, Settings, /run/<job>
-│   ├── lib/                # api.ts (the command contract), stores, forms, components
+│   ├── routes/             # Dashboard, Jobs, Models, Datasets, Chat (/inference), Settings, /run/<job>
+│   ├── lib/                # api.ts (the command contract), stores, forms, nav, components
 │   │   └── specs.generated.ts  # field names of every job, generated from the specs
 │   └── app.html
 ├── src-tauri/              # Rust backend (its own Cargo workspace)
@@ -71,10 +79,15 @@ pmetal-gui/
 │   │   ├── state.rs        # AppState: settings, token, models, jobs, downloads
 │   │   ├── jobs/           # kinds (spec to command), JobHub over the supervisor
 │   │   ├── models.rs       # Hub cache + trained + added folders
+│   │   ├── adapters.rs     # LoRA adapters trained on this Mac
+│   │   ├── datasets.rs     # a look inside a dataset file before a job uses it
 │   │   ├── hub.rs          # search, downloads
+│   │   ├── binary.rs       # finding the `pmetal` command line the jobs run
+│   │   ├── system.rs       # the chip, memory, and whether a model fits
 │   │   ├── secrets.rs      # the Hugging Face token, in the Keychain
 │   │   ├── settings.rs     # the settings file
 │   │   ├── paths.rs        # which locations a job may write to
+│   │   ├── logging.rs      # the app's log file, and what a crash leaves behind
 │   │   └── inference.rs    # chat, the one thing that generates inside the app
 │   ├── build.rs            # declares the commands, so capabilities can name them
 │   ├── capabilities/       # what the window may call

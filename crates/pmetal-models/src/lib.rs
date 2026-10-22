@@ -19,13 +19,20 @@
 //! Checkpoints load through [`loader`], which fails unless the checkpoint and the
 //! model account for each other.
 //!
-//! ## Diffusion (pipeline components available)
+//! ## Diffusion
 //!
-//! - Flux (1-dev, 1-schnell) via [`pipelines::FluxPipeline`]
+//! - Flux (1-dev, 1-schnell) via [`pipelines::FluxPipeline`], with the CLIP and
+//!   T5 text encoders and the VAE it loads
 //!
-//! ## Diffusion components
+//! ## Beyond the architectures
 //!
-//! - CLIP and T5 text encoders and the VAE, loaded by the Flux pipeline
+//! - Generation ([`generation`]): greedy and sampled decoding, cached and
+//!   pipelined
+//! - Speculative decoding: DFlash drafters ([`dflash_drafts`]), tree
+//!   verification ([`ddtree`]) and multi-token-prediction heads ([`mtp`]),
+//!   sharing one rejection-sampling correction ([`speculative`])
+//! - Decision models ([`decision`]), SSD-offloaded experts ([`expert_offload`]),
+//!   and [`model_thread`], a thread that owns a model and its arrays
 //!
 //! # Architecture Support
 //!

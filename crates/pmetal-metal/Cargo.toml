@@ -1,13 +1,15 @@
 [package]
 name = "pmetal-metal"
-description = "Metal GPU compute kernels for PMetal - FlashAttention and optimized ML primitives"
+description = "Metal GPU kernels and Apple Neural Engine programming for PMetal"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["metal", "gpu", "neural-engine", "apple-silicon", "machine-learning"]
+categories = ["hardware-support", "science"]
 build = "build.rs"
 
 [features]

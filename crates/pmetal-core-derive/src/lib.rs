@@ -1,6 +1,8 @@
-//! `#[derive(JobSpec)]` — derives `pmetal_core::JobFields` for a spec struct.
+//! `#[derive(JobSpec)]`: derives `pmetal_core::JobFields` for a spec struct.
 //!
-//! See `pmetal_core::jobs::*` for usage examples.
+//! Use it through `pmetal_core::JobSpec`, which re-exports it; the generated
+//! code needs `pmetal-core` in scope. The specs in `pmetal_core::jobs` are
+//! worked examples, and this crate's README shows a minimal one.
 //!
 //! ## Spec-level attributes (`#[spec(...)]` on the struct)
 //!

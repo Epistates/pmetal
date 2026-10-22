@@ -1,21 +1,28 @@
-//! `pmetal-runtime` — PMetal's tensor runtime for Apple Silicon.
+//! PMetal's tensor runtime for Apple Silicon.
 //!
 //! [`InlineArray`] is the array every pmetal crate computes with: a
 //! stack-allocated handle with no per-op heap allocation, over MLX's lazy
 //! graph today, reached through `extern "C"` calls into this crate's C++.
-//! On it sit compiled graphs, the native inference engines, the decode
-//! sampler, optimizers, the TurboQuant KV cache and pmetal's own Metal
-//! kernels. MLX is an implementation detail behind this API, kept where it is
-//! the best choice and replaced by our own kernels where they are faster or
-//! more correct.
+//! On it sit compiled graphs ([`CompiledFn`]), autodiff
+//! ([`value_and_grad`](inline_array::value_and_grad)), the native inference
+//! engines, the decode sampler, optimizers, the TurboQuant KV cache and
+//! pmetal's own Metal kernels. MLX is an implementation detail behind this
+//! API, kept where it is the best choice and replaced by our own kernels where
+//! they are faster or more correct.
 //!
-//! The `compat` module builds the model-facing API on top of it (`Array`,
+//! The [`compat`] module builds the model-facing API on top of it (`Array`,
 //! `Dtype`, `Module`, `ModuleParameters`, optimizers, layers, etc.), so model
-//! code never touches the FFI directly. The `nn` module holds the operations
+//! code never touches the FFI directly. The [`nn`] module holds the operations
 //! a model's forward and loss are built from (attention, the gated delta rule,
 //! the cut cross-entropy loss, rotary embeddings at explicit positions, the
-//! mixture-of-experts combine), and `memory` the allocator and system memory
+//! mixture-of-experts combine), and [`memory`] the allocator and system memory
 //! figures.
+//!
+//! An op that fails in C++ records the error instead of aborting: see
+//! [`check_unobserved_error`] and the `try_*` ops in [`try_ops`].
+//!
+//! The crate builds MLX from source and links it statically; the crate
+//! README lists the environment variables that control that build.
 
 #[macro_use]
 mod bridge_extern;
@@ -75,3 +82,10 @@ pub mod qwen3_native;
 
 #[cfg(test)]
 mod f64_reference;
+
+/// Compiles the code blocks in `README.md` as doctests, so the crate's front
+/// page cannot drift away from its API. `cfg(doctest)` keeps the item out of
+/// the rendered docs and out of every normal build.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;

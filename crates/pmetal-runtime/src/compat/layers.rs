@@ -1007,8 +1007,8 @@ impl Embedding {
     ///
     /// NEFTune (Jain et al., 2023) adds `U(-mag, mag)` to the embedding output
     /// during training, with `mag = alpha / sqrt(seq_len * dims)`. This is the
-    /// same point TRL injects at, since its hook fires on the embedding
-    /// module's output: for Gemma that means the noise goes in *before* the
+    /// same point the method's reference implementation injects at, on the
+    /// embedding module's output: for Gemma that means the noise goes in *before* the
     /// `sqrt(hidden_size)` scale and gets multiplied up with everything else.
     ///
     /// Only the token-embedding layer should carry an alpha. A tied LM head

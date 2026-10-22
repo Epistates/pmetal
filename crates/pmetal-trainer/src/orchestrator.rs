@@ -1,7 +1,7 @@
-//! Shared training orchestrator consumed by CLI, TUI, GUI, and easy API.
+//! Shared training orchestrator: the one pipeline behind `pmetal train`, the
+//! TUI, the GUI, the MCP server and the Python bindings.
 //!
-//! Replaces four separate training pipeline implementations with one canonical
-//! `run_training()` entry point that handles:
+//! [`run_training`] is the single entry point. It handles:
 //! - Model/dataset resolution (HF download or local path)
 //! - Tokenization with chat template detection
 //! - ANE training path (with GPU fallback)
@@ -418,10 +418,6 @@ pub struct TrainingResult {
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Run a complete training pipeline.
-///
-/// All async work (model/dataset download) completes before any MLX types
-/// are created, avoiding `!Send` issues with `Rc`-based array handles.
 /// Emit a phase update if a callback is set.
 fn emit_phase(phase_cb: Option<&dyn PhaseCallback>, p: TrainingPhase) {
     if let Some(cb) = phase_cb {
@@ -429,6 +425,10 @@ fn emit_phase(phase_cb: Option<&dyn PhaseCallback>, p: TrainingPhase) {
     }
 }
 
+/// Run a complete training pipeline.
+///
+/// All async work (model/dataset download) completes before any runtime
+/// arrays are created, avoiding `!Send` issues with `Rc`-based array handles.
 pub async fn run_training(
     mut config: TrainingJobConfig,
     phase_cb: Option<&dyn PhaseCallback>,

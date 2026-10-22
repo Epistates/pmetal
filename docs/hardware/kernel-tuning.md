@@ -1,31 +1,32 @@
 # Kernel Tuning
 
-Per-tier Metal kernel tuning — threadgroup sizes, chunk sizes, and batch multipliers.
+What PMetal chooses per device, and which custom Metal kernels it carries.
 
-PMetal automatically selects kernel parameters based on your device tier and GPU family.
-
-On Apple10/M5 hardware, the Metal 4 / MPP dispatcher benchmarks and persists MLX `quantized_matmul` versus the MPP path for 4-bit affine quantized linear inference, per device and problem shape.
-
-Dense GEMM, attention, RoPE, SwiGLU and LoRA are not tuned here: they run as tensor-runtime ops, and the hand-written kernels that used to cover them measured slower than those ops.
+Dense GEMM, attention, RoPE, SwiGLU, LoRA and cross-entropy run as tensor-runtime ops in a lazy graph (with autodiff). The hand-written kernels that once covered them measured slower than those ops and were removed, so there are no per-tier tile or threadgroup tables to tune.
 
 ## Batch Size Multiplier
 
+`DeviceProperties::batch_size_multiplier` scales a recommended batch size by tier:
+
 | Tier | Multiplier |
 |------|-----------|
-| Base | 1× |
-| Pro | 2× |
-| Max | 4× |
-| Ultra | 8× |
+| Base | 1x |
+| Pro | 2x |
+| Max | 4x |
+| Ultra | 8x |
 
-## Metal GPU Optimizations
+## Custom Metal Kernels
 
-| Kernel | Description |
-|--------|-------------|
-| Fused GDN | Gated Delta Network recurrence kernel — single-pass state update |
-| Fused Sampler | JIT-compiled token sampling |
-| Async Scheduler | Double/triple-buffered GPU command scheduling |
+| Kernel | Where | Description |
+|--------|-------|-------------|
+| Gated DeltaNet recurrence | `pmetal-runtime` (`nn::gated_delta`) | Fused Metal kernel for Qwen3.5-family linear-attention layers at inference; training uses the differentiable chunkwise algorithm |
+| Fused AdamW | `pmetal-metal` | One-dispatch optimizer update over every parameter |
+| Weight-gradient GEMM | `pmetal-metal` | The f32 dW GEMM the ANE trainer batches into one command buffer |
+| Custom kernels from Rust | `pmetal_runtime::MetalKernel` | Runs a Metal kernel source through MLX's `metal_kernel` |
+
+Per-device choices that are made at run time, not by a tuning table: the KV cache mode (`bench-workload` records which it picked), the memory bandwidth figure (measured once by a GPU copy benchmark and cached), and the NAX path on M5 with macOS 26.2 or later.
 
 ## See Also
 
-- [Apple Silicon Support](/hardware/apple-silicon/) — Hardware detection matrix
-- [pmetal bench](/cli/bench/) — Benchmark on your hardware
+- [Apple Silicon Support](/hardware/apple-silicon/): Hardware detection
+- [pmetal bench](/cli/bench/): Benchmark on your hardware

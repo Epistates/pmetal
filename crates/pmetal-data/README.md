@@ -6,6 +6,8 @@ Dataset loading and preprocessing for LLM training.
 
 This crate provides data loading, preprocessing, and batching utilities optimized for LLM fine-tuning. It supports multiple dataset formats and includes advanced features like sequence packing and chat template application.
 
+`pmetal-trainer`, `pmetal-models`, `pmetal-serve`, the `pmetal` CLI and the Python bindings use it for datasets, tokenizers, chat templates and image preprocessing. It depends on `pmetal-core`, `pmetal-gguf` (GGUF tokenizers) and `pmetal-runtime` (batches are runtime arrays).
+
 ## Supported Formats
 
 The format is detected from a row's columns (structured layouts first) or
@@ -32,9 +34,54 @@ every shard in order (`rows::RowReader`).
 - **Resumable Loading**: Epoch order is a function of the seed; `state()` / `restore()` resume mid-epoch; ranks shard equally
 - **Length-Grouped Batching, Mixing, Deduplication**: `DataLoader::with_length_grouping`, `TrainingDataset::mix`, `dedup`
 - **Streaming Corpora**: `streaming::tokenize_corpus` and a resumable shard reader for pretraining
-- **Tokenizer Integration**: HuggingFace tokenizers support
+- **Tokenizer Integration**: HuggingFace tokenizers, including the tokenizer a GGUF-only checkpoint carries in its metadata (`gguf_tokenizer::build_tokenizer`)
+- **Chat templates**: a model's own Jinja template, executed as shipped (`jinja_chat`), with built-in renderings for base models; `ReasoningSplitter` and `StreamFormatter` separate a thinking model's reasoning from its answer in a token stream
+- **Image preprocessing for vision models**: fixed-size and SigLIP, Gemma 4 patch-budget, Llama 3.2 Vision tiled and Qwen 3.5 image and video processors, on a Pillow-exact resampler (`pillow_resample`) so a model sees the pixels its reference processor produces
+- **Sampling presets**: stop tokens and the sampling defaults a model family's card recommends (`inference_config`)
+
+## Installation
+
+```toml
+[dependencies]
+pmetal-data = "0.7"
+```
 
 ## Usage
+
+### Packing and batching, no tokenizer needed
+
+A dataset is a list of token-id samples; the packer first-fit packs them into fixed-length rows
+with block-diagonal masks, and the loader batches them.
+
+```rust
+use pmetal_data::{DataLoader, DataLoaderConfig, PackerConfig, Sample, SequencePacker, TrainingDataset};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Eight samples of 100, 200, ... 800 tokens.
+    let samples: Vec<Sample> = (1..=8u32).map(|n| Sample::new((0..n * 100).collect())).collect();
+    let dataset = TrainingDataset::from_samples(samples);
+
+    let packer = SequencePacker::new(PackerConfig::with_max_length(1024));
+    let (rows, stats) = packer.pack_with_stats(dataset.samples())?;
+    assert!(rows.len() < dataset.len());
+    assert_eq!(stats.num_sequences, 8);
+
+    let config = DataLoaderConfig {
+        batch_size: 4,
+        max_seq_len: 1024,
+        shuffle: false,
+        ..Default::default()
+    };
+    let mut loader = DataLoader::new(dataset, config, None);
+    let mut batches = 0;
+    while let Some(batch) = loader.next_batch() {
+        assert_eq!(batch.input_ids.shape(), [batch.batch_size as i32, batch.seq_len as i32]);
+        batches += 1;
+    }
+    assert_eq!(batches, 2);
+    Ok(())
+}
+```
 
 ### Basic Dataset Loading
 
@@ -179,8 +226,20 @@ A tokenizer also reports the span of the text each token covers
 | `dataloader` | Batching, sharding, resumable epochs |
 | `packing` | Sequence packing utilities |
 | `streaming` | Pretraining shards: tokenize a corpus, read it back resumably |
-| `chat_templates` | Conversation formatting |
-| `tokenizer` | Tokenizer integration |
+| `chat_templates`, `jinja_chat` | Conversation formatting: template detection, response masks, upstream Jinja execution |
+| `tokenizer`, `gguf_tokenizer` | Tokenizer integration, and rebuilding one from GGUF metadata |
+| `stream_format` | Splitting a reasoning channel from the answer in a token stream |
+| `inference_config` | Stop tokens and per-family sampling presets |
+| `image_processing`, `qwen_vl_processing`, `pillow_resample` | Image and video preprocessing for vision models |
+
+## Feature flags
+
+None.
+
+## Requirements
+
+- Rust 1.95 or later
+- Apple Silicon Mac: batches are `pmetal-runtime` arrays
 
 ## License
 

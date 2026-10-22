@@ -6,8 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["kv-cache", "llm", "inference", "speculative-decoding", "apple-silicon"]
+categories = ["science", "caching"]
 
 [dependencies]
 pmetal-runtime = { workspace = true }

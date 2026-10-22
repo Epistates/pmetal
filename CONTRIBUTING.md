@@ -10,10 +10,12 @@ By participating in this project, you agree to maintain a respectful and inclusi
 
 ### Prerequisites
 
-- **Rust 1.95+**: Install via [rustup](https://rustup.rs/)
-- **macOS**: PMetal targets Apple Silicon exclusively
+- **macOS 14 or later on Apple Silicon**: PMetal targets Apple Silicon exclusively
+- **Rust**: install via [rustup](https://rustup.rs/). The repository pins its toolchain in `rust-toolchain.toml` (rustup installs it on first use); the minimum supported Rust version for library users is 1.95
 - **Xcode Command Line Tools**: `xcode-select --install`
 - **Metal Toolchain**: `xcodebuild -downloadComponent MetalToolchain`
+- **CMake**: `brew install cmake` (builds MLX)
+- **[just](https://github.com/casey/just)**: `brew install just` (the project's task runner)
 - **bun** (optional, for GUI development): `brew install oven-sh/bun/bun`
 
 ### Setting Up the Development Environment
@@ -26,17 +28,19 @@ cd pmetal
 # Build CLI + TUI
 cargo build
 
-# Run tests
-cargo test --all
+# Run the workspace tests (single-threaded: MLX's GPU state is not thread-safe)
+just test
 
-# Run clippy
-cargo clippy --all -- -D warnings
+# Lint
+just lint
 
-# GUI development (requires bun + Tauri CLI)
+# GUI development (requires bun)
 cd crates/pmetal-gui
 bun install
 bun tauri dev
 ```
+
+The first build compiles MLX, which takes several minutes and about 1 GB of disk; later builds reuse it. `just --list` shows every recipe, and `just preflight` runs everything CI runs (formatting, clippy with default, all and minimal features, rustdoc, tests in debug and release, the GUI's checks, version and lockfile checks, and `cargo deny`).
 
 ## How to Contribute
 
@@ -45,8 +49,8 @@ bun tauri dev
 Before reporting a bug:
 1. Check existing issues to avoid duplicates
 2. Collect relevant information:
-   - macOS version and Apple Silicon chip (M1, M2, M3, M4, M5, etc.)
-   - Rust version (`rustc --version`)
+   - macOS version and Apple Silicon chip (`pmetal info` prints both)
+   - PMetal version (`pmetal --version`) and Rust version (`rustc --version`) if you built it
    - Steps to reproduce
    - Expected vs actual behavior
    - Error messages and stack traces
@@ -62,10 +66,10 @@ Feature requests are welcome! Please:
 
 1. **Fork and branch**: Create a feature branch from `main`
 2. **Make changes**: Follow the coding guidelines below
-3. **Test**: Ensure all tests pass (`cargo test --all`)
-4. **Lint**: Run `cargo clippy --all -- -D warnings`
-5. **Format**: Run `cargo fmt --all`
-6. **Document**: Update documentation for public API changes
+3. **Test**: Ensure all tests pass (`just test`)
+4. **Lint**: Run `just lint` (clippy with `-D warnings`)
+5. **Format**: Run `just fmt` (the GUI's `src-tauri` is its own workspace, so `cargo fmt --all` alone misses it)
+6. **Document**: Update documentation for public API, flag and behavior changes
 7. **Submit**: Open a PR with a clear description
 
 ## Coding Guidelines
@@ -74,22 +78,29 @@ Feature requests are welcome! Please:
 
 - Follow the [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/)
 - Use `rustfmt` for formatting (default configuration)
-- Address all `clippy` warnings
-- **No `unwrap()` or `expect()`:** The use of `.unwrap()` and `.expect()` is strictly forbidden in all library crates. Return `Result` and use `thiserror` for meaningful error propagation.
+- Address all `clippy` warnings (CI runs `-D warnings`)
+- **Avoid `unwrap()` and `expect()` in library crates.** Return `Result` and use `thiserror` for meaningful error propagation; reserve `expect` for an invariant, with a message that states it
+- Unsafe code is denied by a workspace lint; the few FFI modules that need it opt in explicitly
 - Use descriptive variable names
+
+### Job specs are the single source of options
+
+A command's fields, defaults, ranges and checks live in its job spec under `crates/pmetal-core/src/jobs/`. The CLI, TUI, GUI, MCP server and Python bindings are generated from those specs, so add or change an option there, not in each surface. Then regenerate what is derived from the specs: the GUI's `src/lib/specs.generated.ts` (`UPDATE_SPEC_TYPES=1 cargo test --manifest-path crates/pmetal-gui/src-tauri/Cargo.toml spec_types`) and the Python stub (`python stub.py` in `crates/pmetal-py`). Removing a flag means removing it from the spec as well, or it stays a live control in the GUI and the MCP server.
 
 ### Documentation
 
 - Document all public APIs with doc comments
 - Include examples in doc comments where helpful
-- Update README.md for user-facing changes
+- Update `README.md` and `docs/` for user-facing changes
+- Every code block in a crate's `README.md` is compiled as a doctest (the READMEs are the crates' rustdoc front pages), so editing one can fail `cargo test`
 
 ### Testing & Fuzzing
 
 - Add unit and integration tests for all new functionality.
 - Maintain existing test coverage.
 - Use descriptive test names: `test_<function>_<scenario>_<expected>`
-- **Fuzzing:** PMetal enforces continuous fuzzing for data ingest points.
+- Tests that touch the GPU run single-threaded (`just test` does this).
+- **Fuzzing:** the GGUF decoders have fuzz targets (`gguf_reader`, `gguf_dequant`, `gguf_quantize`), and CI runs `gguf_reader` on every PR.
   - To run fuzz tests locally, install the nightly toolchain and `cargo-fuzz`:
     ```bash
     cargo +nightly install cargo-fuzz
@@ -100,6 +111,7 @@ Feature requests are welcome! Please:
 ### Metal Shaders
 
 When contributing Metal kernels:
+- Check first that the tensor runtime has no op that does the job: dense attention, RoPE, SwiGLU, LoRA and GEMM run as runtime ops, and hand-written kernels for them measured slower and were removed
 - Follow Metal Best Practices Guide
 - Use appropriate data types for precision/performance tradeoffs
 - Document thread group size assumptions
@@ -109,34 +121,37 @@ When contributing Metal kernels:
 
 ```
 crates/
-├── pmetal-core/        # Core types, traits, configurations
-├── pmetal-metal/       # Metal GPU kernels + ANE runtime
+├── pmetal-runtime/     # Tensor runtime: arrays, autodiff, native engines, optimizers, custom Metal kernels
+├── pmetal-core/        # Core types, traits, configurations, the job specs
+├── pmetal-core-derive/ # Derive macro for the job specs
+├── pmetal-metal/       # Metal context, ANE runtime and kernels
 ├── pmetal-cache/       # KV caches, prefix reuse, speculative-decoding state
-├── pmetal-models/      # LLM architectures
-├── pmetal-lora/        # LoRA/QLoRA implementations
-├── pmetal-trainer/     # Training loops (SFT, DPO, GRPO, etc.)
-├── pmetal-data/        # Dataset processing, chat templates
-├── pmetal-hub/         # HuggingFace Hub integration
+├── pmetal-models/      # LLM architectures and the dispatcher
+├── pmetal-lora/        # LoRA/QLoRA as a property of Linear
+├── pmetal-trainer/     # Training loops (SFT, preference, GRPO, MTP, ...)
+├── pmetal-data/        # Dataset processing, chat templates, tokenization
+├── pmetal-hub/         # Hugging Face Hub integration
 ├── pmetal-distill/     # Knowledge distillation (incl. TAID)
-├── pmetal-merge/       # Model merging algorithms (14 strategies)
-├── pmetal-gguf/        # GGUF format with imatrix quantization
+├── pmetal-merge/       # Model merging and LoRA fusing
+├── pmetal-gguf/        # GGUF reader, writer and quantization
 ├── pmetal-mhc/         # Manifold-Constrained Hyper-Connections
-├── pmetal-distributed/ # Distributed training (mDNS, Ring All-Reduce)
+├── pmetal-distributed/ # Distributed training (mDNS, ring all-reduce)
 ├── pmetal-vocoder/     # BigVGAN vocoder
-├── pmetal-serve/       # OpenAI-compatible inference server
+├── pmetal-serve/       # OpenAI- and Anthropic-compatible inference server
+├── pmetal-supervisor/  # Runs pmetal commands as supervised child processes
+├── pmetal-mcp/         # MCP server
 ├── pmetal-py/          # Python bindings (maturin/PyO3)
-├── pmetal-cli/         # Command-line interface + TUI
-└── pmetal-gui/         # Desktop GUI (Tauri + Svelte)
+├── pmetal/             # Umbrella crate: the CLI, the TUI and re-exports
+└── pmetal-gui/         # Desktop GUI (Tauri + Svelte), its own workspace
 ```
 
 ### Adding a New Model Architecture
 
-1. Implement the `CausalLMModel` trait in `pmetal-models`
-2. Add config parsing in the appropriate module
-3. Add architecture detection in `dispatcher.rs`
-4. Create LoRA wrapper in `pmetal-lora` if applicable
-5. Add tests covering forward pass and generation
-6. Update the model support table in README.md
+1. Implement the model in `pmetal-models/src/architectures/`, with its config parsing (see `traits.rs` for `CausalLMModel`)
+2. Add the variant, `model_type` detection and the load and forward arms in `dispatcher.rs`
+3. LoRA and QLoRA need no per-architecture wrapper: adapters attach to the model's `Linear` layers through `pmetal-lora`'s `AdaptedModel`, so check that the module's parameter names and gradient checkpointing work with it
+4. Add tests: forward pass and generation, and a parity check against reference outputs for a small config (the existing architectures are checked against `transformers`)
+5. Update the model support tables (`README.md`, `docs/models/supported.md`, `crates/pmetal-models/README.md`)
 
 ### Adding a New Metal Kernel
 
@@ -151,14 +166,15 @@ crates/
 PMetal prioritizes performance. When contributing:
 
 - Profile before and after changes for performance-critical code
-- Use `cargo bench` to validate optimizations
+- Use `cargo bench` to validate optimizations, and `pmetal bench-workload` for an end-to-end check
+- Benchmarks record the machine's load average; take timings on a quiet machine
 - Consider memory usage, especially for large models
 - Leverage Metal's parallel capabilities appropriately
 - Avoid unnecessary allocations in hot paths
 
 ## Licensing
 
-By contributing, you agree that your contributions will be licensed under the same dual MIT/Apache 2.0 license as the project.
+By contributing, you agree that your contributions will be licensed under the same dual MIT/Apache 2.0 license as the project. New dependencies must have a permissive license (`just deny` checks this against `deny.toml`), and third-party code you adapt needs an attribution in `THIRD_PARTY_NOTICES`.
 
 ## Questions?
 

@@ -1,10 +1,12 @@
 # Model Merging
 
-Merge models with 17 strategies — SLERP, TIES, DARE, DELLA, Task Arithmetic, and more.
+Merge models with 18 strategies: SLERP, TIES, DARE, DELLA, Task Arithmetic, and more.
 
 PMetal streams merges tensor by tensor from memory-mapped checkpoints (peak memory is a few tensors, not the models), merges in f32, and writes atomic, indexed safetensors shards. FP8 checkpoints with block scales, layer-sliced frankenmerges, filter and layer-gradient parameters, and reproducible stochastic masks are supported.
 
 ## CLI Strategies
+
+`pmetal merge` merges two models (`--model-a`, `--model-b`); task-vector methods also take `--base`. The library and YAML configs merge any number.
 
 | Method | Description |
 |--------|-------------|
@@ -23,6 +25,8 @@ PMetal streams merges tensor by tensor from memory-mapped checkpoints (peak memo
 | `nearswap` | Per-parameter selection of the value nearest the base |
 | `passthrough` | Layer passthrough composition |
 
+The job spec that the GUI, the MCP server and the Python bindings share lists the first eleven (everything above except `della_linear`, `consensus` and `multislerp`); the command line parses all fourteen.
+
 ## Library-Only Strategies
 
 Reachable by setting `MergeConfig.merge_method` directly (or `merge_method:` in a YAML config);
@@ -39,13 +43,13 @@ Reachable by setting `MergeConfig.merge_method` directly (or `merge_method:` in 
 
 ```bash
 # SLERP merge of two models
-pmetal merge --models model-a model-b --method slerp --t 0.5
+pmetal merge --model-a model-a --model-b model-b --method slerp --t 0.5 --output merged
 
-# TIES with sparsification
-pmetal merge --models base ft-1 ft-2 --method ties --density 0.5
+# TIES with sparsification, against the base both were fine-tuned from
+pmetal merge --model-a ft-1 --model-b ft-2 --base base --method ties --density 0.5 --output merged
 
 # DARE-TIES
-pmetal merge --models model-a model-b --method dare_ties --density 0.7
+pmetal merge --model-a ft-1 --model-b ft-2 --base base --method dare_ties --density 0.7 --output merged
 ```
 
 ## Advanced Features
@@ -59,5 +63,5 @@ pmetal merge --models model-a model-b --method dare_ties --density 0.7
 
 ## See Also
 
-- [pmetal merge](/cli/merge/) — CLI reference
-- [pmetal fuse](/cli/fuse/) — LoRA fusing
+- [pmetal merge](/cli/merge/): CLI reference
+- [pmetal fuse](/cli/fuse/): LoRA fusing

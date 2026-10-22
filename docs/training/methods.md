@@ -1,6 +1,6 @@
 # Training Methods
 
-Detailed guide to each training method — SFT, LoRA, DPO, SimPO, ORPO, KTO, GRPO, and more.
+Detailed guide to each training method: SFT, LoRA, DPO, SimPO, ORPO, KTO, GRPO, and more.
 
 ## Supervised Fine-Tuning (SFT)
 
@@ -8,9 +8,9 @@ Standard fine-tuning on instruction/response pairs. Used via `pmetal train`, or 
 `pmetal_trainer::orchestrator::run_training()`.
 
 ### LoRA
-Low-Rank Adaptation — trains small adapter matrices instead of full weights. Parameters:
+Low-Rank Adaptation: trains small adapter matrices instead of full weights. Parameters:
 - **rank** (`--lora-r`): Adapter rank (default: 16)
-- **alpha** (`--lora-alpha`): Scaling factor (default: 2× rank)
+- **alpha** (`--lora-alpha`): Scaling factor (default: 32; the adapter output is scaled by alpha / rank)
 
 ### QLoRA
 LoRA over a packed base: the projections are stored in NF4, NVFP4 or 8-bit integers and unpacked
@@ -31,7 +31,7 @@ quantiles, which is how pretrained weights are distributed. `fp4` and `int8` run
 matmul; NF4 unpacks to the compute dtype first, since MLX has no NF4 kernel.
 
 ### DoRA
-Weight-Decomposed LoRA — decomposes weight updates into magnitude and direction for better training stability.
+Weight-Decomposed LoRA: decomposes weight updates into magnitude and direction for better training stability.
 ```bash
 pmetal train --model Qwen/Qwen3-0.6B --dataset train.jsonl --dora
 ```
@@ -94,10 +94,9 @@ Samples multiple completions per prompt, scores them with reward functions, and 
 pmetal grpo --model Qwen/Qwen3-0.6B --dataset reasoning.jsonl --reasoning-rewards
 ```
 
-**Advanced GRPO features** (added in v0.3.9):
+**Further GRPO options:**
 - **VLM mode** (`--vlm`): Vision-Language Model support with image inputs
 - **ML reward model** (`--reward-model`): Pretrained reward model scoring alongside heuristic rewards
-- **Speculative decoding** (`--speculative`): Draft/verify rollout generation for 2-4× throughput
 - **Async reward pipelining** (`--async-rewards`): Background reward scoring concurrent with GPU training
 
 `--num-iterations N` takes N optimizer updates on each batch of completions. The policy ratio is taken against the log-probs of the policy that generated them, so it is 1 on the first update and clipping (and GSPO) only act from the second.
@@ -111,15 +110,19 @@ pmetal grpo --model Qwen/Qwen3-0.6B --dataset reasoning.jsonl --reasoning-reward
 ### RLKD (Reinforcement Learning with Knowledge Distillation)
 Combines GRPO policy gradient optimization with distillation from a frozen teacher model. Loss: `L = (1-alpha) * L_grpo + alpha * L_distill`.
 ```bash
-pmetal rlkd --model Qwen/Qwen3-0.6B --teacher Qwen/Qwen3-4B --dataset reasoning.jsonl
+pmetal rlkd --model Qwen/Qwen3-0.6B --teacher-model Qwen/Qwen3-4B --dataset reasoning.jsonl
 ```
 
 ## Embedding Training
 
-Sentence-transformer fine-tuning for BERT/encoder models with contrastive learning objectives: InfoNCE, Triplet, and CoSENT. Supports pair and triplet datasets with configurable pooling (CLS, Mean, LastToken) and L2 normalization.
+Sentence-transformer fine-tuning for BERT/encoder models with contrastive learning objectives (`--loss info_nce|mnrl|triplet|cosent|cosine_similarity`). Supports pair and triplet datasets with configurable pooling (`--pooling auto|mean|cls|max|last_token|weighted_mean`) and L2 normalization (`--no-normalize` turns it off); `--lora` trains an adapter instead of the full model.
 ```bash
-pmetal embed-train --model BAAI/bge-small-en-v1.5 --dataset pairs.jsonl --loss infonce
+pmetal embed-train --model BAAI/bge-small-en-v1.5 --dataset pairs.jsonl --loss info_nce
 ```
+
+## Pretraining
+
+`pmetal tokenize` turns a text corpus (JSONL, Parquet, Arrow or a directory) into binary shards, and `pmetal pretrain --arch <architecture> --shards <shards>` trains a model from scratch on them, full-parameter with no LoRA. `--document-mask` keeps the documents of a packed row from attending to each other, and `--eval-shards` holds out a set for evaluation.
 
 ## MTP And Draft Training
 
@@ -128,9 +131,9 @@ pmetal embed-train --model BAAI/bge-small-en-v1.5 --dataset pairs.jsonl --loss i
 `pmetal train-draft` trains DFlash block-diffusion draft checkpoints from tokenized shards and a frozen Qwen3 target for use with `pmetal dflash`.
 
 ## ANE Training
-Automatic Apple Neural Engine training when available. Uses the ANE for forward passes with CPU-based gradient computation. Activated automatically on supported models.
+`pmetal train --ane` (experimental) trains on the Apple Neural Engine for supported models, with parts of the step on the CPU; if the ANE cannot take the model the run falls back to the GPU and says why.
 
 ## See Also
 
-- [Training Overview](/training/overview/) — Method availability matrix
-- [Distillation](/training/distillation/) — Knowledge distillation methods
+- [Training Overview](/training/overview/): Method availability matrix
+- [Distillation](/training/distillation/): Knowledge distillation methods

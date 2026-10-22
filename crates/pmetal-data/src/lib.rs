@@ -4,9 +4,15 @@
 //! - Dataset loading from JSONL, JSON, Parquet, Arrow and CSV, in chat,
 //!   instruction, prompt/completion and text layouts ([`rows`], [`dataset`])
 //! - DataLoader for creating training batches, sharded and resumable
-//! - Sequence packing for efficient training
-//! - Tokenizer integration
-//! - Chat template system with response masking
+//!   ([`dataloader`])
+//! - Sequence packing for efficient training ([`packing`])
+//! - Tokenizer integration, including tokenizers rebuilt from GGUF metadata
+//!   ([`tokenizer`], [`gguf_tokenizer`])
+//! - Chat template system with response masking, backed by each model's own
+//!   Jinja template ([`chat_templates`], [`jinja_chat`])
+//! - Streaming pretraining shards ([`streaming`])
+//! - Image and video preprocessing for vision-language models
+//!   ([`image_processing`], [`qwen_vl_processing`], [`pillow_resample`])
 
 #![warn(missing_docs)]
 
