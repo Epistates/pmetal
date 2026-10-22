@@ -94,18 +94,18 @@ impl SpeculativeRun {
 
 enum Drafter {
     QwenMtp {
-        head: Qwen3NextMtpForCausalLM,
+        head: Box<Qwen3NextMtpForCausalLM>,
         /// The head's own KV cache, reset by each generation.
-        cache: KVCache,
+        cache: Box<KVCache>,
         draft_tokens: usize,
     },
     Gemma4 {
-        assistant: Gemma4AssistantForCausalLM,
+        assistant: Box<Gemma4AssistantForCausalLM>,
         config: Gemma4MtpConfig,
     },
     /// `None` only while a generation has it lent to a decoder.
     DFlash {
-        draft: Option<DFlashDraft>,
+        draft: Option<Box<DFlashDraft>>,
         block: Option<usize>,
     },
 }
@@ -153,8 +153,8 @@ impl Speculator {
                 validate_qwen3_next_mtp_pair(&model.config, &head)?;
                 let cache = head.create_cache(max_seq_len);
                 Drafter::QwenMtp {
-                    head,
-                    cache,
+                    head: Box::new(head),
+                    cache: Box::new(cache),
                     draft_tokens: (*draft_tokens).max(1),
                 }
             }
@@ -163,7 +163,7 @@ impl Speculator {
                     let draft = load_dflash_draft(path, DFlashDraftQuant::None)?;
                     Self::check_dflash_pair(target, &draft)?;
                     Drafter::DFlash {
-                        draft: Some(draft),
+                        draft: Some(Box::new(draft)),
                         block: *tokens,
                     }
                 } else {
@@ -182,7 +182,10 @@ impl Speculator {
                             .unwrap_or(generation.num_assistant_tokens)
                             .max(1),
                     };
-                    Drafter::Gemma4 { assistant, config }
+                    Drafter::Gemma4 {
+                        assistant: Box::new(assistant),
+                        config,
+                    }
                 }
             }
         };
@@ -210,8 +213,8 @@ impl Speculator {
         let cache = head.create_cache(max_seq_len);
         Ok(Self {
             drafter: Drafter::QwenMtp {
-                head,
-                cache,
+                head: Box::new(head),
+                cache: Box::new(cache),
                 draft_tokens: draft_tokens.max(1),
             },
             max_seq_len,
@@ -236,7 +239,7 @@ impl Speculator {
         validate_gemma4_mtp_pair(model, &assistant)?;
         Ok(Self {
             drafter: Drafter::Gemma4 {
-                assistant,
+                assistant: Box::new(assistant),
                 config: Gemma4MtpConfig {
                     num_assistant_tokens: draft_tokens.max(1),
                 },
@@ -255,7 +258,7 @@ impl Speculator {
         Self::check_dflash_pair(target, &draft)?;
         Ok(Self {
             drafter: Drafter::DFlash {
-                draft: Some(draft),
+                draft: Some(Box::new(draft)),
                 block,
             },
             max_seq_len,
@@ -313,7 +316,7 @@ impl Speculator {
             Drafter::QwenMtp { draft_tokens, .. } => *draft_tokens,
             Drafter::Gemma4 { config, .. } => config.num_assistant_tokens,
             Drafter::DFlash { draft, block } => block
-                .or_else(|| draft.as_ref().map(DFlashDraft::block_size))
+                .or_else(|| draft.as_ref().map(|draft| draft.block_size()))
                 .unwrap_or(0),
         }
     }
@@ -384,14 +387,14 @@ impl Speculator {
                 let lent = draft
                     .take()
                     .ok_or_else(|| Exception::custom("the DFlash draft is lent out"))?;
-                let mut decoder = DFlashDecoder::new(&mut *target, lent);
+                let mut decoder = DFlashDecoder::new(&mut *target, *lent);
                 let config = DFlashConfig {
                     speculative_tokens: *block,
                     ..DFlashConfig::new(gen_config.clone())
                 };
                 let result = decoder.generate_with(input_ids, &config, sampler, &mut on_token);
                 // The draft goes back whatever the decode did.
-                *draft = Some(decoder.into_draft());
+                *draft = Some(Box::new(decoder.into_draft()));
                 let out = result?;
                 Ok(SpeculativeRun {
                     num_generated: out.metrics.num_generated,

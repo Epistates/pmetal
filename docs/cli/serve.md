@@ -29,11 +29,14 @@ pmetal serve --model ./output/fused --port 8080
 The server speaks both the OpenAI and the Anthropic wire formats:
 
 - `POST /v1/chat/completions` — chat completions (streaming and non-streaming, tool calling, token logprobs, images and videos)
-- `POST /v1/completions` — text completions
+- `POST /v1/completions` — text completions; `echo` with `logprobs` scores the prompt too
+- `POST /v1/responses` — the OpenAI Responses API
 - `POST /v1/embeddings` — embeddings, 17 architectures via `forward_hidden`
 - `POST /v1/messages` — Anthropic-compatible messages, with SSE streaming and image blocks
+- `POST /v1/messages/count_tokens` — the input tokens a messages request would use
 - `GET /v1/models` — list loaded models
-- `GET /v1/metrics` — serving metrics
+- `GET /v1/metrics` — serving metrics as JSON
+- `GET /metrics` — Prometheus / OpenMetrics metrics
 - `GET /health` — liveness check
 
 Request bodies are capped at 64 MiB, room for base64-encoded images and video frames.
@@ -225,6 +228,96 @@ block the chat template opens itself), DeepSeek-R1, Phi-4-reasoning,
 Magistral's `[THINK]`, Gemma 4's thought channel and gpt-oss's `analysis`
 channel are recognised; the markers themselves appear in neither field.
 Logprobs cover the answer's tokens.
+
+### Speculative decoding
+
+A drafter speeds a single-request decode up without changing what it says: it
+proposes a few tokens, the model checks all of them in one forward, and the
+longest agreeing run is kept. A reply is what the model alone gives (greedy
+decoding gives its exact tokens) or is drawn from the same distribution
+(sampling), through the same sampler: temperature, top-k, top-p, min-p, the
+penalties, `logit_bias`, a seed and a JSON-schema grammar all behave as they do
+without a drafter.
+
+| Flag | Drafter | Target |
+|------|---------|--------|
+| `--mtp` | the model's own multi-token-prediction head (the `mtp.*` weights bundled in the checkpoint) | Qwen3.5, 3.6, 3.8 |
+| `--mtp-model <dir>` | the same head, read from a checkpoint of its own | with `--mtp` |
+| `--draft-model <id or path>` | a Gemma 4 assistant, or a DFlash draft model | Gemma 4; Qwen, Llama, Mistral, Gemma, Phi, DeepSeek and GPT-OSS for DFlash |
+| `--draft-tokens <n>` | tokens a round proposes (default 3 for MTP, the assistant's own setting, the DFlash block size) | |
+
+```bash
+pmetal serve --model Qwen/Qwen3.5-0.8B --mtp
+pmetal serve --model Qwen/Qwen3-4B --draft-model z-lab/Qwen3-4B-DFlash-b16
+```
+
+The drafter is loaded and checked against the model at startup: one for another
+model family, or of another hidden or vocabulary size, is an error then, not on
+the first request. With `--ane`, `--draft-model` still means a DFlash draft model
+that drafts on the GPU for the model on the ANE.
+
+What it does not do:
+
+- Log-probabilities (the reply's or the prompt's) and images decode on the plain
+  path: the verifier's rows are read for checking, not kept. The reply is the
+  same either way; the request just does not speed up.
+- A drafter reads no prefix cache, so `usage.prompt_tokens_details.cached_tokens`
+  is 0, and the target runs on a float KV cache (`--kv-quant` and `--kv-turboquant`
+  are refused with a drafter).
+- Continuous batching serves many requests at once and a drafter one at a time:
+  `--mtp` or `--draft-model` with `--continuous-batch` is an error.
+- Tokens stream a round at a time (up to the drafted length together) instead of
+  one by one.
+
+How many drafted tokens the model accepted is in `/v1/metrics`
+(`speculative_acceptance_rate`) and `/metrics`
+(`pmetal_speculative_drafted_tokens_total`, `pmetal_speculative_accepted_tokens_total`).
+
+### Counting tokens
+
+`POST /v1/messages/count_tokens` takes the body of a messages request that shapes
+the prompt (`model`, `messages`, `system`, `tools`, `tool_choice`, `thinking`)
+and answers `{"input_tokens": N}`. The count is of the prompt `/v1/messages`
+would run: the same chat template, tools and thinking setting, images expanded to
+the tokens the model reads them as, tokenized by the model's tokenizer. Nothing is
+generated.
+
+### Scoring a prompt
+
+`/v1/completions` with `echo: true` and `logprobs: N` returns the prompt's own
+log-probabilities ahead of the completion's, as loglikelihood evaluation reads
+them: `logprobs.tokens`, `token_logprobs`, `top_logprobs` and `text_offset` cover
+the prompt's tokens and then the generated ones, with `null` for the first
+token (nothing precedes it). `max_tokens: 0` scores the prompt and generates
+nothing. `top_logprobs` holds the `N` likeliest tokens at each position, the
+chosen one among them when it is one of them. The prompt is prefilled in full (the
+prefix cache is not read), and streams as the first chunk, with its text. It
+needs the GPU engine: `--ane` refuses it, and `--continuous-batch` runs such a
+request on the single-request path.
+
+### Metrics
+
+`GET /metrics` serves Prometheus text; a scraper that asks for
+`application/openmetrics-text` gets OpenMetrics, anything else text exposition
+format 0.0.4. Like every route but `/health` it needs an API key when the server
+has one (Prometheus sends it as `Authorization: Bearer <key>`).
+
+| Series | Meaning |
+|--------|---------|
+| `pmetal_http_requests_total{route,method,status}` | requests answered, by the route's pattern |
+| `pmetal_http_request_duration_seconds{route,method}` | seconds to the response headers (a streamed reply's end is in the generation series) |
+| `pmetal_http_requests_in_flight` | requests being handled, scrapes included |
+| `pmetal_generation_requests_total`, `pmetal_tokens_total{kind}` | generations finished; prompt, cached-prompt and completion tokens |
+| `pmetal_time_to_first_token_seconds`, `pmetal_generation_duration_seconds`, `pmetal_generation_tokens_per_second` | histograms per generation |
+| `pmetal_speculative_drafted_tokens_total`, `pmetal_speculative_accepted_tokens_total` | the drafter's work; accepted over drafted is the acceptance rate |
+| `pmetal_requests_running`, `pmetal_requests_queued`, `pmetal_request_capacity` | requests holding a slot, waiting for the model, and the limit before a 429 |
+| `pmetal_continuous_batching_active_slots`, `pmetal_continuous_batching_queued_requests` | the batching scheduler |
+| `pmetal_prefix_cache_entries`, `_bytes`, `pmetal_prefix_cache_hits_total`, `_misses_total` | the prefix cache |
+| `pmetal_memory_active_bytes`, `_peak_bytes`, `_cache_bytes` | GPU memory MLX holds |
+| `pmetal_build_info{version,model}`, `pmetal_start_time_seconds` | what runs, and since when |
+
+`/v1/metrics` keeps its JSON: totals, mean latencies, `rolling_tokens_per_second`
+and the speculative counts.
 
 :::note
 The prebuilt release binary and the Homebrew formula both ship this command. If you build PMetal

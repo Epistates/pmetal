@@ -630,6 +630,10 @@ pub fn token_logprobs(
     Ok(rows.remove(0))
 }
 
+/// One position's log-probabilities: the chosen token's, and the likeliest
+/// tokens (id, log-probability), descending.
+pub type LogprobRow = (f32, Vec<(u32, f32)>);
+
 /// The log-probability of `targets[i]` under row `i` of `logits`, with each
 /// row's `top_n` highest-logprob tokens: [`token_logprobs`] for many rows at
 /// once, as prompt scoring needs it.
@@ -643,7 +647,7 @@ pub fn row_logprobs(
     logits: &Array,
     targets: &[u32],
     top_n: usize,
-) -> Result<Vec<(f32, Vec<(u32, f32)>)>, Exception> {
+) -> Result<Vec<LogprobRow>, Exception> {
     use pmetal_runtime::compat::ops::{argpartition_axis, negative, slice_axis, take_along_axis};
 
     let vocab = *logits

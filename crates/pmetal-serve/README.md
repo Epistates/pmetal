@@ -15,8 +15,10 @@ This crate provides a drop-in local inference backend compatible with the OpenAI
 | `/v1/embeddings` | POST | Embeddings: the model's own pooling, unit length, `dimensions`, `base64` |
 | `/v1/responses` | POST | OpenAI Responses API: output items, function tools, streaming events |
 | `/v1/messages` | POST | Anthropic-compatible messages, with image blocks |
+| `/v1/messages/count_tokens` | POST | The input tokens a messages request would use |
 | `/v1/models`, `/v1/models/{id}` | GET | List loaded models; fetch one |
-| `/v1/metrics` | GET | Rolling serving metrics (tok/s, latencies, request counts) |
+| `/v1/metrics` | GET | Rolling serving metrics as JSON (tok/s, latencies, request counts, speculative acceptance) |
+| `/metrics` | GET | Prometheus / OpenMetrics metrics |
 | `/health` | GET | Liveness check |
 
 Qwen3.5-family vision models read images (`image_url` parts holding a `data:image/...;base64,`
@@ -30,7 +32,8 @@ request) from their headers, before anything is decoded.
 * **Chat completions and completions**: `n` choices, `stop` (up to four sequences, matched in the
   text however the tokens fall), `seed`, `max_tokens` / `max_completion_tokens` (cut to the
   context left; a prompt that fills the context is `context_length_exceeded`), `logit_bias`,
-  `logprobs` / `top_logprobs` (with `bytes`), `stream_options.include_usage`, usage with
+  `logprobs` / `top_logprobs` (with `bytes`; on completions, `echo` with `logprobs` scores the
+  prompt too, `max_tokens: 0` only that), `stream_options.include_usage`, usage with
   `cached_tokens` and `reasoning_tokens`, and `finish_reason` of `stop`, `length` or
   `tool_calls`. A thinking model's reasoning comes back as `reasoning_content`. A documented
   field the server cannot honour (`audio`, `prediction`, `web_search_options`, `suffix`, ...) is a
@@ -47,6 +50,13 @@ request) from their headers, before anything is decoded.
 * **Embeddings**: input as a string, strings, token ids or lists of them; pooling and
   normalization from the model's sentence-transformers files; `dimensions` truncates and
   renormalizes; `encoding_format: "base64"`.
+* **Speculative decoding**: `InferenceEngine::enable_speculation` loads a drafter (a Qwen3.5-family
+  model's MTP head, a Gemma 4 assistant or a DFlash draft model) beside the model; requests then
+  decode on it, through their own sampler, to the tokens plain decoding gives. See
+  `pmetal_models::speculator`.
+* **Metrics**: `/metrics` is Prometheus text (OpenMetrics when the scraper asks for it): requests by
+  route, latency and time-to-first-token histograms, tokens, queue and slot gauges, the prefix
+  cache, speculative acceptance and GPU memory (`telemetry`).
 * **Safety**: loopback by default; optional API keys; CORS only for configured origins; a body
   limit and a request time limit; a client that leaves cancels its generation.
 
@@ -170,6 +180,7 @@ frees a request's slot the moment its client hangs up.
 | `continuous_driver` | Per-slot and fused KV caches, batched sampling, the decode step |
 | `continuous_pump` | The pump that runs the scheduler against the model, per request events |
 | `routes` | Axum route handlers and `ServingMetrics` |
+| `telemetry` | The Prometheus registry, the request-counting middleware and `GET /metrics` |
 | `server` | `ServeConfig` and server startup |
 | `types` | OpenAI-compatible request/response types |
 | `media` | Image and video content parts: parsing, validation, decoding |
@@ -190,6 +201,7 @@ frees a request's slot the moment its client hangs up.
 - **tower-http** — CORS and tracing middleware
 - **tokio** — async runtime
 - **tokio-stream** — SSE streaming
+- **prometheus-client** — the metrics registry and OpenMetrics encoding
 
 ## License
 
