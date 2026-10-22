@@ -28,37 +28,46 @@
 //!
 //! # Quick Start (Auto-Discovery)
 //!
-//! ```ignore
-//! use pmetal_distributed::{AutoDiscoveryBackend, DistributedContext};
+//! ```no_run
+//! use pmetal_distributed::{AutoDiscoveryBackend, DistributedContext, ReduceOp};
 //! use std::time::Duration;
 //!
+//! # async fn sync(gradient_buffer: &mut [f32]) -> anyhow::Result<()> {
 //! // Create backend with automatic peer discovery
 //! let backend = AutoDiscoveryBackend::new().await?;
 //!
 //! // Wait for at least 1 peer to join
 //! backend.wait_for_peers(1, Duration::from_secs(30)).await?;
+//! backend.establish_ring().await?;
 //!
 //! // Create context for distributed operations
 //! let ctx = DistributedContext::new(Box::new(backend));
 //!
 //! // Synchronize gradients across cluster
-//! ctx.all_reduce_f32(&mut gradient_buffer, ReduceOp::Mean).await?;
+//! ctx.all_reduce_f32(gradient_buffer, ReduceOp::Mean).await?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Manual Configuration
 //!
 //! For advanced use cases, you can manually configure peers:
 //!
-//! ```ignore
-//! use pmetal_distributed::{DistributedConfig, RingBackend, DistributedContext};
+//! ```no_run
+//! use pmetal_distributed::{ClusterSecret, DistributedConfig, DistributedContext, RingBackend};
 //!
+//! # async fn manual() -> Result<(), Box<dyn std::error::Error>> {
 //! let config = DistributedConfig::new(
 //!     vec!["192.168.1.10:52416".parse()?, "192.168.1.11:52416".parse()?],
 //!     0, // This node's rank
-//! );
+//! )
+//! .with_secret(ClusterSecret::resolve()?);
 //!
 //! let backend = RingBackend::new(config).await?;
 //! let ctx = DistributedContext::new(Box::new(backend));
+//! # let _ = ctx;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Architecture
