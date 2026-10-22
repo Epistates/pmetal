@@ -8,6 +8,8 @@ This crate implements Manifold-Constrained Hyper-Connections from [DeepSeek-AI](
 
 It is a self-contained CPU reference implementation on `ndarray`: `f32` throughout, with the long reductions (the RMSNorm's mean of squares, gradient norms) accumulated in `f64`. Forward and backward passes are written out by hand and verified against finite differences and against float64 transcriptions of the paper's equations (`tests/`). Accelerated implementations are tested against it.
 
+It depends on no other workspace crate and runs on any platform. The `pmetal` umbrella crate re-exports it behind its `mhc` feature.
+
 ## Architecture
 
 ```text
@@ -58,29 +60,38 @@ A fresh layer is a plain residual connection when its streams are equal (the usu
 
 `H^res` is the iterated normalization of `exp(H̃^res)`, written as in the released DeepSeek-V4 kernel: a row softmax (the stable form of `exp`, then the first row normalization), `+ ε`, then `iterations` rounds of column and row normalization with `+ ε` in every denominator, ending on a column step. The iteration count is fixed (20, as in the paper), so the map is smooth and its gradient is exact: `sinkhorn_knopp_backward` replays the forward and runs each normalization's adjoint in reverse, O(n²) per iteration. Columns of the result sum to 1; rows converge towards it (within 1e-3 for logits within ±1.5 at 20 iterations; the more skewed the matrix, the slower).
 
+## Installation
+
+```toml
+[dependencies]
+pmetal-mhc = "0.7"
+```
+
 ## Usage
 
-```rust,no_run
-use ndarray::{Array2, Array3};
-use pmetal_mhc::{MhcConfig, MhcError, MhcLayer, MhcPreset};
+```rust
+use ndarray::Array3;
+use pmetal_mhc::{MhcConfig, MhcError, MhcLayer};
 
-fn step(
-    attention_fn: impl Fn(&Array2<f32>) -> Array2<f32>,
-    attention_backward: impl FnOnce(&Array2<f32>) -> Array2<f32>,
-    grad_output: &Array3<f32>,
-) -> Result<(), MhcError> {
-    let config = MhcConfig::from_preset(MhcPreset::Medium);
+fn main() -> Result<(), MhcError> {
+    // A small layer; `MhcConfig::from_preset(MhcPreset::Medium)` is the 9B shape.
+    let config = MhcConfig { hidden_dim: 16, ..MhcConfig::default() };
     let mut layer = MhcLayer::new(config)?;
 
-    // Forward
-    let x: Array3<f32> = Array3::zeros((2, 4, 1920));
+    // Forward: [batch, n streams, C] in, the same shape out. The sublayer
+    // (attention, an FFN) sees the streams' aggregate, [batch, C].
+    let x = Array3::from_elem((2, 4, 16), 0.1f32);
     let (h_in, mappings) = layer.pre_layer(&x)?;
-    let h_out = attention_fn(&h_in);
-    let _output = layer.post_res_layer(&x, &h_out, &mappings)?;
+    let h_out = h_in.mapv(|v| 2.0 * v);
+    let output = layer.post_res_layer(&x, &h_out, &mappings)?;
+    assert_eq!(output.shape(), x.shape());
 
     // Backward: the sublayer's own backward pass runs inside the layer's.
-    let (_grad_x, grads) =
-        layer.backward(&x, &h_out, &mappings, grad_output, attention_backward)?;
+    let grad_output = Array3::from_elem((2, 4, 16), 1.0f32);
+    let (grad_x, grads) = layer.backward(&x, &h_out, &mappings, &grad_output, |g| {
+        g.mapv(|v| 2.0 * v)
+    })?;
+    assert_eq!(grad_x.shape(), x.shape());
 
     layer.apply_gradients_sgd(&grads, 1e-3);
     Ok(())
@@ -89,18 +100,19 @@ fn step(
 
 ### Transformer Block
 
-```rust,no_run
+```rust
 use ndarray::{Array2, Array3};
-use pmetal_mhc::{MhcConfig, MhcError, MhcPreset, MhcTransformerBlock};
+use pmetal_mhc::{MhcConfig, MhcError, MhcTransformerBlock};
 
-fn block(
-    attn_fn: impl Fn(&Array2<f32>) -> Array2<f32>,
-    ffn_fn: impl Fn(&Array2<f32>) -> Array2<f32>,
-    x: &Array3<f32>,
-) -> Result<Array3<f32>, MhcError> {
-    let config = MhcConfig::from_preset(MhcPreset::Medium);
-    let block = MhcTransformerBlock::new(config, attn_fn, ffn_fn)?;
-    block.forward(x)
+fn main() -> Result<(), MhcError> {
+    let config = MhcConfig { hidden_dim: 16, ..MhcConfig::default() };
+    let attn = |h: &Array2<f32>| h.mapv(|v| 2.0 * v);
+    let ffn = |h: &Array2<f32>| h.mapv(|v| 0.5 * v);
+    let block = MhcTransformerBlock::new(config, attn, ffn)?;
+
+    let x = Array3::from_elem((2, 4, 16), 0.1f32);
+    assert_eq!(block.forward(&x)?.shape(), x.shape());
+    Ok(())
 }
 ```
 
@@ -148,10 +160,18 @@ cargo bench --bench mhc_kernels    # Mapping computation across presets
 | `sinkhorn` | Sinkhorn-Knopp forward and backward |
 | `error` | `MhcError` |
 
+## Feature flags
+
+None.
+
+## Requirements
+
+- Rust 1.95 or later
+
 ## References
 
-- [Hyper-Connections](https://arxiv.org/abs/2409.19606) — Original hyper-connection formulation
-- [Manifold-Constrained Hyper-Connections](https://arxiv.org/abs/2512.24880) — Doubly stochastic constraint (DeepSeek-AI)
+- [Hyper-Connections](https://arxiv.org/abs/2409.19606): the original hyper-connection formulation
+- [Manifold-Constrained Hyper-Connections](https://arxiv.org/abs/2512.24880): the doubly stochastic constraint (DeepSeek-AI)
 
 ## License
 
