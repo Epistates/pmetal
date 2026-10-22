@@ -703,23 +703,11 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
 
         #[cfg(all(feature = "lora", feature = "trainer"))]
         Commands::Eval(args) => {
-            let crate::cli::eval::EvalArgs {
-                model,
-                dataset,
-                lora,
-                max_seq_len,
-                num_samples,
-                json,
-            } = args;
-            commands::eval::run_eval(
-                &model,
-                &dataset,
-                lora.as_deref(),
-                max_seq_len,
-                num_samples,
-                json,
-            )
-            .await?;
+            use pmetal_core::jobs::EvalSpec;
+            let mut spec = EvalSpec::from(args);
+            spec.normalize()
+                .map_err(|errors| commands::invalid_spec::<EvalSpec>(&errors))?;
+            commands::eval::run_eval(spec).await?;
         }
 
         #[cfg(feature = "trainer")]
