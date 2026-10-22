@@ -6,6 +6,15 @@ Training loops and optimization strategies for LLM fine-tuning.
 
 This crate provides the training infrastructure for PMetal, including various training methods, learning rate scheduling, checkpointing, and callback systems.
 
+It sits near the top of the workspace: it trains the models `pmetal-lora` builds on the batches `pmetal-data` produces, and the `pmetal` CLI, the Python bindings and (through `pmetal-supervisor`) the TUI, GUI and MCP server all run their jobs through it. `orchestrator::run_training` is the one pipeline behind them: model and dataset resolution, tokenization and chat template detection, the ANE or GPU path, LoRA or QLoRA, checkpointing, metrics.
+
+## Installation
+
+```toml
+[dependencies]
+pmetal-trainer = "0.7"
+```
+
 ## Training Methods
 
 | Method | Description | Use Case |
@@ -24,8 +33,36 @@ This crate provides the training infrastructure for PMetal, including various tr
 | **ANE** | Apple Neural Engine training | Power-efficient on-device training |
 | **RLKD** | RL with Knowledge Distillation | GRPO + teacher distillation |
 | **Embedding** | Sentence-transformer training | InfoNCE, Triplet, CoSENT contrastive |
+| **Pretraining** | Full-parameter pretraining over streamed shards | Document-masked packed rows, resumable |
+| **Draft training** | DFlash block-diffusion drafters and MTP heads | Speculative decoding drafters for a frozen target |
+| **DiffusionGemma** | Block-diffusion objective, LoRA and QLoRA | Denoising and encoder losses for DiffusionGemma |
 
 ## Usage
+
+### From a job spec
+
+Every `pmetal train` option is a field of `pmetal_core::jobs::TrainSpec`; the spec becomes a
+`TrainingJobConfig` with the conversion the command line, the TUI, the GUI and the Python bindings
+all use. `orchestrator::run_training` then runs the whole pipeline.
+
+```rust
+use pmetal_core::jobs::TrainSpec;
+use pmetal_trainer::orchestrator::TrainingJobConfig;
+
+let spec = TrainSpec {
+    model: "Qwen/Qwen3-0.6B".into(),
+    dataset: "data/train.jsonl".into(),
+    learning_rate: 1e-4,
+    ..Default::default()
+};
+let job = TrainingJobConfig::from_spec(&spec).unwrap();
+assert_eq!(job.model_id, "Qwen/Qwen3-0.6B");
+assert_eq!(job.training.learning_rate, 1e-4);
+
+// Then, in an async context:
+//   let result = pmetal_trainer::orchestrator::run_training(job, None, vec![]).await?;
+//   println!("loss {} after {} steps", result.final_loss, result.total_steps);
+```
 
 ### Basic Training Loop
 
@@ -70,6 +107,20 @@ this rank's share of the data under data parallelism, takes an optimizer step ev
 `gradient_accumulation_steps` micro-batches (the mean gradient over all their tokens), and
 evaluates once per micro-batch. Drive the iteration yourself with
 `train_step(&mut model, &batch, &mut optimizer)` if you need control over batching.
+
+A configuration that cannot work is refused when the loop is built, not partway through a run:
+
+```rust
+use pmetal_core::TrainingConfig;
+use pmetal_trainer::{TrainingLoop, TrainingLoopConfig};
+
+let zero_batch = TrainingLoopConfig {
+    training: TrainingConfig { batch_size: 0, ..Default::default() },
+    ..Default::default()
+};
+assert!(TrainingLoop::new(zero_batch).is_err());
+assert!(TrainingLoop::new(TrainingLoopConfig::default()).is_ok());
+```
 
 ### With Checkpointing
 
@@ -134,7 +185,12 @@ fn train_with_checkpoints(
 | `rlkd` | Reinforcement Learning with Knowledge Distillation |
 | `embedding_trainer` | Sentence-transformer fine-tuning |
 | `contrastive_loss` | InfoNCE, Triplet, CoSENT loss functions |
-| `orchestrator` | Unified training pipeline (shared across CLI/GUI/TUI/easy) |
+| `orchestrator` | `run_training`, the one pipeline behind the CLI, TUI, GUI, MCP server and Python bindings |
+| `pretrain` | Full-parameter pretraining |
+| `dflash_training`, `mtp_training` | Draft-model training for speculative decoding |
+| `diffusion_gemma_train` | DiffusionGemma objective and trainer |
+| `rollout`, `reward_model`, `ane_reward` | Batched completion sampling for RL and distillation; reward-model scoring, pipelined with the next step |
+| `tensorboard` | TensorBoard event files for scalar metrics (always built) |
 | `optimizer` | AdamW, SGD with momentum, Lion, Adafactor, Muon, schedule-free AdamW and 8-bit AdamW, in parameter groups |
 | `mlx_metal_optimizer` | Metal-accelerated AdamW updates |
 | `adaptive_lr` | EMA-based adaptive learning rate control |
@@ -146,14 +202,34 @@ fn train_with_checkpoints(
 
 ## Configuration
 
+`pmetal_core::TrainingConfig` holds the hyperparameters. `TrainingConfig::default()` is:
+
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `batch_size` | Micro-batch size | 4 |
-| `gradient_accumulation_steps` | Accumulation steps | 1 |
+| `batch_size` | Micro-batch size | 1 |
+| `gradient_accumulation_steps` | Accumulation steps | 4 |
 | `learning_rate` | Initial learning rate | 2e-4 |
+| `num_epochs` | Epochs | 3 |
 | `max_grad_norm` | Gradient clipping | 1.0 |
 | `warmup_steps` | LR warmup steps | 0 |
-| `weight_decay` | L2 regularization | 0.0 |
+| `weight_decay` | Decoupled weight decay | 0.01 |
+
+`pmetal train` starts from the `TrainSpec` defaults instead (a single epoch and a sequence length
+taken from the data, among others), which `TrainingJobConfig::from_spec` applies.
+
+## Feature flags
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `ane` | yes | Apple Neural Engine training (`AneTrainingLoop`, `DynamicAneTrainer`); turns on `pmetal-metal/ane` |
+| `hub` | yes | Resolve Hugging Face model and dataset ids through `pmetal-hub` |
+| `distributed` | no | Data-parallel gradient synchronisation over the `pmetal-distributed` ring (`DistributedGradientSync`), with optional compression. A process launched into an MLX distributed group averages gradients on the device instead |
+| `tensorboard` | no | A no-op, kept so manifests that name it still resolve |
+
+## Requirements
+
+- Rust 1.95 or later
+- macOS 14 or later on Apple Silicon
 
 ## License
 
