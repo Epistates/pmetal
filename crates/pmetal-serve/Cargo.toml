@@ -1,13 +1,15 @@
 [package]
 name = "pmetal-serve"
-description = "OpenAI-compatible inference server for PMetal"
+description = "OpenAI- and Anthropic-compatible inference server for PMetal"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["llm", "inference", "openai", "server", "apple-silicon"]
+categories = ["web-programming::http-server", "science"]
 
 [features]
 default = []
