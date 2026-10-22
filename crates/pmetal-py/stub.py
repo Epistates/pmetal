@@ -185,6 +185,7 @@ def generate() -> str:
 
     specs = "".join(spec_stub(name, getattr(native, name)) for name in SPEC_ORDER)
     specs += call_options("TrainCallOptions", native.TrainSpec, ("model", "dataset"), "finetune")
+    specs += call_options("GrpoCallOptions", native.GrpoSpec, ("model", "dataset"), "grpo")
     unsupported = tuple(native.INFER_COMMAND_LINE_ONLY)
     infer = infer_stub(native.InferSpec, unsupported)
     text = TEMPLATE.read_text()

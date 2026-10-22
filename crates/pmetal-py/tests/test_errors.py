@@ -17,6 +17,7 @@ LEAVES = [
     "UnsupportedArchitectureError",
     "TokenizerError",
     "TrainingError",
+    "RewardError",
     "QuantizationError",
     "BackendError",
     "OutOfMemoryError",

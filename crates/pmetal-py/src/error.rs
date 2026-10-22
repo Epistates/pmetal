@@ -17,6 +17,7 @@
 //! │   └── UnsupportedArchitectureError
 //! ├── TokenizerError
 //! ├── TrainingError
+//! │   └── RewardError              a GRPO reward function failed; `__cause__` is its exception
 //! ├── QuantizationError
 //! ├── BackendError                 MLX / Metal / ANE
 //! ├── OutOfMemoryError (MemoryError)
@@ -49,6 +50,7 @@ pub struct Exceptions {
     pub unsupported_architecture_error: Py<PyType>,
     pub tokenizer_error: Py<PyType>,
     pub training_error: Py<PyType>,
+    pub reward_error: Py<PyType>,
     pub quantization_error: Py<PyType>,
     pub backend_error: Py<PyType>,
     pub out_of_memory_error: Py<PyType>,
@@ -133,6 +135,12 @@ impl Exceptions {
             "A tokenizer failed to load or run.",
         )?;
         let training_error = new_class(py, "TrainingError", &[&base], "A training run failed.")?;
+        let reward_error = new_class(
+            py,
+            "RewardError",
+            &[&training_error.bind(py).clone()],
+            "A reward function of a GRPO run failed: it raised, or returned something that is not one number per completion. The function's own exception is the `__cause__`.",
+        )?;
         let quantization_error =
             new_class(py, "QuantizationError", &[&base], "Quantization failed.")?;
         let backend_error = new_class(
@@ -164,6 +172,7 @@ impl Exceptions {
             unsupported_architecture_error,
             tokenizer_error,
             training_error,
+            reward_error,
             quantization_error,
             backend_error,
             out_of_memory_error,
@@ -178,7 +187,7 @@ impl Exceptions {
         })
     }
 
-    fn all(&self) -> [(&'static str, &Py<PyType>); 13] {
+    fn all(&self) -> [(&'static str, &Py<PyType>); 14] {
         [
             ("PMetalError", &self.pmetal_error),
             ("ConfigError", &self.config_error),
@@ -192,6 +201,7 @@ impl Exceptions {
             ),
             ("TokenizerError", &self.tokenizer_error),
             ("TrainingError", &self.training_error),
+            ("RewardError", &self.reward_error),
             ("QuantizationError", &self.quantization_error),
             ("BackendError", &self.backend_error),
             ("OutOfMemoryError", &self.out_of_memory_error),

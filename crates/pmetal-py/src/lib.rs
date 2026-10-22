@@ -7,6 +7,7 @@
 //! - `spec`, `specs`: one class per `pmetal` subcommand, wrapping the job
 //!   specs of `pmetal-core`, which define every field, default and check.
 //! - `trainer`, `callbacks`: a `TrainSpec` run in this process.
+//! - `grpo`: a `GrpoSpec` run in this process, with Python reward functions.
 //! - `model`, `dflash`, `infer`, `tokenizer`: inference.
 //! - `hub`: the Hugging Face Hub.
 //! - `runtime`: the shared async runtime, and how a Python thread waits on
@@ -19,6 +20,7 @@ mod callbacks;
 mod config;
 mod dflash;
 mod error;
+mod grpo;
 #[cfg(feature = "test-hooks")]
 mod hooks;
 mod hub;
@@ -50,6 +52,8 @@ fn pmetal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Training
     m.add_class::<trainer::PyTrainer>()?;
     m.add_class::<trainer::PyTrainResult>()?;
+    m.add_class::<grpo::PyGrpoTrainer>()?;
+    m.add_class::<grpo::PyGrpoResult>()?;
     m.add_class::<callbacks::PyProgressCallback>()?;
     m.add_class::<callbacks::PyLoggingCallback>()?;
     m.add_class::<callbacks::PyMetricsJsonCallback>()?;

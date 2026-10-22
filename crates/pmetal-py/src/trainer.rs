@@ -79,7 +79,7 @@ impl PyTrainResult {
 
 /// The callbacks for a run: the built-in ones become the trainer's own, every
 /// other object goes through the bridge, which also watches for Ctrl-C.
-fn build_callbacks(
+pub(crate) fn build_callbacks(
     py: Python<'_>,
     objects: &[Py<PyAny>],
     state: std::sync::Arc<RunState>,
