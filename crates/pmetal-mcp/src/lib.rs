@@ -248,7 +248,7 @@ pub fn spec_tool_list() -> Vec<Box<dyn SpecTool>> {
         ),
         spec_tool!(
             EvalSpec, "eval_perplexity",
-            "Evaluate a model's perplexity on a dataset, optionally with a LoRA adapter (pmetal eval). Blocks until done.",
+            "Evaluate a model's perplexity on a dataset, or with `task` a benchmark (gsm8k, mmlu, arc_challenge, hellaswag, ifeval-lite, custom), optionally with a LoRA adapter (pmetal eval). Blocks until done.",
             NOW, Hints::READ
         ),
         spec_tool!(
