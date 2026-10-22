@@ -16,14 +16,14 @@
 //! | `custom` | a generation from questions with answers, or the log-likelihood of choices | `Question: {question}\nAnswer:` | exact match, or accuracy |
 //!
 //! Each reports its metrics with their standard errors ([`Metric`]), and a
-//! run can keep every item's prompt, output and verdict ([`TaskReport::samples`]).
+//! run can keep every item's prompt, output and verdict ([`TaskReport::samples_log`]).
 //! The model is anything that can score a continuation and generate
 //! ([`EvalModel`]); [`LoadedModel`] is the inference path's own.
 //!
 //! What is not the same as elsewhere, because it cannot be: the few-shot
 //! examples of a task that draws them at random are drawn from this
 //! implementation's seeded generator, not Python's, so the same `seed` gives
-//! the same examples run to run, but not the ones another harness drew. MMLU's
+//! the same examples run to run, but not the ones another implementation drew. MMLU's
 //! come from the subject's own `dev` split, in order, as they are everywhere.
 
 mod datasets;
