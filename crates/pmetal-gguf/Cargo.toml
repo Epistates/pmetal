@@ -1,13 +1,15 @@
 [package]
 name = "pmetal-gguf"
-description = "GGUF file format implementation for PMetal"
+description = "Read, write, quantize and dequantize GGUF files"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["gguf", "ggml", "quantization", "llm", "file-format"]
+categories = ["encoding", "science"]
 
 [dependencies]
 pmetal-core = { workspace = true }
