@@ -51,9 +51,9 @@ pub struct Cli {
     /// Write every JobEvent of a training run as a JSONL line to this file.
     ///
     /// Works with train, distill, grpo, rlkd and preference; any other command
-    /// refuses it, rather than leave an empty file. The TUI's subprocess
-    /// runner and the MCP server read it. A write that fails is reported when
-    /// the run ends.
+    /// refuses it, rather than leave an empty file. The TUI, the desktop app
+    /// and the Python bindings follow a run through it. A write that fails is
+    /// reported when the run ends.
     #[cfg(feature = "trainer")]
     #[arg(long, global = true, value_name = "PATH")]
     pub log_events: Option<PathBuf>,

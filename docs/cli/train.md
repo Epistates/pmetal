@@ -4,7 +4,7 @@ Fine-tune a model with LoRA, QLoRA or DoRA using supervised fine-tuning (SFT).
 
 Supports SFT on any supported architecture with automatic hardware detection and kernel tuning. The adapter is written to the output directory in the layout `peft` reads.
 
-Ctrl-C (SIGINT) or SIGTERM finishes the step in flight, saves the adapter and exits with status 130; `--resume` continues from the latest checkpoint. `--log-events <file>` (a global option, given before or after the command) writes the run's events as JSONL, which is how the TUI, the GUI and the MCP server follow a run.
+Ctrl-C (SIGINT) or SIGTERM finishes the step in flight, saves the adapter and exits with status 130; `--resume` continues from the latest checkpoint. `--log-events <file>` (a global option, given before or after the command) writes the run's events as JSONL, which is how the TUI, the desktop app and the Python bindings follow a run. The option is available on `train`, `distill`, `grpo`, `rlkd` and `preference`; the other training commands refuse it.
 
 ## Usage
 
