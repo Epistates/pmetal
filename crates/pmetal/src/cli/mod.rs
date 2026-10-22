@@ -351,7 +351,7 @@ pub enum Commands {
         json: bool,
     },
 
-    /// Merge two or more models using various merge methods (SLERP, TIES, DARE, linear, etc.)
+    /// Merge two models with SLERP, TIES, DARE, linear, task arithmetic and other methods
     #[cfg(feature = "merge")]
     Merge(crate::cli::merge::MergeArgs),
 

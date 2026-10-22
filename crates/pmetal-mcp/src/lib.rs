@@ -216,7 +216,7 @@ pub fn spec_tool_list() -> Vec<Box<dyn SpecTool>> {
         ),
         spec_tool!(
             MergeSpec, "merge_models",
-            "Merge two models with SLERP, TIES, DARE, linear or task arithmetic (pmetal merge). Returns a job ID.",
+            "Merge two models with SLERP, TIES, DARE, DELLA, linear, task arithmetic and the other methods of the `method` parameter (pmetal merge). Returns a job ID.",
             JOB, Hints::OVERWRITE
         ),
         spec_tool!(
