@@ -1,8 +1,9 @@
 //! Runs `pmetal` subcommands as child processes and owns them until they end.
 //!
-//! The terminal UI, the MCP server and the desktop app all start long jobs
-//! (training, quantization, a server) as `pmetal <subcommand> <argv…>`
-//! children. This crate is the one place that does it:
+//! The terminal UI, the MCP server, the Python bindings and the desktop app
+//! all start long jobs (training, quantization, a server) as
+//! `pmetal <subcommand> <argv…>` children. This crate is the one place that
+//! does it:
 //!
 //! - **Process groups.** A job leads its own group; stopping it signals the
 //!   group (SIGTERM, then SIGKILL after a grace period), so the helpers it
@@ -56,3 +57,10 @@ pub use supervisor::{
 };
 pub use tail::Tail;
 pub use text::{redact_argv, redact_secrets, sanitize_line};
+
+/// Compiles the code blocks in `README.md` as doctests, so the crate's front
+/// page cannot drift away from its API. `cfg(doctest)` keeps the item out of
+/// the rendered docs and out of every normal build.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;

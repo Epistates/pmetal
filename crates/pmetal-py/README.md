@@ -12,17 +12,19 @@ can do here with the same fields, defaults and checks.
 
 ## Install
 
-```bash
-pip install pmetal
-```
-
-From a checkout, with [maturin](https://www.maturin.rs):
+The package is not published to PyPI yet, so build it from a checkout with
+[maturin](https://www.maturin.rs):
 
 ```bash
 cd crates/pmetal-py
 pip install maturin
 maturin develop --profile wheel
 ```
+
+`just build-wheel` builds the wheel the way a release ships it (MLX linked
+statically, the command line and the metallib inside the package) into
+`target/wheels/`. See Building a wheel below for why the `wheel` profile and
+not `--release`.
 
 ## The job specs
 
@@ -112,7 +114,7 @@ for piece in model.stream("Once upon a time", max_tokens=64):
     print(piece, end="", flush=True)
 
 pmetal.infer("Qwen/Qwen3-0.6B", "What is 2+2?", chat=True, no_thinking=True)  # InferSpec fields
-gen = pmetal.DFlashGenerator("mlx-community/Qwen3-4B-bf16", "z-lab/Qwen3-4B-DFlash-b16")
+gen = pmetal.DFlashGenerator("Qwen/Qwen3-4B", "z-lab/Qwen3-4B-DFlash-b16")
 tokens, metrics = gen.generate(prompt_ids, max_new_tokens=128, temperature=0.7, seed=1)
 ```
 

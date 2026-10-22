@@ -4,7 +4,16 @@ Knowledge distillation losses for training on Apple Silicon.
 
 ## Overview
 
-This crate provides knowledge distillation utilities for training smaller student models to mimic larger teacher models. Every loss is an MLX expression, so it runs on the GPU and the student is trained by differentiating it. The teacher is always a constant: no loss sends gradient into it.
+This crate provides knowledge distillation utilities for training smaller student models to mimic larger teacher models. Every loss is an expression over `pmetal-runtime` arrays, so it runs on the GPU and the student is trained by differentiating it. The teacher is always a constant: no loss sends gradient into it.
+
+`pmetal-trainer` builds its distillation trainers on it (`DistillationTrainer`, the RLKD and cross-vocabulary paths), and the `pmetal` CLI exposes them as `pmetal distill`. It depends only on `pmetal-runtime` from the workspace.
+
+## Installation
+
+```toml
+[dependencies]
+pmetal-distill = "0.7"
+```
 
 ## Loss Functions
 
@@ -41,15 +50,29 @@ al. (2015), so its gradient keeps the same scale as the temperature changes
 
 `pmetal-distill` is the low-level loss/cache crate. It provides `Distiller`,
 `TaidDistiller`, `LogitCache`, and `LogitCompressor` for use inside a higher-level
-training loop.
+training loop. A loss takes the teacher's and the student's logits, `[batch, seq, vocab]`,
+and returns a lazy scalar to differentiate:
 
-```rust,no_run
-use pmetal_distill::{DistillConfig, Distiller, Result};
+```rust
+use pmetal_distill::{DistillConfig, Distiller};
+use pmetal_runtime::compat::Array;
 
-fn build() -> Result<Distiller> {
-    let config = DistillConfig::from_yaml_file("distill_config.yaml")?;
-    // Call `distiller.compute_loss(..)` inside your training loop.
-    Distiller::new(config)
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `DistillConfig::from_yaml_file` reads the same thing from disk.
+    let config = DistillConfig::from_yaml("teacher: Qwen/Qwen3-8B\nstudent: Qwen/Qwen3-0.6B\n")?;
+    let distiller = Distiller::new(config)?;
+
+    let teacher = Array::from_f32_slice(&[2.0, 0.5, 0.1, 0.1, 0.1, 2.0, 0.5, 0.1], &[1, 2, 4]);
+    let flat_student = Array::from_f32_slice(&[0.0; 8], &[1, 2, 4]);
+
+    // (labels, per-token weights, step, total steps)
+    let far = distiller.compute_loss(&teacher, &flat_student, None, None, 0, 100)?;
+    let same = distiller.compute_loss(&teacher, &teacher, None, None, 0, 100)?;
+    let (far, same): (f32, f32) = (far.total.item(), same.total.item());
+
+    assert!(far > 0.01); // the student is not the teacher
+    assert!(same.abs() < 1e-5); // a student that is the teacher owes nothing
+    Ok(())
 }
 ```
 
@@ -67,12 +90,27 @@ For end-to-end model training, use the `pmetal distill` CLI or
 
 ## Configuration
 
-| Parameter | Description | Default |
-|-----------|-------------|---------|
+`DistillConfig` has `teacher`, `student`, `method` (`online`, `offline` or `progressive`),
+`loss`, `offline`, `output_path` and `training`. The `loss` section:
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `loss_type` | Which loss | `kl_divergence` |
 | `temperature` | Softmax temperature | 2.0 |
 | `alpha` | Soft/hard label balance | 0.5 |
-| `hidden_loss` | Hidden state loss type | None |
-| `hidden_weight` | Hidden loss weight | 0.1 |
+| `reverse_kl` | Reverse KL (student ‖ teacher) | false |
+| `rationale`, `rationale_weight` | Reasoning-aware distillation, and the weight of high-entropy tokens | false, 1.0 |
+| `hidden_state` | Layer mapping, loss type and `weight` (default 0.1) for hidden-state alignment | none |
+| `attention` | Attention transfer | none |
+
+## Feature flags
+
+None.
+
+## Requirements
+
+- Rust 1.95 or later
+- macOS 14 or later on Apple Silicon
 
 ## License
 

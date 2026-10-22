@@ -1,11 +1,13 @@
 [package]
 name = "pmetal-core"
-description = "Core types, traits, and configuration for PMetal LLM fine-tuning"
+description = "Configuration, job specs, events and shared types for PMetal"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 

@@ -39,8 +39,9 @@ const CASES: &[(&str, &str)] = &[
     ),
     (
         // Gemma scales the embedding by sqrt(hidden_size) after the lookup, so
-        // the noise is multiplied up with it. That is what TRL does too, since
-        // its hook fires on the embedding module's output.
+        // the noise is multiplied up with it. That is what the method's
+        // reference implementation does too, since its hook fires on the
+        // embedding module's output.
         "gemma",
         r#"{
             "model_type": "gemma",
@@ -150,8 +151,8 @@ fn the_alpha_does_not_outlive_the_call() {
 
 #[test]
 fn noise_is_zero_mean_and_scaled_by_alpha_over_sqrt_of_the_size() {
-    // The scale is the whole content of the method. TRL computes
-    // `mag = alpha / sqrt(seq_len * dims)` and draws `U(-mag, mag)`; an
+    // The scale is the whole content of the method. The paper's formula is
+    // `mag = alpha / sqrt(seq_len * dims)` with draws from `U(-mag, mag)`; an
     // implementation drawing `U(0, mag)` instead would still "add noise", still
     // train, and still be wrong, because it biases every dimension upward.
     let seq_len = 64;

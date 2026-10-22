@@ -78,3 +78,12 @@ pub mod prelude {
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 pub struct ReadmeDoctests;
+
+/// The same for `pmetal-core-derive`'s README. A proc-macro crate cannot run
+/// its own doctests (the derive's output names `::pmetal_core`, and a
+/// dev-dependency back on this crate would be a dependency cycle), so they run
+/// here, where the derive can be used. The file is read only under
+/// `cfg(doctest)`, so a packaged crate builds without it.
+#[cfg(doctest)]
+#[doc = include_str!("../../pmetal-core-derive/README.md")]
+pub struct DeriveReadmeDoctests;

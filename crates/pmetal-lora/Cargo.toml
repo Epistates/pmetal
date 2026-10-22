@@ -1,13 +1,15 @@
 [package]
 name = "pmetal-lora"
-description = "LoRA and QLoRA implementations for PMetal"
+description = "LoRA, DoRA and QLoRA adapters on any architecture PMetal loads"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["lora", "qlora", "fine-tuning", "llm", "apple-silicon"]
+categories = ["science", "algorithms"]
 
 [dependencies]
 pmetal-core = { workspace = true }
