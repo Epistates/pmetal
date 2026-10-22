@@ -7,28 +7,29 @@ need. Each sub-crate is also publishable on its own if you want a narrower depen
 
 ## Architecture
 
-PMetal is a Rust workspace of 20 crates:
+PMetal is a Rust workspace of 21 crates, plus the desktop app (`pmetal-gui`, its own workspace):
 
 | Crate | Purpose |
 |-------|---------|
 | `pmetal` | CLI binary, TUI, inference runner, and the umbrella library |
-| `pmetal-core` | Foundation: configs, traits, types, error handling, job specs |
-| `pmetal-core-derive` | Derive macros for the core traits |
-| `pmetal-runtime` | Tensor runtime: arrays, ops, native engines, memory figures |
-| `pmetal-metal` | Custom Metal GPU kernels + ANE runtime |
+| `pmetal-core` | Foundation: configs, traits, types, error handling, the job specs |
+| `pmetal-core-derive` | Derive macro for the job specs |
+| `pmetal-runtime` | Tensor runtime: arrays, autodiff, native engines, optimizers, custom Metal kernels |
+| `pmetal-metal` | Metal context, ANE runtime and kernels |
 | `pmetal-cache` | KV caches, prefix reuse, speculative-decoding state |
-| `pmetal-models` | LLM architectures (Llama, Qwen, DeepSeek, Gemma, etc.) |
-| `pmetal-lora` | LoRA/QLoRA training implementations |
-| `pmetal-trainer` | Training loops (SFT, DPO, SimPO, ORPO, KTO, GRPO) |
+| `pmetal-models` | LLM architectures, the dispatcher and speculative decoders |
+| `pmetal-lora` | LoRA/QLoRA as a property of `Linear` (`AdaptedModel`, `DynamicLoraModel`) |
+| `pmetal-trainer` | Training loops (SFT, preference, GRPO, MTP, ...) |
 | `pmetal-data` | Dataset loading, chat templates, tokenization, image processing |
-| `pmetal-hub` | HuggingFace Hub integration + model fit estimation |
-| `pmetal-distill` | Knowledge distillation (online, offline, TAID) |
-| `pmetal-merge` | Model merging (14 strategies) |
-| `pmetal-gguf` | GGUF format with imatrix quantization |
+| `pmetal-hub` | Hugging Face Hub integration + model fit estimation |
+| `pmetal-distill` | Knowledge distillation (losses, offline caches, TAID) |
+| `pmetal-merge` | Model merging and LoRA fusing |
+| `pmetal-gguf` | GGUF reader, writer and quantization |
 | `pmetal-mhc` | Manifold-Constrained Hyper-Connections |
-| `pmetal-distributed` | Distributed training (mDNS, Ring All-Reduce) |
+| `pmetal-distributed` | Distributed training (mDNS discovery, authenticated ring all-reduce) |
 | `pmetal-vocoder` | BigVGAN neural vocoder |
 | `pmetal-serve` | OpenAI- and Anthropic-compatible inference server |
+| `pmetal-supervisor` | Runs `pmetal` commands as supervised child processes (TUI, MCP server, GUI, Python) |
 | `pmetal-mcp` | MCP server for Claude Desktop and other MCP clients |
 | `pmetal-py` | Python bindings (maturin/PyO3) |
 
@@ -49,18 +50,19 @@ let model_dir = pmetal::hub::resolve_model_path("Qwen/Qwen3-0.6B", None, None).a
 let model = DynamicModel::load(&model_dir)?;
 ```
 
-For LoRA training, load through `DynamicLoraModel::from_pretrained`, which wraps the base model
-with adapters:
+For LoRA training, load through `DynamicLoraModel::from_pretrained`, which attaches adapters to the same model the dispatcher loads:
 
 ```rust
 let lora_config = pmetal::core::LoraConfig { r: 16, alpha: 32.0, ..Default::default() };
-let model = DynamicLoraModel::from_pretrained(&model_dir, lora_config)?;
+let model = DynamicLoraModel::from_pretrained(&model_dir, lora_config.clone())?;
 ```
 
 ## Manual Training Loop
 
-`TrainingLoop::new` takes a single `TrainingLoopConfig`; the model and dataset are passed to
-`run_packed`. Use `train_step` directly if you want to own the iteration yourself.
+`TrainingLoop::new` takes a single `TrainingLoopConfig` and returns an error for a configuration
+that cannot work; the model and dataset are passed to `run`, which packs sequences when
+`use_sequence_packing` is set. For a complete working program, see
+[`finetune_manual.rs`](https://github.com/Epistates/pmetal/blob/main/crates/pmetal/examples/finetune_manual.rs).
 
 ```rust
 use pmetal::prelude::*;
@@ -101,14 +103,22 @@ let loop_config = TrainingLoopConfig {
 
 let checkpoints = CheckpointManager::new("./output/checkpoints")?.with_max_checkpoints(3);
 
-let mut training_loop = TrainingLoop::new(loop_config);
-training_loop.add_callback(Box::new(ProgressCallback::new(total_steps)));
+let mut training_loop = TrainingLoop::new(loop_config)?;
+training_loop.add_callback(Box::new(LoggingCallback::new(10)));
 
-let model = training_loop.run_packed(model, dataset, None, Some(&checkpoints))?;
-model.save_lora_weights("./output/adapter_model.safetensors")?;
+let mut model = model;
+training_loop.run(&mut model, dataset, None, Some(&checkpoints))?;
 
-println!("final loss {:.4} over {} steps",
-    training_loop.current_loss(), training_loop.current_step());
+// A PEFT adapter directory: adapter_model.safetensors and adapter_config.json
+let weights = pmetal::trainer::orchestrator::save_adapter(
+    &model,
+    std::path::Path::new("./output"),
+    &lora_config,
+    Some(&model_dir.to_string_lossy()),
+)?;
+
+println!("final loss {:.4} over {} steps, adapter at {}",
+    training_loop.current_loss(), training_loop.current_step(), weights.display());
 ```
 
 ## Callback System
@@ -136,5 +146,5 @@ default implementation forwards to `on_step_end`. `ProgressCallback`, `LoggingCa
 
 ## See Also
 
-- [`crates/pmetal/examples/`](https://github.com/Epistates/pmetal/tree/main/crates/pmetal/examples/) — complete working examples, including `finetune_manual.rs`, which this page mirrors
-- [Python SDK](/python/full-control/) — the same pipeline from Python
+- [`crates/pmetal/examples/`](https://github.com/Epistates/pmetal/tree/main/crates/pmetal/examples/): complete working examples, including `finetune_manual.rs`, which this page mirrors
+- [Python SDK](/python/full-control/): the same pipeline from Python
