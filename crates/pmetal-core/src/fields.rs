@@ -149,6 +149,21 @@ impl FieldError {
 /// The trait derived by `#[derive(JobSpec)]` — the contract every spec
 /// satisfies so all four surfaces can consume it uniformly.
 pub trait JobFields: Sized {
+    /// Whether the command writes the `--log-events` file: a stream of
+    /// [`JobEvent`](crate::JobEvent) lines a supervisor follows for phases and
+    /// steps (`#[spec(events)]`). The one statement of it: the CLI refuses the
+    /// flag for every other command, and each surface that launches jobs
+    /// asks for the file only where the command writes it.
+    const REPORTS_EVENTS: bool;
+
+    /// The field that `--output` names: where the job writes its results.
+    /// `None` for a command with no output location.
+    const OUTPUT_FIELD: Option<&'static str>;
+
+    /// The field that `--log-metrics` names, for a command that can write its
+    /// steps to a JSONL file.
+    const LOG_METRICS_FIELD: Option<&'static str>;
+
     /// Per-field descriptors (form metadata + argv binding + defaults).
     fn field_descriptors() -> &'static [FieldDescriptor];
 

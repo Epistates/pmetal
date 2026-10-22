@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Holds the user-facing input fields. Conversion to the trainer's internal
 /// `TrainingJobConfig` happens at the consumer boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, JobSpec)]
-#[spec(kind = "Train", subcommand = "train")]
+#[spec(kind = "Train", subcommand = "train", events)]
 #[serde(rename_all = "snake_case")]
 pub struct TrainSpec {
     // -- Model & data ---------------------------------------------------------

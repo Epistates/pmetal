@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 pub const PREFERENCE_LOSSES: &[&str] = &["dpo", "ipo", "hinge", "simpo", "orpo", "kto"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, JobSpec)]
-#[spec(kind = "Preference", subcommand = "preference")]
+#[spec(kind = "Preference", subcommand = "preference", events)]
 #[serde(rename_all = "snake_case")]
 pub struct PreferenceSpec {
     #[job(

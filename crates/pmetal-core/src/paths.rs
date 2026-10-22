@@ -57,6 +57,21 @@ pub fn output_path(path: &str, what: &str) -> Result<PathBuf> {
     Ok(clean)
 }
 
+/// Where `path` is, when relative paths are relative to `dir`: an absolute
+/// `path` as it is, anything else beneath `dir`.
+///
+/// The rule for every file a command writes into its output directory
+/// (`--log-metrics`): the same answer for the command that writes the file and
+/// for whatever follows it.
+pub fn resolve_in(dir: &Path, path: &str) -> PathBuf {
+    let path = expand_home(path);
+    if path.is_absolute() {
+        path
+    } else {
+        dir.join(path)
+    }
+}
+
 /// `~` and `~/x` spelled out against the home directory; anything else (a
 /// `~user` path included) as it was.
 pub fn expand_home(text: &str) -> PathBuf {
@@ -74,6 +89,23 @@ pub fn expand_home(text: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_relative_path_is_beneath_the_directory_and_an_absolute_one_is_not() {
+        let dir = Path::new("/runs/a");
+        assert_eq!(
+            resolve_in(dir, "metrics.jsonl"),
+            PathBuf::from("/runs/a/metrics.jsonl")
+        );
+        assert_eq!(
+            resolve_in(dir, "logs/m.jsonl"),
+            PathBuf::from("/runs/a/logs/m.jsonl")
+        );
+        assert_eq!(
+            resolve_in(dir, "/elsewhere/m.jsonl"),
+            PathBuf::from("/elsewhere/m.jsonl")
+        );
+    }
 
     #[test]
     fn a_leading_tilde_is_the_home_directory() {

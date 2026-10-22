@@ -6,7 +6,7 @@ use pmetal_core_derive::JobSpec;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JobSpec)]
-#[spec(kind = "Rlkd", subcommand = "rlkd")]
+#[spec(kind = "Rlkd", subcommand = "rlkd", events)]
 #[serde(rename_all = "snake_case")]
 pub struct RlkdSpec {
     #[job(

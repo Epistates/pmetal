@@ -6,7 +6,7 @@ use pmetal_core_derive::JobSpec;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JobSpec)]
-#[spec(kind = "Distill", subcommand = "distill")]
+#[spec(kind = "Distill", subcommand = "distill", events)]
 #[serde(rename_all = "snake_case")]
 pub struct DistillSpec {
     #[job(

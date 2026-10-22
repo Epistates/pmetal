@@ -6,7 +6,7 @@ use pmetal_core_derive::JobSpec;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JobSpec)]
-#[spec(kind = "Grpo", subcommand = "grpo")]
+#[spec(kind = "Grpo", subcommand = "grpo", events)]
 #[serde(rename_all = "snake_case")]
 pub struct GrpoSpec {
     #[job(
