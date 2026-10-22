@@ -75,6 +75,8 @@ async-trait = "0.1"
 # HTTP server (pmetal-serve)
 axum = "0.8"
 tower-http = "0.7"
+# Prometheus / OpenMetrics instrumentation (pmetal-serve `/metrics`)
+prometheus-client = "0.25"
 # Grammar-constrained decoding (pmetal-serve): JSON-schema and Lark grammars
 # compiled to token masks.
 llguidance = "1.9"

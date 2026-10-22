@@ -89,6 +89,27 @@ pub struct RequestMetrics {
     pub cached_prompt_tokens: usize,
     /// Number of completion tokens.
     pub completion_tokens: usize,
+    /// What speculative decoding did for this request, when it ran.
+    pub speculative: Option<SpeculativeUsage>,
+}
+
+/// How a speculative decode fared: tokens proposed by the draft model or MTP
+/// head and how many of them the target model kept.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpeculativeUsage {
+    pub drafted_tokens: usize,
+    pub accepted_tokens: usize,
+}
+
+impl SpeculativeUsage {
+    /// Fraction of drafted tokens accepted; 0 when none were drafted.
+    pub fn acceptance_rate(&self) -> f64 {
+        if self.drafted_tokens == 0 {
+            0.0
+        } else {
+            self.accepted_tokens as f64 / self.drafted_tokens as f64
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1050,6 +1071,12 @@ impl InferenceEngine {
         }
     }
 
+    /// Requests waiting for the model: queued behind the one it is running,
+    /// and, under continuous batching, waiting for a slot.
+    pub fn queue_depth(&self) -> usize {
+        self.model.pending() + self.continuous_batching_depth().1
+    }
+
     /// Snapshot of prefix-cache stats: `(entries, bytes, hits, misses, hit_rate)`.
     pub fn prefix_cache_stats(&self) -> (usize, usize, u64, u64, f64) {
         match self.prefix_cache.lock() {
@@ -1790,6 +1817,7 @@ impl InferenceEngine {
             prompt_tokens,
             cached_prompt_tokens: 0,
             completion_tokens,
+            speculative: None,
         }
     }
 

@@ -45,6 +45,11 @@ pub struct ServingMetrics {
     pub sum_completion_tokens: AtomicU64,
     /// Sum of prompt token counts.
     pub sum_prompt_tokens: AtomicU64,
+    /// Tokens the draft model or MTP head proposed, over every speculative
+    /// generation.
+    pub sum_drafted_tokens: AtomicU64,
+    /// Drafted tokens the target model accepted.
+    pub sum_accepted_tokens: AtomicU64,
 }
 
 /// Pick the right streaming receiver: the continuous-batching pump
@@ -89,6 +94,12 @@ impl ServingMetrics {
             .fetch_add(metrics.completion_tokens as u64, Ordering::Relaxed);
         self.sum_prompt_tokens
             .fetch_add(metrics.prompt_tokens as u64, Ordering::Relaxed);
+        if let Some(spec) = &metrics.speculative {
+            self.sum_drafted_tokens
+                .fetch_add(spec.drafted_tokens as u64, Ordering::Relaxed);
+            self.sum_accepted_tokens
+                .fetch_add(spec.accepted_tokens as u64, Ordering::Relaxed);
+        }
     }
 
     /// Compute rolling averages and return as a JSON value.
@@ -116,6 +127,14 @@ impl ServingMetrics {
             0.0
         };
 
+        let drafted = self.sum_drafted_tokens.load(Ordering::Relaxed);
+        let accepted = self.sum_accepted_tokens.load(Ordering::Relaxed);
+        let acceptance = if drafted > 0 {
+            accepted as f64 / drafted as f64
+        } else {
+            0.0
+        };
+
         json!({
             "total_requests": total,
             "avg_first_token_latency_ms": avg_first_ms,
@@ -123,6 +142,9 @@ impl ServingMetrics {
             "rolling_tokens_per_second": rolling_tps,
             "total_prompt_tokens": sum_prompt,
             "total_completion_tokens": sum_compl,
+            "speculative_drafted_tokens": drafted,
+            "speculative_accepted_tokens": accepted,
+            "speculative_acceptance_rate": acceptance,
         })
     }
 }
@@ -135,7 +157,11 @@ impl ServingMetrics {
 pub struct AppState {
     pub engine: InferenceEngine,
     pub metrics: ServingMetrics,
+    /// The Prometheus registry behind `GET /metrics`.
+    pub telemetry: crate::telemetry::Telemetry,
     pub request_permits: Arc<Semaphore>,
+    /// How many permits `request_permits` started with.
+    pub configured_permits: usize,
     /// How long one request may run; see [`crate::server::ServeConfig`].
     pub request_timeout: Option<std::time::Duration>,
     /// The most choices (`n`) a request may ask for.
@@ -149,6 +175,12 @@ impl AppState {
         Arc::clone(&self.request_permits)
             .try_acquire_owned()
             .map_err(|_| ServeError::Busy)
+    }
+
+    /// Count a finished generation in the JSON and the Prometheus metrics.
+    pub(crate) fn record_request(&self, metrics: &RequestMetrics) {
+        self.metrics.record(metrics);
+        self.telemetry.record_request(metrics);
     }
 
     /// When a request that starts now must be done, and the limit in seconds.

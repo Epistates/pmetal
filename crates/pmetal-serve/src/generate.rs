@@ -90,7 +90,7 @@ pub(crate) fn start_choices(
                     metrics: Some(m), ..
                 }) = event
                 {
-                    metrics.metrics.record(m);
+                    metrics.record_request(m);
                 }
             })
         })
