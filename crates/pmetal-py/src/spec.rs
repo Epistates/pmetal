@@ -397,6 +397,21 @@ pub fn argv<S: SpecType>(spec: &S) -> Vec<String> {
     spec.to_argv()
 }
 
+/// The command that runs `spec` and its event log, from the supervisor's plan
+/// (the one every surface starts jobs from).
+pub fn launch<S: SpecType>(
+    spec: &S,
+    events_dir: Option<std::path::PathBuf>,
+) -> PyResult<(String, Vec<String>, Option<std::path::PathBuf>)> {
+    use pmetal_supervisor::{EventsFile, LaunchOptions, LaunchPlan};
+    let options = LaunchOptions {
+        events: events_dir.map_or(EventsFile::Off, EventsFile::InDir),
+        ..LaunchOptions::default()
+    };
+    let plan = LaunchPlan::for_spec(spec, &options).map_err(config_err)?;
+    Ok((plan.subcommand, plan.argv, plan.events_file))
+}
+
 pub fn reduce<'py, S: SpecType>(
     py: Python<'py>,
     class: &Bound<'py, PyAny>,
@@ -452,6 +467,24 @@ macro_rules! py_spec {
                 <$spec as ::pmetal_core::JobFields>::subcommand()
             }
 
+            /// Whether the command writes a `--log-events` stream of progress events.
+            #[classattr]
+            fn reports_events() -> bool {
+                <$spec as ::pmetal_core::JobFields>::REPORTS_EVENTS
+            }
+
+            /// The command that runs this spec, as `(subcommand, argv, events_file)`:
+            /// `argv` includes the files the command is asked to write, and
+            /// `events_file` is the event log in `events_dir` when the command
+            /// writes one and a directory is given.
+            #[pyo3(signature = (events_dir=None))]
+            fn _launch(
+                &self,
+                events_dir: Option<::std::path::PathBuf>,
+            ) -> PyResult<(String, Vec<String>, Option<::std::path::PathBuf>)> {
+                $crate::spec::launch(&self.inner, events_dir)
+            }
+
             /// Every field with its type, default, bounds and help.
             #[staticmethod]
             fn fields(py: Python<'_>) -> PyResult<Bound<'_, PyList>> {
@@ -474,7 +507,7 @@ macro_rules! py_spec {
                 let mut names = dir(&self.inner)?;
                 names.extend(
                     ["fields", "normalize", "to_argv", "to_dict", "from_dict", "to_json",
-                     "from_json", "copy", "validation_errors", "subcommand"]
+                     "from_json", "copy", "validation_errors", "subcommand", "reports_events"]
                         .map(String::from),
                 );
                 Ok(names)

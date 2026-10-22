@@ -5553,7 +5553,6 @@ dependencies = [
  "pyo3-build-config",
  "serde",
  "serde_json",
- "tempfile",
  "tokio",
  "tracing",
 ]

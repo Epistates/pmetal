@@ -48,13 +48,15 @@ def test_training_commands_get_an_event_log_and_others_do_not(fake_cli):
         assert "--log-events" not in pmetal.run(spec, cli=cli).json()
 
 
-def test_the_event_log_subcommands_are_the_specs_that_stream_events():
-    # The command line's own list (main.rs: Distill, Grpo, Rlkd, Preference, and Train).
+def test_the_specs_that_stream_events_are_the_trainers_the_command_line_accepts_the_flag_for():
+    # The specs state it themselves (`#[spec(events)]`); the command line refuses
+    # `--log-events` for every other command (Commands::writes_event_log).
     names = {
         cls.subcommand
-        for cls in (pmetal.TrainSpec, pmetal.DistillSpec, pmetal.GrpoSpec, pmetal.RlkdSpec, pmetal.PreferenceSpec)
+        for cls in vars(pmetal).values()
+        if isinstance(cls, type) and hasattr(cls, "reports_events") and cls.reports_events
     }
-    assert names == set(_jobs.EVENT_LOG_SUBCOMMANDS)
+    assert names == {"train", "distill", "grpo", "rlkd", "preference"}
 
 
 def test_events_reach_on_event_in_order_and_the_result(fake_cli):

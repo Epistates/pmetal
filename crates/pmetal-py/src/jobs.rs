@@ -62,7 +62,16 @@ struct Core {
     failure: Mutex<Option<PyErr>>,
     finished: (Mutex<bool>, Condvar),
     /// Holds the `--log-events` file; removed when the job is gone.
-    _events_dir: Option<tempfile::TempDir>,
+    _events_dir: Option<Scratch>,
+}
+
+/// A directory removed when this is dropped.
+struct Scratch(PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 impl Core {
@@ -331,35 +340,25 @@ impl PyJob {
 
 /// Start `pmetal <subcommand> <argv>` under a supervisor and return its handle.
 ///
-/// With `log_events`, the job is also told to write its `JobEvent` stream to a
-/// file the supervisor follows (`--log-events`); the events reach `on_event` as
-/// they are written. `stop_grace` is the seconds a stopped job has to exit
+/// `argv` and `events_file` are what a spec's `_launch` gave. With an
+/// `events_file` (a file of the `JobEvent` stream the command was told to write,
+/// `--log-events`) the supervisor follows it and the events reach `on_event` as
+/// they are written; `events_dir`, the directory made for it, is removed when
+/// the job is gone. `stop_grace` is the seconds a stopped job has to exit
 /// before it is killed.
 #[pyfunction]
-#[pyo3(signature = (binary, subcommand, argv, log_events=false, stop_grace=30.0, on_event=None))]
+#[pyo3(signature = (binary, subcommand, argv, events_file=None, events_dir=None, stop_grace=30.0, on_event=None))]
 pub fn _start_job(
     binary: PathBuf,
     subcommand: String,
-    mut argv: Vec<String>,
-    log_events: bool,
+    argv: Vec<String>,
+    events_file: Option<PathBuf>,
+    events_dir: Option<PathBuf>,
     stop_grace: f64,
     on_event: Option<Py<PyAny>>,
 ) -> PyResult<PyJob> {
     let rt = runtime()?;
-    let events_dir = if log_events {
-        let dir = tempfile::Builder::new()
-            .prefix("pmetal-events-")
-            .tempdir()
-            .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?;
-        Some(dir)
-    } else {
-        None
-    };
-    let events_file = events_dir.as_ref().map(|d| d.path().join("events.jsonl"));
-    if let Some(file) = &events_file {
-        argv.push("--log-events".to_string());
-        argv.push(file.display().to_string());
-    }
+    let events_dir = events_dir.map(Scratch);
 
     let supervisor = Supervisor::new(
         binary.clone(),
