@@ -6,8 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["process", "supervisor", "jobs", "subprocess", "pmetal"]
+categories = ["concurrency", "os::unix-apis"]
 
 [features]
 # `schemars::JsonSchema` on the summary types, for the MCP server's tool schemas.
