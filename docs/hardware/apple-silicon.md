@@ -1,81 +1,55 @@
 # Apple Silicon Support
 
-Hardware detection, per-chip capabilities, M1–M5 support matrix, and ANE integration.
+Hardware detection, chip generations, and the Neural Engine.
 
-PMetal automatically detects your Apple Silicon hardware at startup and tunes kernel parameters accordingly.
+PMetal detects your Apple Silicon hardware at startup and chooses its paths accordingly. macOS 14 or later is required.
 
-## Chip Support Matrix
+## Chip Generations
 
-| Chip | GPU Family | GPU Cores | BW (GB/s) | ANE TFLOPS | NAX | Notes |
-|------|-----------|-----------|-----------|------------|-----|-------|
-| M1 | Apple7 | 8 | 100 | ~11 | No | |
-| M1 Pro | Apple7 | 14 | 200 | ~11 | No | |
-| M1 Max | Apple7 | 24 | 400 | ~11 | No | |
-| M1 Ultra | Apple7 | 48 | 800 | ~22 | No | 2-die UltraFusion |
-| M2 | Apple8 | 8 | 100 | ~15 | No | |
-| M2 Pro | Apple8 | 16 | 200 | ~15 | No | |
-| M2 Max | Apple8 | 30 | 400 | ~15 | No | |
-| M2 Ultra | Apple8 | 48 | 800 | ~30 | No | 2-die UltraFusion |
-| M3 | Apple9 | 10 | 120 | 15.8 | No | Dynamic caching |
-| M3 Pro | Apple9 | 18 | 273 | 15.8 | No | |
-| M3 Max | Apple9 | 30 | 546 | 15.8 | No | |
-| M3 Ultra | Apple9 | 60 | 800 | 31.6 | No | 32 NE cores |
-| M4 | Apple9 | 10 | 120 | ~12.2 | No | Dynamic caching |
-| M4 Pro | Apple9 | 20 | 273 | 12.57 | No | |
-| M4 Max | Apple9 | 40 | 546 | 10.93 | No | |
-| M4 Ultra | Apple9 | 80 | 800 | ~24 | No | 2-die UltraFusion |
-| **M5** | **Apple10** | **10** | **120** | **~12.2** | **Yes** | NAX support |
-| **M5 Pro** | **Apple10** | **20** | **273** | **~12.3** | **Yes** | |
-| **M5 Max** | **Apple10** | **40** | **546** | **TBD** | **Yes** | |
-| **M5 Ultra** | **Apple10** | **80** | **800** | **TBD** | **Yes** | 2-die UltraFusion |
+| Chip family | GPU family | Arch gen | NAX | Notes |
+|-------------|-----------|----------|-----|-------|
+| M1 / Pro / Max / Ultra | Apple7 | 13 | No | |
+| M2 / Pro / Max / Ultra | Apple8 | 14 | No | |
+| M3 / Pro / Max / Ultra | Apple9 | 15 | No | Dynamic caching |
+| M4 / Pro / Max / Ultra | Apple9 | 16 | No | Dynamic caching |
+| **M5 / Pro / Max / Ultra** | **Apple10** | **17** | **Yes** | Needs macOS 26.2 or later for NAX |
 
-ANE TFLOPS measured at FP16 via PMetal benchmarks.
+An Ultra is two Max dies joined by UltraFusion, with 32 Neural Engine cores; every other chip reports 16. GPU core counts are read from the device, so binned parts are reported as they are. Published peak memory bandwidth per chip is in [Hardware Support](/hardware-support/).
 
 ## Auto-Detection
 
 PMetal detects at startup:
 
-- **GPU family** (Apple7–Apple10) and architecture generation
-- **Device tier** (Base/Pro/Max/Ultra)
+- **GPU family** (Apple7 to Apple10) and architecture generation
+- **Device tier** (Base, Pro, Max, Ultra)
 - **GPU core count**
 - **ANE core count** and availability
-- **Memory bandwidth** (persisted GPU copy benchmark with spec fallback)
-- **NAX** (M5+, Apple10)
+- **Memory bandwidth** (measured by a cached GPU copy benchmark, else Apple's published peak)
+- **NAX** (generation 17 or later, macOS 26.2 or later)
 - **Metal features** (dynamic caching, mesh shaders)
-- **UltraFusion topology** (via `sysctl hw.packages`)
+- **UltraFusion topology**
 
-Use `pmetal info` to display all detected hardware properties.
+Use `pmetal info` to display all detected hardware properties. On UltraFusion machines it also reports the local same-process executor plan: per-die resource slices and the number of in-memory pipeline stages.
 
-On UltraFusion machines, `pmetal info` now also reports the local same-process executor scaffold: per-die resource slices, the in-memory stage count, and the heuristic 32 TB/s interconnect used by PMetal's local UltraFusion planner.
+Use `pmetal bench-corpus` to collect a comparable kernel report for the current machine, and `pmetal bench-workload` for a fast end-to-end regression loop (inference plus a short LoRA run on a cached model and dataset; it records the KV cache mode chosen on the machine).
 
-Use `pmetal bench-corpus` to collect a comparable kernel report for the current machine. That corpus exercises standard-Metal hot paths on M1-M4, includes fused-merge plus initial MoE/model-family coverage across Apple7-Apple10.
+Across Apple7 to Apple10 GPUs, PMetal runs dense GEMM, attention, RoPE, SwiGLU and LoRA as tensor-runtime ops. M1 to M4 are first-class paths, not fallbacks.
 
-Use `pmetal bench-workload` when you want a fast end-to-end regression loop instead of only kernel microbenchmarks. The default workload uses the cached `Qwen/Qwen3-0.6B` model plus `TeichAI/gemini-3-pro-preview-high-reasoning-250x`, and the inference report now records the KV cache mode chosen on the current machine.
+## M5: NAX
 
-Across Apple7-10 GPUs, PMetal runs dense GEMM, attention, RoPE, SwiGLU and LoRA as tensor-runtime ops. Shared MLX MoE routers now use GPU-native `argpartition` selection instead of heavier full sorts or CPU top-k paths. M1-M4 remain first-class paths rather than “fallback” hardware. PMetal also now auto-selects the inference KV cache mode: on Apple7-Apple9 it prefers fp16 KV cache when the model plus context comfortably fit the device budget and only promotes to q8 when memory pressure justifies it.
-
-## M5-Specific: NAX
-
-M5 (Apple10, arch gen 17) introduces Neural Accelerator units within GPU cores for hardware-accelerated:
-
-- GEMM (fused matrix multiply)
-- Quantized inference (FP4/FP8)
-- Scaled dot-product attention
-
-Accessed via Metal 4.0 (`-std=metal4.0`) kernels. NAX availability is checked via `DeviceProperties::has_nax()`. PMetal currently ships the Metal 4 dispatcher, NAX-capable hardware detection, and persisted Apple10/M5 MPP dispatch tuning for quantized linears. Dense GEMM and attention run on the tensor runtime's own ops, which use MLX's NAX kernels. Remaining work is to track upstream MLX NAX API changes and keep `pmetal-runtime` bindings current.
+M5-generation GPUs have neural accelerator units in each GPU core, reached through Metal 4 tensor operations, which the runtime uses (through MLX's NAX kernels) for matrix multiplication, quantized matmul and attention. Detection and the runtime apply the same gate, so both agree on which device takes the NAX path.
 
 ## ANE (Apple Neural Engine)
 
-PMetal's ANE pipeline:
+PMetal's ANE pipeline uses Apple's private framework APIs (experimental):
 
-- **Dynamic Weight Pipeline**: training kernels compiled once at startup
-- **Inference**: the whole model on the ANE, several layers per program over a KV cache held in IOSurfaces, int8 weights by default. Tokens are sampled from its logits as on the GPU: temperature, top-k, top-p, min-p, the seed, and the repetition, frequency and presence penalties
-- **Power-of-2 bucketing**: Optimal kernel compilation for sequence lengths
-- **CPU RMSNorm**: f32 computation on CPU in training to avoid fp16 ANE overflow
-- **IOSurface Zero-Copy**: Shared memory surfaces for CPU-ANE transfer
-- **M1–M5 Compatibility**: Per-matrix blobs for M1, single-blob for M3+
+- **Training** (`train --ane`): training kernels compiled once, with weights packed alongside activations in IOSurfaces. Attention and FFN kernels too large for ANE memory fall back to per-projection kernels
+- **Inference** (`infer --ane`, `serve --ane`): the whole model on the ANE, several layers per program over a KV cache held in IOSurfaces, int8 weights by default. Tokens are sampled from its logits as on the GPU: temperature, top-k, top-p, min-p, the seed, and the repetition, frequency and presence penalties
+- **Power-of-2 bucketing**: kernels are compiled for context lengths from 512 up to `--ane-max-seq-len`
+- **CPU RMSNorm**: f32 computation on the CPU in training to avoid fp16 ANE overflow
+- **IOSurface zero-copy**: shared memory surfaces for CPU-ANE transfer
 
 ## See Also
 
-- [Kernel Tuning](/hardware/kernel-tuning/) — Per-tier parameter tuning
-- [pmetal info](/cli/info/) — View your hardware info
+- [Kernel Tuning](/hardware/kernel-tuning/): What is tuned per device
+- [pmetal info](/cli/info/): View your hardware info

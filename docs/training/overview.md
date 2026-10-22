@@ -1,36 +1,44 @@
 # Training Overview
 
-All training methods available in PMetal — SFT, LoRA, DPO, GRPO, distillation, and more.
+All training methods available in PMetal: SFT, LoRA, DPO, GRPO, distillation, and more.
 
-PMetal supports 12+ training methods across CLI, GUI, TUI, and the Rust/Python SDK. All methods support callback-based cancellation, JSONL metrics logging, and adaptive learning rate control.
+PMetal supports the training methods below from the CLI, TUI, GUI, MCP server, Python and Rust. All support cancellation, JSONL metrics logging (`--log-metrics`) and, where the loop has one, adaptive learning rate control.
 
 ## Method Matrix
 
-| Method | CLI | GUI | TUI | Library |
-|--------|-----|-----|-----|---------|
-| SFT (Supervised Fine-Tuning) | `train` | Yes | Yes | `orchestrator::run_training()` |
-| LoRA | `train` | Yes | Yes | `orchestrator::run_training()` |
-| QLoRA (4-bit) | `train --quantization nf4` | Yes | Yes | `orchestrator::run_training()` |
-| DoRA | — | — | — | `LoraConfig { use_dora: true }` |
-| DPO / Robust DPO, IPO, hinge | `preference --loss dpo\|ipo\|hinge` | Yes | Yes | `PreferenceTrainer` |
-| SimPO | `preference --loss simpo` | Yes | Yes | `PreferenceTrainer` |
-| ORPO | `preference --loss orpo` | Yes | Yes | `PreferenceTrainer` |
-| KTO | `preference --loss kto` | Yes | Yes | `KtoTrainer` |
-| GRPO (Reasoning) | `grpo` | Yes | Yes | `GrpoTrainer` |
-| DAPO | `grpo --dapo` | Yes | Yes | `GrpoConfig::for_dapo` |
-| Dr. GRPO | `grpo --loss-type dr_grpo` | Yes | Yes | `GrpoConfig::for_dr_grpo` |
-| GSPO | `grpo --loss-type gspo --num-iterations 2` | Yes | Yes | `GrpoConfig::for_gspo` |
-| Knowledge Distillation | `distill` | Yes | Yes | `Distiller` |
-| TAID | — | — | — | `TaidDistiller` |
-| ANE Training | `train` (auto) | — | Yes | `AneTrainingLoop` |
+Every command is a job spec shared by the CLI, TUI, GUI, MCP server and Python bindings, so a method available as a command has a form in the GUI and a tool in the MCP server.
+
+| Method | Command | Library |
+|--------|---------|---------|
+| SFT (Supervised Fine-Tuning) | `train` | `orchestrator::run_training()` |
+| LoRA | `train` | `orchestrator::run_training()` |
+| QLoRA (NF4, NVFP4 or int8 base) | `train --quantization nf4\|fp4\|int8` | `orchestrator::run_training()` |
+| DoRA, rsLoRA | `train --dora`, `train --rslora` | `LoraConfig { use_dora, use_rslora }` |
+| DPO / Robust DPO, IPO, hinge | `preference --loss dpo\|ipo\|hinge` | `PreferenceTrainer` |
+| SimPO | `preference --loss simpo` | `PreferenceTrainer` |
+| ORPO | `preference --loss orpo` | `PreferenceTrainer` |
+| KTO | `preference --loss kto` | `KtoTrainer` |
+| GRPO (Reasoning) | `grpo --loss-type grpo` | `GrpoTrainer` |
+| DAPO | `grpo --dapo` (the default `--loss-type`) | `GrpoConfig::for_dapo` |
+| Dr. GRPO | `grpo --loss-type dr_grpo` | `GrpoConfig::for_dr_grpo` |
+| GSPO | `grpo --loss-type gspo --num-iterations 2` | `GrpoConfig::for_gspo` |
+| Knowledge Distillation | `distill` | `Distiller` |
+| TAID | not wired to a command | `TaidDistiller` |
+| RLKD (RL + Distillation) | `rlkd` | `RlkdTrainer` |
+| Embedding training | `embed-train` | `EmbeddingTrainer` |
+| Pretraining | `pretrain` | `pmetal_trainer` |
+| Block diffusion (DiffusionGemma) | `train-diffusion` | `DiffusionGemmaTrainer` |
+| MTP predictor and assistant training | `train-mtp` | `pmetal_trainer::mtp_training` |
+| DFlash draft training | `train-draft` | `pmetal_trainer::mtp_training` |
+| ANE training (experimental) | `train --ane` | `AneTrainingLoop` |
 
 ## Training Infrastructure
 
 ### Sequence Packing
-Packs multiple sequences into single batches for 2–5× throughput. Enabled by default with proper attention masking.
+Packs multiple sequences into single rows so short samples do not waste compute on padding. On by default with block-diagonal attention masking, and for models with recurrent layers (Nemotron-H, Granite 4.0-H) the recurrent state is reset at sequence boundaries; `--no-sequence-packing` turns it off.
 
 ### Gradient Checkpointing
-Trade compute for memory on large models. Configurable layer grouping (default: 4 layers per block).
+Trade compute for memory: each decoder layer is recomputed in the backward pass instead of stored. On by default; `--no-gradient-checkpointing` turns it off.
 
 ### Adaptive Learning Rate
 EMA-based anomaly detection with automatic spike recovery, plateau reduction, and divergence detection.
@@ -62,10 +70,11 @@ group's rate together, keeping the ratios.
 `constant`, `linear`, `cosine`, `cosine_with_restarts`, `polynomial`, `wsd`
 
 ### Additional Features
-- **NEFTune** — Noise-augmented fine-tuning for improved generation quality
-- **Checkpoint Management** — Save/resume with best-loss rollback
-- **Tool/Function Calling** — Chat templates with native tool definitions
-- **Distributed Training** — mDNS auto-discovery, Ring All-Reduce
+- **NEFTune** (`--neftune-alpha`), **label smoothing** (`--label-smoothing`) and **z-loss** (`--z-loss`)
+- **Cut cross-entropy** (`--cut-cross-entropy`) computes the loss without materializing the full logits
+- **Checkpoint Management**: Save/resume with best-loss rollback
+- **Tool/Function Calling**: Chat templates with native tool definitions
+- **Distributed Training**: mDNS auto-discovery, Ring All-Reduce
 
 ## Dataset Formats
 
@@ -86,6 +95,6 @@ assistant turn of a conversation trains; plain-text completions end in an EOS.
 
 ## See Also
 
-- [Training Methods](/training/methods/) — Detailed method descriptions
-- [Distillation](/training/distillation/) — Knowledge distillation deep dive
-- [pmetal train](/cli/train/) — CLI training parameters
+- [Training Methods](/training/methods/): Detailed method descriptions
+- [Distillation](/training/distillation/): Knowledge distillation deep dive
+- [pmetal train](/cli/train/): CLI training parameters

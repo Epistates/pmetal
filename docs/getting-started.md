@@ -1,15 +1,15 @@
 # Getting Started
 
-Get up and running with PMetal in minutes — install, train your first model, and run inference.
+Install PMetal, fine-tune a model, run it and serve it.
 
-PMetal is a complete machine learning platform for Apple Silicon — from low-level Metal GPU kernels and Apple Neural Engine integration to high-level training APIs, a terminal TUI, and a full desktop GUI.
+PMetal trains and runs language models on the GPU and Neural Engine of an Apple Silicon Mac. The same job specifications drive a command line, a terminal UI, a desktop app, an MCP server, Python bindings and a Rust SDK.
 
 ## Prerequisites
 
-- **macOS** on Apple Silicon (M1 or later)
-- **Xcode Command Line Tools**: `xcode-select --install`
+- **macOS 14 (Sonoma) or later** on Apple Silicon (M1 or later)
 
-For building from source, also install:
+For building from source (`cargo install`, `brew install` and the repository), also:
+- **Xcode Command Line Tools**: `xcode-select --install`
 - **Rust 1.95+** via [rustup](https://rustup.rs/)
 - **Metal Toolchain**: `xcodebuild -downloadComponent MetalToolchain`
 - **CMake**: `brew install cmake`
@@ -17,15 +17,14 @@ For building from source, also install:
 ## Quick Install
 
 ```bash
-# Option 1: Prebuilt binary
-curl -fsSL https://github.com/Epistates/pmetal/releases/latest/download/pmetal-aarch64-apple-darwin.tar.gz | tar xz
-sudo mv pmetal /usr/local/bin/
+# Option 1: Homebrew
+brew install epistates/tap/pmetal
 
-# Option 2: Install from crates.io
-cargo install pmetal
+# Option 2: crates.io (serve and mcp are opt-in features)
+cargo install pmetal --features serve,mcp
 ```
 
-See [Installation](/installation/) for all options including building from source and GUI setup.
+A prebuilt binary and the desktop app are on the [Releases](https://github.com/Epistates/pmetal/releases) page. See [Installation](/installation/) for every option, including building from source and GUI setup.
 
 ## Your First Training Run
 
@@ -39,7 +38,7 @@ pmetal train \
   --lora-r 16 --batch-size 4 --learning-rate 2e-4
 ```
 
-PMetal automatically downloads the model from HuggingFace Hub, detects your hardware capabilities, and tunes kernel parameters for your specific chip.
+PMetal downloads the model from the Hugging Face Hub on first use and detects your chip. The adapter is written to `./output` as `adapter_model.safetensors` and `adapter_config.json`, the layout PEFT reads. Training data is JSONL (or JSON, Parquet, Arrow, CSV) in any of the [formats](/training/overview/#dataset-formats) PMetal detects from the columns.
 
 ## Run Inference
 
@@ -50,8 +49,21 @@ pmetal infer \
   --model Qwen/Qwen3-0.6B \
   --lora ./output/adapter_model.safetensors \
   --prompt "Explain quantum entanglement" \
-  --chat --show-thinking
+  --chat
 ```
+
+Thinking models show their reasoning; `--hide-thinking` hides it and `--no-thinking` turns it off.
+
+## Serve a model
+
+```bash
+pmetal serve --model Qwen/Qwen3-0.6B --port 8080
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "Qwen/Qwen3-0.6B", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+The server speaks the OpenAI Chat Completions, Completions, Responses and Embeddings APIs and the Anthropic Messages API, and listens on loopback unless you pass `--host`.
 
 ## Use the SDK
 
@@ -87,9 +99,9 @@ result = pmetal.finetune(
 
 ## Explore Further
 
-- **[CLI Reference](/cli/train/)** — Command reference
-- **[Rust SDK](/sdk/advanced/)** — Crate-level API reference
-- **[Python SDK](/python/quick-start/)** — PyO3 bindings
-- **[Training Methods](/training/overview/)** — SFT, DPO, GRPO, distillation, and more
-- **[Supported Models](/models/supported/)** — All supported architectures
-- **[Hardware](/hardware/apple-silicon/)** — Chip detection and kernel tuning
+- **[CLI Reference](/cli/train/)**: Command reference
+- **[Rust SDK](/sdk/advanced/)**: Crate-level API reference
+- **[Python SDK](/python/quick-start/)**: PyO3 bindings
+- **[Training Methods](/training/overview/)**: SFT, DPO, GRPO, distillation, and more
+- **[Supported Models](/models/supported/)**: All supported architectures
+- **[Hardware](/hardware/apple-silicon/)**: Chip detection and kernel tuning
