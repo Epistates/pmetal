@@ -202,7 +202,7 @@ pub struct Qwen3Config {
 
     /// Quantization parameters under MLX's own key.
     ///
-    /// ⚠️ `mlx_lm.convert` writes **both** `quantization` and
+    /// ⚠️ MLX's converter writes **both** `quantization` and
     /// `quantization_config`, with the same contents, so HF tooling that only
     /// knows the latter still sees them. A serde `alias` maps both spellings
     /// onto one field and then rejects the checkpoint for a duplicate, which
@@ -232,7 +232,7 @@ pub struct Qwen3Config {
 
 /// Weight quantization parameters (from `quantization_config` in config.json).
 ///
-/// Present in models quantized with `mlx_lm.convert --q-bits 4` or similar.
+/// Present in models quantized with MLX's converter (`--q-bits 4` or similar).
 /// FP8 checkpoint metadata uses the same JSON key in HF configs; those entries
 /// are filtered out during parsing because FP8 is normalized from
 /// `weight_scale_inv` sidecars instead of MLX affine `.scales/.biases`.
@@ -281,7 +281,7 @@ impl Qwen3Config {
     /// The checkpoint's quantization parameters, under whichever key it used.
     ///
     /// MLX's own `quantization` wins when a checkpoint carries both, since it
-    /// is the one `mlx_lm.convert` writes first and the one the per-module
+    /// is the one MLX's converter writes first and the one the per-module
     /// overrides live under.
     pub fn quantization(&self) -> Option<&QuantizationConfig> {
         self.quantization_mlx
@@ -872,7 +872,7 @@ mod tests {
         assert!(config.quantization().is_none());
     }
 
-    /// ⚠️ `mlx_lm.convert` writes the quantization block twice, once under its
+    /// ⚠️ MLX's converter writes the quantization block twice, once under its
     /// own key and once under the Hugging Face one, so tooling that knows only
     /// `quantization_config` still finds it. A serde `alias` folded both onto
     /// one field and then rejected the file for a duplicate, which meant no

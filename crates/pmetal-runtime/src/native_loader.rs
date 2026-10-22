@@ -34,7 +34,7 @@ pub fn read_config_json(model_dir: &Path) -> Result<String, String> {
 /// The quantization block of a parsed `config.json`, or `None` when the
 /// weights are dense.
 ///
-/// ⚠️ `mlx_lm.convert` writes the block **twice**, under `quantization` (MLX's
+/// ⚠️ MLX's converter writes the block **twice**, under `quantization` (MLX's
 /// own key, which is where per-module overrides live) and `quantization_config`
 /// (the HF key), with identical contents. MLX's key wins. HF's multimodal
 /// exports also park it inside `text_config`, which is checked last.

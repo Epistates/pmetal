@@ -8,7 +8,7 @@
 
 use crate::{GgufContent, MetadataValue, keys};
 
-/// llama.cpp token-type codes (`enum llama_token_type`). Stored per token in
+/// GGUF token-type codes. Stored per token in
 /// `tokenizer.ggml.token_type`.
 pub mod token_type {
     /// Ordinary vocabulary token.
@@ -32,7 +32,7 @@ pub mod token_type {
 /// carry `scores` and no `merges`.
 #[derive(Debug, Clone, Default)]
 pub struct GgufTokenizerData {
-    /// llama.cpp tokenizer model: `"llama"` (SPM), `"gpt2"` (BPE), `"bert"`, …
+    /// GGUF tokenizer model (`tokenizer.ggml.model`): `"llama"` (SPM), `"gpt2"` (BPE), `"bert"`, …
     pub model: String,
     /// Pre-tokenizer identifier (`tokenizer.ggml.pre`), e.g. `"llama-bpe"`,
     /// `"qwen2"`, `"default"`. Absent on older exports.

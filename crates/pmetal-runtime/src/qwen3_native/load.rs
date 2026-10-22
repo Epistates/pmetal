@@ -215,7 +215,7 @@ pub fn load_model(
     //     `{prefix}.experts.down_proj` `[E, out, I]`: transformers 5's fused
     //     layout, split here into the next layout's keys;
     //   * `{prefix}.switch_mlp.{gate,up,down}_proj.{weight,scales,biases}`:
-    //     the layout `mlx_lm` converts to and saves, read as it stands;
+    //     the layout MLX's converter writes, read as it stands;
     //   * `{prefix}.experts.{e}.{gate,up,down}_proj.*`: one module per expert
     //     (transformers 4, NVIDIA ModelOpt), each loaded like any projection
     //     and stacked when the layer is built.
@@ -352,7 +352,7 @@ pub fn load_model(
         }
     };
 
-    // A stack of experts at `{base_key}`, `[E, out, in]` as `mlx_lm` saves it
+    // A stack of experts at `{base_key}`, `[E, out, in]` as MLX's converter saves it
     // and as the fused layout was split into above: packed as it stands,
     // dense pre-transposed to `[E, in, out]` for `gather_mm`.
     let stacked_projection = |base_key: &str| -> Result<LayerWeight, String> {
@@ -444,7 +444,7 @@ pub fn load_model(
         ) = if is_moe_layer {
             // MoE layer: router + stacked experts + shared expert.
             // The router, `[num_experts, hidden]` in the checkpoint, is a
-            // projection like the rest, and `mlx_lm` quantizes it (at 8 bits).
+            // projection like the rest, and MLX's converter quantizes it (at 8 bits).
             let router = get_layer_weight(&format!("{p}.mlp.gate"))?;
 
             // Stacked as the checkpoint ships them (`switch_mlp`, or the fused
@@ -465,7 +465,7 @@ pub fn load_model(
 
             // The shared expert (the Qwen3.5 family; Qwen3-MoE has none),
             // may be quantized. Its gate is `[1, hidden]`, quantized by
-            // `mlx_lm` like the router.
+            // MLX's converter like the router.
             let shared = if config.has_shared_expert() {
                 (
                     Some(get_layer_weight(&format!(

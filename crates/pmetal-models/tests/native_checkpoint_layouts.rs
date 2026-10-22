@@ -8,9 +8,9 @@
 //! other layouts, and every one must load and give the base's logits:
 //!
 //! * one module per expert (`experts.{e}.gate_proj.weight`, transformers 4),
-//! * `mlx_lm`'s own: `language_model.model.*` keys and the experts stacked as
+//! * MLX's own: `language_model.model.*` keys and the experts stacked as
 //!   `switch_mlp.{gate,up,down}_proj`,
-//! * `mlx_lm`'s, quantized the way `mlx_lm.convert` quantizes it: every
+//! * MLX's, quantized the way MLX's converter quantizes it: every
 //!   projection, the embedding and the head at the file's bits and group size
 //!   (4-bit affine, or mxfp4), and `mlp.gate` and `shared_expert_gate` at 8
 //!   bits and group size 64 through the model's `quant_predicate`. Against the
@@ -141,7 +141,7 @@ fn per_expert_layout() -> Tensors {
     out
 }
 
-/// How `mlx_lm.convert` quantizes one module.
+/// How MLX's converter quantizes one module.
 #[derive(Clone, Copy)]
 struct Spec {
     bits: i32,
@@ -182,7 +182,7 @@ fn pack(dense: &Array, spec: Spec) -> Packed {
     }
 }
 
-/// The checkpoint `mlx_lm` would write for the base model, and the base
+/// The checkpoint MLX's converter would write for the base model, and the base
 /// weights it stands for: the same tensors in transformers' layout, each
 /// quantized one replaced by its dequantization.
 ///
@@ -364,7 +364,7 @@ fn one_module_per_expert_loads_the_same_model() {
     assert_same_logits("per-expert layout", &logits(dir.path()), &want, 1e-5);
 }
 
-/// What `mlx_lm.convert` writes for an unquantized model: `language_model`
+/// What MLX's converter writes for an unquantized model: `language_model`
 /// keys and the experts stacked as `switch_mlp`, `[E, out, in]`.
 #[test]
 fn mlx_stacked_experts_load_the_same_model() {

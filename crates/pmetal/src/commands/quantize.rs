@@ -181,7 +181,7 @@ fn add_hf_config_metadata(
         (heads != 0).then_some(hidden / heads)
     });
     if let Some(value) = head_dim {
-        // llama.cpp uses key_length/value_length. Keep the older pmetal
+        // The GGUF convention is key_length/value_length. Keep the older pmetal
         // compatibility key until all internal loaders consume the standard one.
         add_arch_u32(builder, architecture, "attention.head_dim", value);
         add_arch_u32(builder, architecture, "attention.key_length", value);

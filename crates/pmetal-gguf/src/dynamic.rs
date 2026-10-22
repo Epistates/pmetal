@@ -18,10 +18,6 @@
 //! quantize → dequantize round-trip and measures quality loss using a combined NRMSE + cosine
 //! distance metric.  The type with the lowest score that still meets `kl_threshold` is selected,
 //! keeping the model as compressed as possible while bounding reconstruction error.
-//!
-//! # References
-//!
-//! - [llama.cpp imatrix](https://github.com/ggml-org/llama.cpp/blob/master/tools/imatrix/README.md)
 
 use crate::imatrix::IMatrix;
 use crate::types::GgmlType;

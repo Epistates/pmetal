@@ -869,7 +869,7 @@ mod tests {
     }
 
     /// The Qwen3.5 shared expert's gate is a `[1, hidden]` logit that scales
-    /// the whole shared expert in every layer; `mlx_lm` keeps it at 8 bits
+    /// the whole shared expert in every layer; MLX's converter keeps it at 8 bits
     /// beside the router, and this quantizer keeps both out of the low-bit
     /// allocation.
     #[test]

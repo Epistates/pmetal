@@ -4,9 +4,9 @@
 //! usually calculated as the accumulated squared activations of the inputs
 //! to that weight matrix during a calibration pass.
 //!
-//! # Binary Format (llama.cpp legacy .dat format)
+//! # Binary Format (legacy `.dat` format)
 //!
-//! Based on llama.cpp `save_imatrix_legacy()` and `load_imatrix_legacy()`:
+//! The legacy layout, as the reference imatrix tool writes and reads it:
 //!
 //! **Header:**
 //! - `n_entries: i32` - Number of tensor entries
@@ -31,10 +31,6 @@
 //! for a mixture-of-experts matrix) and `<name>.counts` with the number of
 //! tokens accumulated (one per expert); `imatrix.chunk_count` and
 //! `imatrix.datasets` describe the run. [`IMatrix::load`] reads either format.
-//!
-//! # References
-//!
-//! - [llama.cpp imatrix](https://github.com/ggml-org/llama.cpp/blob/master/tools/imatrix/imatrix.cpp)
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use pmetal_core::{PMetalError, Result};
@@ -275,7 +271,7 @@ impl IMatrix {
         })
     }
 
-    /// Save IMatrix to a file (llama.cpp legacy .dat format), atomically.
+    /// Save IMatrix to a file (legacy `.dat` format), atomically.
     pub fn save(&self, path: &std::path::Path) -> Result<()> {
         let dir = match path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p,

@@ -45,7 +45,7 @@ pub enum WeightFormatError {
 pub enum WeightFormat {
     /// Safetensors format (HuggingFace).
     Safetensors,
-    /// GGUF format (llama.cpp).
+    /// GGUF format.
     Gguf,
 }
 
@@ -280,8 +280,8 @@ impl WeightLoader {
     /// generic [`Self::gguf_to_hf_name`] mis-maps it: in Gemma the GGUF
     /// `ffn_norm` is the *pre*-feedforward norm (Llama's `ffn_norm` is the
     /// post-attention norm), and Gemma carries a separate `post_attention_norm`
-    /// and `post_ffw_norm`. Names are taken verbatim from llama.cpp
-    /// `gguf-py/gguf/constants.py` `TENSOR_NAMES` for the Gemma architectures:
+    /// and `post_ffw_norm`. Names are taken verbatim from the `gguf` Python package's
+    /// `gguf/constants.py` `TENSOR_NAMES` for the Gemma architectures:
     ///
     /// | GGUF                        | HuggingFace                       |
     /// |-----------------------------|-----------------------------------|
