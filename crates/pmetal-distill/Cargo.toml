@@ -1,13 +1,15 @@
 [package]
 name = "pmetal-distill"
-description = "Knowledge distillation toolkit for PMetal - KL divergence, hidden state alignment, and offline distillation"
+description = "Knowledge distillation for PMetal: divergence losses, hidden state alignment, TAID and offline logit caches"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["distillation", "knowledge-distillation", "llm", "machine-learning", "apple-silicon"]
+categories = ["science", "algorithms"]
 
 [dependencies]
 pmetal-runtime = { workspace = true }
