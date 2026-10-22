@@ -338,7 +338,7 @@ fn observe_experts_collecting(
         // Per token: `ids` is `[tokens, k]`; per slot: one row per id.
         let (rows, k) = if per_token {
             let k = ids.dim(-1) as usize;
-            (if k == 0 { 0 } else { n_ids / k }, k)
+            (n_ids.checked_div(k).unwrap_or(0), k)
         } else {
             (n_ids, 1)
         };

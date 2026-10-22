@@ -232,4 +232,38 @@ mod tests {
         assert!(argv.contains(&"--model".to_string()));
         assert!(argv.contains(&"--output".to_string()));
     }
+
+    /// A matrix is read or measured, not both.
+    #[test]
+    fn an_imatrix_file_and_calibration_data_are_exclusive() {
+        let mut spec = QuantizeSpec {
+            model: "m".into(),
+            output: "o.gguf".into(),
+            imatrix: Some("im.gguf".into()),
+            ..Default::default()
+        };
+        assert!(spec.normalize().is_ok());
+        spec.imatrix = None;
+        spec.calibration_dataset = Some("calib.txt".into());
+        assert!(spec.normalize().is_ok());
+        spec.imatrix = Some("im.gguf".into());
+        let errors = spec.normalize().unwrap_err();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].field, "calibration_dataset");
+    }
+
+    /// The two 4-bit non-linear formats are methods.
+    #[test]
+    fn the_iq4_formats_are_quantize_methods() {
+        for method in ["iq4_nl", "iq4_xs"] {
+            let spec = QuantizeSpec {
+                model: "m".into(),
+                output: "o.gguf".into(),
+                method: method.into(),
+                ..Default::default()
+            };
+            let mut spec = spec;
+            assert!(spec.normalize().is_ok(), "{method}");
+        }
+    }
 }

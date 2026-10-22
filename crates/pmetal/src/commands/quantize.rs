@@ -1420,38 +1420,7 @@ pub(crate) async fn run_quantization(
     // is how they are scored and weighted below as well as how they are
     // written.
     tracing::info!("Planning the quantization...");
-    let shapes: HashMap<&str, &Vec<usize>> = metas
-        .iter()
-        .map(|meta| (meta.name.as_str(), &meta.shape))
-        .collect();
-    let expert_groups = collect_expert_groups(metas.iter().map(|meta| meta.name.as_str()));
-    let expert_source_keys: HashSet<&str> = expert_groups
-        .values()
-        .flat_map(|group| group.iter().map(|tensor| tensor.name.as_str()))
-        .collect();
-
-    let mut entries: Vec<PlanEntry> = Vec::new();
-    // Stacked experts first, in layer order.
-    let mut group_keys: Vec<ExpertGroupKey> = expert_groups.keys().copied().collect();
-    group_keys.sort_by_key(|key| (key.layer, key.projection.gguf_suffix()));
-    for key in group_keys {
-        let (experts, shape) = expert_stack_layout(&expert_groups[&key], &shapes)?;
-        entries.push(PlanEntry {
-            gguf_name: format!("blk.{}.{}", key.layer, key.projection.gguf_suffix()),
-            shape,
-            from: Origin::Experts(experts),
-        });
-    }
-    for meta in &metas {
-        if expert_source_keys.contains(meta.name.as_str()) {
-            continue;
-        }
-        entries.push(PlanEntry {
-            gguf_name: pmetal_models::weight_format::WeightLoader::hf_to_gguf_name(&meta.name),
-            shape: meta.shape.iter().map(|&d| d as u64).collect(),
-            from: Origin::Tensor(meta.name.clone()),
-        });
-    }
+    let entries = plan_entries(&metas)?;
     let read_entry = |source: &mut dyn crate::commands::quantize_source::TensorSource,
                       from: &Origin|
      -> anyhow::Result<Vec<f32>> {
@@ -1610,6 +1579,45 @@ pub(crate) async fn run_quantization(
 
     println!("Quantization complete!");
     Ok(())
+}
+
+/// The tensors of the output file, in file order, under the names the file
+/// gives them. The per-expert tensors of a layer's projection are one stacked
+/// `[experts, out, in]` tensor, listed first in layer order; everything else
+/// follows in the order of `metas`.
+fn plan_entries(metas: &[TensorMeta]) -> anyhow::Result<Vec<PlanEntry>> {
+    let shapes: HashMap<&str, &Vec<usize>> = metas
+        .iter()
+        .map(|meta| (meta.name.as_str(), &meta.shape))
+        .collect();
+    let expert_groups = collect_expert_groups(metas.iter().map(|meta| meta.name.as_str()));
+    let expert_source_keys: HashSet<&str> = expert_groups
+        .values()
+        .flat_map(|group| group.iter().map(|tensor| tensor.name.as_str()))
+        .collect();
+
+    let mut entries: Vec<PlanEntry> = Vec::new();
+    let mut group_keys: Vec<ExpertGroupKey> = expert_groups.keys().copied().collect();
+    group_keys.sort_by_key(|key| (key.layer, key.projection.gguf_suffix()));
+    for key in group_keys {
+        let (experts, shape) = expert_stack_layout(&expert_groups[&key], &shapes)?;
+        entries.push(PlanEntry {
+            gguf_name: format!("blk.{}.{}", key.layer, key.projection.gguf_suffix()),
+            shape,
+            from: Origin::Experts(experts),
+        });
+    }
+    for meta in metas {
+        if expert_source_keys.contains(meta.name.as_str()) {
+            continue;
+        }
+        entries.push(PlanEntry {
+            gguf_name: pmetal_models::weight_format::WeightLoader::hf_to_gguf_name(&meta.name),
+            shape: meta.shape.iter().map(|&d| d as u64).collect(),
+            from: Origin::Tensor(meta.name.clone()),
+        });
+    }
+    Ok(entries)
 }
 
 /// A tensor of the output file before its type is chosen.
@@ -2143,6 +2151,230 @@ mod tests {
         assert!(model.num_tensors() > 0);
         let (_, _, dtype) = dequantized(&model, "blk.0.ffn_up.weight");
         assert_ne!(dtype, GgmlType::F32);
+    }
+
+    /// The calibration and the importance matrix are keyed by the names the
+    /// file gives its tensors, so the routed experts of a projection are listed
+    /// as the one stacked tensor they are written as, never one by one.
+    #[test]
+    fn the_plan_lists_the_stacked_experts_once_under_the_name_the_file_gives_them() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tiny_model(dir.path(), true);
+        let source = crate::commands::quantize_source::open(dir.path()).unwrap();
+        let entries = plan_entries(source.tensors()).unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.gguf_name.as_str()).collect();
+        for proj in ["gate", "up", "down"] {
+            let name = format!("blk.0.ffn_{proj}_exps.weight");
+            assert_eq!(names.iter().filter(|n| **n == name).count(), 1, "{name}");
+        }
+        assert!(names.iter().all(|n| !n.contains("experts.")), "{names:?}");
+        let up = entries
+            .iter()
+            .find(|e| e.gguf_name == "blk.0.ffn_up_exps.weight")
+            .unwrap();
+        assert_eq!(up.shape, [3, 16, 64]);
+        assert!(matches!(&up.from, Origin::Experts(experts) if experts.len() == 3));
+    }
+
+    /// An importance matrix on disk, from `(name, per-token means, token counts)`.
+    fn write_imatrix(path: &Path, entries: &[(&str, Vec<f32>, Vec<f32>)]) {
+        let mut imatrix = pmetal_gguf::imatrix::IMatrix::new();
+        for (name, mean, counts) in entries {
+            imatrix.insert_measured(name.to_string(), mean.clone(), counts.clone());
+        }
+        imatrix.save_gguf(path).unwrap();
+    }
+
+    /// `sum_j importance_j * (want - got)^2` over the rows of one slice.
+    fn weighted_error(want: &[f32], got: &[f32], importance: &[f32]) -> f64 {
+        let n = importance.len();
+        want.iter()
+            .zip(got)
+            .enumerate()
+            .map(|(i, (w, g))| f64::from(importance[i % n]) * f64::from(w - g).powi(2))
+            .sum()
+    }
+
+    /// Quantizing with the importance matrix of a model gives a smaller error
+    /// where the activations are large than quantizing without it.
+    #[tokio::test]
+    async fn an_importance_matrix_lowers_the_weighted_error_of_the_quantized_model() {
+        use crate::cli::quantize::QuantizeMethod;
+        let dir = tempfile::tempdir().unwrap();
+        let tensors = write_tiny_model(dir.path(), false);
+        // Four loud channels of every 64-wide input.
+        let importance: Vec<f32> = (0..64).map(|j| if j < 4 { 400.0 } else { 1.0 }).collect();
+        let names = [
+            "blk.0.attn_q.weight",
+            "blk.0.attn_k.weight",
+            "blk.0.ffn_gate.weight",
+            "blk.0.ffn_up.weight",
+        ];
+        let entries: Vec<(&str, Vec<f32>, Vec<f32>)> = names
+            .iter()
+            .map(|n| (*n, importance.clone(), vec![1024.0]))
+            .collect();
+        let matrix = dir.path().join("imatrix.gguf");
+        write_imatrix(&matrix, &entries);
+
+        let plain = dir.path().join("plain.gguf");
+        let weighted = dir.path().join("weighted.gguf");
+        quantize_dir(dir.path(), &plain, QuantizeMethod::Iq4Nl, false, None)
+            .await
+            .unwrap();
+        run_quantization(
+            dir.path().to_str().unwrap(),
+            weighted.to_str().unwrap(),
+            ImportanceSource::File(matrix.to_str().unwrap()),
+            QuantizeMethod::Iq4Nl,
+            false,
+            None,
+            0.01,
+        )
+        .await
+        .unwrap();
+
+        let (plain, weighted) = (
+            pmetal_gguf::GgufModel::open(&plain).unwrap(),
+            pmetal_gguf::GgufModel::open(&weighted).unwrap(),
+        );
+        let (mut without, mut with) = (0.0, 0.0);
+        for gguf_name in names {
+            let original = tensors
+                .iter()
+                .find(|(hf, ..)| {
+                    pmetal_models::weight_format::WeightLoader::hf_to_gguf_name(hf) == gguf_name
+                })
+                .map(|(_, _, values)| values)
+                .unwrap();
+            let (a, _, dtype) = dequantized(&plain, gguf_name);
+            let (b, ..) = dequantized(&weighted, gguf_name);
+            assert_eq!(dtype, GgmlType::Iq4Nl, "{gguf_name}");
+            let (ea, eb) = (
+                weighted_error(original, &a, &importance),
+                weighted_error(original, &b, &importance),
+            );
+            assert!(eb < ea, "{gguf_name}: weighted error {eb} against {ea}");
+            without += ea;
+            with += eb;
+        }
+        assert!(with < 0.9 * without, "{with} against {without}");
+    }
+
+    /// The matrix of a stacked-experts tensor has one run of channels per expert,
+    /// found under the stacked name: experts quantized with it are weighted by
+    /// their own channels, not left unweighted for want of a key that matches.
+    #[tokio::test]
+    async fn stacked_experts_are_weighted_by_their_own_importance() {
+        use crate::cli::quantize::QuantizeMethod;
+        let dir = tempfile::tempdir().unwrap();
+        let tensors = write_tiny_model(dir.path(), true);
+        // Expert e is loud in channels [8e, 8e + 4).
+        let importance: Vec<Vec<f32>> = (0..3)
+            .map(|e| {
+                (0..64)
+                    .map(|j| {
+                        if (8 * e..8 * e + 4).contains(&j) {
+                            400.0
+                        } else {
+                            1.0
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let stacked: Vec<f32> = importance.iter().flatten().copied().collect();
+        let matrix = dir.path().join("imatrix.gguf");
+        write_imatrix(
+            &matrix,
+            &[(
+                "blk.0.ffn_up_exps.weight",
+                stacked,
+                vec![300.0, 500.0, 200.0],
+            )],
+        );
+
+        let plain = dir.path().join("plain.gguf");
+        let weighted = dir.path().join("weighted.gguf");
+        quantize_dir(dir.path(), &plain, QuantizeMethod::Iq4Nl, false, None)
+            .await
+            .unwrap();
+        run_quantization(
+            dir.path().to_str().unwrap(),
+            weighted.to_str().unwrap(),
+            ImportanceSource::File(matrix.to_str().unwrap()),
+            QuantizeMethod::Iq4Nl,
+            false,
+            None,
+            0.01,
+        )
+        .await
+        .unwrap();
+
+        let (a, dims, _) = dequantized(
+            &pmetal_gguf::GgufModel::open(&plain).unwrap(),
+            "blk.0.ffn_up_exps.weight",
+        );
+        let (b, ..) = dequantized(
+            &pmetal_gguf::GgufModel::open(&weighted).unwrap(),
+            "blk.0.ffn_up_exps.weight",
+        );
+        assert_eq!(dims, [3, 16, 64]);
+        let per_expert = 16 * 64;
+        for (e, importance) in importance.iter().enumerate() {
+            let name = format!("model.layers.0.mlp.experts.{e}.up_proj.weight");
+            let original = &tensors.iter().find(|(n, ..)| *n == name).unwrap().2;
+            let range = e * per_expert..(e + 1) * per_expert;
+            let (ea, eb) = (
+                weighted_error(original, &a[range.clone()], importance),
+                weighted_error(original, &b[range], importance),
+            );
+            assert!(eb < ea, "expert {e}: weighted error {eb} against {ea}");
+        }
+    }
+
+    /// A matrix that does not describe the tensor it is keyed to is an error
+    /// naming the tensor, not a quantization with the wrong weights.
+    #[tokio::test]
+    async fn an_importance_matrix_of_the_wrong_width_is_an_error_naming_the_tensor() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tiny_model(dir.path(), false);
+        let matrix = dir.path().join("imatrix.gguf");
+        write_imatrix(
+            &matrix,
+            &[("blk.0.ffn_up.weight", vec![1.0; 48], vec![10.0])],
+        );
+        let result = run_quantization(
+            dir.path().to_str().unwrap(),
+            dir.path().join("out.gguf").to_str().unwrap(),
+            ImportanceSource::File(matrix.to_str().unwrap()),
+            crate::cli::quantize::QuantizeMethod::Iq4Nl,
+            false,
+            None,
+            0.01,
+        )
+        .await;
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("blk.0.ffn_up.weight"), "{error}");
+        assert!(!dir.path().join("out.gguf").exists());
+    }
+
+    /// An importance matrix weights the GGUF quantizers; MLX output has none to
+    /// weight, and a flag that does nothing is refused.
+    #[tokio::test]
+    async fn mlx_output_refuses_an_importance_matrix() {
+        for (imatrix, calibration) in [(Some("im.gguf"), None), (None, Some("data.txt"))] {
+            let spec = pmetal_core::jobs::QuantizeSpec {
+                model: "m".into(),
+                output: "o".into(),
+                format: "mlx".into(),
+                imatrix: imatrix.map(Into::into),
+                calibration_dataset: calibration.map(Into::into),
+                ..Default::default()
+            };
+            let error = run_quantize(spec).await.unwrap_err().to_string();
+            assert!(error.contains("--format mlx"), "{error}");
+        }
     }
 
     /// A shard cut short is an error, and the destination is not touched.
