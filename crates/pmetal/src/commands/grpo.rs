@@ -89,6 +89,13 @@ pub(crate) async fn run_grpo(spec: GrpoSpec, ctx: RunContext) -> anyhow::Result<
     // 1. Resolve and Download Model
     tracing::info!("Resolving model: {}", model_id);
     let model_path = pmetal_hub::resolve_model_path(model_id, None, None).await?;
+    super::record_training(
+        std::path::Path::new(output_dir),
+        model_id,
+        &model_path,
+        dataset_path,
+        "grpo",
+    );
 
     // 2. Load Tokenizer (with config-aware special token resolution)
     tracing::info!("Loading tokenizer...");

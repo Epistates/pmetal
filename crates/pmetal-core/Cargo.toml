@@ -17,6 +17,7 @@ ane = []
 
 [dependencies]
 pmetal-core-derive = { workspace = true }
+chrono = { workspace = true }
 dirs = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }

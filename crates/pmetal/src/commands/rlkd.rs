@@ -78,6 +78,13 @@ pub(crate) async fn run_rlkd(spec: RlkdSpec, ctx: RunContext) -> anyhow::Result<
     // 1. Resolve and download policy model
     tracing::info!("Resolving policy model: {}", model_id);
     let model_path = pmetal_hub::resolve_model_path(model_id, None, None).await?;
+    super::record_training(
+        std::path::Path::new(output_dir),
+        model_id,
+        &model_path,
+        dataset_path,
+        "rlkd",
+    );
 
     // 2. Resolve and download teacher model
     tracing::info!("Resolving teacher model: {}", teacher_model_id);

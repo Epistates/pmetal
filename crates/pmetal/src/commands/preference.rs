@@ -86,6 +86,13 @@ pub(crate) async fn run_preference(spec: PreferenceSpec, ctx: RunContext) -> any
     let dataset_path = pmetal_trainer::resolve_dataset_path(&spec.dataset).await?;
     let output_dir = PathBuf::from(&spec.output_dir);
     std::fs::create_dir_all(&output_dir)?;
+    super::record_training(
+        &output_dir,
+        &spec.model,
+        &model_path,
+        &spec.dataset,
+        &spec.loss,
+    );
 
     if emit_console_output {
         println!("========================================");

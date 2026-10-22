@@ -102,6 +102,27 @@ impl RunContext {
     }
 }
 
+/// Leave beside a run's results what it started from (`training_info.json`),
+/// so the terminal UI and the desktop app can list the adapter with its base
+/// model. A record that cannot be written is a warning: the run does not
+/// depend on it.
+#[cfg(feature = "trainer")]
+pub(crate) fn record_training(
+    output_dir: &std::path::Path,
+    base_model: &str,
+    base_model_path: &std::path::Path,
+    dataset: &str,
+    method: &str,
+) {
+    pmetal_core::TrainingInfo {
+        base_model_path: Some(base_model_path.display().to_string()),
+        dataset: Some(dataset.to_string()),
+        method: Some(method.to_string()),
+        ..pmetal_core::TrainingInfo::starting(base_model)
+    }
+    .write_or_warn(output_dir);
+}
+
 /// Run a trainer command the way the command line does: `--log-events`
 /// applied (the run gets the event log's callback, and a failed log write is
 /// reported when it ends), and a request to stop honoured (Ctrl-C or SIGTERM

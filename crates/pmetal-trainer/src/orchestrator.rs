@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 /// The sections of a training config file, loaded and checked by `pmetal-core`.
 pub use pmetal_core::FullTrainingConfig;
-use pmetal_core::{ConfigValidator, LoraConfig, TrainingCallback, TrainingConfig};
+use pmetal_core::{ConfigValidator, LoraConfig, TrainingCallback, TrainingConfig, TrainingInfo};
 use pmetal_data::{
     DataLoaderConfig, DatasetColumnConfig, DatasetFormat, DatasetSource, Tokenizer,
     TrainingDataset, resolve_dataset_source,
@@ -514,6 +514,26 @@ pub async fn run_training(
     tokio::task::yield_now().await;
     tracing::info!("Loading model: {}", full_config.model.model_id);
     let model_path = resolve_model_path(&full_config.model.model_id).await?;
+
+    // What this run starts from, beside its results: the terminal UI and the
+    // desktop app list an adapter with its base model from it. A resumed run
+    // keeps the record of the run it continues.
+    let record_dir = Path::new(&output_dir);
+    if !(config.resume && TrainingInfo::read(record_dir).is_some()) {
+        let method = match (config.qlora.is_some(), config.lora.use_dora) {
+            (false, false) => "lora",
+            (true, false) => "qlora",
+            (false, true) => "dora",
+            (true, true) => "qdora",
+        };
+        TrainingInfo {
+            base_model_path: Some(model_path.display().to_string()),
+            dataset: Some(full_config.dataset.dataset_id.clone()),
+            method: Some(method.to_string()),
+            ..TrainingInfo::starting(full_config.model.model_id.clone())
+        }
+        .write_or_warn(record_dir);
+    }
 
     // -----------------------------------------------------------------------
     // Phase 3: Load model config

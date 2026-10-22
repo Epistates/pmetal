@@ -282,6 +282,14 @@ pub(crate) async fn run_distillation(spec: DistillSpec, ctx: RunContext) -> anyh
     tracing::info!("Resolving student model: {}", student_id);
     let student_path = pmetal_hub::resolve_model_path(student_id, None, None).await?;
 
+    super::record_training(
+        &validated_distill_output,
+        student_id,
+        &student_path,
+        dataset_path,
+        "distill",
+    );
+
     tracing::info!("Loading tokenizer...");
     let tokenizer = Tokenizer::from_model_dir(&student_path)?;
     let chat_template =

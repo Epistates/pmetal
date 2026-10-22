@@ -5274,6 +5274,7 @@ dependencies = [
 name = "pmetal-core"
 version = "0.7.0"
 dependencies = [
+ "chrono",
  "dirs 7.0.0",
  "pmetal-core-derive",
  "secrecy",
@@ -5613,6 +5614,7 @@ version = "0.7.0"
 dependencies = [
  "anstream",
  "chrono",
+ "dirs 7.0.0",
  "pmetal-core",
  "rustix",
  "schemars",
