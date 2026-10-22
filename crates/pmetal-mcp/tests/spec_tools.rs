@@ -172,7 +172,7 @@ fn leaving_a_parameter_out_gives_the_specs_default() {
         }
         // And the command line is the one the spec itself builds.
         assert!(
-            !prepared.argv.is_empty() || tool.name() == "bench_train",
+            !prepared.plan.argv.is_empty() || tool.name() == "bench_train",
             "{}",
             tool.name()
         );

@@ -15,9 +15,9 @@
 //! cross-field rules. What comes out is the argv to run.
 
 use std::marker::PhantomData;
-use std::path::PathBuf;
 
 use pmetal_core::{FieldDescriptor, FieldError, FieldKind};
+use pmetal_supervisor::{EventsFile, LaunchOptions, LaunchPlan};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use turbomcp::ToolOutputSchema;
@@ -42,12 +42,8 @@ pub enum Mode {
 /// A command ready to run.
 #[derive(Debug, Clone)]
 pub struct Prepared {
-    pub subcommand: &'static str,
-    pub argv: Vec<String>,
-    /// Where the command writes its results (`--output`), absolute.
-    pub output: Option<PathBuf>,
-    /// The metrics file the server asked the command to write.
-    pub metrics_file: Option<PathBuf>,
+    /// The command and the files it is asked to write.
+    pub plan: LaunchPlan,
     /// The spec as the command will see it.
     pub spec: Value,
 }
@@ -74,14 +70,11 @@ pub trait SpecTool: Send + Sync {
 /// value that the spec itself cannot know (what a server may expose, say).
 pub type SpecCheck = fn(&Map<String, Value>) -> Result<(), String>;
 
-/// The spec field that names the file step metrics are written to.
-const LOG_METRICS: &str = "log_metrics";
-
 /// Docs for the spec fields that several specs have and no descriptor shows.
 fn shared_doc(field: &str) -> Option<&'static str> {
     match field {
         "resume" => Some("Resume from the latest checkpoint in the output directory"),
-        LOG_METRICS => Some(
+        "log_metrics" => Some(
             "Write per-step metrics as JSONL to this file (default: metrics.jsonl in the output \
              directory)",
         ),
@@ -166,7 +159,7 @@ impl<S: Spec> SpecEntry<S> {
     /// Whether a field names a model, a dataset or a path.
     fn path_role(&self, name: &str) -> Option<PathRole> {
         // The metrics file a training spec may name.
-        if name == LOG_METRICS {
+        if S::LOG_METRICS_FIELD == Some(name) {
             return Some(PathRole::Path);
         }
         if let Some(d) = S::field_descriptors().iter().find(|d| d.name == name) {
@@ -182,10 +175,6 @@ impl<S: Spec> SpecEntry<S> {
             .extra_path_fields
             .contains(&name)
             .then_some(PathRole::PathList)
-    }
-
-    fn descriptor_for_flag(flag: &str) -> Option<&'static FieldDescriptor> {
-        S::field_descriptors().iter().find(|d| d.argv == Some(flag))
     }
 
     /// The spec built from `args`, before `normalize` and the paths: the shape
@@ -220,6 +209,25 @@ impl<S: Spec> SpecEntry<S> {
             return Err(McpError::internal("a spec did not serialize to an object"));
         };
 
+        // A relative metrics file is relative to the output directory, as the
+        // command itself reads it, not to this server's working directory.
+        if let (Some(metrics), Some(output)) = (S::LOG_METRICS_FIELD, S::OUTPUT_FIELD) {
+            let text = |name: &str| {
+                fields
+                    .get(name)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            };
+            if let (Some(given), Some(out)) = (text(metrics), text(output))
+                && !std::path::Path::new(&given).is_absolute()
+                && let Ok(out) = policy.check_path(output, &out)
+            {
+                let file = pmetal_core::paths::resolve_in(&out, &given);
+                fields.insert(metrics.into(), Value::String(file.display().to_string()));
+            }
+        }
+
         // Paths: every one the caller gave, and every default, must be allowed.
         let mut problems = Vec::new();
         for (name, field) in fields.iter_mut() {
@@ -234,28 +242,6 @@ impl<S: Spec> SpecEntry<S> {
             return Err(McpError::invalid_params(problems.join("; ")));
         }
 
-        // The metrics file, where the TUI and GUI look for it too.
-        let output_field = Self::descriptor_for_flag("--output").map(|d| d.name);
-        let output = output_field
-            .and_then(|name| fields.get(name))
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from);
-        let metrics_field = Self::descriptor_for_flag("--log-metrics")
-            .map(|d| d.name)
-            .or_else(|| fields.contains_key(LOG_METRICS).then_some(LOG_METRICS));
-        let mut metrics_file = None;
-        if let (Some(name), Some(dir)) = (metrics_field, &output) {
-            match fields.get(name).and_then(Value::as_str) {
-                None | Some("") => {
-                    let file = dir.join("metrics.jsonl");
-                    fields.insert(name.into(), Value::String(file.display().to_string()));
-                    metrics_file = Some(file);
-                }
-                Some(given) => metrics_file = Some(PathBuf::from(given)),
-            }
-        }
-
         if let Some(check) = self.config.check {
             check(fields).map_err(McpError::invalid_params)?;
         }
@@ -263,14 +249,17 @@ impl<S: Spec> SpecEntry<S> {
         let mut spec: S = serde_json::from_value(value.clone())
             .map_err(|e| McpError::internal(format!("a spec did not round-trip: {e}")))?;
         spec.normalize_spec().map_err(field_errors)?;
-        let argv = spec.to_argv();
-        Ok(Prepared {
-            subcommand: S::subcommand(),
-            argv,
-            output,
-            metrics_file,
-            spec: value,
-        })
+        // A command that runs to completion is read by its output, not followed.
+        let options = LaunchOptions {
+            events: match self.config.mode {
+                Mode::Job => EventsFile::InOutput,
+                Mode::Blocking => EventsFile::Off,
+            },
+            ..LaunchOptions::default()
+        };
+        let plan =
+            LaunchPlan::for_spec(&spec, &options).map_err(|e| McpError::internal(e.to_string()))?;
+        Ok(Prepared { plan, spec: value })
     }
 
     /// The `properties` of the input schema.
