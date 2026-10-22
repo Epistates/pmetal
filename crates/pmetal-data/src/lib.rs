@@ -10,6 +10,7 @@
 
 #![warn(missing_docs)]
 
+pub mod calibration;
 pub mod chat_templates;
 pub mod dataloader;
 pub mod dataset;
