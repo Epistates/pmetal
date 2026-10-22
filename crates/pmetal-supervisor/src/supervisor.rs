@@ -62,7 +62,10 @@ pub enum Error {
     #[error("job not found: {0}")]
     NotFound(String),
     /// Starting the job would exceed [`Limits::max_running`].
-    #[error("{running} jobs are already running (the limit is {limit})")]
+    #[error(
+        "{running} jobs are already running (the limit is {limit}). Stop one, or wait for one \
+         to finish."
+    )]
     TooManyRunning {
         /// Jobs running now.
         running: usize,
@@ -78,6 +81,9 @@ pub enum Error {
     /// The process could not be started, or a file it needs could not be made.
     #[error("{0}")]
     Io(String),
+    /// A spec could not be turned into a command (a bug in the spec).
+    #[error("the job's settings could not be turned into a command: {0}")]
+    InvalidSpec(String),
 }
 
 /// How a job's process stands.

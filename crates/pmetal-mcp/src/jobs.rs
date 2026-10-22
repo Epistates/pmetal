@@ -112,8 +112,7 @@ impl JobManager {
     pub async fn spawn(&self, request: JobRequest) -> McpResult<String> {
         self.supervisor.spawn(request).map_err(|e| match e {
             SupervisorError::TooManyRunning { .. } => McpError::invalid_request(format!(
-                "{e}. Stop one with stop_job, wait for one to finish, or raise \
-                 PMETAL_MCP_MAX_JOBS"
+                "{e} Stop one with stop_job, or raise the limit with PMETAL_MCP_MAX_JOBS."
             )),
             other => mcp_error(other),
         })
@@ -167,6 +166,8 @@ fn mcp_error(e: SupervisorError) -> McpError {
         SupervisorError::NotRunning
         | SupervisorError::NoOutput(_)
         | SupervisorError::TooManyRunning { .. } => McpError::invalid_request(e.to_string()),
-        SupervisorError::Io(_) => McpError::internal(e.to_string()),
+        SupervisorError::Io(_) | SupervisorError::InvalidSpec(_) => {
+            McpError::internal(e.to_string())
+        }
     }
 }
