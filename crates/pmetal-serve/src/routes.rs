@@ -1146,7 +1146,13 @@ pub async fn completions(
                             Vec::new(),
                             &mut offsets[index],
                         );
-                        vec![frame(index, echoes[index].clone(), Some(payload), None, usage())]
+                        vec![frame(
+                            index,
+                            echoes[index].clone(),
+                            Some(payload),
+                            None,
+                            usage(),
+                        )]
                     }
                     ChoiceEvent::Piece(Piece::Content { text, logprobs }) => {
                         let payload = logprobs_top_n.is_some().then(|| {
@@ -1217,9 +1223,9 @@ pub async fn completions(
         .map(|(index, ((reply, echoed), ids))| {
             let finish_reason = reply.finish_reason().to_string();
             let scored = reply.prompt_logprobs.map(|scored| (&ids[..], scored));
-            let logprobs = logprobs_top_n.is_some().then(|| {
-                completion_logprobs(&state.engine, scored, reply.logprobs, &mut 0)
-            });
+            let logprobs = logprobs_top_n
+                .is_some()
+                .then(|| completion_logprobs(&state.engine, scored, reply.logprobs, &mut 0));
             CompletionChoice {
                 index,
                 text: if echo {

@@ -108,7 +108,13 @@ fn chat(extra: Value) -> Value {
 fn scraped(body: &str, series: &str) -> f64 {
     body.lines()
         .filter(|l| !l.starts_with('#'))
-        .find_map(|l| l.strip_prefix(series)?.strip_prefix(' ')?.trim().parse().ok())
+        .find_map(|l| {
+            l.strip_prefix(series)?
+                .strip_prefix(' ')?
+                .trim()
+                .parse()
+                .ok()
+        })
         .unwrap_or_else(|| panic!("{series} in\n{body}"))
 }
 
@@ -123,7 +129,9 @@ async fn a_drafter_changes_the_speed_and_not_the_reply() {
         &plain,
         &speculating,
         chat_path,
-        chat(json!({"frequency_penalty": 0.7, "presence_penalty": 0.4, "logit_bias": {"104": 5.0}})),
+        chat(
+            json!({"frequency_penalty": 0.7, "presence_penalty": 0.4, "logit_bias": {"104": 5.0}}),
+        ),
     )
     .await;
     // Sampled, seeded: the target's own draws, however many drafts were kept.
@@ -163,7 +171,13 @@ async fn a_drafter_changes_the_speed_and_not_the_reply() {
             .contains(&stop)
     );
     // The reply's length, usage included.
-    same_reply(&plain, &speculating, chat_path, chat(json!({"max_tokens": 3}))).await;
+    same_reply(
+        &plain,
+        &speculating,
+        chat_path,
+        chat(json!({"max_tokens": 3})),
+    )
+    .await;
     // Raw completions, a prompt as token ids.
     same_reply(
         &plain,
@@ -183,7 +197,11 @@ async fn a_streamed_reply_is_the_same_frames_of_text() {
         reply
             .sse_json()
             .iter()
-            .filter_map(|f| f["choices"][0]["delta"]["content"].as_str().map(str::to_owned))
+            .filter_map(|f| {
+                f["choices"][0]["delta"]["content"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
             .collect()
     };
     let (a, b) = (
@@ -245,7 +263,13 @@ async fn log_probabilities_come_from_the_target_by_decoding_plainly() {
         chat(json!({"logprobs": true, "top_logprobs": 2})),
     )
     .await;
-    assert_eq!(reply["choices"][0]["logprobs"]["content"].as_array().unwrap().len(), 24);
+    assert_eq!(
+        reply["choices"][0]["logprobs"]["content"]
+            .as_array()
+            .unwrap()
+            .len(),
+        24
+    );
     let after = metrics(&speculating).await;
     assert_eq!(
         after["speculative_drafted_tokens"], before["speculative_drafted_tokens"],
@@ -265,7 +289,12 @@ async fn log_probabilities_come_from_the_target_by_decoding_plainly() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_acceptance_rate_is_in_both_metrics() {
     let (_plain, speculating, _a, _b) = pair();
-    let reply = post(&speculating, "/v1/chat/completions", &chat(json!({"max_tokens": 30}))).await;
+    let reply = post(
+        &speculating,
+        "/v1/chat/completions",
+        &chat(json!({"max_tokens": 30})),
+    )
+    .await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
 
     let json = get(&speculating, "/v1/metrics").await.json();
@@ -285,8 +314,14 @@ async fn the_acceptance_rate_is_in_both_metrics() {
     )
     .await
     .text();
-    assert_eq!(scraped(&scrape, "pmetal_speculative_drafted_tokens_total"), drafted as f64);
-    assert_eq!(scraped(&scrape, "pmetal_speculative_accepted_tokens_total"), accepted as f64);
+    assert_eq!(
+        scraped(&scrape, "pmetal_speculative_drafted_tokens_total"),
+        drafted as f64
+    );
+    assert_eq!(
+        scraped(&scrape, "pmetal_speculative_accepted_tokens_total"),
+        accepted as f64
+    );
     assert_no_unobserved_error();
 }
 

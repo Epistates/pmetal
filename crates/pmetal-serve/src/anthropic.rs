@@ -571,7 +571,11 @@ pub async fn count_tokens(
     ApiJson(req): ApiJson<CountTokensRequest>,
 ) -> Result<Json<CountTokensResponse>, ServeError> {
     state.engine.check_model(&req.model)?;
-    let plan = plan_tools(req.tools.as_deref(), req.tool_choice.as_ref(), &state.engine)?;
+    let plan = plan_tools(
+        req.tools.as_deref(),
+        req.tool_choice.as_ref(),
+        &state.engine,
+    )?;
     let messages = conversation(req.system.as_ref(), &req.messages)?;
     let kwargs = thinking_kwargs(req.thinking.as_ref())?;
     let prompt = state
@@ -599,7 +603,11 @@ pub async fn messages(
             "`temperature` must be between 0 and 1",
         ));
     }
-    let tool_plan = plan_tools(req.tools.as_deref(), req.tool_choice.as_ref(), &state.engine)?;
+    let tool_plan = plan_tools(
+        req.tools.as_deref(),
+        req.tool_choice.as_ref(),
+        &state.engine,
+    )?;
     let permit = state.try_acquire_request_permit()?;
 
     let messages = conversation(req.system.as_ref(), &req.messages)?;

@@ -90,7 +90,10 @@ async fn an_echoed_prompt_comes_with_its_own_log_probabilities() {
         ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         let top = lp["top_logprobs"][i].as_object().unwrap();
         assert!(top.len() <= 2 && !top.is_empty(), "{top:?}");
-        let best = top.values().map(|v| v.as_f64().unwrap()).fold(f64::MIN, f64::max);
+        let best = top
+            .values()
+            .map(|v| v.as_f64().unwrap())
+            .fold(f64::MIN, f64::max);
         assert!(
             (best as f32 - ranked[0].1).abs() < 2e-4,
             "token {i}: best {best} against {}",
@@ -157,7 +160,10 @@ async fn generated_tokens_follow_the_prompt_in_the_arrays() {
         floats(&plain_lp["token_logprobs"]),
     );
     for i in 0..3 {
-        assert!((a[n + i].unwrap() - b[i].unwrap()).abs() < 1e-4, "token {i}");
+        assert!(
+            (a[n + i].unwrap() - b[i].unwrap()).abs() < 1e-4,
+            "token {i}"
+        );
     }
     // A greedy token is the likeliest, so it is in its own top map, which is
     // the `logprobs` likeliest tokens of the distribution, the chosen one
@@ -211,7 +217,10 @@ async fn a_loglikelihood_request_scores_each_prompt_in_the_batch() {
             // is_greedy: the prompt token is the top-1 exactly when its
             // log-probability is the best the top map holds.
             let top = lp["top_logprobs"][i].as_object().unwrap();
-            let best = top.values().map(|v| v.as_f64().unwrap()).fold(f64::MIN, f64::max);
+            let best = top
+                .values()
+                .map(|v| v.as_f64().unwrap())
+                .fold(f64::MIN, f64::max);
             let greedy = want[i - 1]
                 .1
                 .iter()
@@ -320,7 +329,12 @@ async fn what_scoring_cannot_do_is_refused() {
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
         let reply = post(&router, "/v1/completions", &body).await;
-        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{extra}: {}", reply.text());
+        assert_eq!(
+            reply.status,
+            StatusCode::BAD_REQUEST,
+            "{extra}: {}",
+            reply.text()
+        );
         assert_eq!(reply.json()["error"]["param"], param, "{extra}");
     }
 }

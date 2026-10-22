@@ -35,8 +35,8 @@ use axum::extract::{MatchedPath, Request, State};
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use prometheus_client::encoding::text::encode;
 use prometheus_client::encoding::EncodeLabelSet;
+use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
@@ -459,7 +459,9 @@ impl Telemetry {
         gauge(&self.memory_peak, s.memory_peak);
         gauge(&self.memory_cache, s.memory_cache);
         // The cache keeps its own totals; a counter takes them as they are.
-        self.prefix_hits.inner().store(s.prefix_hits, Ordering::Relaxed);
+        self.prefix_hits
+            .inner()
+            .store(s.prefix_hits, Ordering::Relaxed);
         self.prefix_misses
             .inner()
             .store(s.prefix_misses, Ordering::Relaxed);
@@ -559,12 +561,10 @@ pub async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
     let in_use = state
         .configured_permits
         .saturating_sub(state.request_permits.available_permits());
-    let (content_type, body) = state.telemetry.render(
-        &state.engine,
-        in_use,
-        state.configured_permits,
-        format,
-    );
+    let (content_type, body) =
+        state
+            .telemetry
+            .render(&state.engine, in_use, state.configured_permits, format);
     (
         [(header::CONTENT_TYPE, HeaderValue::from_static(content_type))],
         body,

@@ -7,6 +7,7 @@
 //! random models.
 
 use pmetal_cache::kv_cache::KVCache;
+use pmetal_models::DynamicModel;
 use pmetal_models::architectures::dflash_draft::{
     DFlashDraftConfig, DFlashDraftModel, DFlashExtras,
 };
@@ -17,7 +18,6 @@ use pmetal_models::architectures::{
 use pmetal_models::dflash_drafts::DFlashDraft;
 use pmetal_models::generation::GenerationConfig;
 use pmetal_models::speculator::{Speculator, SpeculatorSpec};
-use pmetal_models::DynamicModel;
 use pmetal_runtime::compat::random;
 use pmetal_runtime::decode::{DecodeSampler, last_token_logits, prompt_tokens_to_input};
 use serial_test::serial;

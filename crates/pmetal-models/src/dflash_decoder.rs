@@ -937,7 +937,12 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
         // Every round writes `max_tree_nodes` tokens and keeps at most
         // `max_tree_nodes - 1` (tree_budget) after compaction, so the cache
         // needs room for `prompt + max_new_tokens + max_tree_nodes` at peak.
-        let mut run = self.begin(prompt, config, max_tree_nodes, config.generation.sampler(prompt))?;
+        let mut run = self.begin(
+            prompt,
+            config,
+            max_tree_nodes,
+            config.generation.sampler(prompt),
+        )?;
         let mut past_length = prompt.len(); // cache length after prefill
 
         // ── Adaptive tree budget state ────────────────────────────────

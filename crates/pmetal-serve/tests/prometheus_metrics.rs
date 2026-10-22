@@ -189,12 +189,8 @@ async fn metrics_need_the_api_key_like_every_route_but_health() {
     let (router, _dir) = tiny(256).router(&keyed);
     let refused = get(&router, "/metrics").await;
     assert_eq!(refused.status, StatusCode::UNAUTHORIZED);
-    let allowed = get_with_headers(
-        &router,
-        "/metrics",
-        &[("authorization", "Bearer sk-test")],
-    )
-    .await;
+    let allowed =
+        get_with_headers(&router, "/metrics", &[("authorization", "Bearer sk-test")]).await;
     assert_eq!(allowed.status, StatusCode::OK);
     // The refusal was counted, under the route it was aimed at.
     let body = allowed.text();
