@@ -372,6 +372,11 @@ impl WeightLoader {
             "mlp.experts.gate_proj.weight" => "ffn_gate_exps.weight",
             "mlp.experts.up_proj.weight" => "ffn_up_exps.weight",
             "mlp.experts.down_proj.weight" => "ffn_down_exps.weight",
+            // The stacked layout an MLX conversion (and a loaded model's own
+            // parameter tree) holds the routed experts in.
+            "mlp.switch_mlp.gate_proj.weight" => "ffn_gate_exps.weight",
+            "mlp.switch_mlp.up_proj.weight" => "ffn_up_exps.weight",
+            "mlp.switch_mlp.down_proj.weight" => "ffn_down_exps.weight",
             "mlp.shared_expert.gate_proj.weight" => "ffn_gate_shexp.weight",
             "mlp.shared_expert.up_proj.weight" => "ffn_up_shexp.weight",
             "mlp.shared_expert.down_proj.weight" => "ffn_down_shexp.weight",
