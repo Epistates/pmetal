@@ -386,20 +386,40 @@ pub enum Commands {
 }
 
 impl Commands {
-    /// Whether this command writes the `--log-events` file: the trainers that
-    /// run under `commands::with_run_context`. The others (`pretrain`,
-    /// `embed-train`, `train-mtp`, `train-draft`, `train-diffusion`) take no
-    /// event log, and `main` refuses the flag for them.
+    /// Whether this command writes the `--log-events` file. A spec says so
+    /// itself (`#[spec(events)]`, `JobFields::REPORTS_EVENTS`): the same fact
+    /// every surface that starts a job asks the file by, so the one list is the
+    /// specs'. `main` refuses the flag for a command that writes no event log.
     #[cfg(feature = "trainer")]
     pub fn writes_event_log(&self) -> bool {
-        matches!(
-            self,
-            Commands::Train(_)
-                | Commands::Distill(_)
-                | Commands::Grpo(_)
-                | Commands::Rlkd(_)
-                | Commands::Preference(_)
-        )
+        use pmetal_core::JobFields;
+        use pmetal_core::jobs::{DistillSpec, GrpoSpec, PreferenceSpec, RlkdSpec, TrainSpec};
+        match self {
+            Commands::Train(_) => TrainSpec::REPORTS_EVENTS,
+            Commands::Distill(_) => DistillSpec::REPORTS_EVENTS,
+            Commands::Grpo(_) => GrpoSpec::REPORTS_EVENTS,
+            Commands::Rlkd(_) => RlkdSpec::REPORTS_EVENTS,
+            Commands::Preference(_) => PreferenceSpec::REPORTS_EVENTS,
+            _ => false,
+        }
+    }
+
+    /// The commands that write the `--log-events` file, by name, for the
+    /// message that refuses the flag to the others.
+    #[cfg(feature = "trainer")]
+    pub fn event_log_commands() -> Vec<&'static str> {
+        use pmetal_core::JobFields;
+        use pmetal_core::jobs::{DistillSpec, GrpoSpec, PreferenceSpec, RlkdSpec, TrainSpec};
+        [
+            (TrainSpec::subcommand(), TrainSpec::REPORTS_EVENTS),
+            (DistillSpec::subcommand(), DistillSpec::REPORTS_EVENTS),
+            (GrpoSpec::subcommand(), GrpoSpec::REPORTS_EVENTS),
+            (RlkdSpec::subcommand(), RlkdSpec::REPORTS_EVENTS),
+            (PreferenceSpec::subcommand(), PreferenceSpec::REPORTS_EVENTS),
+        ]
+        .into_iter()
+        .filter_map(|(name, writes)| writes.then_some(name))
+        .collect()
     }
 
     /// Whether this command runs anything on MLX. The ones that don't skip the
@@ -493,3 +513,5 @@ mod argv_roundtrip;
 mod mcp_tools;
 #[cfg(test)]
 mod parity;
+#[cfg(all(test, feature = "mcp", feature = "trainer", feature = "dashboard"))]
+mod surfaces;

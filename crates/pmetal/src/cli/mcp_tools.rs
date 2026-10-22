@@ -63,8 +63,8 @@ fn every_spec_tool_builds_a_command_the_cli_parses() {
         let prepared = tool
             .prepare(Value::Object(args), &policy)
             .unwrap_or_else(|e| panic!("{}: {e}", tool.name()));
-        let mut argv = vec![prepared.subcommand.to_string()];
-        argv.extend(prepared.argv);
+        let mut argv = vec![prepared.plan.subcommand];
+        argv.extend(prepared.plan.argv);
         parses(tool.name(), &argv);
     }
 }

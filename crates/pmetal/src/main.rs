@@ -148,8 +148,8 @@ fn run() -> anyhow::Result<()> {
     #[cfg(feature = "trainer")]
     if cli.log_events.is_some() && !cli.command.writes_event_log() {
         anyhow::bail!(
-            "--log-events is written by train, distill, grpo, rlkd and preference only; \
-             this command writes no event log"
+            "--log-events is written by {} only; this command writes no event log",
+            Commands::event_log_commands().join(", ")
         );
     }
 
