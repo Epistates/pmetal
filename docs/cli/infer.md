@@ -1,17 +1,72 @@
 # pmetal infer
 
-Run interactive inference with chat, tool use, thinking mode, and LoRA adapters.
+Generate text from a model: one prompt in, one completion out, with the model's chat template, tool definitions, thinking controls, LoRA adapters, speculative decoding, and opt-in per-layer profiling for supported hybrid models.
 
-Run inference on a loaded model. Supports interactive chat, tool/function calling, thinking mode, FP8 quantization, LoRA adapter loading, and opt-in per-layer profiling for supported hybrid models.
+`--prompt` is required. For an interactive conversation use the Inference tab of [`pmetal tui`](/cli/tui/); to serve a model to other programs use [`pmetal serve`](/cli/serve/).
 
 ## Usage
 
 ```bash
 pmetal infer \
   --model <MODEL> \
-  [--prompt <PROMPT>] \
+  --prompt <PROMPT> \
   [OPTIONS]
 ```
+
+## Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-m`, `--model` | required | HuggingFace model ID or local path |
+| `-p`, `--prompt` | required | Input prompt |
+| `--lora` | none | LoRA adapter: a directory written by `pmetal train` (or any PEFT adapter directory) or its weights file |
+| `--chat` | `false` | Apply the model's chat template (instruct models and `--tools` use it regardless) |
+| `--system` | none | System message |
+| `--image` | none | Image file to show a Qwen3.5-family vision model, before the prompt (repeatable, in order) |
+| `--video` | none | Directory of a video's frames to show a Qwen3.5-family vision model, after the images (repeatable). The frames are its image files in natural file-name order (`frame2.png` before `frame10.png`); video files are not decoded |
+| `--video-fps` | `24` | Frame rate of the `--video` frames. They are sampled to the checkpoint's rate (2 per second in the released configs, at least 4 and at most 768 frames) and time-stamped in the prompt. Without it the frames are taken to be 24 per second with a warning: frames extracted at 2 per second would then mostly be dropped and their timestamps would be 12 times too small |
+| `--max-tokens` | model default | Maximum generation length (see [Output Length](#output-length)) |
+| `--temperature` | model default | Sampling temperature; `0` is greedy |
+| `--top-k` | model default | Top-k sampling; `0` disables |
+| `--top-p` | model default | Nucleus sampling (0.0 to 1.0) |
+| `--min-p` | model default | Min-p dynamic sampling; `0` disables |
+| `--repetition-penalty` | `1.0` | Penalty on tokens of the prompt and output; `1.0` disables |
+| `--frequency-penalty` | `0.0` | Penalty proportional to a token's count; `0` disables |
+| `--presence-penalty` | `0.0` | Penalty for any token that has appeared; `0` disables |
+| `--seed` | random | Random seed for reproducible generation |
+| `--mode` | `auto` | Sampling preset with the model card's parameters: `auto`, `thinking-general`, `thinking-coding`, `instruct-general` or `instruct-reasoning` (see [Sampling Defaults](#sampling-defaults)) |
+| `--no-thinking` | `false` | Turn thinking off (the chat template's `enable_thinking`) |
+| `--hide-thinking` | `false` | Leave the thinking trace out of the output |
+| `--reasoning-effort` | template default | How long the model thinks, for chat templates with a `reasoning_effort` control |
+| `--no-preserve-thinking` | `false` | Keep only the current turn's thinking in the prompt, for chat templates with a `preserve_thinking` control |
+| `--chat-template-kwargs` | none | Extra chat template keyword arguments as a JSON object; `--no-thinking`, `--reasoning-effort` and `--no-preserve-thinking` win over the same keys |
+| `--tools` | none | JSON file of tool definitions (OpenAI format) |
+| `--json` | `false` | Print one JSON object on stdout (text, token counts, timing, why generation stopped) instead of streaming the text; the banner and statistics go to stderr |
+| `--fp8` | `false` | FP8 weights (about 2x memory reduction) |
+| `--experts-dir` | none | Packed expert directory for SSD-offloaded MoE inference (see [`pmetal pack-experts`](/cli/pack-experts/)) |
+| `--backend` | `auto` | Generation path: `auto` (the GPU, or the ANE with `--ane`), `standard` (the GPU, whatever `--ane` says) or `ane` (Apple Neural Engine) |
+| `--ane` | `false` | Run on the Apple Neural Engine (experimental) |
+| `--ane-max-seq-len` | `4096` | Largest context (prompt plus output) the ANE compiles a model for. Each request gets the smallest power of two from 512 that fits it, up to this; a smaller context runs faster |
+| `--draft-model` | none | Draft model for exact speculative decoding: a Gemma 4 MTP assistant, or with `--ane` a DFlash draft model (which runs on the GPU, drafting for the model on the ANE) |
+| `--mtp` | `false` | Bundled Qwen3Next/Qwen3.6 MTP exact speculative decoding |
+| `--mtp-model` | bundled `mtp.*` in `--model` | External Qwen MTP checkpoint directory (needs `--mtp`) |
+| `--mtp-draft-tokens` | `3` | Qwen MTP draft tokens per verify step |
+| `--kv-quant` | engine default | KV cache quantization bits: `8` (q8_0), `4` (q4_0) or `0` (fp16) |
+| `--kv-k-bits`, `--kv-v-bits` | none | Key and value bits on their own, for an asymmetric cache (override `--kv-quant`) |
+| `--kv-group-size` | `64` | KV cache quantization group size |
+| `--kv-turboquant` | `false` | TurboQuant KV cache compression |
+| `--kv-turboquant-preset` | none | Mixed-bit TurboQuant preset: `q2_5` or `q3_5` |
+| `--kv-quant-preset` | none | Mixed-bit affine preset: `q2_5` or `q3_5` |
+| `--kv-qjl` | `false` | QJL residual correction for 2- and 3-bit key quantization |
+| `--no-kv-quant` | `false` | Use an fp16 KV cache |
+| `--detect-repetition` | `false` | Stop on n-gram repetition loops |
+| `--benchmark` | `false` | Time prompt processing and generation instead of answering (needs `--benchmark-prompt-tokens`) |
+| `--benchmark-iters` | `5` | Measured trials for `--benchmark` |
+| `--benchmark-prompt-tokens` | none | Synthetic prompt length for `--benchmark` |
+| `--profile-layers` | `false` | Per-layer forward profile for supported hybrid models |
+| `--profile-output` | none | Write the layer profile report as pretty JSON |
+
+Images and videos run on the native engine only: they cannot be combined with `--lora`, `--fp8`, `--experts-dir`, `--ane`, `--mtp`, `--draft-model`, `--benchmark` or `--profile-layers`.
 
 ## Examples
 
@@ -19,19 +74,19 @@ pmetal infer \
 # Simple generation
 pmetal infer --model Qwen/Qwen3-0.6B --prompt "What is 2+2?"
 
-# Interactive chat with LoRA
+# Chat template, a LoRA adapter trained with `pmetal train`
 pmetal infer \
   --model Qwen/Qwen3-0.6B \
-  --lora ./output/adapter_model.safetensors \
-  --chat
+  --lora ./output \
+  --chat --prompt "Summarize monotonic queues."
 
-# FP8 quantized inference (2× memory reduction)
-pmetal infer --model Qwen/Qwen3-4B --fp8 --chat
+# FP8 quantized inference (2x memory reduction)
+pmetal infer --model Qwen/Qwen3-4B --fp8 --chat --prompt "Explain LoRA in two sentences."
 
 # With tool definitions
 pmetal infer \
   --model Qwen/Qwen3-0.6B \
-  --tools tools.json --chat
+  --tools tools.json --prompt "What is the weather in Paris?"
 
 # Images and videos (Qwen3.5-family vision models)
 pmetal infer --model Qwen/Qwen3.5-0.8B --image photo.jpg \
@@ -44,7 +99,8 @@ pmetal infer --model Qwen/Qwen3.5-0.8B --video frames/ --video-fps 2 \
   --prompt "Describe what happens in this video." --chat
 
 # Inference on the Apple Neural Engine
-pmetal infer --model Qwen/Qwen3-4B --backend ane --ane-max-seq-len 2048 --chat
+pmetal infer --model Qwen/Qwen3-4B --backend ane --ane-max-seq-len 2048 \
+  --chat --prompt "Explain monotonic queues."
 
 # Gemma 4 MTP assistant (exact speculative decode)
 pmetal infer \
@@ -73,6 +129,10 @@ pmetal infer \
   --mtp --fp8 --experts-dir /path/to/packed_experts \
   --prompt "Summarize monotonic queues."
 
+# Throughput benchmark with a 512-token synthetic prompt
+pmetal infer --model Qwen/Qwen3-0.6B --benchmark --benchmark-prompt-tokens 512 \
+  --prompt "unused by --benchmark"
+
 # Profile Qwen 3.5 hybrid prefill + cached decode layers and write JSON
 pmetal infer \
   --model Qwen/Qwen3.5-0.8B \
@@ -81,41 +141,6 @@ pmetal infer \
   --profile-layers \
   --profile-output qwen35_layer_profile.json
 ```
-
-## Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--model` | *required* | HuggingFace model ID or local path |
-| `--prompt` | — | Input prompt (omit for stdin) |
-| `--lora` | — | Path to LoRA adapter weights |
-| `--image` | — | Image file to show a Qwen3.5-family vision model, before the prompt (repeatable) |
-| `--video` | — | Directory of a video's frames to show a Qwen3.5-family vision model, after the images (repeatable). The frames are its image files in natural file-name order (`frame2.png` before `frame10.png`); video files are not decoded |
-| `--video-fps` | `24` | Frame rate of the `--video` frames. They are sampled to the checkpoint's rate (2 per second in the released configs, at least 4 and at most 768 frames) and time-stamped in the prompt. Without it the frames are taken to be 24 per second, as the reference does, with a warning: frames extracted at 2 per second would then mostly be dropped and their timestamps would be 12 times too small |
-| `--draft-model` | — | Gemma 4 MTP assistant model for exact speculative decoding |
-| `--mtp` | off | Enable bundled Qwen3Next/Qwen3.6 MTP exact speculative decoding |
-| `--mtp-model` | bundled `mtp.*` in `--model` | Optional external Qwen MTP checkpoint directory |
-| `--mtp-draft-tokens` | `3` | Number of Qwen MTP draft tokens per verify step |
-| `--temperature` | model default | Sampling temperature |
-| `--top-k` | model default | Top-k sampling |
-| `--top-p` | model default | Nucleus sampling |
-| `--min-p` | model default | Min-p dynamic sampling |
-| `--max-tokens` | model default | Maximum generation length (see [Output Length](#output-length)) |
-| `--repetition-penalty` | `1.0` | Repetition penalty |
-| `--frequency-penalty` | `0.0` | Frequency penalty |
-| `--presence-penalty` | `0.0` | Presence penalty |
-| `--chat` | `false` | Apply chat template |
-| `--fp8` | `false` | FP8 weights (~2× mem reduction) |
-| `--backend` | `auto` | Generation path: `auto` (the GPU, or the ANE with `--ane`), `standard` (the GPU, whatever `--ane` says) or `ane` (Apple Neural Engine) |
-| `--profile-layers` | `false` | Run an opt-in per-layer forward profile for supported hybrid models |
-| `--profile-output` | — | Write the layer profile report as pretty JSON |
-| `--ane-max-seq-len` | `4096` | Largest context (prompt plus output) the ANE compiles a model for |
-| `--tools` | — | Tool definitions file (OpenAI format) |
-| `--system` | — | System message |
-| `--no-thinking` | `false` | Turn thinking off (the chat template's `enable_thinking`) |
-| `--reasoning-effort` | template default | How long the model thinks, for chat templates with a `reasoning_effort` control |
-| `--no-preserve-thinking` | `false` | Keep only the current turn's thinking in the prompt, for chat templates with a `preserve_thinking` control |
-| `--chat-template-kwargs` | — | Extra chat template keyword arguments as a JSON object |
 
 ## Output Length
 
@@ -152,19 +177,19 @@ same way. The family is read from `config.json` and the model's name.
 | Family | Thinking | Non-thinking | Output budget |
 |--------|----------|--------------|---------------|
 | Qwen3 (hybrid) | 0.6 / 0.95 / 20 | 0.7 / 0.8 / 20 | 32,768 |
-| Qwen3-2507 Instruct, Qwen3-Next Instruct | — | 0.7 / 0.8 / 20 | 16,384 |
-| Qwen3-2507 Thinking, Qwen3-Next Thinking | 0.6 / 0.95 / 20 | — | 32,768 |
+| Qwen3-2507 Instruct, Qwen3-Next Instruct | none | 0.7 / 0.8 / 20 | 16,384 |
+| Qwen3-2507 Thinking, Qwen3-Next Thinking | 0.6 / 0.95 / 20 | none | 32,768 |
 | Qwen3.5 | 1.0 / 0.95 / 20 (coding 0.6) | 0.7 / 0.8 / 20, presence 1.5 (reasoning 1.0 / 1.0 / 40, presence 2.0) | 32,768 |
 | Qwen3.6 | 1.0 / 0.95 / 20 (coding 0.6) | 0.7 / 0.8 / 20, presence 1.5 | 32,768 |
 | Qwen3.8, Qwen3.8-Flash-Next | 1.0 / 0.95 / 20 | 0.7 / 0.8 / 20, presence 1.5 | 32,768 |
-| Gemma 4 | 1.0 / 0.95 / 64 | 1.0 / 0.95 / 64 | — |
-| gpt-oss | 1.0 / 1.0 | — | — |
-| Mistral Small 3.x | — | 0.15 | — |
-| Magistral | 0.7 / 0.95 | — | 40,960 |
-| Phi-4-reasoning | 0.8 / 0.95 / 50 | — | 32,768 |
-| DeepSeek-R1 and distillations | 0.6 / 0.95 | — | — |
-| DeepSeek-V3-0324 | — | 0.3 | — |
-| Nemotron Nano 2 | 0.6 / 0.95 | greedy | — |
+| Gemma 4 | 1.0 / 0.95 / 64 | 1.0 / 0.95 / 64 | none |
+| gpt-oss | 1.0 / 1.0 | none | none |
+| Mistral Small 3.x | none | 0.15 | none |
+| Magistral | 0.7 / 0.95 | none | 40,960 |
+| Phi-4-reasoning | 0.8 / 0.95 / 50 | none | 32,768 |
+| DeepSeek-R1 and distillations | 0.6 / 0.95 | none | none |
+| DeepSeek-V3-0324 | none | 0.3 | none |
+| Nemotron Nano 2 | 0.6 / 0.95 | greedy | none |
 
 Values are temperature / top-p / top-k. Families not listed (Llama 3.x and 4,
 Gemma 2/3, Phi-3/4, Mistral 7B, Mixtral, Cohere, Granite, SmolLM2, Qwen2.5)
@@ -243,7 +268,7 @@ gpt-oss.
 
 ## Layer Profiling
 
-`--profile-layers` is currently implemented for standard `Qwen 3.5 / qwen3_next` inference. It runs one real prefill pass and one real cached decode pass using the shared inference runner, forcing MLX evaluation at each measured section so the report reflects actual wall time instead of only op scheduling overhead.
+`--profile-layers` is currently implemented for standard `Qwen 3.5 / qwen3_next` inference. It runs one real prefill pass and one real cached decode pass using the shared inference runner, forcing MLX evaluation at each measured section so the report reflects actual wall time instead of only op scheduling overhead. It is its own mode: it cannot be combined with `--benchmark` or `--lora`.
 
 `--mtp` is its own verifier/drafter generation backend. It supports bundled Qwen `mtp.*` weights or an external `--mtp-model` checkpoint, FP8 target/MTP weights, packed expert offload, LoRA-merged Qwen3Next targets, and checkpoints with more than one MTP predictor layer. `--backend` is ignored while MTP is active because exact speculative verification owns the decode loop. LoRA and `--experts-dir` are not combined; fuse the adapter first if you need packed expert offload.
 
@@ -251,7 +276,7 @@ When Gemma 4 or Qwen MTP is active, the CLI prints a `Speculative:` summary with
 acceptance rate, accepted/attempted draft tokens, average accepted draft tokens per verify
 step, and the number of target bonus/correction tokens.
 
-Use `--profile-output <PATH>` to capture the full JSON report. The CLI summary now prints:
+Use `--profile-output <PATH>` to capture the full JSON report. The CLI summary prints:
 - total layer time vs non-layer overhead
 - aggregated time by layer kind (`linear_attention` vs `full_attention`)
 - top section buckets within each kind
@@ -259,21 +284,18 @@ Use `--profile-output <PATH>` to capture the full JSON report. The CLI summary n
 
 That makes long-prompt hybrid profiles much easier to read when you are deciding whether the next prompt-heavy optimization should target GDN prefill, full-attention preparation/SDPA, sparse MoE combine, or decode-only paths.
 
-## Chat Mode
+## Chat Template
 
-With `--chat`, PMetal applies the model's chat template and starts an interactive session:
+With `--chat` (or an instruct model, or `--tools`), PMetal wraps the prompt in the model's chat template, with `--system` as the system message, and generates the assistant's reply to it. The command answers one prompt and exits; for a multi-turn conversation use the Inference tab of [`pmetal tui`](/cli/tui/).
 
-```
-> What is quantum entanglement?
-Quantum entanglement is a phenomenon where two particles...
-
-> Can you explain it more simply?
-Think of it like two coins that always land on opposite sides...
+```bash
+pmetal infer --model Qwen/Qwen3-0.6B --chat --system "Answer in one sentence." \
+  --prompt "What is quantum entanglement?"
 ```
 
 ## Tool Use
 
-Pass OpenAI-format tool definitions with `--tools`:
+Pass OpenAI-format tool definitions with `--tools`; the model's reply carries its tool calls:
 
 ```json
 [
@@ -297,6 +319,8 @@ Supported for Qwen, Llama 3.1+, Mistral v3+, and DeepSeek models.
 
 ## See Also
 
-- [pmetal serve](/cli/serve/) — OpenAI-compatible inference server
-- [Rust SDK](/sdk/advanced/) — Programmatic inference
-- [Python SDK](/python/quick-start/) — Python inference
+- [pmetal serve](/cli/serve/): OpenAI-compatible inference server
+- [pmetal dflash](/cli/dflash/): Block-diffusion speculative decoding on the GPU
+- [pmetal train-mtp](/cli/train-mtp/): Train an MTP predictor or assistant
+- [Rust SDK](/sdk/advanced/): Programmatic inference
+- [Python SDK](/python/quick-start/): Python inference
