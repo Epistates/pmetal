@@ -40,6 +40,12 @@ pub enum WeightFormatError {
     Json(#[from] serde_json::Error),
 }
 
+impl From<pmetal_gguf::config::GgufConfigError> for WeightFormatError {
+    fn from(e: pmetal_gguf::config::GgufConfigError) -> Self {
+        Self::Gguf(e.to_string())
+    }
+}
+
 /// Detected weight format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightFormat {
@@ -430,17 +436,10 @@ impl GgufModelConfig {
     /// states a scaling of its own as well would have two to apply, and gets an
     /// error rather than one of them.
     pub fn set_rope_frequency_factors(&mut self, factors: &[f32]) -> Result<(), WeightFormatError> {
-        if self.rope_scaling.is_some() {
-            return Err(WeightFormatError::Gguf(
-                "the file carries both a rope_freqs tensor and rope.scaling metadata; \
-                 applying one of them would be a guess"
-                    .into(),
-            ));
-        }
-        self.rope_scaling = Some(serde_json::json!({
-            "rope_type": "frequency_factors",
-            "factors": factors,
-        }));
+        self.rope_scaling = Some(pmetal_gguf::config::frequency_factors_scaling(
+            self.rope_scaling.as_ref(),
+            factors,
+        )?);
         Ok(())
     }
 
@@ -455,124 +454,39 @@ impl GgufModelConfig {
     }
 
     /// Extract config from GGUF metadata.
+    ///
+    /// The parameters are read by [`pmetal_gguf::config::GgufArchConfig`], which
+    /// the generated `config.json` is written from as well; this adds what
+    /// loading a model needs on top: the parameters every architecture has to
+    /// state (an error when the file leaves one out), and a default for the
+    /// ones with a conventional value. The vocabulary has none: a file that
+    /// does not say how large it is cannot be loaded as a guess.
     pub fn from_gguf(content: &pmetal_gguf::GgufContent) -> Result<Self, WeightFormatError> {
-        let arch = content
-            .architecture()
-            .ok_or_else(|| WeightFormatError::Gguf("Missing general.architecture".into()))?
-            .to_string();
-
-        // Helper to get metadata with architecture prefix
-        let get_u32 = |key: &str| -> Option<u32> {
-            let full_key = format!("{}.{}", arch, key);
-            match content.get_metadata(&full_key) {
-                Some(pmetal_gguf::MetadataValue::Uint32(v)) => Some(*v),
-                Some(pmetal_gguf::MetadataValue::Int32(v)) => Some(*v as u32),
-                Some(pmetal_gguf::MetadataValue::Uint64(v)) => Some(*v as u32),
-                Some(pmetal_gguf::MetadataValue::Int64(v)) => Some(*v as u32),
-                _ => None,
-            }
-        };
-
-        let get_f32 = |key: &str| -> Option<f32> {
-            let full_key = format!("{}.{}", arch, key);
-            match content.get_metadata(&full_key) {
-                Some(pmetal_gguf::MetadataValue::Float32(v)) => Some(*v),
-                Some(pmetal_gguf::MetadataValue::Float64(v)) => Some(*v as f32),
-                _ => None,
-            }
-        };
-
-        // `rope.scaling.*`: linear and YaRN are what a `rope_scaling` dict
-        // states; a type this loader does not know is an error, because the
-        // positions past the original context would be wrong without a word.
-        let rope_scaling = match content.get_str(&format!("{arch}.rope.scaling.type")) {
-            None | Some("none") | Some("") => None,
-            // LongRoPE's factors are tensors, not metadata: the dict stays
-            // incomplete here (the Phi loader completes it from the tensors) and
-            // a family that cannot read it is refused by the missing factors.
-            Some("longrope") => Some(serde_json::json!({ "rope_type": "longrope" })),
-            Some(kind @ ("linear" | "yarn")) => {
-                let factor = get_f32("rope.scaling.factor").ok_or_else(|| {
-                    WeightFormatError::Gguf(format!(
-                        "{arch}.rope.scaling.type is {kind:?} but {arch}.rope.scaling.factor is \
-                         missing"
-                    ))
-                })?;
-                let mut dict = serde_json::json!({ "rope_type": kind, "factor": factor });
-                if let Some(original) = get_u32("rope.scaling.original_context_length") {
-                    dict["original_max_position_embeddings"] = original.into();
-                }
-                Some(dict)
-            }
-            Some(other) => {
-                return Err(WeightFormatError::Gguf(format!(
-                    "{arch}.rope.scaling.type {other:?} is not supported (linear, yarn and none \
-                     are)"
-                )));
-            }
-        };
-
-        // Extract required values
-        let hidden_size = get_u32("embedding_length").ok_or_else(|| {
-            WeightFormatError::Gguf(format!("{}.embedding_length not found", arch))
-        })? as i32;
-
-        let num_hidden_layers = get_u32("block_count")
-            .ok_or_else(|| WeightFormatError::Gguf(format!("{}.block_count not found", arch)))?
-            as i32;
-
-        let num_attention_heads = get_u32("attention.head_count").ok_or_else(|| {
-            WeightFormatError::Gguf(format!("{}.attention.head_count not found", arch))
-        })? as i32;
-
-        let intermediate_size = get_u32("feed_forward_length").ok_or_else(|| {
-            WeightFormatError::Gguf(format!("{}.feed_forward_length not found", arch))
-        })? as i32;
-
-        // Get vocab size from tokenizer or estimate from token embedding
-        let vocab_size = content
-            .get_metadata("tokenizer.ggml.tokens")
-            .and_then(|v| match v {
-                pmetal_gguf::MetadataValue::Array(arr) => Some(arr.len() as i32),
-                _ => None,
+        let arch = pmetal_gguf::config::GgufArchConfig::from_gguf(content)?;
+        let required = |value: Option<u32>, key: &str| -> Result<i32, WeightFormatError> {
+            value.and_then(|v| i32::try_from(v).ok()).ok_or_else(|| {
+                WeightFormatError::Gguf(format!("{}.{key} not found", arch.architecture))
             })
-            .or_else(|| {
-                // Fallback: estimate from token embedding tensor shape
-                content
-                    .get_tensor_info("token_embd.weight")
-                    .map(|t| t.dimensions[0] as i32)
-            })
-            .unwrap_or(32000); // Default fallback
-
-        // Optional values with defaults
-        let num_kv_heads = get_u32("attention.head_count_kv").map(|v| v as i32);
-        let rms_norm_eps = get_f32("attention.layer_norm_rms_epsilon").unwrap_or(1e-5);
-        let rope_theta = get_f32("rope.freq_base").unwrap_or(10000.0);
-        let max_position_embeddings = get_u32("context_length").unwrap_or(4096) as i32;
-        let head_dim = get_u32("attention.head_dim")
-            .or_else(|| get_u32("attention.key_length"))
-            .or_else(|| get_u32("rope.dimension_count"))
-            .map(|v| v as i32);
-
-        let rope_dimension_count = get_u32("rope.dimension_count").map(|v| v as i32);
-        let original_context_length =
-            get_u32("rope.scaling.original_context_length").map(|v| v as i32);
+        };
+        let as_i32 = |value: Option<u32>| value.and_then(|v| i32::try_from(v).ok());
 
         Ok(Self {
-            architecture: arch,
-            hidden_size,
-            num_hidden_layers,
-            num_attention_heads,
-            num_kv_heads,
-            intermediate_size,
-            vocab_size,
-            rms_norm_eps,
-            rope_theta,
-            max_position_embeddings,
-            head_dim,
-            rope_dimension_count,
-            original_context_length,
-            rope_scaling,
+            hidden_size: required(arch.hidden_size, "embedding_length")?,
+            num_hidden_layers: required(arch.num_hidden_layers, "block_count")?,
+            num_attention_heads: required(arch.num_attention_heads, "attention.head_count")?,
+            intermediate_size: required(arch.intermediate_size, "feed_forward_length")?,
+            // No tokenizer, no `vocab_size`, no embedding to count rows of: the
+            // size is unknown, and 32000 would be somebody else's.
+            vocab_size: required(arch.vocab_size, "vocab_size")?,
+            num_kv_heads: as_i32(arch.num_key_value_heads),
+            rms_norm_eps: arch.rms_norm_eps.map_or(1e-5, |v| v as f32),
+            rope_theta: arch.rope_theta.map_or(10000.0, |v| v as f32),
+            max_position_embeddings: as_i32(arch.max_position_embeddings).unwrap_or(4096),
+            head_dim: as_i32(arch.head_dim),
+            rope_dimension_count: as_i32(arch.rope_dimension_count),
+            original_context_length: as_i32(arch.original_context_length),
+            rope_scaling: arch.rope_scaling,
+            architecture: arch.architecture,
         })
     }
 
@@ -647,24 +561,12 @@ impl GgufModelConfig {
         short: Option<&[f32]>,
         long: Option<&[f32]>,
     ) -> Result<(), WeightFormatError> {
-        let (short, long) = match (short, long) {
-            (None, None) => return Ok(()),
-            (Some(short), Some(long)) => (short, long),
-            _ => {
-                return Err(WeightFormatError::Gguf(
-                    "the file has only one of rope_factors_short and rope_factors_long".into(),
-                ));
-            }
-        };
-        let mut dict = serde_json::json!({
-            "rope_type": "longrope",
-            "short_factor": short,
-            "long_factor": long,
-        });
-        if let Some(original) = self.original_context_length {
-            dict["original_max_position_embeddings"] = original.into();
+        let original = self
+            .original_context_length
+            .and_then(|v| u32::try_from(v).ok());
+        if let Some(scaling) = pmetal_gguf::config::longrope_scaling(short, long, original)? {
+            self.rope_scaling = Some(scaling);
         }
-        self.rope_scaling = Some(dict);
         Ok(())
     }
 
