@@ -575,6 +575,14 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             commands::quantize::run_quantize(spec).await?;
         }
 
+        Commands::Imatrix(args) => {
+            use pmetal_core::jobs::ImatrixSpec;
+            let mut spec = ImatrixSpec::from(args);
+            spec.normalize()
+                .map_err(|errors| commands::invalid_spec::<ImatrixSpec>(&errors))?;
+            commands::imatrix::run_imatrix(spec).await?;
+        }
+
         #[cfg(feature = "trainer")]
         Commands::Distill(args) => {
             use pmetal_core::jobs::DistillSpec;

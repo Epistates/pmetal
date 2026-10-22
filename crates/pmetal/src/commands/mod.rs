@@ -19,6 +19,7 @@ pub(crate) mod events;
 pub(crate) mod fuse;
 #[cfg(feature = "trainer")]
 pub(crate) mod grpo;
+pub(crate) mod imatrix;
 pub(crate) mod infer;
 pub(crate) mod info;
 #[cfg(feature = "trainer")]

@@ -85,6 +85,7 @@ macro_rules! for_every_spec {
         $callback!(EvalSpec);
         $callback!(FuseSpec);
         $callback!(GrpoSpec);
+        $callback!(ImatrixSpec);
         $callback!(InferSpec);
         $callback!(MergeSpec);
         $callback!(PackExpertsSpec);

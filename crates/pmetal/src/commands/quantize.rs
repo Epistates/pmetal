@@ -38,6 +38,8 @@ fn quantize_method_file_type(
         crate::cli::quantize::QuantizeMethod::Q4KS => FileType::MostlyQ4KS,
         crate::cli::quantize::QuantizeMethod::Q4_0 => FileType::MostlyQ4_0,
         crate::cli::quantize::QuantizeMethod::Q4_1 => FileType::MostlyQ4_1,
+        crate::cli::quantize::QuantizeMethod::Iq4Nl => FileType::MostlyIq4Nl,
+        crate::cli::quantize::QuantizeMethod::Iq4Xs => FileType::MostlyIq4Xs,
         crate::cli::quantize::QuantizeMethod::Q3KM => FileType::MostlyQ3KM,
         crate::cli::quantize::QuantizeMethod::Q3KS => FileType::MostlyQ3KS,
         crate::cli::quantize::QuantizeMethod::Q3KL => FileType::MostlyQ3KL,
@@ -1054,6 +1056,8 @@ fn llama_style_tensor_type(
             | crate::cli::quantize::QuantizeMethod::Q4KS
             | crate::cli::quantize::QuantizeMethod::Q5KM
             | crate::cli::quantize::QuantizeMethod::Q5KS
+            | crate::cli::quantize::QuantizeMethod::Iq4Nl
+            | crate::cli::quantize::QuantizeMethod::Iq4Xs
             | crate::cli::quantize::QuantizeMethod::Q6K => GgmlType::Q6K,
             _ => dtype,
         };
@@ -1155,6 +1159,11 @@ pub(crate) async fn run_quantize(spec: pmetal_core::jobs::QuantizeSpec) -> anyho
             "--lora is not supported with --format mlx; fuse the adapter first with `pmetal fuse`, \
              then quantize the fused model"
         );
+        anyhow::ensure!(
+            spec.imatrix.is_none() && spec.calibration_dataset.is_none(),
+            "--imatrix and --calibration-dataset weight the GGUF quantizers and have no effect \
+             on --format mlx output"
+        );
         return run_quantization_mlx(
             &spec.model,
             &spec.output,
@@ -1167,11 +1176,22 @@ pub(crate) async fn run_quantize(spec: pmetal_core::jobs::QuantizeSpec) -> anyho
 
     let method = crate::cli::quantize::QuantizeMethod::from_str(&spec.method, true)
         .map_err(|e| anyhow::anyhow!("--method: {e}"))?;
+    let importance = if let Some(dataset) = spec.calibration_dataset.as_deref() {
+        ImportanceSource::Measure {
+            dataset,
+            ctx_size: spec.calibration_ctx_size,
+            chunks: spec.calibration_chunks,
+        }
+    } else if let Some(path) = spec.imatrix.as_deref() {
+        ImportanceSource::File(path)
+    } else {
+        ImportanceSource::None
+    };
     let Some(lora) = spec.lora.as_deref() else {
         return run_quantization(
             &spec.model,
             &spec.output,
-            spec.imatrix.as_deref(),
+            importance,
             method,
             spec.kl_calibrate,
             spec.target_bpw,
@@ -1214,7 +1234,7 @@ pub(crate) async fn run_quantize(spec: pmetal_core::jobs::QuantizeSpec) -> anyho
         run_quantization(
             &fused.to_string_lossy(),
             &spec.output,
-            spec.imatrix.as_deref(),
+            importance,
             method,
             spec.kl_calibrate,
             spec.target_bpw,
@@ -1224,11 +1244,27 @@ pub(crate) async fn run_quantize(spec: pmetal_core::jobs::QuantizeSpec) -> anyho
     }
 }
 
+/// Where the quantization's per-channel importance comes from.
+#[derive(Clone, Copy)]
+pub(crate) enum ImportanceSource<'a> {
+    /// None: every weight counts the same.
+    None,
+    /// An importance matrix file, measured earlier (`pmetal imatrix`).
+    File(&'a str),
+    /// Measured now, on this calibration data, from the model being quantized.
+    Measure {
+        dataset: &'a str,
+        ctx_size: usize,
+        /// 0: all the data makes.
+        chunks: usize,
+    },
+}
+
 /// Run model quantization.
 pub(crate) async fn run_quantization(
     model_path: &str,
     output_path: &str,
-    imatrix_path: Option<&str>,
+    importance: ImportanceSource<'_>,
     method: crate::cli::quantize::QuantizeMethod,
     kl_calibrate: bool,
     target_bpw: Option<f32>,
@@ -1249,8 +1285,12 @@ pub(crate) async fn run_quantization(
     println!("Model:    {}", model_path);
     println!("Output:   {}", output_path);
     println!("Method:   {}", method.as_str());
-    if let Some(imp) = imatrix_path {
-        println!("IMatrix:  {}", imp);
+    match importance {
+        ImportanceSource::None => {}
+        ImportanceSource::File(path) => println!("IMatrix:  {path}"),
+        ImportanceSource::Measure { dataset, .. } => {
+            println!("IMatrix:  measured on {dataset}")
+        }
     }
     if kl_calibrate {
         println!("KL Calib: enabled (threshold={:.4})", kl_threshold);
@@ -1265,12 +1305,37 @@ pub(crate) async fn run_quantization(
     let resolved_model_path: PathBuf =
         pmetal_hub::resolve_model_path(model_path, None, None).await?;
 
-    // 1. Load IMatrix if provided
-    let imatrix = if let Some(path) = imatrix_path {
-        tracing::info!("Loading IMatrix from {}", path);
-        Some(IMatrix::load(Path::new(path))?)
-    } else {
-        None
+    // 1. The importance matrix: read, or measured on the model being quantized
+    // (which is loaded for that and dropped before any weight is quantized).
+    let imatrix = match importance {
+        ImportanceSource::None => None,
+        ImportanceSource::File(path) => {
+            tracing::info!("Loading IMatrix from {}", path);
+            Some(IMatrix::load(Path::new(path))?)
+        }
+        ImportanceSource::Measure {
+            dataset,
+            ctx_size,
+            chunks,
+        } => {
+            println!("Measuring the importance matrix...");
+            let run = crate::commands::imatrix::measure_imatrix(
+                &resolved_model_path,
+                model_path,
+                dataset,
+                ctx_size,
+                (chunks > 0).then_some(chunks),
+                pmetal_core::jobs::ImatrixSpec::default().batch_size,
+            )
+            .await?;
+            println!(
+                "Measured {} matrices over {} chunks ({} tokens)\n",
+                run.imatrix.len(),
+                run.chunks,
+                run.tokens
+            );
+            Some(run.imatrix)
+        }
     };
 
     // 2. Initialize quantizer
@@ -1349,23 +1414,78 @@ pub(crate) async fn run_quantization(
         tracing::warn!("config.json not found, defaulting architecture to 'llama'");
     }
 
-    // 5. KL-divergence calibration pass (optional): each tensor is read, scored
+    // 5. Plan: which tensors the file holds and in what order, under the names
+    // it gives them (the names the imatrix and the calibration are keyed by).
+    // The routed experts of a layer's projection are one stacked tensor, which
+    // is how they are scored and weighted below as well as how they are
+    // written.
+    tracing::info!("Planning the quantization...");
+    let shapes: HashMap<&str, &Vec<usize>> = metas
+        .iter()
+        .map(|meta| (meta.name.as_str(), &meta.shape))
+        .collect();
+    let expert_groups = collect_expert_groups(metas.iter().map(|meta| meta.name.as_str()));
+    let expert_source_keys: HashSet<&str> = expert_groups
+        .values()
+        .flat_map(|group| group.iter().map(|tensor| tensor.name.as_str()))
+        .collect();
+
+    let mut entries: Vec<PlanEntry> = Vec::new();
+    // Stacked experts first, in layer order.
+    let mut group_keys: Vec<ExpertGroupKey> = expert_groups.keys().copied().collect();
+    group_keys.sort_by_key(|key| (key.layer, key.projection.gguf_suffix()));
+    for key in group_keys {
+        let (experts, shape) = expert_stack_layout(&expert_groups[&key], &shapes)?;
+        entries.push(PlanEntry {
+            gguf_name: format!("blk.{}.{}", key.layer, key.projection.gguf_suffix()),
+            shape,
+            from: Origin::Experts(experts),
+        });
+    }
+    for meta in &metas {
+        if expert_source_keys.contains(meta.name.as_str()) {
+            continue;
+        }
+        entries.push(PlanEntry {
+            gguf_name: pmetal_models::weight_format::WeightLoader::hf_to_gguf_name(&meta.name),
+            shape: meta.shape.iter().map(|&d| d as u64).collect(),
+            from: Origin::Tensor(meta.name.clone()),
+        });
+    }
+    let read_entry = |source: &mut dyn crate::commands::quantize_source::TensorSource,
+                      from: &Origin|
+     -> anyhow::Result<Vec<f32>> {
+        match from {
+            Origin::Tensor(name) => source.read_f32(name),
+            Origin::Experts(experts) => {
+                let mut stacked = Vec::new();
+                for expert in experts {
+                    stacked.append(&mut source.read_f32(&expert.name)?);
+                }
+                Ok(stacked)
+            }
+        }
+    };
+
+    // 6. KL-divergence calibration pass (optional): each tensor is read, scored
     // and let go of; only the choices are kept.
     let calibration_map: CalibrationMap = if kl_calibrate {
         println!(
             "Running KL calibration pass over {} tensors...",
-            metas.len()
+            entries.len()
         );
-        // Keyed by GGUF name: that is what the imatrix and the lookups below use.
-        let mut hf_by_gguf: HashMap<String, &str> = HashMap::with_capacity(metas.len());
-        let listing: Vec<(String, Vec<i32>)> = metas
+        let listing: Vec<(String, Vec<i32>)> = entries
             .iter()
-            .map(|meta| {
-                let gguf_name =
-                    pmetal_models::weight_format::WeightLoader::hf_to_gguf_name(&meta.name);
-                hf_by_gguf.insert(gguf_name.clone(), meta.name.as_str());
-                (gguf_name, meta.shape.iter().map(|&d| d as i32).collect())
+            .map(|e| {
+                (
+                    e.gguf_name.clone(),
+                    e.shape.iter().map(|&d| d as i32).collect(),
+                )
             })
+            .collect();
+        let by_name: HashMap<&str, &Origin> = entries
+            .iter()
+            .map(|e| (e.gguf_name.as_str(), &e.from))
             .collect();
         let kl_config = KlCalibrationConfig {
             kl_threshold,
@@ -1374,16 +1494,16 @@ pub(crate) async fn run_quantization(
         };
         let map = quantizer.calibrate_streaming(
             &listing,
-            |gguf_name| source.read_f32(hf_by_gguf[gguf_name]),
+            |gguf_name| read_entry(&mut *source, by_name[gguf_name]),
             &kl_config,
         )?;
 
-        let tensor_sizes: Vec<(String, usize)> = metas
+        let tensor_sizes: Vec<(String, usize)> = entries
             .iter()
-            .map(|meta| {
+            .map(|e| {
                 (
-                    pmetal_models::weight_format::WeightLoader::hf_to_gguf_name(&meta.name),
-                    meta.elements(),
+                    e.gguf_name.clone(),
+                    e.shape.iter().product::<u64>() as usize,
                 )
             })
             .collect();
@@ -1407,25 +1527,13 @@ pub(crate) async fn run_quantization(
         CalibrationMap::new()
     };
 
-    // 6. Metadata
+    // 7. Metadata
     let mut builder = GgufBuilder::with_model(&architecture, "quantized-model");
     add_hf_config_metadata(&mut builder, &architecture, config_json.as_ref(), method);
     add_tokenizer_metadata(&mut builder, &resolved_model_path, config_json.as_ref())?;
 
-    // 7. Plan: which tensors the file holds, in what order, as what type. The
-    // header of a GGUF file comes first and names every tensor's type and
-    // size, which depend on the shapes alone.
-    tracing::info!("Planning the quantization...");
-    let shapes: HashMap<&str, &Vec<usize>> = metas
-        .iter()
-        .map(|meta| (meta.name.as_str(), &meta.shape))
-        .collect();
-    let expert_groups = collect_expert_groups(metas.iter().map(|meta| meta.name.as_str()));
-    let expert_source_keys: HashSet<&str> = expert_groups
-        .values()
-        .flat_map(|group| group.iter().map(|tensor| tensor.name.as_str()))
-        .collect();
-
+    // Each tensor's type. The header of a GGUF file comes first and names every
+    // tensor's type and size, which depend on the shapes alone.
     let choose_type = |gguf_name: &str, shape_u64: &[u64]| {
         let proposed = if calibration_map.is_empty() {
             quantizer.get_tensor_type(gguf_name, shape_u64)
@@ -1439,36 +1547,15 @@ pub(crate) async fn run_quantization(
         let n_per_row = shape_u64.last().copied().unwrap_or(1) as usize;
         fit_to_row_length(chosen, n_per_row)
     };
-
-    let mut plan: Vec<PlannedTensor> = Vec::new();
-    // Stacked experts first, in layer order.
-    let mut group_keys: Vec<ExpertGroupKey> = expert_groups.keys().copied().collect();
-    group_keys.sort_by_key(|key| (key.layer, key.projection.gguf_suffix()));
-    for key in group_keys {
-        let (experts, shape) = expert_stack_layout(&expert_groups[&key], &shapes)?;
-        let gguf_name = format!("blk.{}.{}", key.layer, key.projection.gguf_suffix());
-        let dtype = choose_type(&gguf_name, &shape);
-        plan.push(PlannedTensor {
-            gguf_name,
-            shape,
-            dtype,
-            from: Origin::Experts(experts),
-        });
-    }
-    for meta in &metas {
-        if expert_source_keys.contains(meta.name.as_str()) {
-            continue;
-        }
-        let gguf_name = pmetal_models::weight_format::WeightLoader::hf_to_gguf_name(&meta.name);
-        let shape: Vec<u64> = meta.shape.iter().map(|&d| d as u64).collect();
-        let dtype = choose_type(&gguf_name, &shape);
-        plan.push(PlannedTensor {
-            gguf_name,
-            shape,
-            dtype,
-            from: Origin::Tensor(meta.name.clone()),
-        });
-    }
+    let plan: Vec<PlannedTensor> = entries
+        .into_iter()
+        .map(|e| PlannedTensor {
+            dtype: choose_type(&e.gguf_name, &e.shape),
+            gguf_name: e.gguf_name,
+            shape: e.shape,
+            from: e.from,
+        })
+        .collect();
 
     // 8. Quantize and write, one tensor at a time. The file is built beside the
     // destination and moved into place when complete.
@@ -1481,16 +1568,7 @@ pub(crate) async fn run_quantization(
         .map_err(|e| anyhow::anyhow!("could not start '{}': {e}", validated_output.display()))?;
     let total = plan.len();
     for (done, planned) in plan.iter().enumerate() {
-        let data_f32 = match &planned.from {
-            Origin::Tensor(name) => source.read_f32(name)?,
-            Origin::Experts(experts) => {
-                let mut stacked = Vec::new();
-                for expert in experts {
-                    stacked.append(&mut source.read_f32(&expert.name)?);
-                }
-                stacked
-            }
-        };
+        let data_f32 = read_entry(&mut *source, &planned.from)?;
         let n_per_row = planned.shape.last().copied().unwrap_or(1) as usize;
         match &planned.from {
             Origin::Tensor(name) => tracing::info!(
@@ -1514,6 +1592,14 @@ pub(crate) async fn run_quantization(
                 anyhow::anyhow!("Quantization error for {}: {:?}", planned.gguf_name, e)
             })?;
         drop(data_f32);
+        match &planned.from {
+            Origin::Tensor(name) => source.done_with(name),
+            Origin::Experts(experts) => {
+                for expert in experts {
+                    source.done_with(&expert.name);
+                }
+            }
+        }
         writer
             .write_tensor(&planned.gguf_name, &quantized)
             .map_err(|e| anyhow::anyhow!("could not write {}: {e}", planned.gguf_name))?;
@@ -1524,6 +1610,14 @@ pub(crate) async fn run_quantization(
 
     println!("Quantization complete!");
     Ok(())
+}
+
+/// A tensor of the output file before its type is chosen.
+struct PlanEntry {
+    gguf_name: String,
+    /// Row-major, as the builder takes it (the writer reverses).
+    shape: Vec<u64>,
+    from: Origin,
 }
 
 /// One tensor of the output file, in file order.
@@ -1948,7 +2042,7 @@ mod tests {
         run_quantization(
             dir.to_str().unwrap(),
             out.to_str().unwrap(),
-            None,
+            ImportanceSource::None,
             method,
             kl,
             bpw,

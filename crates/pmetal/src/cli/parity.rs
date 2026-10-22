@@ -186,6 +186,7 @@ parity!(dflash, DflashSpec);
 parity!(serve, ServeSpec, feature = "serve");
 parity!(pack_experts, PackExpertsSpec);
 parity!(quantize, QuantizeSpec);
+parity!(imatrix, ImatrixSpec);
 parity!(tokenize, TokenizeSpec);
 parity!(fuse, FuseSpec, feature = "lora");
 parity!(eval, EvalSpec, all(feature = "lora", feature = "trainer"));

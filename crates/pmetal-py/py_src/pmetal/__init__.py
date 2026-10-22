@@ -50,6 +50,7 @@ from .pmetal import (
     GenerationConfig as GenerationConfig,
     GrpoSpec as GrpoSpec,
     HubError as HubError,
+    ImatrixSpec as ImatrixSpec,
     InferResult as InferResult,
     InferSpec as InferSpec,
     LoggingCallback as LoggingCallback,

@@ -88,6 +88,7 @@ export const SECTIONS: NavSection[] = [
       job('merge', 'Merge', 'Combine models', icons.merge),
       job('fuse', 'Fuse adapter', 'Into base weights', icons.merge),
       job('quantize', 'Quantize', 'GGUF and MLX', icons.chip),
+      job('imatrix', 'Importance matrix', 'Guide quantization', icons.chip),
       job('ollama_modelfile', 'Modelfile', 'For Ollama', icons.cloud),
       job('pack_experts', 'Pack experts', 'Mixture of experts', icons.chip),
     ],

@@ -24,6 +24,7 @@ pub mod embed_train;
 pub mod eval;
 pub mod fuse;
 pub mod grpo;
+pub mod imatrix;
 pub mod infer;
 pub mod merge;
 pub mod pack_experts;
@@ -47,6 +48,7 @@ pub use embed_train::EmbedTrainSpec;
 pub use eval::EvalSpec;
 pub use fuse::FuseSpec;
 pub use grpo::GrpoSpec;
+pub use imatrix::ImatrixSpec;
 pub use infer::InferSpec;
 pub use merge::MergeSpec;
 pub use pack_experts::PackExpertsSpec;
@@ -111,6 +113,7 @@ impl_spec!(
     EvalSpec,
     FuseSpec,
     GrpoSpec,
+    ImatrixSpec,
     InferSpec,
     MergeSpec,
     PackExpertsSpec,
