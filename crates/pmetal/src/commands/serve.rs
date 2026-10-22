@@ -57,9 +57,7 @@ pub(crate) async fn run_serve(spec: ServeSpec, api_keys: Vec<String>) -> anyhow:
     if ane_enabled {
         anyhow::bail!("--ane needs the 'ane' feature: cargo build --features ane");
     }
-    use pmetal::inference_runner::{
-        CacheModeRequest, TurboQuantPreset, explicit_cache_mode_override,
-    };
+    use pmetal::inference_runner::{CacheModeRequest, TurboQuantPreset};
     use pmetal_models::dispatcher::DynamicModel;
     use pmetal_serve::{BatcherConfig, InferenceEngine, ServeConfig};
 
@@ -128,7 +126,6 @@ pub(crate) async fn run_serve(spec: ServeSpec, api_keys: Vec<String>) -> anyhow:
     // The model loads on the engine's own thread, where every request will
     // run: arrays it leaves unevaluated can't be evaluated anywhere else.
     tracing::info!("Loading model from {:?}...", model_path);
-    let (cache_mode_tx, cache_mode_rx) = std::sync::mpsc::channel();
     let load_path = model_path.clone();
     let load = move || -> anyhow::Result<DynamicModel> {
         let mut model = DynamicModel::load_with_options(
@@ -152,15 +149,6 @@ pub(crate) async fn run_serve(spec: ServeSpec, api_keys: Vec<String>) -> anyhow:
                 "this model requires expert offloading; repack routed experts with `pmetal pack-experts` and pass --experts-dir <packed_dir>"
             );
         }
-
-        // Resolve the KV cache mode override from the model's own cache
-        // configuration, as CLI/GUI inference does, so dense and MoE models
-        // share one TurboQuant/KV selection policy.
-        let base_cache = model.create_cache(max_seq_len);
-        let _ = cache_mode_tx.send(explicit_cache_mode_override(
-            base_cache.config(),
-            cache_mode_request,
-        ));
         Ok(model)
     };
 
@@ -174,13 +162,9 @@ pub(crate) async fn run_serve(spec: ServeSpec, api_keys: Vec<String>) -> anyhow:
         ane_max_seq_len,
     )?;
     tracing::info!("Model loaded successfully");
-    let engine = match cache_mode_rx.recv().ok().flatten() {
-        Some(mode) => {
-            tracing::info!(mode = %mode.describe(), "KV cache override");
-            engine.with_cache_mode_override(mode)
-        }
-        None => engine,
-    };
+    // Each request's cache is chosen on the model thread by the policy
+    // `pmetal infer` uses, from the model's own cache layout.
+    let engine = engine.with_cache_request(cache_mode_request);
     let engine = match draft_path {
         Some(path) => engine.with_ane_drafter(path),
         None => engine,

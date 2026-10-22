@@ -3,7 +3,7 @@
 use crate::continuous_pump::ContinuousPump;
 use crate::error::{ServeError, ServeResult};
 use crate::types::ChatMessage;
-use pmetal_cache::kv_cache::{CacheMode, KVCache, KVCacheConfig, MambaCache};
+use pmetal_cache::kv_cache::{KVCache, KVCacheConfig, MambaCache};
 use pmetal_data::chat_templates::{ChatTemplate, ChatTemplateType, detect_chat_template};
 use pmetal_data::image_processing::{
     MllamaImageProcessor, MllamaImageProcessorConfig, mllama_cross_attention_mask,
@@ -12,16 +12,17 @@ use pmetal_data::inference_config::collect_all_stop_tokens;
 use pmetal_data::qwen_vl_processing::{ProcessedMedia, QwenVlProcessor, RgbImage};
 use pmetal_models::architectures::mllama::{CrossAttentionInputs, MllamaVisionInputs};
 use pmetal_models::architectures::qwen3_5_vision::{Qwen3_5MultimodalConfig, Qwen3_5Vision};
+use pmetal_models::cache_policy::{
+    CacheModeRequest, log_cache_selection, select_cache_mode_for_model,
+};
 use pmetal_models::dispatcher::DynamicModel;
 use pmetal_models::generation::GenerationConfig;
 use pmetal_models::model_thread::{Background, ModelThread, ModelThreadStartError};
-pub use pmetal_models::speculator::SpeculatorSpec;
 use pmetal_models::speculator::Speculator;
+pub use pmetal_models::speculator::SpeculatorSpec;
 use pmetal_models::{GenerationOutput, generate_cached_ane_streaming, is_ane_inference_compatible};
 use pmetal_runtime::compat::{Array, Dtype, ModuleParameters as _};
 use pmetal_runtime::decode::DecodeSampler;
-use std::collections::HashSet;
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -182,32 +183,6 @@ enum PreferredGenerationBackend {
     Ane,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ServeCacheModeSource {
-    AutoFp16,
-    AutoQ8,
-    Explicit,
-}
-
-impl ServeCacheModeSource {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::AutoFp16 => "auto-fp16",
-            Self::AutoQ8 => "auto-q8",
-            Self::Explicit => "explicit",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ServeCacheModeSelection {
-    mode: CacheMode,
-    source: ServeCacheModeSource,
-    estimated_weight_bytes: u64,
-    estimated_fp16_kv_bytes: u64,
-    working_set_bytes: Option<u64>,
-}
-
 fn build_generation_config_from_parts(
     stop_token_ids: &[u32],
     max_seq_len: usize,
@@ -349,165 +324,6 @@ fn select_accelerated_backend(
     Ok(PreferredGenerationBackend::Ane)
 }
 
-fn select_serve_cache_mode(
-    model_path: &Path,
-    param_count: usize,
-    base_cache_config: &KVCacheConfig,
-) -> ServeCacheModeSelection {
-    let working_set_bytes = pmetal_metal::context::MetalContext::global()
-        .ok()
-        .map(|ctx| ctx.properties().recommended_working_set_size);
-    let estimated_weight_bytes = estimate_serve_weight_bytes(
-        model_path,
-        estimate_weight_bytes_from_param_count(param_count),
-    );
-
-    select_serve_cache_mode_with_working_set(
-        base_cache_config,
-        estimated_weight_bytes,
-        working_set_bytes,
-    )
-}
-
-fn select_serve_cache_mode_with_working_set(
-    base_cache_config: &KVCacheConfig,
-    estimated_weight_bytes: u64,
-    working_set_bytes: Option<u64>,
-) -> ServeCacheModeSelection {
-    let estimated_fp16_kv_bytes = estimate_fp16_kv_cache_bytes(base_cache_config);
-    let estimated_total_fp16 = estimated_weight_bytes.saturating_add(estimated_fp16_kv_bytes);
-    let prefer_q8 = working_set_bytes.is_some_and(|working_set| {
-        working_set > 0 && estimated_total_fp16 > ((working_set as f64) * 0.70) as u64
-    });
-
-    ServeCacheModeSelection {
-        mode: if prefer_q8 {
-            CacheMode::Quantized {
-                bits: 8,
-                group_size: 64,
-            }
-        } else {
-            CacheMode::Standard
-        },
-        source: if prefer_q8 {
-            ServeCacheModeSource::AutoQ8
-        } else {
-            ServeCacheModeSource::AutoFp16
-        },
-        estimated_weight_bytes,
-        estimated_fp16_kv_bytes,
-        working_set_bytes,
-    }
-}
-
-fn log_serve_cache_selection(selection: &ServeCacheModeSelection, max_seq_len: usize) {
-    let estimated_weight_gb = selection.estimated_weight_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-    let estimated_fp16_kv_gb =
-        selection.estimated_fp16_kv_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-    let working_set_gb = selection
-        .working_set_bytes
-        .map(|bytes| bytes as f64 / (1024.0 * 1024.0 * 1024.0));
-
-    tracing::info!(
-        mode = %selection.mode.describe(),
-        source = selection.source.as_str(),
-        tokens = max_seq_len,
-        estimated_weight_gb = format!("{estimated_weight_gb:.2}"),
-        estimated_fp16_kv_gb = format!("{estimated_fp16_kv_gb:.2}"),
-        working_set_gb = working_set_gb.map(|value| format!("{value:.2}")),
-        "serve KV cache"
-    );
-}
-
-fn estimate_serve_weight_bytes(model_path: &Path, param_estimate: u64) -> u64 {
-    estimate_local_model_weight_bytes(model_path)
-        .map(|bytes| bytes.max(param_estimate))
-        .unwrap_or(param_estimate)
-}
-
-fn estimate_weight_bytes_from_param_count(param_count: usize) -> u64 {
-    (param_count as f64 * 2.0) as u64
-}
-
-fn estimate_local_model_weight_bytes(model_path: &Path) -> Option<u64> {
-    let mut total = 0u64;
-    let mut visited_dirs = HashSet::new();
-    let mut counted_files = HashSet::new();
-    accumulate_model_weight_file_bytes(
-        model_path,
-        &mut visited_dirs,
-        &mut counted_files,
-        &mut total,
-    );
-    (total > 0).then_some(total)
-}
-
-fn accumulate_model_weight_file_bytes(
-    path: &Path,
-    visited_dirs: &mut HashSet<PathBuf>,
-    counted_files: &mut HashSet<PathBuf>,
-    total: &mut u64,
-) {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return;
-    };
-
-    if metadata.is_dir() {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        if !visited_dirs.insert(canonical) {
-            return;
-        }
-
-        let Ok(entries) = std::fs::read_dir(path) else {
-            return;
-        };
-
-        for entry in entries.flatten() {
-            accumulate_model_weight_file_bytes(&entry.path(), visited_dirs, counted_files, total);
-        }
-        return;
-    }
-
-    if !metadata.is_file() || !is_supported_model_weight_file(path) {
-        return;
-    }
-
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if counted_files.insert(canonical) {
-        *total = total.saturating_add(metadata.len());
-    }
-}
-
-fn is_supported_model_weight_file(path: &Path) -> bool {
-    let extension = path
-        .extension()
-        .and_then(OsStr::to_str)
-        .map(|ext| ext.to_ascii_lowercase());
-    let file_name = path
-        .file_name()
-        .and_then(OsStr::to_str)
-        .map(|name| name.to_ascii_lowercase())
-        .unwrap_or_default();
-
-    match extension.as_deref() {
-        Some("safetensors") | Some("gguf") => true,
-        Some("bin") | Some("pt") | Some("pth") => {
-            file_name.contains("model")
-                || file_name.contains("pytorch")
-                || file_name.contains("consolidated")
-        }
-        _ => false,
-    }
-}
-
-fn estimate_fp16_kv_cache_bytes(base_cache_config: &KVCacheConfig) -> u64 {
-    base_cache_config
-        .clone()
-        .with_dtype(Dtype::Float16)
-        .with_mode(CacheMode::Standard)
-        .memory_footprint() as u64
-}
-
 // ────────────────────────────────────────────────────────────────────────────
 // Inference engine
 // ────────────────────────────────────────────────────────────────────────────
@@ -558,8 +374,9 @@ pub struct InferenceEngine {
     stop_token_ids: Vec<u32>,
     /// Model creation timestamp.
     created_at: i64,
-    /// Explicit cache mode override (bypasses auto-selection when set).
-    cache_mode_override: Option<CacheMode>,
+    /// What the operator asked of the KV cache (see
+    /// [`pmetal_models::cache_policy`]); nothing leaves it to the memory budget.
+    cache_request: CacheModeRequest,
     /// Cross-request KV prefix cache. Consulted at the start of every
     /// request to skip the prefill of any prompt prefix we've already
     /// processed. Empty for hybrid/recurrent models (they can't be
@@ -915,7 +732,7 @@ const DEFAULT_PREFIX_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
 struct GpuRequestContext {
     model_path: PathBuf,
     max_seq_len: usize,
-    cache_mode_override: Option<CacheMode>,
+    cache_request: CacheModeRequest,
     tokenizer: Arc<pmetal_data::Tokenizer>,
     prefix_cache: Arc<Mutex<pmetal_cache::prefix_cache::PrefixCache>>,
 }
@@ -939,25 +756,16 @@ impl InferenceEngine {
         model: &DynamicModel,
         model_path: &Path,
         max_seq_len: usize,
-        cache_mode_override: Option<CacheMode>,
+        request: CacheModeRequest,
     ) -> (KVCache, Option<MambaCache>) {
         let base_cache = model.create_cache(max_seq_len);
-        let selection = if let Some(mode) = cache_mode_override {
-            let estimated_weight_bytes = estimate_serve_weight_bytes(
-                model_path,
-                estimate_weight_bytes_from_param_count(model.num_parameters()),
-            );
-            ServeCacheModeSelection {
-                mode,
-                source: ServeCacheModeSource::Explicit,
-                estimated_weight_bytes,
-                estimated_fp16_kv_bytes: estimate_fp16_kv_cache_bytes(base_cache.config()),
-                working_set_bytes: None,
-            }
-        } else {
-            select_serve_cache_mode(model_path, model.num_parameters(), base_cache.config())
-        };
-        log_serve_cache_selection(&selection, max_seq_len);
+        let selection = select_cache_mode_for_model(
+            base_cache.config(),
+            model_path,
+            model.num_parameters(),
+            request,
+        );
+        log_cache_selection(&selection, max_seq_len);
         let cache = model.create_cache_with_mode(max_seq_len, selection.mode);
         let mamba_cache = model.create_mamba_cache();
         (cache, mamba_cache)
@@ -1071,7 +879,7 @@ impl InferenceEngine {
             backend: preferred_backend,
             stop_token_ids,
             created_at: chrono::Utc::now().timestamp(),
-            cache_mode_override: None,
+            cache_request: CacheModeRequest::default(),
             prefix_cache: Arc::new(Mutex::new(pmetal_cache::prefix_cache::PrefixCache::new(
                 DEFAULT_PREFIX_CACHE_ENTRIES,
                 DEFAULT_PREFIX_CACHE_BYTES,
@@ -1088,10 +896,12 @@ impl InferenceEngine {
         self
     }
 
-    /// Use `mode` for every request's KV cache instead of choosing one from
-    /// the model's size and the device's memory.
-    pub fn with_cache_mode_override(mut self, mode: CacheMode) -> Self {
-        self.cache_mode_override = Some(mode);
+    /// Choose every request's KV cache as `request` asks, by the one policy
+    /// `pmetal infer` uses (see [`pmetal_models::cache_policy`]): an explicit
+    /// mode is honoured, anything else is fp16 unless the weights and the
+    /// cache would crowd the device, then 8-bit.
+    pub fn with_cache_request(mut self, request: CacheModeRequest) -> Self {
+        self.cache_request = request;
         self
     }
 
@@ -1168,15 +978,17 @@ impl InferenceEngine {
         let max_seq_len = self.max_seq_len;
         let info = self
             .model
-            .call(move |state| -> Result<SpeculationInfo, pmetal_runtime::compat::Exception> {
-                let speculator = load(&state.model, max_seq_len)?;
-                let info = SpeculationInfo {
-                    kind: speculator.kind(),
-                    draft_tokens: speculator.draft_tokens(),
-                };
-                state.speculator = Some(speculator);
-                Ok(info)
-            })
+            .call(
+                move |state| -> Result<SpeculationInfo, pmetal_runtime::compat::Exception> {
+                    let speculator = load(&state.model, max_seq_len)?;
+                    let info = SpeculationInfo {
+                        kind: speculator.kind(),
+                        draft_tokens: speculator.draft_tokens(),
+                    };
+                    state.speculator = Some(speculator);
+                    Ok(info)
+                },
+            )
             .map_err(|_| ServeError::ModelNotLoaded)?
             .map_err(ServeError::Model)?;
         *current = Some(info.clone());
@@ -1364,14 +1176,14 @@ impl InferenceEngine {
     fn create_continuous_cache_config(&self) -> ServeResult<KVCacheConfig> {
         let model_path = self.model_path.clone();
         let max_seq_len = self.max_seq_len;
-        let cache_mode_override = self.cache_mode_override;
+        let cache_request = self.cache_request;
         self.model
             .call(move |state| {
                 let (cache, _) = Self::create_request_caches(
                     &state.model,
                     &model_path,
                     max_seq_len,
-                    cache_mode_override,
+                    cache_request,
                 );
                 cache.config().clone()
             })
@@ -2165,9 +1977,10 @@ impl InferenceEngine {
                 let logits = slice_axis(&logits, 1, 0, scorable as i32);
                 // One more than asked, so the chosen token can be left out
                 // of its own alternatives as chat logprobs do.
-                for (target, (logprob, mut top)) in targets
-                    .iter()
-                    .zip(row_logprobs(&logits, targets, top_n + 1)?)
+                for (target, (logprob, mut top)) in
+                    targets
+                        .iter()
+                        .zip(row_logprobs(&logits, targets, top_n + 1)?)
                 {
                     top.retain(|(token, _)| token != target);
                     top.truncate(top_n);
@@ -2262,8 +2075,8 @@ impl InferenceEngine {
                     .into(),
             ));
         }
-        let prefix_cache = prefix_cache
-            .filter(|_| media.is_none() && prompt_logprobs_top_n.is_none());
+        let prefix_cache =
+            prefix_cache.filter(|_| media.is_none() && prompt_logprobs_top_n.is_none());
         let prefix_hit_len: usize =
             if let (Some(pc), true) = (prefix_cache.as_ref(), mamba_cache.is_none()) {
                 let mut guard = match pc.lock() {
@@ -2457,7 +2270,7 @@ impl InferenceEngine {
         GpuRequestContext {
             model_path: self.model_path.clone(),
             max_seq_len: self.max_seq_len,
-            cache_mode_override: self.cache_mode_override,
+            cache_request: self.cache_request,
             tokenizer: Arc::clone(&self.tokenizer),
             prefix_cache: Arc::clone(&self.prefix_cache),
         }
@@ -2500,12 +2313,8 @@ impl InferenceEngine {
             return Self::generate_speculatively(state, ctx, request, start, on_token);
         }
         let model = &mut state.model;
-        let (mut cache, mut mamba_cache) = Self::create_request_caches(
-            model,
-            &ctx.model_path,
-            ctx.max_seq_len,
-            ctx.cache_mode_override,
-        );
+        let (mut cache, mut mamba_cache) =
+            Self::create_request_caches(model, &ctx.model_path, ctx.max_seq_len, ctx.cache_request);
         let max_tokens = request.gen_config.max_new_tokens;
         let stop_tokens = request.gen_config.stop_tokens.clone();
         let prefill_step_size = request.gen_config.prefill_step_size;
@@ -2971,10 +2780,6 @@ mod tests {
         })
     }
 
-    fn qwen3_cache_config(max_seq_len: usize) -> KVCacheConfig {
-        KVCacheConfig::new(28, max_seq_len, 8, 128)
-    }
-
     fn tiny_nemotron_h_config() -> NemotronHConfig {
         serde_json::from_value(serde_json::json!({
             "vocab_size": 1000,
@@ -3213,36 +3018,6 @@ mod tests {
     }
 
     #[test]
-    fn serve_auto_cache_prefers_fp16_when_model_fits_comfortably() {
-        let selection = select_serve_cache_mode_with_working_set(
-            &qwen3_cache_config(256),
-            1_240_000_000,
-            Some(48 * 1024 * 1024 * 1024),
-        );
-
-        assert_eq!(selection.mode, CacheMode::Standard);
-        assert_eq!(selection.source, ServeCacheModeSource::AutoFp16);
-    }
-
-    #[test]
-    fn serve_auto_cache_prefers_q8_when_budget_is_tight() {
-        let selection = select_serve_cache_mode_with_working_set(
-            &qwen3_cache_config(8192),
-            14_000_000_000,
-            Some(18 * 1024 * 1024 * 1024),
-        );
-
-        assert_eq!(
-            selection.mode,
-            CacheMode::Quantized {
-                bits: 8,
-                group_size: 64,
-            }
-        );
-        assert_eq!(selection.source, ServeCacheModeSource::AutoQ8);
-    }
-
-    #[test]
     fn create_request_caches_allocates_mamba_cache_for_hybrid_models() {
         let model =
             DynamicModel::NemotronH(NemotronHForCausalLM::new(tiny_nemotron_h_config()).unwrap());
@@ -3250,7 +3025,7 @@ mod tests {
             &model,
             std::env::temp_dir().as_path(),
             64,
-            None,
+            CacheModeRequest::default(),
         );
 
         assert_eq!(cache.config().max_seq_len, 64);
@@ -3258,8 +3033,8 @@ mod tests {
     }
 
     #[test]
-    fn continuous_cache_config_honors_cache_mode_override() {
-        let override_mode = CacheMode::TurboQuant {
+    fn continuous_cache_config_honors_the_cache_request() {
+        let override_mode = pmetal_cache::kv_cache::CacheMode::TurboQuant {
             config: pmetal_cache::kv_cache::TurboQuantConfig::uniform(4, 4),
         };
         let engine = InferenceEngine::new_with_backend(
@@ -3276,7 +3051,11 @@ mod tests {
             1024,
         )
         .unwrap()
-        .with_cache_mode_override(override_mode);
+        .with_cache_request(CacheModeRequest {
+            kv_quant: Some(4),
+            kv_turboquant: true,
+            ..CacheModeRequest::default()
+        });
 
         let cfg = engine.create_continuous_cache_config().unwrap();
         assert_eq!(cfg.mode, override_mode);

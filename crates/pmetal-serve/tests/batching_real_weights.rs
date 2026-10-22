@@ -31,8 +31,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pmetal_cache::kv_cache::{CacheMode, TurboQuantConfig};
 use pmetal_models::DynamicModel;
+use pmetal_models::cache_policy::CacheModeRequest;
 use pmetal_serve::InferenceEngine;
 use pmetal_serve::continuous_batch::BatcherConfig;
 use pmetal_serve::engine::{SamplingParams, TokenEvent};
@@ -52,12 +52,12 @@ fn engine(dir: &PathBuf, max_slots: usize, per_slot: Option<bool>) -> Arc<Infere
     engine_with_cache(dir, max_slots, per_slot, None)
 }
 
-/// [`engine`] with every request's KV cache in `mode`.
+/// [`engine`] with every request's KV cache chosen as `cache` asks.
 fn engine_with_cache(
     dir: &PathBuf,
     max_slots: usize,
     per_slot: Option<bool>,
-    mode: Option<CacheMode>,
+    cache: Option<CacheModeRequest>,
 ) -> Arc<InferenceEngine> {
     let load_dir = dir.clone();
     let engine = InferenceEngine::new_with_backend(
@@ -70,8 +70,8 @@ fn engine_with_cache(
         4096,
     )
     .unwrap();
-    let engine = match mode {
-        Some(mode) => engine.with_cache_mode_override(mode),
+    let engine = match cache {
+        Some(request) => engine.with_cache_request(request),
         None => engine,
     };
     // No request shares a prefix with another, so the prefix cache plays no
@@ -316,21 +316,23 @@ async fn compressed_caches_decode_per_slot_exactly() {
     let modes = [
         (
             "8-bit",
-            CacheMode::Quantized {
-                bits: 8,
-                group_size: 64,
+            CacheModeRequest {
+                kv_quant: Some(8),
+                ..CacheModeRequest::default()
             },
         ),
         (
             "turboquant 4/4",
-            CacheMode::TurboQuant {
-                config: TurboQuantConfig::uniform(4, 4),
+            CacheModeRequest {
+                kv_quant: Some(4),
+                kv_turboquant: true,
+                ..CacheModeRequest::default()
             },
         ),
     ];
-    for (label, mode) in modes {
+    for (label, request) in modes {
         // Fused decode is asked for, and refused for these caches.
-        let engine = engine_with_cache(&dir, 3, Some(false), Some(mode));
+        let engine = engine_with_cache(&dir, 3, Some(false), Some(request));
         let mut requests = greedy_requests(&dir);
         requests.extend(sampled_requests(&dir).into_iter().take(3));
         let want = alone(&engine, &requests).await;
