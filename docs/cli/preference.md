@@ -89,7 +89,7 @@ pmetal dpo --model Qwen/Qwen3-0.6B --dataset pairs.jsonl --label-smoothing 0.1
 pmetal preference --model Qwen/Qwen3-0.6B --dataset feedback.jsonl --loss kto --batch-size 4
 
 # Use the trained adapter
-pmetal infer --model Qwen/Qwen3-0.6B --lora ./output/preference/adapter_model.safetensors
+pmetal infer --model Qwen/Qwen3-0.6B --lora ./output/preference --chat --prompt "What is 2 + 2?"
 ```
 
 ## Choosing settings

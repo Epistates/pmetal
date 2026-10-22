@@ -4,6 +4,8 @@ Generate text from a model: one prompt in, one completion out, with the model's 
 
 `--prompt` is required. For an interactive conversation use the Inference tab of [`pmetal tui`](/cli/tui/); to serve a model to other programs use [`pmetal serve`](/cli/serve/).
 
+Ctrl-C stops the generation after the token in flight; the text so far is kept (with `--json`, `stopped_by` is `interrupted`) and the command exits with status 130.
+
 ## Usage
 
 ```bash
@@ -41,7 +43,7 @@ pmetal infer \
 | `--no-preserve-thinking` | `false` | Keep only the current turn's thinking in the prompt, for chat templates with a `preserve_thinking` control |
 | `--chat-template-kwargs` | none | Extra chat template keyword arguments as a JSON object; `--no-thinking`, `--reasoning-effort` and `--no-preserve-thinking` win over the same keys |
 | `--tools` | none | JSON file of tool definitions (OpenAI format) |
-| `--json` | `false` | Print one JSON object on stdout (text, token counts, timing, why generation stopped) instead of streaming the text; the banner and statistics go to stderr |
+| `--json` | `false` | Print one JSON object on stdout instead of streaming the text: `model`, `text`, `prompt_tokens`, `generated_tokens`, `stopped_by` (`eos`, `length` or `interrupted`), `seconds`, `time_to_first_token_seconds`, `decode_tokens_per_second` and `speculative_acceptance`. The banner and statistics go to stderr |
 | `--fp8` | `false` | FP8 weights (about 2x memory reduction) |
 | `--experts-dir` | none | Packed expert directory for SSD-offloaded MoE inference (see [`pmetal pack-experts`](/cli/pack-experts/)) |
 | `--backend` | `auto` | Generation path: `auto` (the GPU, or the ANE with `--ane`), `standard` (the GPU, whatever `--ane` says) or `ane` (Apple Neural Engine) |
