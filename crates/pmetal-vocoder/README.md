@@ -24,7 +24,43 @@ Every released configuration is a preset (`BigVGANConfig::v2_24khz_100band`,
 `v2_44khz_128band_512x`, `base_24khz_100band`, ...), and a release's
 `config.json` deserialises as is.
 
+It computes on `pmetal-runtime` arrays and resolves Hugging Face ids through
+`pmetal-hub`; the `pmetal` CLI exposes it as `pmetal vocode`.
+
+## Installation
+
+```toml
+[dependencies]
+pmetal-vocoder = "0.7"
+```
+
 ## Usage
+
+A generator with random weights and a small configuration runs without any download. The
+output is `frames * hop_size` samples long:
+
+```rust
+use pmetal_runtime::compat::{Dtype, ops};
+use pmetal_vocoder::{BigVGAN, BigVGANConfig};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = BigVGANConfig::from_json(
+        r#"{"resblock": "1", "num_mels": 8, "hop_size": 8, "n_fft": 32, "win_size": 32,
+            "sampling_rate": 16000, "upsample_rates": [4, 2], "upsample_kernel_sizes": [8, 4],
+            "upsample_initial_channel": 16, "resblock_kernel_sizes": [3, 5],
+            "resblock_dilation_sizes": [[1, 3, 5], [1, 2, 3]], "use_tanh_at_final": false,
+            "use_bias_at_final": false, "activation": "snakebeta", "snake_logscale": true,
+            "fmin": 0, "fmax": null}"#,
+    )?;
+    let vocoder = BigVGAN::new(config)?;
+
+    // mel: [batch, mel_bins, frames] -> audio: [batch, 1, samples]
+    let mel = ops::zeros(&[1, 8, 5], Dtype::Float32);
+    let audio = vocoder.forward(&mel)?;
+    assert_eq!(audio.shape(), [1, 1, 5 * 8]);
+    Ok(())
+}
+```
 
 Synthesis from a released model (a Hugging Face id, or a local directory with
 `config.json` and `bigvgan_generator.pt` or `model.safetensors`):
@@ -152,6 +188,15 @@ your machine.
 - Spectral norm in the discriminators (`use_spectral_norm`); no released model
   uses it, and loading says so.
 - The CUDA-only options of the reference.
+
+## Feature flags
+
+None.
+
+## Requirements
+
+- Rust 1.95 or later
+- macOS 14 or later on Apple Silicon
 
 ## License
 
