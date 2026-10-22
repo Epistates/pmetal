@@ -234,6 +234,113 @@ pub trait DFlashTarget {
     }
 }
 
+/// A target the decoder borrows: a caller that keeps its model (a server's)
+/// decodes with `DFlashDecoder::new(&mut model, draft)`. Every hook is
+/// forwarded, the defaulted ones included, so a target's overrides hold.
+impl<T: DFlashTarget + ?Sized> DFlashTarget for &mut T {
+    fn embed_tokens(&mut self, input_ids: &Array) -> Result<Array, Exception> {
+        (**self).embed_tokens(input_ids)
+    }
+
+    fn forward_with_capture(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        kv_cache: Option<&mut KVCache>,
+        mamba_cache: Option<&mut MambaCache>,
+        capture: &mut SpecCapture,
+    ) -> Result<Array, Exception> {
+        (**self).forward_with_capture(input_ids, mask, kv_cache, mamba_cache, capture)
+    }
+
+    fn prefill_with_capture(
+        &mut self,
+        input_ids: &Array,
+        kv_cache: Option<&mut KVCache>,
+        mamba_cache: Option<&mut MambaCache>,
+        capture: &mut SpecCapture,
+    ) -> Result<Array, Exception> {
+        (**self).prefill_with_capture(input_ids, kv_cache, mamba_cache, capture)
+    }
+
+    fn verify_with_capture(
+        &mut self,
+        input_ids: &Array,
+        kv_cache: Option<&mut KVCache>,
+        mamba_cache: Option<&mut MambaCache>,
+        capture: &mut SpecCapture,
+    ) -> Result<Array, Exception> {
+        (**self).verify_with_capture(input_ids, kv_cache, mamba_cache, capture)
+    }
+
+    fn lm_head_project(&mut self, hidden: &Array) -> Result<Array, Exception> {
+        (**self).lm_head_project(hidden)
+    }
+
+    fn target_hidden_size(&self) -> i32 {
+        (**self).target_hidden_size()
+    }
+
+    fn target_num_layers(&self) -> usize {
+        (**self).target_num_layers()
+    }
+
+    fn target_num_kv_heads(&self) -> i32 {
+        (**self).target_num_kv_heads()
+    }
+
+    fn target_head_dim(&self) -> i32 {
+        (**self).target_head_dim()
+    }
+
+    fn target_needs_mamba_cache(&self) -> bool {
+        (**self).target_needs_mamba_cache()
+    }
+
+    fn reset_state(&mut self) {
+        (**self).reset_state();
+    }
+
+    fn make_kv_cache(&self, max_seq_len: usize) -> KVCache {
+        (**self).make_kv_cache(max_seq_len)
+    }
+
+    fn make_mamba_cache(&self) -> Option<MambaCache> {
+        (**self).make_mamba_cache()
+    }
+
+    fn rollback_rejected(&mut self, kv_cache: &mut KVCache, n: usize) -> Result<(), Exception> {
+        (**self).rollback_rejected(kv_cache, n)
+    }
+
+    fn supports_tree_verify(&self) -> bool {
+        (**self).supports_tree_verify()
+    }
+
+    fn tree_mask_dtype(&self) -> i32 {
+        (**self).tree_mask_dtype()
+    }
+
+    fn forward_tree_verify(
+        &mut self,
+        input_ids: &Array,
+        position_ids: &Array,
+        attention_mask: &Array,
+        capture: &mut SpecCapture,
+    ) -> Result<Array, Exception> {
+        (**self).forward_tree_verify(input_ids, position_ids, attention_mask, capture)
+    }
+
+    fn compact_tree_cache(
+        &mut self,
+        past_length: usize,
+        tree_length: usize,
+        accepted_indices: &[usize],
+    ) {
+        (**self).compact_tree_cache(past_length, tree_length, accepted_indices);
+    }
+}
+
 // ----------------------------------------------------------------------------
 // Configuration / outputs
 // ----------------------------------------------------------------------------
@@ -316,6 +423,8 @@ pub struct DFlashOutput {
     /// Token ids, including the prompt. A stop token ends the generation and
     /// is not part of the output.
     pub tokens: Vec<u32>,
+    /// Whether a stop token ended the generation.
+    pub stopped_by_token: bool,
     /// Metrics collected during the run.
     pub metrics: DFlashMetrics,
 }
@@ -343,10 +452,14 @@ struct Run {
     total_max: usize,
     /// A stop token was drawn, or the length is reached.
     finished: bool,
+    /// A stop token was drawn.
+    stopped_by_token: bool,
     /// Where the last step's tokens start, to count only those kept.
     last_step_from: usize,
     /// [`DFlashConfig::cancel`].
     cancel: Option<Arc<AtomicBool>>,
+    /// How many of `tokens` have gone to the caller's `on_token`.
+    delivered: usize,
 }
 
 impl Run {
@@ -355,7 +468,12 @@ impl Run {
     fn emit(&mut self, drawn: &[u32], config: &GenerationConfig) {
         self.last_step_from = self.tokens.len();
         for &token in drawn {
-            if config.is_stop_token(token) || self.tokens.len() >= self.total_max {
+            if config.is_stop_token(token) {
+                self.stopped_by_token = true;
+                self.finished = true;
+                return;
+            }
+            if self.tokens.len() >= self.total_max {
                 self.finished = true;
                 return;
             }
@@ -368,6 +486,19 @@ impl Run {
                 .is_some_and(|flag| flag.load(Ordering::SeqCst));
     }
 
+    /// Hand the tokens decided since the last call to `on_token`, in order. A
+    /// `false` from it ends the generation.
+    fn deliver(&mut self, on_token: &mut dyn FnMut(u32) -> bool) {
+        while self.delivered < self.tokens.len() {
+            let token = self.tokens[self.delivered];
+            self.delivered += 1;
+            if !on_token(token) {
+                self.finished = true;
+                return;
+            }
+        }
+    }
+
     fn finish(mut self) -> DFlashOutput {
         // A stop token or the length limit can cut the last step short;
         // count the tokens it kept, as the reference does.
@@ -377,6 +508,7 @@ impl Run {
         self.metrics.num_generated = self.tokens.len() - self.prompt_len;
         DFlashOutput {
             tokens: self.tokens,
+            stopped_by_token: self.stopped_by_token,
             metrics: self.metrics,
         }
     }
@@ -421,6 +553,12 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
         &self.draft
     }
 
+    /// Take the draft model back, for a caller that lends it to a decoder
+    /// for one request and keeps it between requests.
+    pub fn into_draft(self) -> DFlashDraft {
+        self.draft
+    }
+
     /// The draft block size a run uses: the override, within what the draft
     /// was trained for.
     fn block_size(&self, config: &DFlashConfig) -> usize {
@@ -440,6 +578,7 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
         prompt: &[u32],
         config: &DFlashConfig,
         headroom: usize,
+        mut sampler: DecodeSampler,
     ) -> Result<Run, Exception> {
         if prompt.is_empty() {
             return Err(Exception::custom("DFlash: the prompt has no tokens"));
@@ -482,7 +621,6 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
             mamba_cache.as_mut(),
             &mut capture,
         )?;
-        let mut sampler = config.generation.sampler(prompt);
         let first = read_token(&sampler.sample(&last_row(&last_logits)))?;
         let target_hidden = capture.stack_hidden()?;
 
@@ -498,8 +636,10 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
             prompt_len: prompt.len(),
             total_max,
             finished: config.generation.max_new_tokens == 0,
+            stopped_by_token: false,
             last_step_from: prompt.len(),
             cancel: config.cancel.clone(),
+            delivered: prompt.len(),
         };
         if !run.finished {
             run.emit(&[first], &config.generation);
@@ -513,12 +653,34 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
         prompt: &[u32],
         config: &DFlashConfig,
     ) -> Result<DFlashOutput, Exception> {
+        self.generate_with(
+            prompt,
+            config,
+            config.generation.sampler(prompt),
+            &mut |_| true,
+        )
+    }
+
+    /// [`generate`](Self::generate) drawing through `sampler`, which must
+    /// continue `prompt` (see [`GenerationConfig::sampler`]): a caller that
+    /// wants more of the draw than the config says, such as a grammar the
+    /// output must follow (`DecodeSampler::with_processor`), builds it
+    /// itself. `on_token` sees each token as it is decided, a round's tokens
+    /// together; returning `false` ends the generation.
+    pub fn generate_with(
+        &mut self,
+        prompt: &[u32],
+        config: &DFlashConfig,
+        sampler: DecodeSampler,
+        on_token: &mut dyn FnMut(u32) -> bool,
+    ) -> Result<DFlashOutput, Exception> {
         let block_size = self.block_size(config);
         if block_size < 2 {
             // A block of one has nothing to guess.
-            return self.generate_plain(prompt, config);
+            return self.plain_with(prompt, config, sampler, on_token);
         }
-        let mut run = self.begin(prompt, config, block_size)?;
+        let mut run = self.begin(prompt, config, block_size, sampler)?;
+        run.deliver(on_token);
 
         while !run.finished {
             // Draft: start with the latest accepted token, fill the rest
@@ -610,6 +772,7 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
             let emitted = &drawn[..accepted_inputs];
             run.sampler.commit(emitted);
             run.emit(emitted, &config.generation);
+            run.deliver(on_token);
 
             // The next draft step conditions on the tapped hidden states of
             // the accepted positions.
@@ -627,7 +790,23 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
         prompt: &[u32],
         config: &DFlashConfig,
     ) -> Result<DFlashOutput, Exception> {
-        let mut run = self.begin(prompt, config, 1)?;
+        self.plain_with(
+            prompt,
+            config,
+            config.generation.sampler(prompt),
+            &mut |_| true,
+        )
+    }
+
+    fn plain_with(
+        &mut self,
+        prompt: &[u32],
+        config: &DFlashConfig,
+        sampler: DecodeSampler,
+        on_token: &mut dyn FnMut(u32) -> bool,
+    ) -> Result<DFlashOutput, Exception> {
+        let mut run = self.begin(prompt, config, 1, sampler)?;
+        run.deliver(on_token);
         let mut metrics = DFlashMetrics::default();
         while !run.finished {
             run.capture.clear();
@@ -641,6 +820,7 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
             )?;
             let token = read_token(&run.sampler.sample(&last_row(&logits)))?;
             run.emit(&[token], &config.generation);
+            run.deliver(on_token);
             metrics.acceptance_lengths.push(1);
         }
         let mut output = run.finish();
@@ -757,7 +937,7 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
         // Every round writes `max_tree_nodes` tokens and keeps at most
         // `max_tree_nodes - 1` (tree_budget) after compaction, so the cache
         // needs room for `prompt + max_new_tokens + max_tree_nodes` at peak.
-        let mut run = self.begin(prompt, config, max_tree_nodes)?;
+        let mut run = self.begin(prompt, config, max_tree_nodes, config.generation.sampler(prompt))?;
         let mut past_length = prompt.len(); // cache length after prefill
 
         // ── Adaptive tree budget state ────────────────────────────────
@@ -1485,6 +1665,72 @@ mod tests {
         };
         let out = decoder.generate(&[1, 2], &one).unwrap();
         assert_eq!(out.metrics.num_generated, 6);
+    }
+
+    /// `generate_with` hands each token to the callback as it is decided, in
+    /// order and once, and a `false` from it ends the generation; a stop token
+    /// is reported as the reason, not shown.
+    #[test]
+    #[serial]
+    fn tokens_stream_to_the_callback_as_they_are_decided() {
+        let prompt = [1u32, 2, 3];
+        let mut decoder = DFlashDecoder::new(tiny_target(), tiny_draft(4));
+        let config = config(GenerationConfig::greedy(20));
+        let whole = decoder.generate(&prompt, &config).unwrap();
+
+        let mut seen = Vec::new();
+        let streamed = decoder
+            .generate_with(
+                &prompt,
+                &config,
+                config.generation.sampler(&prompt),
+                &mut |t| {
+                    seen.push(t);
+                    true
+                },
+            )
+            .unwrap();
+        assert_eq!(seen, whole.tokens[prompt.len()..]);
+        assert_eq!(streamed.tokens, whole.tokens);
+        assert!(!streamed.stopped_by_token);
+
+        // Ended by the callback after 7 tokens.
+        let mut seen = Vec::new();
+        let cut = decoder
+            .generate_with(
+                &prompt,
+                &config,
+                config.generation.sampler(&prompt),
+                &mut |t| {
+                    seen.push(t);
+                    seen.len() < 7
+                },
+            )
+            .unwrap();
+        assert_eq!(seen, whole.tokens[prompt.len()..prompt.len() + 7]);
+        assert!(cut.tokens.len() >= prompt.len() + 7);
+
+        // A stop token: not delivered, and the reason says so.
+        let stop = whole.tokens[prompt.len() + 4];
+        let at = whole.tokens[prompt.len()..]
+            .iter()
+            .position(|&t| t == stop)
+            .unwrap();
+        let stopping = DFlashConfig::new(GenerationConfig::greedy(20).with_stop_tokens(vec![stop]));
+        let mut seen = Vec::new();
+        let out = decoder
+            .generate_with(
+                &prompt,
+                &stopping,
+                stopping.generation.sampler(&prompt),
+                &mut |t| {
+                    seen.push(t);
+                    true
+                },
+            )
+            .unwrap();
+        assert_eq!(seen, whole.tokens[prompt.len()..prompt.len() + at]);
+        assert!(out.stopped_by_token);
     }
 
     /// A cancellation ends the run after the step in flight, with the tokens
