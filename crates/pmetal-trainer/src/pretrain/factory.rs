@@ -170,7 +170,7 @@ pub fn create_model(arch: &str, config_path: Option<&Path>) -> Result<PretrainMo
                 architectures::Gemma4ForCausalLM::new(config)?,
             )))
         }
-        "mistral" | "mixtral" => {
+        "mistral" => {
             let config: architectures::MistralConfig = match &json {
                 Some(v) => serde_json::from_value(v.clone())
                     .map_err(|e| Exception::custom(format!("mistral config: {e}")))?,

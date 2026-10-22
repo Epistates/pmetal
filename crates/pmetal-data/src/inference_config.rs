@@ -339,14 +339,8 @@ impl ModelFamily {
         let config = read_json(&model_path.join("config.json"));
         let model_type = config
             .as_ref()
-            .and_then(|c| {
-                c.get("text_config")
-                    .and_then(|t| t.get("model_type"))
-                    .or_else(|| c.get("model_type"))
-            })
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
+            .and_then(pmetal_core::model_type::effective_model_type)
+            .unwrap_or_default();
         let name_or_path = config
             .as_ref()
             .and_then(|c| c.get("_name_or_path"))
@@ -360,7 +354,8 @@ impl ModelFamily {
     /// (both lower case).
     pub fn from_model_type_and_name(model_type: &str, name: &str) -> Option<Self> {
         let has = |needle: &str| name.contains(needle);
-        let model_type = model_type.strip_suffix("_mtp").unwrap_or(model_type);
+        let model_type = pmetal_core::model_type::canonical_model_type(model_type);
+        let model_type = model_type.as_str();
         if model_type.starts_with("qwen3_5")
             || model_type.starts_with("qwen3_6")
             || model_type.starts_with("qwen4_exp")
