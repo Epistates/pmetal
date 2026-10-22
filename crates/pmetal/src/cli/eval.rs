@@ -13,8 +13,8 @@ pub struct EvalArgs {
     /// Perplexity: the dataset (JSONL file) to score. With --task: a local
     /// file of the task's data in place of the standard dataset, and the
     /// questions of --task custom.
-    #[arg(short, long = "dataset", default_value = "")]
-    pub dataset: String,
+    #[arg(short, long = "dataset")]
+    pub dataset: Option<String>,
 
     /// Score a benchmark instead of perplexity: gsm8k (chain-of-thought math,
     /// exact match), mmlu, arc_challenge and hellaswag (multiple choice by
@@ -76,7 +76,7 @@ impl From<EvalArgs> for EvalSpec {
     fn from(a: EvalArgs) -> Self {
         EvalSpec {
             model: a.model,
-            dataset: a.dataset,
+            dataset: a.dataset.unwrap_or_default(),
             task: a.task,
             fewshot: a.fewshot,
             lora: a.lora,
