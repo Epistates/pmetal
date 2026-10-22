@@ -808,9 +808,7 @@ mod tests {
         data.insert("model.layers.3.mlp.down_proj".to_string(), vec![10.0; 100]); // 1000
         IMatrix {
             data,
-            ncalls: HashMap::new(),
-            dataset_name: None,
-            last_chunk: None,
+            ..IMatrix::default()
         }
     }
 
