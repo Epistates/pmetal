@@ -230,7 +230,6 @@ pub(crate) async fn run_distillation(spec: DistillSpec, ctx: RunContext) -> anyh
     use pmetal_distill::{DistillConfig, Distiller, LogitCache, LossConfig};
     use pmetal_lora::DynamicLoraModel;
     use pmetal_trainer::{DistillationTrainer, TrainingLoopConfig, generate_teacher_logit_cache};
-    use std::path::PathBuf;
 
     // The data loader takes `seed` too; this one covers MLX's own key, which
     // initialises the student's LoRA weights.
