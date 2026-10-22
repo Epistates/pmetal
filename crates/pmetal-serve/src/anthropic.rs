@@ -657,6 +657,7 @@ pub async fn messages(
                 ChoiceEvent::Piece(piece) => {
                     blocks.events(piece).iter().map(encode_event).collect()
                 }
+                ChoiceEvent::PromptLogprobs(_) => Vec::new(),
                 ChoiceEvent::Done(done) => {
                     let mut events = blocks.closing();
                     events.push(MessageEvent::MessageDelta {

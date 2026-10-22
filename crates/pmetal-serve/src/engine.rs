@@ -15,6 +15,8 @@ use pmetal_models::architectures::qwen3_5_vision::{Qwen3_5MultimodalConfig, Qwen
 use pmetal_models::dispatcher::DynamicModel;
 use pmetal_models::generation::GenerationConfig;
 use pmetal_models::model_thread::{Background, ModelThread, ModelThreadStartError};
+pub use pmetal_models::speculator::SpeculatorSpec;
+use pmetal_models::speculator::Speculator;
 use pmetal_models::{GenerationOutput, generate_cached_ane_streaming, is_ane_inference_compatible};
 use pmetal_runtime::compat::{Array, Dtype, ModuleParameters as _};
 use pmetal_runtime::decode::DecodeSampler;
@@ -50,6 +52,13 @@ pub struct SamplingParams {
     /// includes the top-`n` alternative logprobs. `None` (default) skips
     /// logprob computation entirely to keep the hot path unchanged.
     pub logprobs_top_n: Option<usize>,
+    /// When `Some(n)`, also score the prompt: the log-probability of each
+    /// prompt token after the first, given the tokens before it, with the top
+    /// `n` alternatives (OpenAI's `echo` with `logprobs`). It arrives as one
+    /// [`TokenEvent::PromptLogprobs`] ahead of the first token. The prompt is
+    /// prefilled in full, bypassing the prefix cache, and a request that asks
+    /// for this may set `max_tokens` to 0 to only score.
+    pub prompt_logprobs_top_n: Option<usize>,
     /// A grammar the output must conform to (see [`crate::structured`]),
     /// enforced by masking the logits at every step through the request's own
     /// sampler, in a batch as well as alone.
@@ -125,6 +134,10 @@ pub enum TokenEvent {
         id: u32,
         logprob: Option<TokenLogprobEntry>,
     },
+    /// The prompt's own log-probabilities, once, before any token: one entry
+    /// per prompt token after the first (`token` is that prompt token), for a
+    /// request that set `SamplingParams::prompt_logprobs_top_n`.
+    PromptLogprobs(Vec<TokenLogprobEntry>),
     /// Generation is complete — carries finish reason and final metrics.
     Done {
         finish_reason: String,
@@ -151,6 +164,8 @@ enum StepOutcome {
 
 /// Aggregated result of a single async decode run.
 struct DecodeRun {
+    /// What speculative decoding did, when the request ran on it.
+    speculative: Option<SpeculativeUsage>,
     /// Prompt tokens restored from the prefix cache.
     cached_prompt_tokens: usize,
     /// Finish reason: `"length"`, `"stop"`, or `"cancelled"`.
@@ -556,6 +571,8 @@ pub struct InferenceEngine {
     /// default). The model thread drives it; this handle is for
     /// [`continuous_batching_depth`](Self::continuous_batching_depth).
     continuous: Mutex<Option<Arc<Mutex<ContinuousPump>>>>,
+    /// How the engine drafts, when it does.
+    speculation: Mutex<Option<SpeculationInfo>>,
 }
 
 /// What lives on the model thread.
@@ -567,6 +584,18 @@ struct EngineState {
     /// A Qwen 3.5-family vision tower, loaded by the first request with
     /// media and kept.
     qwen_vision: Option<Qwen3_5Vision>,
+    /// The drafter that speeds single-request decoding up, once enabled (see
+    /// [`InferenceEngine::enable_speculation`]).
+    speculator: Option<Speculator>,
+}
+
+/// How the engine drafts, once speculative decoding is enabled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeculationInfo {
+    /// What drafts: `qwen-mtp`, `gemma4-assistant` or `dflash`.
+    pub kind: &'static str,
+    /// Tokens a round drafts.
+    pub draft_tokens: usize,
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -897,6 +926,8 @@ struct GpuRequest {
     gen_config: GenerationConfig,
     stop_sequences: Vec<String>,
     logprobs_top_n: Option<usize>,
+    /// Score the prompt, with this many alternatives per token.
+    prompt_logprobs_top_n: Option<usize>,
     /// The grammar the output must conform to.
     constraint: Option<crate::structured::Constraint>,
     /// The images and videos the prompt's media tokens stand for.
@@ -998,6 +1029,7 @@ impl InferenceEngine {
                     model,
                     continuous: None,
                     qwen_vision: None,
+                    speculator: None,
                 })
             },
             continuous_step,
@@ -1045,6 +1077,7 @@ impl InferenceEngine {
                 DEFAULT_PREFIX_CACHE_BYTES,
             ))),
             continuous: Mutex::new(None),
+            speculation: Mutex::new(None),
         })
     }
 
@@ -1085,6 +1118,76 @@ impl InferenceEngine {
         }
     }
 
+    /// Speed single-request decoding up with a drafter: a Qwen 3.5-family
+    /// model's MTP head, a Gemma 4 assistant or a DFlash draft model (see
+    /// [`SpeculatorSpec`]). The model thread loads it and checks it fits the
+    /// model; from then on every request that can run on it does, and gets the
+    /// tokens plain decoding would give (greedy), or draws from the same
+    /// distribution (sampled), only sooner. A request that wants log-probabilities
+    /// or carries an image decodes plainly.
+    ///
+    /// Continuous batching serves many requests at once, which a drafter
+    /// does not: asking for both is an error, whichever came first. So is the
+    /// ANE backend, which has its own drafter.
+    ///
+    /// # Errors
+    ///
+    /// The drafter cannot be loaded, does not fit the model, or the engine is
+    /// already drafting, batching or on the ANE.
+    pub fn enable_speculation(&self, spec: SpeculatorSpec) -> ServeResult<SpeculationInfo> {
+        self.enable_speculation_with(move |model, max_seq_len| {
+            Speculator::load(model, &spec, max_seq_len)
+        })
+    }
+
+    /// [`enable_speculation`](Self::enable_speculation) with a drafter the
+    /// caller builds: `load` runs on the model thread, given the model and
+    /// the longest sequence a request holds.
+    pub fn enable_speculation_with(
+        &self,
+        load: impl FnOnce(&DynamicModel, usize) -> Result<Speculator, pmetal_runtime::compat::Exception>
+        + Send
+        + 'static,
+    ) -> ServeResult<SpeculationInfo> {
+        let refuse = |why: &str| ServeError::Internal(why.to_string());
+        if self.backend == PreferredGenerationBackend::Ane {
+            return Err(refuse(
+                "speculative decoding on the GPU is not for --ane, which drafts with its own DFlash draft model",
+            ));
+        }
+        let batching = self.continuous.lock().map_err(|_| ServeError::Busy)?;
+        if batching.is_some() {
+            return Err(refuse(
+                "speculative decoding runs one request at a time, and continuous batching serves many: choose one",
+            ));
+        }
+        let mut current = self.speculation.lock().map_err(|_| ServeError::Busy)?;
+        if current.is_some() {
+            return Err(refuse("speculative decoding is already enabled"));
+        }
+        let max_seq_len = self.max_seq_len;
+        let info = self
+            .model
+            .call(move |state| -> Result<SpeculationInfo, pmetal_runtime::compat::Exception> {
+                let speculator = load(&state.model, max_seq_len)?;
+                let info = SpeculationInfo {
+                    kind: speculator.kind(),
+                    draft_tokens: speculator.draft_tokens(),
+                };
+                state.speculator = Some(speculator);
+                Ok(info)
+            })
+            .map_err(|_| ServeError::ModelNotLoaded)?
+            .map_err(ServeError::Model)?;
+        *current = Some(info.clone());
+        Ok(info)
+    }
+
+    /// How the engine drafts, when speculative decoding is enabled.
+    pub fn speculation(&self) -> Option<SpeculationInfo> {
+        self.speculation.lock().ok().and_then(|info| info.clone())
+    }
+
     /// Enable continuous batching with the given capacity. The model thread
     /// then runs one scheduler step (a prefill chunk or a decode step across
     /// the decoding slots) whenever no other request is queued, and sleeps
@@ -1112,6 +1215,12 @@ impl InferenceEngine {
         let mut guard = self.continuous.lock().map_err(|_| ServeError::Busy)?;
         if guard.is_some() {
             return Ok(());
+        }
+        if self.speculation().is_some() {
+            return Err(ServeError::Internal(
+                "continuous batching serves many requests at once, and speculative decoding runs one at a time: choose one"
+                    .into(),
+            ));
         }
         let tokenizer = Arc::clone(&self.tokenizer);
         let prefix_cache = Arc::clone(&self.prefix_cache);
@@ -1176,6 +1285,12 @@ impl InferenceEngine {
         if input_ids.is_empty() {
             return Err(ServeError::BadRequest("the prompt is empty".into()));
         }
+        if params.prompt_logprobs_top_n.is_some() {
+            return Err(ServeError::BadRequest(
+                "prompt log-probabilities are scored in a request of their own, not in a batch"
+                    .into(),
+            ));
+        }
         if !self.continuous_batching_enabled() {
             return Err(ServeError::Internal(
                 "continuous batching not enabled; call enable_continuous_batching first".into(),
@@ -1195,6 +1310,7 @@ impl InferenceEngine {
             gen_config,
             stop_sequences: params.stop_sequences,
             logprobs_top_n: params.logprobs_top_n,
+            prompt_logprobs_top_n: None,
             constraint: params.constraint,
             media: None,
         };
@@ -1706,7 +1822,7 @@ impl InferenceEngine {
     /// Deliberately does not error on `max_tokens > max_seq_len` — the engine
     /// clamps silently, matching OpenAI behaviour.
     fn validate_params(params: &SamplingParams, _max_seq_len: usize) -> ServeResult<()> {
-        if params.max_tokens == 0 {
+        if params.max_tokens == 0 && params.prompt_logprobs_top_n.is_none() {
             return Err(ServeError::BadRequest("max_tokens must be >= 1".into()));
         }
         if params.temperature < 0.0 || !params.temperature.is_finite() {
@@ -1764,7 +1880,7 @@ impl InferenceEngine {
     pub fn validate_sampling_params(&self, params: &SamplingParams) -> ServeResult<()> {
         Self::validate_params(params, self.max_seq_len)?;
         if self.backend == PreferredGenerationBackend::Ane {
-            if params.logprobs_top_n.is_some() {
+            if params.logprobs_top_n.is_some() || params.prompt_logprobs_top_n.is_some() {
                 return Err(ServeError::unsupported(
                     "logprobs",
                     "the ANE engine (--ane) does not report log-probabilities",
@@ -2005,6 +2121,68 @@ impl InferenceEngine {
         }
     }
 
+    /// Prefill `input_ids` and score them: for every prompt token after the
+    /// first, its log-probability given the tokens before it and the top
+    /// `top_n` alternatives, appended to `scored`. Returns the last chunk's
+    /// logits, as a prefill does.
+    ///
+    /// The prompt goes through in chunks small enough that a chunk's logits
+    /// (`chunk * vocab` floats) stay modest, each chunk's rows reduced to
+    /// their log-probabilities on the device before the next runs.
+    fn prefill_scoring(
+        model: &mut DynamicModel,
+        cache: &mut KVCache,
+        mut mamba_cache: Option<&mut MambaCache>,
+        input_ids: &[u32],
+        prefill_step_size: usize,
+        top_n: usize,
+        scored: &mut Vec<TokenLogprobEntry>,
+    ) -> Result<Array, pmetal_runtime::compat::Exception> {
+        use pmetal_models::generation::{row_logprobs, run_cached_prefill_chunks_at};
+        use pmetal_runtime::compat::ops::slice_axis;
+
+        /// Positions scored per forward: 512 rows of a 152k vocabulary are
+        /// 150 MB of bf16 logits.
+        const SCORING_CHUNK: usize = 512;
+        let step = match prefill_step_size {
+            0 => SCORING_CHUNK,
+            size => size.min(SCORING_CHUNK),
+        };
+        let mut position = 0usize;
+        run_cached_prefill_chunks_at(input_ids, 0, step, |chunk| {
+            let logits = model.forward_with_hybrid_cache(
+                chunk,
+                None,
+                Some(cache),
+                mamba_cache.as_deref_mut(),
+            )?;
+            let rows = chunk.dim(1) as usize;
+            // Row `i` predicts prompt token `position + i + 1`; the last
+            // prompt position predicts the first token to generate.
+            let scorable = rows.min(input_ids.len() - 1 - position);
+            if scorable > 0 {
+                let targets = &input_ids[position + 1..position + 1 + scorable];
+                let logits = slice_axis(&logits, 1, 0, scorable as i32);
+                // One more than asked, so the chosen token can be left out
+                // of its own alternatives as chat logprobs do.
+                for (target, (logprob, mut top)) in targets
+                    .iter()
+                    .zip(row_logprobs(&logits, targets, top_n + 1)?)
+                {
+                    top.retain(|(token, _)| token != target);
+                    top.truncate(top_n);
+                    scored.push(TokenLogprobEntry {
+                        token: *target,
+                        logprob,
+                        top_logprobs: top,
+                    });
+                }
+            }
+            position += rows;
+            Ok(logits)
+        })
+    }
+
     /// Run a single GPU decode request with 1-step look-ahead async
     /// pipelining, chunked prefill, and wired-memory management.
     ///
@@ -2043,10 +2221,12 @@ impl InferenceEngine {
         stop_tokens: &[u32],
         stop_sequences: &[String],
         logprobs_top_n: Option<usize>,
+        prompt_logprobs_top_n: Option<usize>,
         prefill_step_size: usize,
         prefix_cache: Option<&Arc<Mutex<pmetal_cache::prefix_cache::PrefixCache>>>,
         media: Option<&MediaForward>,
         start: Instant,
+        on_prompt_logprobs: impl FnOnce(Vec<TokenLogprobEntry>),
         mut on_token: E,
     ) -> ServeResult<DecodeRun>
     where
@@ -2073,7 +2253,17 @@ impl InferenceEngine {
         // so we skip the cache entirely when `mamba_cache` is populated.
         // A prompt with media skips it too: the cache is keyed by token ids,
         // and an image's tokens are the same placeholder id whatever it shows.
-        let prefix_cache = prefix_cache.filter(|_| media.is_none());
+        //
+        // Scoring the prompt needs the logits of every prompt position, so it
+        // is prefilled in full and takes no hit.
+        if prompt_logprobs_top_n.is_some() && media.is_some() {
+            return Err(ServeError::BadRequest(
+                "prompt log-probabilities are not available for a prompt with images or videos"
+                    .into(),
+            ));
+        }
+        let prefix_cache = prefix_cache
+            .filter(|_| media.is_none() && prompt_logprobs_top_n.is_none());
         let prefix_hit_len: usize =
             if let (Some(pc), true) = (prefix_cache.as_ref(), mamba_cache.is_none()) {
                 let mut guard = match pc.lock() {
@@ -2115,8 +2305,8 @@ impl InferenceEngine {
         //
         // A prompt with media prefills in one forward from its merged
         // embeddings, as `pmetal infer --image` does.
-        let prefill_logits = match media {
-            None => run_cached_prefill_chunks_at(
+        let prefill_logits = match (media, prompt_logprobs_top_n) {
+            (None, None) => run_cached_prefill_chunks_at(
                 prefill_slice,
                 prefix_hit_len,
                 prefill_step_size,
@@ -2130,7 +2320,23 @@ impl InferenceEngine {
                     )
                 },
             ),
-            Some(media) => Self::prefill_media(model, media, cache, mamba_cache.as_mut()),
+            (None, Some(top_n)) => {
+                let mut scored = Vec::with_capacity(input_ids.len().saturating_sub(1));
+                let logits = Self::prefill_scoring(
+                    model,
+                    cache,
+                    mamba_cache.as_mut(),
+                    input_ids,
+                    prefill_step_size,
+                    top_n,
+                    &mut scored,
+                );
+                if logits.is_ok() {
+                    on_prompt_logprobs(scored);
+                }
+                logits
+            }
+            (Some(media), _) => Self::prefill_media(model, media, cache, mamba_cache.as_mut()),
         }
         .map_err(ServeError::Model)?;
 
@@ -2239,6 +2445,7 @@ impl InferenceEngine {
 
         let completion_tokens = generated.len();
         Ok(DecodeRun {
+            speculative: None,
             cached_prompt_tokens: prefix_hit_len,
             finish_reason,
             first_token_time_ms,
@@ -2262,6 +2469,7 @@ impl InferenceEngine {
         state: &mut EngineState,
         ctx: &GpuRequestContext,
         request: GpuRequest,
+        on_prompt_logprobs: impl FnOnce(Vec<TokenLogprobEntry>),
         on_token: E,
     ) -> ServeResult<(DecodeRun, Instant)>
     where
@@ -2280,6 +2488,17 @@ impl InferenceEngine {
             )?),
             None => None,
         };
+        // A request the drafter can serve runs on it: the target's own tokens,
+        // sooner. What it cannot (the target's per-token log-probabilities,
+        // the prompt's, an image) takes the plain path below: the reply is the
+        // same either way.
+        if state.speculator.is_some()
+            && request.media.is_none()
+            && request.logprobs_top_n.is_none()
+            && request.prompt_logprobs_top_n.is_none()
+        {
+            return Self::generate_speculatively(state, ctx, request, start, on_token);
+        }
         let model = &mut state.model;
         let (mut cache, mut mamba_cache) = Self::create_request_caches(
             model,
@@ -2305,13 +2524,109 @@ impl InferenceEngine {
             &stop_tokens,
             &request.stop_sequences,
             request.logprobs_top_n,
+            request.prompt_logprobs_top_n,
             prefill_step_size,
             Some(&ctx.prefix_cache),
             media.as_ref(),
             start,
+            on_prompt_logprobs,
             on_token,
         )?;
         Ok((run, start))
+    }
+
+    /// Decode `request` with the engine's drafter: the same sampler, stop
+    /// tokens, stop sequences and cancellation as [`run_async_decode`]
+    /// (the tokens come a round at a time, not one at a time), and the same
+    /// tokens.
+    ///
+    /// [`run_async_decode`]: Self::run_async_decode
+    fn generate_speculatively<E>(
+        state: &mut EngineState,
+        ctx: &GpuRequestContext,
+        request: GpuRequest,
+        start: Instant,
+        mut on_token: E,
+    ) -> ServeResult<(DecodeRun, Instant)>
+    where
+        E: FnMut(u32, Option<TokenLogprobEntry>) -> StepOutcome,
+    {
+        use pmetal_runtime::inline_array::{GenerationStream, WiredLimit};
+
+        let EngineState {
+            model, speculator, ..
+        } = state;
+        let speculator = speculator
+            .as_mut()
+            .ok_or_else(|| ServeError::Internal("no drafter is loaded".into()))?;
+        let _wired = WiredLimit::max();
+        let _stream = GenerationStream::enter();
+
+        let mut sampler = request.gen_config.sampler(&request.input_ids);
+        if let Some(constraint) = &request.constraint {
+            sampler = sampler.with_processor(constraint.processor());
+        }
+        let mut generated: Vec<u32> = Vec::with_capacity(request.gen_config.max_new_tokens);
+        let mut first_token_time_ms: Option<f64> = None;
+        let mut finish_reason: &'static str = "length";
+        let mut cancelled = false;
+        let tokenizer = ctx.tokenizer.as_ref();
+
+        let run = speculator
+            .generate(
+                model,
+                &request.input_ids,
+                &request.gen_config,
+                sampler,
+                |token| {
+                    if first_token_time_ms.is_none() {
+                        first_token_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    // A stop token never arrives here: the drafter ends the
+                    // generation at it, and says so in the run.
+                    generated.push(token);
+                    if let StepOutcome::Cancel = on_token(token, None) {
+                        cancelled = true;
+                        return false;
+                    }
+                    // As in the plain path, the tokens that complete a stop
+                    // sequence are kept: where the text is cut is the
+                    // reply's business (see `crate::stop`).
+                    if detect_stop_sequence_suffix(tokenizer, &generated, &request.stop_sequences)
+                        .is_some()
+                    {
+                        finish_reason = "stop";
+                        return false;
+                    }
+                    if generated.len() % 256 == 0 {
+                        pmetal_runtime::inline_array::clear_cache();
+                    }
+                    true
+                },
+            )
+            .map_err(ServeError::Model)?;
+        pmetal_runtime::check_unobserved_error()
+            .map_err(|e| ServeError::Internal(format!("speculative decoding: {e}")))?;
+
+        if run.stopped_by_token {
+            finish_reason = "stop";
+        }
+        if cancelled {
+            finish_reason = "cancelled";
+        }
+        Ok((
+            DecodeRun {
+                speculative: Some(SpeculativeUsage {
+                    drafted_tokens: run.drafted_tokens,
+                    accepted_tokens: run.accepted_tokens,
+                }),
+                cached_prompt_tokens: 0,
+                finish_reason,
+                first_token_time_ms,
+                completion_tokens: generated.len(),
+            },
+            start,
+        ))
     }
 
     /// Run one request on the GPU, on the model thread, streaming its tokens
@@ -2324,16 +2639,25 @@ impl InferenceEngine {
         tx: &tokio::sync::mpsc::Sender<TokenEvent>,
     ) {
         let prompt_tokens = request.input_ids.len();
-        let run = Self::generate_on_model(state, ctx, request, |token, logprob| {
-            if tx
-                .blocking_send(TokenEvent::Token { id: token, logprob })
-                .is_err()
-            {
-                StepOutcome::Cancel
-            } else {
-                StepOutcome::Continue
-            }
-        });
+        let run = Self::generate_on_model(
+            state,
+            ctx,
+            request,
+            |scored| {
+                // A client that has gone shows at the first token.
+                let _ = tx.blocking_send(TokenEvent::PromptLogprobs(scored));
+            },
+            |token, logprob| {
+                if tx
+                    .blocking_send(TokenEvent::Token { id: token, logprob })
+                    .is_err()
+                {
+                    StepOutcome::Cancel
+                } else {
+                    StepOutcome::Continue
+                }
+            },
+        );
         let (run, start) = match run {
             Ok(r) => r,
             Err(e) => {
@@ -2347,6 +2671,7 @@ impl InferenceEngine {
         }
         let metrics = RequestMetrics {
             cached_prompt_tokens: run.cached_prompt_tokens,
+            speculative: run.speculative,
             ..Self::build_metrics(
                 start,
                 prompt_tokens,
@@ -2420,6 +2745,8 @@ impl InferenceEngine {
                     ..
                 } => return Ok((tokens, logprobs, finish_reason, metrics)),
                 TokenEvent::Error(message) => return Err(ServeError::Internal(message)),
+                // Not reported here; a caller that wants them reads the stream.
+                TokenEvent::PromptLogprobs(_) => {}
             }
         }
         Err(ServeError::Internal(
@@ -2586,6 +2913,7 @@ impl InferenceEngine {
             gen_config: self.build_generation_config(&params),
             stop_sequences: params.stop_sequences,
             logprobs_top_n: params.logprobs_top_n,
+            prompt_logprobs_top_n: params.prompt_logprobs_top_n,
             constraint: params.constraint.clone(),
             media: prompt.media.clone(),
         };
@@ -2871,6 +3199,7 @@ mod tests {
             extra_stop_token_ids: vec![99],
             stop_sequences: vec![],
             logprobs_top_n: None,
+            prompt_logprobs_top_n: None,
             logit_bias: Vec::new(),
             constraint: None,
         };
@@ -3073,6 +3402,7 @@ mod tests {
                     logprobs.push(logprob.expect("requested logprobs").logprob);
                 }
                 TokenEvent::Done { .. } => return (tokens, logprobs),
+                TokenEvent::PromptLogprobs(_) => {}
                 TokenEvent::Error(e) => panic!("stream failed: {e}"),
             }
         }
@@ -3118,6 +3448,7 @@ mod tests {
             extra_stop_token_ids: vec![],
             stop_sequences: vec![],
             logprobs_top_n: None,
+            prompt_logprobs_top_n: None,
             logit_bias: Vec::new(),
             constraint: None,
         }
@@ -3129,6 +3460,7 @@ mod tests {
             match event {
                 TokenEvent::Token { id, .. } => tokens.push(id),
                 TokenEvent::Done { .. } => return tokens,
+                TokenEvent::PromptLogprobs(_) => {}
                 TokenEvent::Error(e) => panic!("stream failed: {e}"),
             }
         }

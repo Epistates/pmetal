@@ -54,7 +54,10 @@ pub use continuous_driver::{
 };
 pub use continuous_pump::{ContinuousPump, Tick};
 pub use decision::DecisionEngine;
-pub use engine::{InferenceEngine, PreparedPrompt, RequestMetrics, SpeculativeUsage};
+pub use engine::{
+    InferenceEngine, PreparedPrompt, RequestMetrics, SpeculationInfo, SpeculativeUsage,
+    SpeculatorSpec,
+};
 pub use routes::ServingMetrics;
 pub use server::ServeConfig;
 

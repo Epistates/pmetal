@@ -103,6 +103,7 @@ fn params(max_tokens: usize) -> SamplingParams {
         extra_stop_token_ids: vec![],
         stop_sequences: vec![],
         logprobs_top_n: Some(0),
+        prompt_logprobs_top_n: None,
         logit_bias: Vec::new(),
         constraint: None,
     }
@@ -189,6 +190,7 @@ async fn collect(mut rx: Receiver<TokenEvent>, start: Instant) -> Reply {
                 reply.finish = finish_reason;
                 return reply;
             }
+            TokenEvent::PromptLogprobs(_) => {}
             TokenEvent::Error(e) => panic!("stream failed: {e}"),
         }
     }

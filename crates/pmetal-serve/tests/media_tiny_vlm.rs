@@ -301,6 +301,7 @@ async fn collect(mut rx: tokio::sync::mpsc::Receiver<TokenEvent>) -> (Vec<u32>, 
                 logprobs.push(logprob.expect("logprobs requested").logprob);
             }
             TokenEvent::Done { .. } => return (tokens, logprobs),
+            TokenEvent::PromptLogprobs(_) => {}
             TokenEvent::Error(e) => panic!("stream failed: {e}"),
         }
     }

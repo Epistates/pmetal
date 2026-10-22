@@ -65,7 +65,12 @@ pub(crate) fn stream_tokens(
     prompt: &PreparedPrompt,
     params: SamplingParams,
 ) -> tokio::sync::mpsc::Receiver<TokenEvent> {
-    if !prompt.has_media() && engine.continuous_batching_enabled() {
+    // A request that scores its prompt needs every prompt position's logits,
+    // which a batch's prefill does not keep.
+    if !prompt.has_media()
+        && params.prompt_logprobs_top_n.is_none()
+        && engine.continuous_batching_enabled()
+    {
         match engine.generate_batched(&prompt.input_ids, params.clone()) {
             Ok(rx) => return rx,
             Err(e) => {
@@ -330,21 +335,28 @@ fn data_event(value: &impl serde::Serialize) -> Event {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// OpenAI's entry for a token: its text, bytes and log-probability.
+/// The text and bytes a token adds to a reply.
+fn token_piece(
+    engine: &InferenceEngine,
+    vocab: Option<&crate::vocab::ByteVocab>,
+    id: u32,
+) -> (String, Vec<u8>) {
+    match vocab {
+        Some(vocab) => (vocab.text(id), vocab.bytes(id).to_vec()),
+        None => {
+            let text = engine.decode(&[id]).unwrap_or_default();
+            let bytes = text.clone().into_bytes();
+            (text, bytes)
+        }
+    }
+}
+
 fn wire_logprob(
     engine: &InferenceEngine,
     entry: crate::engine::TokenLogprobEntry,
 ) -> TokenLogprobContent {
     let vocab = engine.byte_vocab();
-    let text_and_bytes = |id: u32| -> (String, Vec<u8>) {
-        match &vocab {
-            Some(vocab) => (vocab.text(id), vocab.bytes(id).to_vec()),
-            None => {
-                let text = engine.decode(&[id]).unwrap_or_default();
-                let bytes = text.clone().into_bytes();
-                (text, bytes)
-            }
-        }
-    };
+    let text_and_bytes = |id: u32| token_piece(engine, vocab.as_deref(), id);
     let (token, bytes) = text_and_bytes(entry.token);
     TokenLogprobContent {
         token,
@@ -685,6 +697,7 @@ pub async fn chat_completions(
             seed: req.seed,
             logit_bias: req.logit_bias.as_ref(),
             logprobs_top_n,
+            ..SamplingRequest::default()
         },
         &stops,
         req.response_format.as_ref(),
@@ -795,6 +808,8 @@ pub async fn chat_completions(
                             None,
                         )]
                     }
+                    // Only completions score their prompt.
+                    ChoiceEvent::PromptLogprobs(_) => Vec::new(),
                     ChoiceEvent::Piece(Piece::ToolCall(call)) => {
                         let slot = opened_calls[index];
                         opened_calls[index] += 1;
@@ -995,12 +1010,6 @@ pub async fn completions(
         .and_then(|o| o.include_usage)
         .unwrap_or(false);
     let echo = req.echo.unwrap_or(false);
-    if echo && req.logprobs.is_some() {
-        return Err(ServeError::unsupported(
-            "echo",
-            "echoing the prompt with `logprobs` needs the prompt's own log-probabilities",
-        ));
-    }
     if req.logprobs.is_some_and(|n| n > 5) {
         return Err(ServeError::invalid_with_code(
             "logprobs",
@@ -1014,6 +1023,8 @@ pub async fn completions(
     let stops =
         resolve_stop_sequences(req.stop.as_deref(), Some(MAX_STOP_SEQUENCES), &state.engine)?;
     let logprobs_top_n = req.logprobs.map(|n| n as usize);
+    // An echoed prompt comes with its own log-probabilities.
+    let prompt_logprobs_top_n = logprobs_top_n.filter(|_| echo);
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
     let model_id = state.engine.model_id().to_string();
     // Use request-time timestamp per OpenAI spec — not model creation time.
@@ -1023,6 +1034,7 @@ pub async fn completions(
     // template, so no thinking.
     let mut streams = Vec::new();
     let mut echoes = Vec::new();
+    let mut prompt_ids: Vec<Arc<Vec<u32>>> = Vec::new();
     let mut prompt_tokens = 0usize;
     for (ids, text) in &prompts {
         let params = sampling_params(
@@ -1039,6 +1051,7 @@ pub async fn completions(
                 seed: req.seed,
                 logit_bias: req.logit_bias.as_ref(),
                 logprobs_top_n,
+                prompt_logprobs_top_n,
             },
             &stops,
             false,
@@ -1064,6 +1077,7 @@ pub async fn completions(
             make_assembler,
         ));
         echoes.extend(std::iter::repeat_n(text.clone(), n));
+        prompt_ids.extend(std::iter::repeat_n(Arc::new(ids.clone()), n));
     }
     let total_choices = streams.len();
 
@@ -1100,7 +1114,9 @@ pub async fn completions(
                 Event::default().data(chunk.to_string())
             }
         };
-        let opening: Vec<Event> = if echo {
+        // With `logprobs` the echoed prompt goes out with its scores, when the
+        // engine has them; without, it can open the stream at once.
+        let opening: Vec<Event> = if echo && prompt_logprobs_top_n.is_none() {
             echoes
                 .iter()
                 .enumerate()
@@ -1123,9 +1139,23 @@ pub async fn completions(
             move |index: usize, event: ChoiceEvent, _totals: &mut StreamTotals| -> Vec<Event> {
                 let usage = || include_usage.then_some(Value::Null);
                 match event {
+                    ChoiceEvent::PromptLogprobs(scored) => {
+                        let payload = completion_logprobs(
+                            &engine_state.engine,
+                            Some((&prompt_ids[index][..], scored)),
+                            Vec::new(),
+                            &mut offsets[index],
+                        );
+                        vec![frame(index, echoes[index].clone(), Some(payload), None, usage())]
+                    }
                     ChoiceEvent::Piece(Piece::Content { text, logprobs }) => {
                         let payload = logprobs_top_n.is_some().then(|| {
-                            completion_logprobs(&engine_state.engine, logprobs, &mut offsets[index])
+                            completion_logprobs(
+                                &engine_state.engine,
+                                None,
+                                logprobs,
+                                &mut offsets[index],
+                            )
                         });
                         vec![frame(index, text, payload, None, usage())]
                     }
@@ -1182,12 +1212,14 @@ pub async fn completions(
     let choices = replies
         .into_iter()
         .zip(echoes)
+        .zip(prompt_ids)
         .enumerate()
-        .map(|(index, (reply, echoed))| {
+        .map(|(index, ((reply, echoed), ids))| {
             let finish_reason = reply.finish_reason().to_string();
-            let logprobs = logprobs_top_n
-                .is_some()
-                .then(|| completion_logprobs(&state.engine, reply.logprobs, &mut 0));
+            let scored = reply.prompt_logprobs.map(|scored| (&ids[..], scored));
+            let logprobs = logprobs_top_n.is_some().then(|| {
+                completion_logprobs(&state.engine, scored, reply.logprobs, &mut 0)
+            });
             CompletionChoice {
                 index,
                 text: if echo {
@@ -1212,34 +1244,65 @@ pub async fn completions(
     .into_response())
 }
 
+/// The most likely tokens at one position as the legacy completions API
+/// reports them: the top `n` of the whole distribution, where `n` is how many
+/// alternatives the engine found besides the chosen token, so the chosen
+/// token is among them when it is one of them. Ties go to the lower id.
+fn legacy_top(entry: &crate::engine::TokenLogprobEntry) -> Vec<(u32, f32)> {
+    let n = entry.top_logprobs.len();
+    let mut top = entry.top_logprobs.clone();
+    top.push((entry.token, entry.logprob));
+    top.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    top.truncate(n);
+    top
+}
+
 /// OpenAI's four parallel arrays for the tokens of a piece of a completion.
 ///
+/// `prompt` is an echoed prompt's token ids and its scores, one per token
+/// after the first (see [`TokenEvent::PromptLogprobs`]): the arrays then start
+/// with the prompt's tokens, the first of which has `null` log-probabilities.
 /// `running_offset` is the caller-owned byte cursor into the concatenated
 /// text: it advances by each token's text so `text_offset` entries align
 /// across chunk boundaries.
 fn completion_logprobs(
     engine: &InferenceEngine,
+    prompt: Option<(&[u32], Vec<crate::engine::TokenLogprobEntry>)>,
     entries: Vec<crate::engine::TokenLogprobEntry>,
     running_offset: &mut usize,
 ) -> CompletionLogprobs {
-    let n = entries.len();
+    let vocab = engine.byte_vocab();
+    let piece = |id: u32| token_piece(engine, vocab.as_deref(), id);
+    let n = entries.len() + prompt.as_ref().map_or(0, |(ids, _)| ids.len());
     let mut tokens = Vec::with_capacity(n);
     let mut token_logprobs = Vec::with_capacity(n);
     let mut top_logprobs = Vec::with_capacity(n);
     let mut text_offset = Vec::with_capacity(n);
-    for entry in entries {
-        let entry = wire_logprob(engine, entry);
+    let mut push = |id: u32, scored: Option<&crate::engine::TokenLogprobEntry>| {
+        let (text, bytes) = piece(id);
         text_offset.push(*running_offset);
-        *running_offset += entry.bytes.len();
-        tokens.push(entry.token);
-        token_logprobs.push(entry.logprob);
-        top_logprobs.push(
-            entry
-                .top_logprobs
-                .into_iter()
-                .map(|alt| (alt.token, alt.logprob))
-                .collect(),
-        );
+        *running_offset += bytes.len();
+        tokens.push(text);
+        token_logprobs.push(scored.map(|entry| entry.logprob));
+        top_logprobs.push(scored.map(|entry| {
+            let mut map = std::collections::HashMap::new();
+            for (alt, logprob) in legacy_top(entry) {
+                // Two tokens can spell the same text; the likelier one stays.
+                map.entry(piece(alt).0).or_insert(logprob);
+            }
+            map
+        }));
+    };
+    if let Some((ids, scored)) = &prompt {
+        if let Some(first) = ids.first() {
+            push(*first, None);
+        }
+        for (id, entry) in ids.iter().skip(1).zip(scored) {
+            push(*id, Some(entry));
+        }
+    }
+    for entry in &entries {
+        push(entry.token, Some(entry));
     }
     CompletionLogprobs {
         tokens,
