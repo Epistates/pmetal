@@ -1505,7 +1505,7 @@ fn load_dataset(
 // Helper: resolve model path (async, may download from HF)
 // ---------------------------------------------------------------------------
 
-async fn resolve_model_path(model_id: &str) -> anyhow::Result<PathBuf> {
+pub(crate) async fn resolve_model_path(model_id: &str) -> anyhow::Result<PathBuf> {
     #[cfg(feature = "hub")]
     {
         pmetal_hub::resolve_model_path(model_id, None, None)

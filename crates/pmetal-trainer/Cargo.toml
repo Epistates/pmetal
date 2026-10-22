@@ -31,6 +31,11 @@ safetensors = { workspace = true, optional = true }
 pmetal-distributed = { workspace = true, optional = true }
 pmetal-hub = { workspace = true, optional = true }
 pmetal-runtime = { workspace = true }
+# Kills an external reward command's process group.
+pmetal-supervisor = { workspace = true }
+jsonschema = { workspace = true }
+regex = { workspace = true }
+shlex = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
