@@ -7,6 +7,10 @@ use crate::{
 use pmetal_core_derive::JobSpec;
 use serde::{Deserialize, Serialize};
 
+/// The highest learning rate `--full` accepts: above it a full fine-tune of a
+/// pretrained model diverges, and LoRA's default (2e-4) is above it.
+const FULL_FINETUNE_MAX_LEARNING_RATE: f64 = 1e-4;
+
 /// Spec for `pmetal train`.
 ///
 /// Holds the user-facing input fields. Conversion to the trainer's internal
@@ -504,6 +508,39 @@ pub struct TrainSpec {
     pub ane: bool,
 
     #[job(
+        label = "Full Fine-Tune",
+        group = "Full Fine-Tune",
+        argv = "--full",
+        flag,
+        default_bool = false,
+        help = "Train every weight instead of LoRA adapters, and save a whole model that `infer` and `serve` load. Needs several times the model's size in memory (weights, gradients and optimizer state): refused up front when it will not fit. Pass a learning rate of 1e-5 to 5e-5"
+    )]
+    #[serde(default)]
+    pub full_finetune: bool,
+
+    #[job(
+        label = "Freeze Embeddings",
+        group = "Full Fine-Tune",
+        argv = "--freeze-embeddings",
+        flag,
+        default_bool = false,
+        help = "With --full, keep the input token embedding as loaded (a model that ties its output head to it keeps the head too): saves its gradient and optimizer state"
+    )]
+    #[serde(default)]
+    pub freeze_embeddings: bool,
+
+    #[job(
+        label = "No Memory Check",
+        group = "Full Fine-Tune",
+        argv = "--no-memory-check",
+        flag,
+        default_bool = false,
+        help = "With --full, run without checking the memory estimate against the device's working set"
+    )]
+    #[serde(default)]
+    pub no_memory_check: bool,
+
+    #[job(
         label = "Pack Max Seq Len",
         group = "Compute",
         argv = "--pack-max-seq-len"
@@ -611,6 +648,9 @@ impl Default for TrainSpec {
             cut_cross_entropy: false,
             no_adaptive_lr: false,
             ane: false,
+            full_finetune: false,
+            freeze_embeddings: false,
+            no_memory_check: false,
             pack_max_seq_len: None,
             distributed_peers: None,
             distributed_auto: false,
@@ -635,7 +675,55 @@ impl TrainSpec {
                 !(matches!(e.field.as_str(), "model" | "dataset") && e.message == "required")
             });
         }
+        errs.extend(self.full_finetune_errors());
         if errs.is_empty() { Ok(()) } else { Err(errs) }
+    }
+
+    /// What `--full` rules out, and what only it means.
+    fn full_finetune_errors(&self) -> Vec<FieldError> {
+        let mut errs = Vec::new();
+        if !self.full_finetune {
+            for (set, field) in [
+                (self.freeze_embeddings, "freeze_embeddings"),
+                (self.no_memory_check, "no_memory_check"),
+            ] {
+                if set {
+                    errs.push(FieldError::new(field, "needs --full"));
+                }
+            }
+            return errs;
+        }
+        if self.quantization.is_some() {
+            errs.push(FieldError::new(
+                "quantization",
+                "cannot be combined with --full: the weights themselves train, and a quantized base cannot (QLoRA is the quantized way to fine-tune)",
+            ));
+        }
+        if self.ane {
+            errs.push(FieldError::new(
+                "ane",
+                "cannot be combined with --full: the Neural Engine path already trains every weight",
+            ));
+        }
+        if self.dora || self.rslora || !self.lora_targets.is_empty() {
+            errs.push(FieldError::new(
+                "full_finetune",
+                "has no adapters, so --dora, --rslora and --lora-targets do not apply",
+            ));
+        }
+        // The default rate is LoRA's: at it a full fine-tune diverges. (A config
+        // file may set the rate, which this spec does not see.)
+        if self.config_path.is_none() && self.learning_rate > FULL_FINETUNE_MAX_LEARNING_RATE {
+            errs.push(FieldError::new(
+                "learning_rate",
+                format!(
+                    "{} is a LoRA rate and would diverge a full fine-tune; use 1e-5 to 5e-5 \
+                     (the most --full accepts is {FULL_FINETUNE_MAX_LEARNING_RATE})",
+                    self.learning_rate
+                ),
+            ));
+        }
+        errs
     }
 
     /// The adapter this spec asks for. Every surface that runs a spec builds
@@ -781,6 +869,88 @@ mod tests {
         assert!(!descs.iter().any(|d| d.name == "config_path"));
         // `resume` is a form field (a toggle).
         assert!(descs.iter().any(|d| d.name == "resume"));
+    }
+
+    fn full_spec() -> TrainSpec {
+        TrainSpec {
+            model: "m".into(),
+            dataset: "d".into(),
+            full_finetune: true,
+            learning_rate: 2e-5,
+            ..Default::default()
+        }
+    }
+
+    fn rejected_fields(mut spec: TrainSpec) -> Vec<String> {
+        spec.normalize()
+            .err()
+            .map(|errs| errs.into_iter().map(|e| e.field).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_full_fine_tune_is_a_flag_with_its_own_options() {
+        let spec = TrainSpec {
+            freeze_embeddings: true,
+            ..full_spec()
+        };
+        let argv = spec.to_argv();
+        assert!(argv.contains(&"--full".to_string()));
+        assert!(argv.contains(&"--freeze-embeddings".to_string()));
+        assert!(!argv.contains(&"--no-memory-check".to_string()));
+        let mut ok = spec;
+        assert!(ok.normalize().is_ok());
+    }
+
+    #[test]
+    fn full_rules_out_what_has_no_meaning_without_adapters_or_a_trainable_base() {
+        assert!(rejected_fields(full_spec()).is_empty());
+        let quantized = TrainSpec {
+            quantization: Some("nf4".into()),
+            ..full_spec()
+        };
+        assert_eq!(rejected_fields(quantized), ["quantization"]);
+        let ane = TrainSpec {
+            ane: true,
+            ..full_spec()
+        };
+        assert_eq!(rejected_fields(ane), ["ane"]);
+        let adapters = TrainSpec {
+            dora: true,
+            ..full_spec()
+        };
+        assert_eq!(rejected_fields(adapters), ["full_finetune"]);
+        // Its options mean nothing without it.
+        let stray = TrainSpec {
+            full_finetune: false,
+            freeze_embeddings: true,
+            no_memory_check: true,
+            ..full_spec()
+        };
+        assert_eq!(
+            rejected_fields(stray),
+            ["freeze_embeddings", "no_memory_check"]
+        );
+    }
+
+    #[test]
+    fn full_refuses_loras_learning_rate_before_it_diverges_a_model() {
+        let lora_rate = TrainSpec {
+            learning_rate: crate::defaults::LEARNING_RATE,
+            ..full_spec()
+        };
+        assert_eq!(rejected_fields(lora_rate.clone()), ["learning_rate"]);
+        // LoRA itself is untouched, and a config file may set the rate.
+        let lora = TrainSpec {
+            full_finetune: false,
+            ..lora_rate.clone()
+        };
+        assert!(rejected_fields(lora).is_empty());
+        let with_config = TrainSpec {
+            config_path: Some("run.yaml".into()),
+            ..lora_rate
+        };
+        assert!(rejected_fields(with_config).is_empty());
     }
 
     #[test]

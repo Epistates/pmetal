@@ -20,7 +20,9 @@ use pmetal_data::{
 };
 use pmetal_lora::{DynamicLoraModel, QLoraConfig, QLoraScheme, TrainableModel};
 use pmetal_models::WeightFormat;
+use pmetal_runtime::compat::ModuleParametersExt;
 
+use crate::full_finetune::{self, FullFineTuneConfig};
 use crate::{
     AdaptiveLrConfig, CheckpointManager, MetricsJsonCallback, TrainingLoop, TrainingLoopConfig,
 };
@@ -138,6 +140,10 @@ pub struct TrainingJobConfig {
     pub lora: LoraConfig,
     /// Optional QLoRA quantization.
     pub qlora: Option<QLoraOrchConfig>,
+    /// Train every weight of the model instead of LoRA adapters: a
+    /// full-parameter fine-tune, which saves a whole model (see
+    /// [`crate::full_finetune`]).
+    pub full: Option<FullFineTuneConfig>,
     /// Core training hyperparameters.
     pub training: TrainingConfig,
     /// Optional dataset column overrides.
@@ -165,6 +171,7 @@ impl Default for TrainingJobConfig {
             output_dir: "./output".to_string(),
             lora: LoraConfig::default(),
             qlora: None,
+            full: None,
             training: TrainingConfig::default(),
             columns: None,
             dispatch: DispatchConfig::default(),
@@ -229,6 +236,10 @@ impl TrainingJobConfig {
             output_dir: spec.output_dir.clone(),
             lora: spec.lora_config(),
             qlora,
+            full: spec.full_finetune.then_some(FullFineTuneConfig {
+                freeze_embeddings: spec.freeze_embeddings,
+                skip_memory_check: spec.no_memory_check,
+            }),
             training: spec.training_config()?,
             columns: DatasetColumnConfig::from_selectors(
                 spec.text_column.clone(),
@@ -534,6 +545,27 @@ pub async fn run_training(
         None
     };
 
+    if config.full.is_some() {
+        if config.qlora.is_some() {
+            anyhow::bail!(
+                "--full trains the weights themselves, which a quantized base cannot take; \
+                 drop --quantization (QLoRA is the quantized way to fine-tune)"
+            );
+        }
+        if config.dispatch.ane {
+            anyhow::bail!(
+                "--ane already trains every weight of the model on the Neural Engine; use \
+                 either --ane or --full"
+            );
+        }
+        if WeightFormat::detect(&model_path) == Some(WeightFormat::Gguf) {
+            anyhow::bail!(
+                "--full fine-tunes a safetensors checkpoint and saves one; a GGUF file is \
+                 quantized. Point at the safetensors checkpoint."
+            );
+        }
+    }
+
     // Auto-detect max_seq_len if requested (0)
     if full_config.training.max_seq_len == 0 {
         if let Some(ref cfg) = model_config_json {
@@ -769,8 +801,15 @@ pub async fn run_training(
     // -----------------------------------------------------------------------
     // Phase 8: Set up training infrastructure
     // -----------------------------------------------------------------------
+    // A full fine-tune's checkpoint is the whole model and its optimizer's
+    // state, so only the latest, the one a resume reads, is kept.
     let checkpoint_dir = PathBuf::from(&output_dir).join("checkpoints");
-    let checkpoint_manager = CheckpointManager::new(&checkpoint_dir)?.with_max_checkpoints(3);
+    let checkpoint_manager = CheckpointManager::new(&checkpoint_dir)?
+        .with_max_checkpoints(if config.full.is_some() { 1 } else { 3 });
+
+    if let Some(full) = &config.full {
+        check_full_finetune(full, &model_path, &full_config.training, &config.dispatch)?;
+    }
 
     let dataloader_config = DataLoaderConfig {
         batch_size: full_config.training.batch_size,
@@ -915,21 +954,37 @@ pub async fn run_training(
         println!("========================================");
 
         println!("\nNext steps:");
-        println!(
-            "  Inference:  pmetal infer -m {} --lora {}/{} -p \"Your prompt\"",
-            full_config.model.model_id,
-            output_dir,
-            pmetal_lora::peft::ADAPTER_WEIGHTS
-        );
-        println!(
-            "  Quantize:   pmetal quantize -m {} --lora {}/{} -o model.gguf",
-            full_config.model.model_id,
-            output_dir,
-            pmetal_lora::peft::ADAPTER_WEIGHTS
-        );
+        if config.full.is_some() {
+            println!("  Inference:  pmetal infer -m {output_dir} -p \"Your prompt\"");
+            println!("  Serve:      pmetal serve -m {output_dir}");
+        } else {
+            println!(
+                "  Inference:  pmetal infer -m {} --lora {}/{} -p \"Your prompt\"",
+                full_config.model.model_id,
+                output_dir,
+                pmetal_lora::peft::ADAPTER_WEIGHTS
+            );
+            println!(
+                "  Quantize:   pmetal quantize -m {} --lora {}/{} -o model.gguf",
+                full_config.model.model_id,
+                output_dir,
+                pmetal_lora::peft::ADAPTER_WEIGHTS
+            );
+        }
     }
 
-    let lora_weights_path = PathBuf::from(&output_dir).join(pmetal_lora::peft::ADAPTER_WEIGHTS);
+    // The trained weights: an adapter, or for a full fine-tune the model itself
+    // (a single file, or the index of its shards).
+    let lora_weights_path = if config.full.is_some() {
+        let single = PathBuf::from(&output_dir).join("model.safetensors");
+        if single.exists() {
+            single
+        } else {
+            PathBuf::from(&output_dir).join("model.safetensors.index.json")
+        }
+    } else {
+        PathBuf::from(&output_dir).join(pmetal_lora::peft::ADAPTER_WEIGHTS)
+    };
 
     emit_phase(phase_cb, TrainingPhase::Complete);
 
@@ -962,6 +1017,43 @@ fn qlora_config(config: &TrainingJobConfig) -> Option<QLoraConfig> {
     })
 }
 
+/// Refuse a full fine-tune that would not fit the device, before the model
+/// loads (see [`full_finetune::estimate_memory`]).
+fn check_full_finetune(
+    full: &FullFineTuneConfig,
+    model_path: &Path,
+    training: &TrainingConfig,
+    dispatch: &DispatchConfig,
+) -> anyhow::Result<()> {
+    let request = full_finetune::memory_request(
+        model_path,
+        training.optimizer,
+        training.batch_size,
+        training.max_seq_len,
+        full.freeze_embeddings,
+        dispatch.gradient_checkpointing,
+        dispatch.cut_cross_entropy,
+    )?;
+    let estimate = full_finetune::estimate_memory(&request);
+    let budget = full_finetune::device_budget();
+    tracing::info!(
+        "Full fine-tune memory estimate: {:.1} GB (weights {:.1}, gradients {:.1}, optimizer \
+         {:.1}, activations {:.1}) of a {:.1} GB working set",
+        estimate.total() as f64 / 1e9,
+        estimate.weights as f64 / 1e9,
+        estimate.gradients as f64 / 1e9,
+        estimate.optimizer as f64 / 1e9,
+        estimate.activations as f64 / 1e9,
+        budget as f64 / 1e9,
+    );
+    if full.skip_memory_check {
+        tracing::warn!("--no-memory-check: running a full fine-tune without checking it fits");
+        return Ok(());
+    }
+    estimate.check(budget, &request)?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_lora_path(
     config: &TrainingJobConfig,
@@ -978,10 +1070,24 @@ fn run_lora_path(
     has_metrics_cb: bool,
     distributed_sync: DistributedSyncOption,
 ) -> anyhow::Result<(f64, usize, usize)> {
-    tracing::info!("Initializing LoRA model with auto-detected architecture...");
+    let full = config.full.as_ref();
+    tracing::info!(
+        "Initializing {} model with auto-detected architecture...",
+        if full.is_some() {
+            "full fine-tune"
+        } else {
+            "LoRA"
+        }
+    );
 
     let qlora = qlora_config(config);
     let mut model = match (WeightFormat::detect(model_path), qlora) {
+        _ if full.is_some() => DynamicLoraModel::from_pretrained_full(
+            model_path,
+            pmetal_lora::FullFineTune {
+                freeze_embeddings: full.is_some_and(|f| f.freeze_embeddings),
+            },
+        )?,
         (Some(WeightFormat::Gguf), Some(_)) => anyhow::bail!(
             "--quantization packs a safetensors checkpoint for QLoRA; a GGUF file is \
              already quantized in its own format. Train LoRA on it without --quantization, \
@@ -1024,9 +1130,24 @@ fn run_lora_path(
         (_, None) => DynamicLoraModel::from_pretrained(model_path, config.lora.clone())?,
     };
     tracing::info!(
-        "Loaded {} model with LoRA adapters",
-        model.architecture_name()
+        "Loaded {} model {}",
+        model.architecture_name(),
+        if full.is_some() {
+            "for a full fine-tune"
+        } else {
+            "with LoRA adapters"
+        }
     );
+
+    // A full fine-tune's result is a whole model written in the checkpoint's own
+    // layout. Whether it can be is known now, not after the run.
+    let save_plan = match full {
+        Some(_) => Some(full_finetune::plan_for_model(
+            model_path,
+            &model.flatten_params(),
+        )?),
+        None => None,
+    };
 
     // GDN resource guard
     if model.architecture_name() == "Qwen3Next" && full_config.training.max_seq_len > 512 {
@@ -1075,19 +1196,31 @@ fn run_lora_path(
 
     {
         let mut adaptive_config = AdaptiveLrConfig::for_lora();
-        if config.dispatch.no_adaptive_lr {
+        // Rolling back from a divergence means holding a copy of the best
+        // weights, which for a full fine-tune is a second copy of the model.
+        if config.dispatch.no_adaptive_lr || full.is_some() {
             adaptive_config.enabled = false;
         }
         let control_file = pmetal_core::lr_control_path(std::path::Path::new(output_dir));
         training_loop.enable_adaptive_lr_with_control(adaptive_config, control_file);
-        training_loop.set_snapshot_persist_dir(checkpoint_manager.checkpoint_dir().to_path_buf());
+        if full.is_none() {
+            training_loop
+                .set_snapshot_persist_dir(checkpoint_manager.checkpoint_dir().to_path_buf());
+        }
     }
 
     if config.resume && !training_loop.resume_from(&mut model, checkpoint_manager)? {
         tracing::info!("No checkpoint found, starting fresh");
     }
 
-    tracing::info!("Starting LoRA training...");
+    tracing::info!(
+        "Starting {} training...",
+        if full.is_some() {
+            "full fine-tune"
+        } else {
+            "LoRA"
+        }
+    );
     emit_phase(phase_cb, TrainingPhase::Training);
 
     // Notify all callbacks that training is starting (TrainingLoop doesn't do this)
@@ -1102,12 +1235,25 @@ fn run_lora_path(
         Some(checkpoint_manager),
     )?;
 
-    save_adapter(
-        &model,
-        Path::new(output_dir),
-        &config.lora,
-        Some(&full_config.model.model_id),
-    )?;
+    match &save_plan {
+        Some(plan) => {
+            let weights = full_finetune::save_full_model(
+                &model.flatten_params(),
+                plan,
+                model_path,
+                Path::new(output_dir),
+            )?;
+            tracing::info!("Saved the fine-tuned model to {}", weights.display());
+        }
+        None => {
+            save_adapter(
+                &model,
+                Path::new(output_dir),
+                &config.lora,
+                Some(&full_config.model.model_id),
+            )?;
+        }
+    }
 
     // Recover the metrics callback (always inserted first) for finalization.
     // Only recover if we actually created one — don't grab a user callback by mistake.

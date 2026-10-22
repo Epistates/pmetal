@@ -35,7 +35,33 @@ use crate::{
 /// on save and tolerated on load.
 const TRUNK_PREFIX: &str = "model.";
 
-/// A loaded model with low-rank adapters on its targeted projections.
+/// How a full-parameter fine-tune differs from the default: which of the
+/// model's own parameters stay as loaded.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FullFineTune {
+    /// Keep the input token embedding frozen. It is the largest single
+    /// parameter of a small model with a big vocabulary, and holds the
+    /// optimizer's state for rows no training token ever touches. A model that
+    /// ties its output head to the embedding (Qwen3-0.6B does) freezes the head
+    /// with it; an untied head still trains.
+    pub freeze_embeddings: bool,
+}
+
+/// What an [`AdaptedModel`] trains.
+#[derive(Debug, Clone)]
+enum Scope {
+    /// The adapters on the targeted projections, and nothing else: LoRA.
+    Adapters,
+    /// Every parameter of the model but the frozen ones: a full fine-tune.
+    Full {
+        /// Parameter paths that keep their loaded value.
+        frozen: std::collections::BTreeSet<String>,
+    },
+}
+
+/// A loaded model with low-rank adapters on its targeted projections, or, for
+/// a full fine-tune ([`AdaptedModel::full`]), with none and every parameter
+/// trainable.
 pub struct AdaptedModel {
     model: DynamicModel,
     config: LoraConfig,
@@ -45,6 +71,7 @@ pub struct AdaptedModel {
     /// The paths among `adapted` that are stacked expert projections, whose
     /// adapters hold one factor pair per expert.
     experts: std::collections::BTreeSet<String>,
+    scope: Scope,
 }
 
 impl std::fmt::Debug for AdaptedModel {
@@ -212,7 +239,84 @@ impl AdaptedModel {
             config,
             adapted,
             experts,
+            scope: Scope::Adapters,
         })
+    }
+
+    /// A model whose every parameter trains: a full-parameter fine-tune.
+    ///
+    /// Nothing is attached, so the forward pass is exactly the one inference
+    /// runs, and the trainer's parameters are the model's own, named as the
+    /// loader named them (see [`lora_parameters`](Self::lora_parameters)). The
+    /// weights must be dense: a packed (quantized) projection cannot take a
+    /// gradient.
+    ///
+    /// # Errors
+    ///
+    /// [`LoraError::InvalidState`] for a model with a packed parameter.
+    pub fn full(model: DynamicModel, options: FullFineTune) -> Result<Self, LoraError> {
+        let mut model = model;
+        let packed: Vec<String> = model
+            .flatten_params()
+            .into_iter()
+            .filter(|(_, value)| !value.dtype().is_float())
+            .map(|(path, _)| path.to_string())
+            .collect();
+        if !packed.is_empty() {
+            let mut packed = packed;
+            packed.sort_unstable();
+            return Err(LoraError::InvalidState(format!(
+                "a full fine-tune needs dense weights, but {} parameter(s) are packed or \
+                 integer ({:?}{}): load the unquantized checkpoint",
+                packed.len(),
+                &packed[..packed.len().min(3)],
+                if packed.len() > 3 { ", ..." } else { "" },
+            )));
+        }
+        let mut frozen = std::collections::BTreeSet::new();
+        if options.freeze_embeddings {
+            let embedding: Option<*const Array> = model
+                .token_embedding_mut()
+                .map(|embedding| &embedding.weight.value as *const Array);
+            let Some(embedding) = embedding else {
+                return Err(LoraError::InvalidState(
+                    "this architecture has no single token embedding to freeze".into(),
+                ));
+            };
+            for (path, slot) in model.flatten_params_mut() {
+                if std::ptr::eq(&*slot as *const Array, embedding) {
+                    frozen.insert(path);
+                }
+            }
+            if frozen.is_empty() {
+                return Err(LoraError::InvalidState(
+                    "the token embedding is not among the model's parameters, so it cannot be \
+                     frozen"
+                        .into(),
+                ));
+            }
+        }
+        Ok(Self {
+            model,
+            config: LoraConfig::default(),
+            adapted: Vec::new(),
+            experts: std::collections::BTreeSet::new(),
+            scope: Scope::Full { frozen },
+        })
+    }
+
+    /// Whether this is a full fine-tune (see [`full`](Self::full)).
+    pub fn is_full_finetune(&self) -> bool {
+        matches!(self.scope, Scope::Full { .. })
+    }
+
+    /// The parameters that keep their loaded value in a full fine-tune: the
+    /// paths [`FullFineTune::freeze_embeddings`] froze. Empty for LoRA.
+    pub fn frozen_parameters(&self) -> Vec<String> {
+        match &self.scope {
+            Scope::Full { frozen } => frozen.iter().cloned().collect(),
+            Scope::Adapters => Vec::new(),
+        }
     }
 
     /// Load a checkpoint through the production dispatcher, then adapt it.
@@ -302,14 +406,28 @@ impl AdaptedModel {
         self.model.forward(input_ids, mask).map_err(LoraError::Mlx)
     }
 
-    /// Adapter tensors, keyed the way an adapter file is.
+    /// What the trainer trains, keyed the way a checkpoint of it is.
+    ///
+    /// For LoRA, the adapter tensors, keyed as an adapter file is. For a full
+    /// fine-tune, every trainable parameter of the model, under the path the
+    /// loader gave it (`model.layers.0.self_attn.q_proj.weight`): checkpoints
+    /// and the optimizer see the same keys.
     pub fn lora_parameters(&self) -> HashMap<Rc<str>, Array> {
-        self.model
-            .flatten_params()
-            .into_iter()
-            .filter(|(path, _)| is_adapter_key(path))
-            .map(|(path, value)| (Rc::from(adapter_key(&path).as_str()), value))
-            .collect()
+        match &self.scope {
+            Scope::Adapters => self
+                .model
+                .flatten_params()
+                .into_iter()
+                .filter(|(path, _)| is_adapter_key(path))
+                .map(|(path, value)| (Rc::from(adapter_key(&path).as_str()), value))
+                .collect(),
+            Scope::Full { frozen } => self
+                .model
+                .flatten_params()
+                .into_iter()
+                .filter(|(path, _)| !frozen.contains(&**path))
+                .collect(),
+        }
     }
 
     /// Overwrite adapter tensors from a map keyed as [`lora_parameters`] emits.
@@ -319,6 +437,16 @@ impl AdaptedModel {
     ///
     /// [`lora_parameters`]: Self::lora_parameters
     pub fn set_lora_parameters(&mut self, params: &HashMap<Rc<str>, Array>) {
+        if let Scope::Full { frozen } = &self.scope {
+            for (path, slot) in self.model.flatten_params_mut() {
+                if !frozen.contains(&path)
+                    && let Some(value) = params.get(path.as_str())
+                {
+                    *slot = value.clone();
+                }
+            }
+            return;
+        }
         let mut tree = self.model.flatten_params_mut();
         for (path, slot) in tree.iter_mut() {
             if !is_adapter_key(path) {
@@ -334,7 +462,8 @@ impl AdaptedModel {
         }
     }
 
-    /// Trainable element count: the adapters, and nothing else.
+    /// Trainable element count: the adapters, and nothing else; for a full
+    /// fine-tune, every element of every parameter that trains.
     pub fn num_trainable_params(&self) -> usize {
         self.lora_parameters()
             .values()
@@ -358,6 +487,11 @@ impl AdaptedModel {
     /// Write the adapters to a safetensors file in PEFT's layout
     /// (`base_model.model.<module>.lora_A.weight`, ...; see [`crate::peft`]).
     pub fn save_lora_weights(&self, path: impl AsRef<Path>) -> Result<(), LoraError> {
+        if self.is_full_finetune() {
+            return Err(LoraError::InvalidState(
+                "a full fine-tune has no adapter to save; save the model".into(),
+            ));
+        }
         let params = self.lora_parameters();
         let mut out: HashMap<String, Array> = HashMap::new();
         for module in &self.adapted {
@@ -834,24 +968,32 @@ impl ModuleParameters for AdaptedModel {
         fn collect<'a>(
             tree: &pmetal_runtime::compat::ModuleParamRef<'a>,
             prefix: &str,
+            trains: &dyn Fn(&str) -> bool,
             out: &mut pmetal_runtime::compat::ModuleParamRef<'a>,
         ) {
             for (name, value) in tree {
                 let path = pmetal_runtime::compat::child_path(prefix, name);
                 match value {
                     pmetal_runtime::compat::NestedValue::Value(array) => {
-                        if is_adapter_key(&path) {
+                        if trains(&path) {
                             out.insert(Rc::from(path.as_str()), NestedValue::Value(array));
                         }
                     }
-                    pmetal_runtime::compat::NestedValue::Map(inner) => collect(inner, &path, out),
+                    pmetal_runtime::compat::NestedValue::Map(inner) => {
+                        collect(inner, &path, trains, out)
+                    }
                 }
             }
         }
 
         let tree = self.model.parameters();
         let mut out = pmetal_runtime::compat::ModuleParamRef::new();
-        collect(&tree, "", &mut out);
+        match &self.scope {
+            Scope::Adapters => collect(&tree, "", &is_adapter_key, &mut out),
+            Scope::Full { frozen } => {
+                collect(&tree, "", &|path| !frozen.contains(path), &mut out);
+            }
+        }
         out
     }
 }

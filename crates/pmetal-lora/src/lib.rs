@@ -27,7 +27,7 @@ pub mod peft;
 mod qlora;
 mod trainable;
 
-pub use adapted::AdaptedModel;
+pub use adapted::{AdaptedModel, FullFineTune};
 pub use dynamic::*;
 pub use lora::*;
 pub use qlora::*;

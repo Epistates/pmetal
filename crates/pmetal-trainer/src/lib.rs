@@ -39,6 +39,7 @@ pub mod dflash_training;
 pub mod diffusion_gemma_train;
 pub mod distillation;
 pub mod embedding_trainer;
+pub mod full_finetune;
 pub mod grpo;
 pub mod logprob_utils;
 pub mod mlx_metal_optimizer;
