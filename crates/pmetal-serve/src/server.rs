@@ -105,6 +105,10 @@ pub fn build_router_with(engine: InferenceEngine, config: &ServeConfig) -> Route
         .route("/v1/embeddings", axum::routing::post(routes::embeddings))
         .route("/v1/messages", axum::routing::post(anthropic::messages))
         .route(
+            "/v1/messages/count_tokens",
+            axum::routing::post(anthropic::count_tokens),
+        )
+        .route(
             "/v1/responses",
             axum::routing::post(crate::responses::responses),
         )
