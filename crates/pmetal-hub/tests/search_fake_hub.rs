@@ -275,3 +275,38 @@ async fn a_model_card_is_fetched_and_parsed() {
     assert_eq!(card.base_models, ["org/base"]);
     assert_eq!(card.body, "# Card\n");
 }
+
+#[tokio::test]
+async fn datasets_are_searched_by_name_and_listed_by_trend() {
+    isolate_env();
+    let hub = FakeHub::start().await;
+    hub.add_dataset(
+        "acme/chat-data",
+        repo_with_info(
+            &[],
+            json!({"downloads": 70, "likes": 3, "tags": ["task_categories:text-generation"], "description": "chats"}),
+        ),
+    );
+    hub.add_dataset("plain", repo_with_info(&[], json!({"downloads": 1})));
+    hub.add_model("acme/chat-model", repo_with_info(&[], json!({})));
+    let options = hub_options(&hub);
+
+    let found = pmetal_hub::search_datasets_with("chat", 10, &options)
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    let chat = &found[0];
+    assert_eq!(chat.dataset_id, "acme/chat-data");
+    assert_eq!(chat.author.as_deref(), Some("acme"));
+    assert_eq!((chat.downloads, chat.likes), (70, 3));
+    assert_eq!(chat.tags, ["task_categories:text-generation"]);
+    assert_eq!(chat.description.as_deref(), Some("chats"));
+
+    // An empty query lists them, models excluded; a bare name has no author.
+    let all = pmetal_hub::search_datasets_with("  ", 10, &options)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = all.iter().map(|d| d.dataset_id.as_str()).collect();
+    assert_eq!(ids, ["acme/chat-data", "plain"]);
+    assert_eq!(all[1].author, None);
+}
