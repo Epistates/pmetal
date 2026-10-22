@@ -47,7 +47,7 @@ pub use embed_train::EmbedTrainSpec;
 pub use eval::EvalSpec;
 pub use fuse::FuseSpec;
 pub use grpo::GrpoSpec;
-pub use infer::InferSpec;
+pub use infer::{ChatMessage, InferSpec, MAX_MESSAGES_BYTES, parse_messages};
 pub use merge::MergeSpec;
 pub use pack_experts::PackExpertsSpec;
 pub use preference::PreferenceSpec;
