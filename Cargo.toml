@@ -101,7 +101,7 @@ crossterm = "0.29"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde-saphyr = "1.3"
+serde-saphyr = "2.0"
 # Names the key a deserialization error came from.
 serde_path_to_error = "0.1"
 json5 = "1.3.3"
@@ -186,7 +186,7 @@ libc = "0.2.191"
 rustix = { version = "1.1", features = ["process"] }
 # Strips terminal escape sequences from a child's output (pmetal-supervisor)
 anstream = "1.0"
-parking_lot = "0.12.5"
+parking_lot = "0.13"
 regex = "1.13"
 uuid = "1.28"
 
