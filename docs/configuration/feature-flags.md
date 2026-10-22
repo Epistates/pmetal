@@ -6,7 +6,7 @@ PMetal uses Cargo feature flags to control which crates and capabilities are com
 
 ## Feature Matrix
 
-The default set is `cli`, `dashboard`, `trainer`, `lora`, `merge`, `ane` and `distributed`.
+The default set is `cli`, `dashboard`, `trainer`, `lora`, `merge`, `vocoder`, `ane` and `distributed`.
 Entries marked `Yes*` are not listed in `default` but arrive through one of those.
 
 | Feature | Default | Crate | Description |
@@ -28,7 +28,7 @@ Entries marked `Yes*` are not listed in `default` but arrive through one of thos
 | `ane` | Yes | — | Apple Neural Engine |
 | `dashboard` | Yes | — | TUI control center |
 | `native-only` | **No** | `pmetal-runtime` | Bridge-only build, without `pmetal-cache` or `pmetal-models` |
-| `vocoder` | **No** | `pmetal-vocoder` | BigVGAN neural vocoder |
+| `vocoder` | Yes | `pmetal-vocoder` | BigVGAN neural vocoder |
 | `mhc` | **No** | `pmetal-mhc` | Manifold-Constrained Hyper-Connections |
 | `serve` | **No** | `pmetal-serve` | OpenAI-compatible inference server (`pmetal serve`) |
 | `mcp` | **No** | `pmetal-mcp` | MCP server for Claude Desktop (`pmetal mcp`) |
@@ -58,16 +58,16 @@ cargo build --release --no-default-features --features dashboard
 
 ```toml
 [dependencies]
-pmetal = "0.6"                                    # default features
-pmetal = { version = "0.6", features = ["full"] } # every sub-crate
+pmetal = "0.7"                                    # default features
+pmetal = { version = "0.7", features = ["full"] } # every sub-crate
 
 # Or depend on the crates you need directly
-pmetal-models = "0.6"
-pmetal-trainer = "0.6"
-pmetal-lora = "0.6"
+pmetal-models = "0.7"
+pmetal-trainer = "0.7"
+pmetal-lora = "0.7"
 ```
 
 ## See Also
 
-- [Installation](/installation/) — Build options
-- [Advanced SDK Usage](/sdk/advanced/) — Crate-level API
+- [Installation](/installation/): Build options
+- [Advanced SDK Usage](/sdk/advanced/): Crate-level API

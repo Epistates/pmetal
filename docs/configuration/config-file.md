@@ -35,7 +35,7 @@ dataset:
 pmetal train --config training.yaml
 ```
 
-CLI flags override config file values when both are specified.
+A command-line option that differs from its default overrides the file; an option left at its default (including one typed with the default's value) leaves the file's value in force. `--model` and `--dataset` override `model.model_id` and `dataset.dataset_id` when given.
 
 ## Strict loading
 
@@ -46,20 +46,23 @@ every problem is listed with its dotted key (`training.learning_rate`), and so
 are contradictions, such as setting both `warmup_steps` and `warmup_ratio`, or
 setting `wsd_stable_ratio` under a schedule that is not `wsd`.
 
-Options that are recognised but not available yet are refused by name rather
-than run as something else: the `muon`, `adamw_schedule_free` and `adamw_8bit`
-optimizers, LoRA `bias` other than `none`, and the `pissa` and `loftq` values
-of `init_lora_weights`.
+LoRA `bias` other than `none` is refused by name: training bias terms is not implemented.
+`init_lora_weights: false` is refused too (a randomly initialised `B` starts the adapter away
+from the base model); name an initialisation instead.
 
 Files written by earlier releases still load. `epochs`, `lr_schedule`,
 `cosine_num_cycles`, `name` (for `model_id`) and `path` (for `dataset_id`) are
 accepted as spellings of the keys below. Keys that were accepted but never read
-(`model.dtype`, `model.device`, `model.quantization`, `model.trust_remote_code`,
-`model.revision`, `dataset.split`, `dataset.text_column`, `dataset.max_samples`,
-`dataset.seed`) are dropped when they hold the value `pmetal init` wrote; set to
-anything else they are an error, since they never did what they asked for.
-`model.max_seq_len` is read as `training.max_seq_len` when the training section
-leaves it out.
+are retired: `model.dtype`, `model.device`, `model.quantization`,
+`model.trust_remote_code`, `model.revision`, `model.hf_token`, `dataset.split`,
+`dataset.text_column`, `dataset.max_samples` and `dataset.seed` are dropped when
+they hold the value `pmetal init` wrote and are an error set to anything else,
+since they never did what they asked for. `model.use_flash_attention`,
+`dataset.format` and `training.gradient_checkpointing` are dropped with a note
+whatever they hold (attention always uses the fused kernel where one applies, the
+dataset format is detected, and gradient checkpointing is on by default;
+`pmetal train --no-gradient-checkpointing` turns it off). `model.max_seq_len` is
+read as `training.max_seq_len` when the training section leaves it out.
 
 ## Sections
 
@@ -80,7 +83,8 @@ leaves it out.
 | `use_rslora` | bool | `false` | Scale by `alpha / sqrt(r)` |
 | `use_dora` | bool | `false` | Weight-decomposed LoRA |
 | `loraplus_lr_ratio` | float | unset | LoRA+ learning-rate ratio for the `B` matrices (the paper uses 16) |
-| `init_lora_weights` | `true` or name | `true` | Initialisation of `A` and `B`: `true` (the standard one: `A` random, `B` zero), `pissa` (principal singular components), `olora` (QR factors), `loftq` (quantization-aware; needs `quantization`) |
+| `bias` | string | `none` | Only `none` is implemented |
+| `init_lora_weights` | `true` or name | `true` | Initialisation of `A` and `B`: `true` or `standard` (`A` random, `B` zero), `pissa` (principal singular components), `olora` (QR factors), `loftq` (fitted to a quantizer; needs QLoRA, `pmetal train --quantization`). Config file only: there is no command-line option |
 
 ### training
 
@@ -110,6 +114,9 @@ leaves it out.
 | `output_dir` | string | `./output` | Where weights and checkpoints go |
 | `use_packing` | bool | `true` | Pack short sequences |
 | `max_seq_len` | integer | `8192` | Maximum sequence length; 0 takes it from the model |
+| `label_smoothing` | float | `0` | Label smoothing of the training loss, in [0, 1); evaluation reports the plain loss |
+| `z_loss` | float | `0` | Weight of the z-loss (`weight * logsumexp^2` per token); 1e-4 is the paper's value |
+| `neftune_noise_alpha` | float | unset | NEFTune noise magnitude added to the token embeddings (5 for small models, 15 for larger ones) |
 
 ### dataset
 
@@ -120,5 +127,5 @@ leaves it out.
 
 ## See Also
 
-- [pmetal init](/cli/init/) — Generate a sample config
-- [pmetal train](/cli/train/) — CLI training parameters
+- [pmetal init](/cli/init/): Generate a sample config
+- [pmetal train](/cli/train/): CLI training parameters

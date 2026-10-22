@@ -7,17 +7,15 @@ It needs macOS 14 or later on Apple Silicon.
 
 ## Installation
 
-```bash
-pip install pmetal
-```
-
-From a checkout:
+The wheel is not on PyPI yet, so build it from a checkout with [maturin](https://www.maturin.rs):
 
 ```bash
 cd crates/pmetal-py
 pip install maturin
 maturin develop --profile wheel
 ```
+
+`just build-wheel` builds the wheel a release ships, with the `pmetal` command line and the Metal library inside the package.
 
 ## Fine-Tuning
 
