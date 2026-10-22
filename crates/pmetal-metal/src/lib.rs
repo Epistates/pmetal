@@ -1,30 +1,39 @@
-//! Metal GPU compute kernels for PMetal.
+//! Metal GPU compute kernels and Apple Neural Engine programming for PMetal.
 //!
-//! This crate provides Metal compute kernels for the operations the tensor
-//! runtime has no op for, optimized for Apple Silicon:
+//! This crate holds the Apple-Silicon pieces the tensor runtime
+//! (`pmetal-runtime`) has no op for:
 //!
-//! - **Training kernels**: fused cross-entropy (including the chunked linear +
-//!   cross-entropy that never materializes the logits), fused AdamW, FP8
-//! - **DwGemm**: the f32 weight-gradient GEMM the ANE trainer batches into one
-//!   command buffer
-//! - **Merging and KV-cache transforms**: model merging, TurboQuant
-//! - **Device Management**: Thread-safe Metal device and command queue handling
-//! - **Buffer Abstractions**: Type-safe GPU buffer management with unified memory
+//! - **Training kernels** ([`kernels`]): [`FusedAdamW`](kernels::FusedAdamW),
+//!   a one-dispatch optimizer update over every parameter, and
+//!   [`DwGemm`](kernels::DwGemm), the f32 weight-gradient GEMM the ANE trainer
+//!   batches into one command buffer
+//! - **Apple Neural Engine** ([`ane`], feature `ane`, on by default): MIL
+//!   program generation, IOSurface transfer, a compile-once training loop and
+//!   an inference engine, through the private `AppleNeuralEngine.framework`
+//! - **CPU helpers**: [`accelerate`] (vDSP and cblas wrappers for RMSNorm,
+//!   softmax, cross-entropy, Adam and GEMM) and [`neon_convert`] (bulk
+//!   f16 and f32 conversion)
+//! - **Device management and buffers**: a thread-safe [`MetalContext`] with a
+//!   pipeline cache, type-safe [`MetalBuffer`]s over unified memory, and
+//!   zero-copy [views](view) of memory the runtime owns
 //!
 //! Dense attention, RoPE, SwiGLU, LoRA and GEMM are deliberately absent: the
 //! runtime runs them in its lazy graph, with autodiff, faster than the
 //! hand-written kernels this crate used to carry for them.
 //!
+//! The whole crate is `cfg(target_os = "macos")`.
+//!
 //! # Architecture
 //!
-//! The crate is designed to work alongside MLX, sharing unified memory:
+//! The crate is designed to work alongside the runtime, sharing unified memory:
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │                    Unified Memory                           │
 //! │                                                             │
 //! │  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐     │
-//! │  │  MLX Array  │◄──►│ Metal Buffer│◄──►│ CPU Access  │     │
+//! │  │   Runtime   │◄──►│ Metal Buffer│◄──►│ CPU Access  │     │
+//! │  │    Array    │    │             │    │             │     │
 //! │  └─────────────┘    └─────────────┘    └─────────────┘     │
 //! │                                                             │
 //! └─────────────────────────────────────────────────────────────┘

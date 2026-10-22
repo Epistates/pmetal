@@ -3,6 +3,11 @@
 Reading, writing, dequantizing and quantizing GGUF files, the single-file format for GGML-family
 inference runtimes. Implements the GGUF specification (versions 1 to 3) and the ggml block formats.
 
+It is plain Rust with no GPU or runtime dependency. `pmetal-models` loads GGUF checkpoints through
+it, `pmetal-data` builds a tokenizer from the one a file carries, `pmetal-hub` verifies GGUF
+downloads and writes the `config.json` they lack, and the `pmetal` CLI writes quantized models
+with it.
+
 ## Features
 
 - **Reading**: a parser that checks every count and length against the bytes the file has left and
@@ -19,7 +24,52 @@ inference runtimes. Implements the GGUF specification (versions 1 to 3) and the 
 - **Metadata**: tokenizer and `config.json` extraction from `tokenizer.ggml.*` and
   `<arch>.*` keys.
 
+## Installation
+
+```toml
+[dependencies]
+pmetal-gguf = "0.7"
+```
+
 ## Usage
+
+### Round trip in memory
+
+Quantize a tensor, write a GGUF file to bytes, read it back and decode it. `TensorInfo::dimensions`
+are row-major, outermost first, as `dequant` takes them.
+
+```rust
+use std::io::Cursor;
+
+use pmetal_gguf::{GgmlType, GgufBuilder, GgufContent, dequant, quantize};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Two rows of 64 weights, quantized to Q8_0 (blocks of 32).
+    let (rows, cols) = (2usize, 64usize);
+    let weights: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.05).sin()).collect();
+    let packed = quantize::quantize_tensor(&weights, GgmlType::Q8_0, cols, None)?;
+
+    let mut builder = GgufBuilder::with_model("llama", "tiny");
+    builder.add_raw_tensor(
+        "blk.0.ffn_up.weight",
+        vec![rows as u64, cols as u64],
+        GgmlType::Q8_0,
+        packed,
+    );
+    let mut file = Cursor::new(builder.build_to_bytes()?);
+
+    let gguf = GgufContent::read(&mut file)?;
+    assert_eq!(gguf.architecture(), Some("llama"));
+    let info = gguf.get_tensor_info("blk.0.ffn_up.weight").unwrap();
+    let raw = gguf.read_tensor_data(&mut file, "blk.0.ffn_up.weight")?;
+    let shape: Vec<i32> = info.dimensions.iter().map(|&d| d as i32).collect();
+    let decoded = dequant::dequantize(&raw, info.dtype, &shape)?;
+
+    let worst = weights.iter().zip(&decoded).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+    assert!(worst < 0.01);
+    Ok(())
+}
+```
 
 ### Reading GGUF Files
 
@@ -117,6 +167,14 @@ decoded.
 | `imatrix` | Importance matrix (legacy `.dat` and GGUF) |
 | `k_quants`, `iq_quants` | Block formats |
 | `tokenizer`, `config` | Metadata extraction |
+
+## Feature flags
+
+None.
+
+## Requirements
+
+- Rust 1.95 or later; any platform
 
 ## License
 

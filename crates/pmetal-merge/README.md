@@ -6,6 +6,8 @@ Model merging toolkit for Apple Silicon.
 
 This crate provides utilities for merging multiple fine-tuned models into a single model. It supports various merging strategies and is optimized for memory-efficient processing of large models.
 
+It computes on `pmetal-runtime` arrays and needs only `pmetal-hub` to resolve model ids. `pmetal-trainer` borrows its checkpoint helpers (behind the trainer's `ane` feature), and the `pmetal` CLI exposes it as `pmetal merge` and `pmetal fuse`.
+
 ## Merge Methods
 
 | Method | Description | Reference |
@@ -41,7 +43,56 @@ This crate provides utilities for merging multiple fine-tuned models into a sing
 - **LoRA fusing**: PEFT and `pmetal train` adapters, rsLoRA, DoRA, `alpha_pattern`, and
   MLX-quantized bases (dequantize, fold, requantize)
 
+## Installation
+
+```toml
+[dependencies]
+pmetal-merge = "0.7"
+```
+
 ## Usage
+
+### A merge, end to end
+
+`MergeBuilder` assembles a configuration and runs it. This one merges two tiny models written
+into a temporary directory, so it needs no downloaded weights; a real merge names model
+directories (or Hugging Face ids) instead.
+
+```rust
+use std::collections::HashMap;
+use std::path::Path;
+
+use pmetal_merge::{MergeBuilder, MergeMethodConfig, SafetensorsLoader, TensorLoader};
+use safetensors::{Dtype, tensor::TensorView};
+
+fn write_model(dir: &Path, weights: [f32; 4]) {
+    std::fs::create_dir_all(dir).unwrap();
+    let bytes: Vec<u8> = weights.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let view = TensorView::new(Dtype::F32, vec![1, 4], &bytes).unwrap();
+    let file = safetensors::serialize(HashMap::from([("w", view)]), None).unwrap();
+    std::fs::write(dir.join("model.safetensors"), file).unwrap();
+    std::fs::write(dir.join("config.json"), r#"{"model_type": "test", "hidden_size": 4}"#).unwrap();
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let work = tempfile::tempdir()?;
+    let (a, b) = (work.path().join("a"), work.path().join("b"));
+    write_model(&a, [0.0, 2.0, 4.0, 6.0]);
+    write_model(&b, [2.0, 4.0, 6.0, 8.0]);
+
+    let merged = MergeBuilder::new()
+        .method(MergeMethodConfig::Linear)
+        .add_model(a.to_string_lossy())
+        .add_model(b.to_string_lossy())
+        .output(work.path().join("merged"))
+        .dtype("float32")
+        .run()?;
+
+    let mut w = SafetensorsLoader::new(&merged)?.load_tensor("w")?;
+    assert_eq!(w.to_f32_vec(4).unwrap(), [1.0, 3.0, 5.0, 7.0]);
+    Ok(())
+}
+```
 
 ### Linear Merge
 
@@ -192,6 +243,15 @@ model.
 | `moe_align` | Expert permutation alignment for MoE merges |
 | `sanity` | NaN/inf checks on merged tensors |
 | `sparsify` | Magnitude, DARE, DELLA and Breadcrumbs sparsifiers |
+
+## Feature flags
+
+None.
+
+## Requirements
+
+- Rust 1.95 or later
+- macOS 14 or later on Apple Silicon (merging computes on `pmetal-runtime` arrays)
 
 ## License
 

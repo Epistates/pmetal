@@ -1,11 +1,13 @@
 [package]
 name = "pmetal-trainer"
-description = "Training loops and optimization for PMetal"
+description = "Training loops, trainers and optimizers for PMetal: SFT, LoRA, preference, GRPO, distillation, pretraining"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 
