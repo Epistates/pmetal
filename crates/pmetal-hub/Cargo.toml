@@ -1,13 +1,15 @@
 [package]
 name = "pmetal-hub"
-description = "HuggingFace Hub integration for PMetal"
+description = "Hugging Face Hub downloads, verification, search and publishing for PMetal"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["huggingface", "hub", "download", "model", "llm"]
+categories = ["api-bindings", "science"]
 
 [dependencies]
 pmetal-core = { workspace = true }

@@ -143,6 +143,16 @@ fn main() -> std::process::ExitCode {
 fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // A command that writes no event log must not take the flag: the caller
+    // would wait on a file that never fills.
+    #[cfg(feature = "trainer")]
+    if cli.log_events.is_some() && !cli.command.writes_event_log() {
+        anyhow::bail!(
+            "--log-events is written by train, distill, grpo, rlkd and preference only; \
+             this command writes no event log"
+        );
+    }
+
     // The TUI owns the terminal, so it logs to the file only.
     #[cfg(feature = "dashboard")]
     let is_tui = matches!(

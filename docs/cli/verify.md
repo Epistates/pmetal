@@ -12,7 +12,12 @@ however large the weights) and says what is missing.
 pmetal verify <MODEL> [--json]
 ```
 
-`MODEL` is a model directory, or a Hub model ID with a copy in the Hub cache.
+## Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `<MODEL>` | required | A model directory, or a Hub model ID with a copy in the Hub cache |
+| `--json` | `false` | Print the report as JSON |
 
 ## What is checked
 
@@ -31,7 +36,17 @@ and a verdict. With `--json`, the same as a JSON object (`complete`, `loadable`,
 The exit status is `0` for a complete model and `1` for an incomplete or damaged one, so
 `pmetal verify ./model && pmetal infer ...` works in a script.
 
+## Examples
+
+```bash
+# A directory
+pmetal verify ./output/fused
+
+# A cached Hub model, as JSON
+pmetal verify Qwen/Qwen3-0.6B --json
+```
+
 ## See Also
 
-- [pmetal download](/cli/download/): fetch a model (it verifies what it downloads)
-- [pmetal info](/cli/info/): the device and the build
+- [pmetal download](/cli/download/): Fetch a model (it verifies what it downloads)
+- [pmetal info](/cli/info/): The device and the build

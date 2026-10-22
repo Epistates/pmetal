@@ -20,28 +20,47 @@
 //! - `t` advances with the student's measured improvement, never slower than
 //!   a linear schedule.
 //!
-//! ```rust,ignore
+//! ```
 //! use pmetal_distill::{TaidConfig, TaidDistiller};
+//! use pmetal_runtime::compat::Array;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let teacher = Array::from_f32_slice(&[2.0, 0.5, 0.1, 0.1, 0.1, 2.0, 0.5, 0.1], &[1, 2, 4]);
+//! let student = Array::from_f32_slice(&[0.0; 8], &[1, 2, 4]);
 //!
 //! let mut taid = TaidDistiller::new(TaidConfig::default())?;
-//! let out = taid.compute_loss(&teacher_logits, &student_logits, Some(&mask), None)?;
-//! // ... differentiate `out.total`, step the optimizer ...
-//! taid.observe(out.distillation.item::<f32>() as f64, step, total_steps);
+//! let out = taid.compute_loss(&teacher, &student, None, None)?;
+//! // ... differentiate `out.total`, step the optimizer, then report progress:
+//! let objective: f32 = out.distillation.item();
+//! taid.observe(f64::from(objective), 0, 100);
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Differentiability
 //!
-//! Every loss is an MLX expression, so it runs on the GPU through MLX and the
-//! student is trained by differentiating it directly.
+//! Every loss is an expression over `pmetal-runtime` arrays, so it runs on the
+//! GPU and the student is trained by differentiating it directly.
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```
 //! use pmetal_distill::{DistillConfig, Distiller};
+//! use pmetal_runtime::compat::Array;
 //!
-//! let config = DistillConfig::from_yaml_file("distill_config.yaml")?;
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! // `DistillConfig::from_yaml_file` reads the same thing from disk.
+//! let config = DistillConfig::from_yaml("teacher: Qwen/Qwen3-8B\nstudent: Qwen/Qwen3-0.6B\n")?;
 //! let distiller = Distiller::new(config)?;
-//! // Use `distiller.compute_loss(...)` inside your own training loop.
+//!
+//! let teacher = Array::from_f32_slice(&[2.0, 0.5, 0.1, 0.1, 0.1, 2.0, 0.5, 0.1], &[1, 2, 4]);
+//! let student = Array::from_f32_slice(&[0.0; 8], &[1, 2, 4]);
+//! // Use `distiller.compute_loss(..)` inside your own training loop:
+//! // (labels, per-token weights, step, total steps)
+//! let out = distiller.compute_loss(&teacher, &student, None, None, 0, 100)?;
+//! assert!(out.total.item::<f32>() > 0.0);
+//! # Ok(())
+//! # }
 //! ```
 
 mod config;

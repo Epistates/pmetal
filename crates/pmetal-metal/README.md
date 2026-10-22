@@ -1,15 +1,20 @@
 # pmetal-metal
 
-High-performance Metal GPU kernels for Apple Silicon.
+Metal GPU kernels and direct Apple Neural Engine programming for Apple Silicon.
 
 ## Overview
 
 This crate provides custom Metal shaders for the operations the tensor runtime has no op for. Dense attention, RoPE, SwiGLU, LoRA and GEMM are deliberately not here: the runtime runs them in its lazy graph, with autodiff, and a hand-written kernel for any of them measured slower than the runtime op.
 
+It sits under the training and inference crates: `pmetal-trainer`, `pmetal-models`, `pmetal-serve` and `pmetal-mcp` depend on it, and the `pmetal` CLI and `pmetal-py` reach it through them. It needs only `pmetal-core` from the workspace. The whole crate is `cfg(target_os = "macos")`.
+
 ## Features
 
 - **Fused AdamW**: one-dispatch optimizer update over every parameter
 - **dW GEMM**: the f32 weight-gradient GEMM the ANE trainer batches into one command buffer
+- **Apple Neural Engine**: MIL program generation, IOSurface transfer, a compile-once training loop and the `AneLm` inference engine (prefill, decode and speculative verification on one set of kernels)
+- **CPU helpers**: vDSP and cblas wrappers (`accelerate`) and NEON f16/f32 bulk conversion (`neon_convert`)
+- **Device management**: a thread-safe `MetalContext` with a pipeline cache, typed `MetalBuffer`s over unified memory, and zero-copy views of runtime arrays
 
 ## Architecture
 
@@ -21,6 +26,7 @@ pmetal-metal/
 │   ├── view.rs           # Zero-copy Metal views of runtime arrays
 │   ├── pipeline.rs       # Compute pipeline management
 │   ├── accelerate.rs     # vDSP/cblas wrappers (RMSNorm, Adam, GEMM, etc.)
+│   ├── neon_convert.rs   # NEON f16 <-> f32 bulk conversion
 │   ├── kernels/
 │   │   ├── metal/        # .metal shader source files
 │   │   └── *.rs          # Rust wrappers for each kernel
@@ -32,6 +38,8 @@ pmetal-metal/
 │       ├── kernel.rs         # Weight blobs, int8 quantization, RoPE helpers
 │       ├── dynamic_kernel.rs # Dynamic weight kernel generators (training)
 │       ├── dynamic_trainer.rs# Compile-once training loop
+│       ├── loss.rs           # Composable loss functions for the trainer
+│       ├── scratch.rs        # Pre-allocated scratch pool for the backward pass
 │       ├── extend.rs         # Multi-layer prefill/decode/verify kernels over an IOSurface KV cache
 │       └── lm.rs             # ANE text generation from a Hugging Face checkpoint
 ```
@@ -51,6 +59,13 @@ The ANE module provides a complete training and inference pipeline using Apple's
 | `ffn_bwd_w13t` | FFN backward through W1/W3 |
 | `sdpa_bwd1` | Attention backward part 1 (dV, attention probs), fused with the output projection |
 | `sdpa_bwd2` | Attention backward part 2 (dQ, dK) |
+
+## Installation
+
+```toml
+[dependencies]
+pmetal-metal = "0.7"
+```
 
 ## Usage
 
@@ -92,10 +107,16 @@ fn adamw_step() -> Result<()> {
 
 ## Requirements
 
+- Rust 1.95 or later
 - macOS 14+ (Sonoma or later), MLX's floor
 - Apple Silicon (M1/M2/M3/M4/M5)
 - Metal Toolchain (via Xcode or `xcodebuild -downloadComponent MetalToolchain`)
-- ANE features require `--features ane` at build time
+
+## Feature flags
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `ane` | yes | The `ane` module (also turns on `pmetal-core/ane`). It drives the Neural Engine through Apple's private `AppleNeuralEngine.framework`; build with `default-features = false` to leave it out |
 
 ## License
 

@@ -14,8 +14,8 @@ echo "Address: http://$HOST:$PORT"
 echo ""
 
 if ! "$PMETAL_BIN" serve --help >/dev/null 2>&1; then
-    echo "This pmetal binary was built without the serve feature."
-    echo "Build it with: cargo build -p pmetal --release --features serve"
+    echo "This pmetal binary was built without the serve feature." >&2
+    echo "Build it with: cargo build -p pmetal --release --features serve,mcp" >&2
     exit 1
 fi
 

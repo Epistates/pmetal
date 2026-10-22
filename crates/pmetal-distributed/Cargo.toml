@@ -2,9 +2,14 @@
 name = "pmetal-distributed"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Distributed training and inference backend for PMetal (Home Clusters)"
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["distributed", "all-reduce", "cluster", "apple-silicon", "mlx"]
+categories = ["network-programming", "science"]
 
 [features]
 default = []

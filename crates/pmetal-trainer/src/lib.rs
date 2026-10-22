@@ -1,12 +1,18 @@
 //! Training loops and optimization for PMetal.
 //!
 //! This crate provides:
-//! - Supervised Fine-Tuning (SFT)
-//! - LoRA fine-tuning
+//! - The whole pipeline behind `pmetal train` ([`orchestrator::run_training`])
+//! - Supervised Fine-Tuning (SFT) and LoRA / QLoRA fine-tuning
+//!   ([`TrainingLoop`])
+//! - Full-parameter pretraining ([`pretrain`])
 //! - Offline preference optimization ([`preference`]): DPO, IPO, hinge,
 //!   SimPO and ORPO on preference pairs, and KTO on labelled completions
 //! - Group Relative Policy Optimization (GRPO), with DAPO's clip-higher,
 //!   dynamic sampling and overlong penalty as a mode of the same trainer
+//! - Knowledge distillation ([`distillation`], [`rlkd`]) and sentence-embedding
+//!   training ([`embedding_trainer`])
+//! - Draft-model training for speculative decoding ([`dflash_training`],
+//!   [`mtp_training`])
 //! - Learning rate schedulers
 //! - Training callbacks
 //! - Parameter grouping for per-layer learning rates
@@ -18,7 +24,7 @@
 //! - Embeddings use a lower learning rate (default 5e-5 vs 2e-4 for LoRA)
 //! - Use [`ParamGroupOptimizer`] or the `--embedding-lr` CLI flag
 //!
-//! ```ignore
+//! ```
 //! use pmetal_core::OptimizerType;
 //! use pmetal_trainer::ParamGroupOptimizerBuilder;
 //!
@@ -26,6 +32,7 @@
 //!     .with_embedding_lr(5e-5)  // recommended default
 //!     .with_weight_decay(0.01)
 //!     .build();
+//! # let _ = optimizer;
 //! ```
 
 pub mod orchestrator;

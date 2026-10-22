@@ -9,12 +9,14 @@ pub struct PretrainArgs {
     #[arg(short, long = "arch")]
     pub arch: String,
 
-    /// Glob pattern or comma-separated list of tokenized shard files (.bin)
-    #[arg(short, long = "shards", value_delimiter = ',')]
+    /// Tokenized shard files (.bin) from `pmetal tokenize`: a comma-separated
+    /// list, or several values (an unquoted shell glob expands to them)
+    #[arg(short, long = "shards", value_delimiter = ',', num_args = 1..)]
     pub shards: Vec<String>,
 
-    /// Optional held-out tokenized shard files for evaluation.
-    #[arg(long = "eval-shards", value_delimiter = ',')]
+    /// Optional held-out tokenized shard files for evaluation (same forms as
+    /// --shards).
+    #[arg(long = "eval-shards", value_delimiter = ',', num_args = 1..)]
     pub eval_shards: Vec<String>,
 
     /// Target sequence length for packed training batches

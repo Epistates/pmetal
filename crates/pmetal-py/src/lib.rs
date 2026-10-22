@@ -10,6 +10,9 @@
 //! - `grpo`: a `GrpoSpec` run in this process, with Python reward functions.
 //! - `model`, `dflash`, `infer`, `tokenizer`: inference.
 //! - `hub`: the Hugging Face Hub.
+//! - `jobs`: any spec's command run under `pmetal-supervisor` (the package's
+//!   `run` and `start`).
+//! - `metallib`: pointing the runtime at the metallib the wheel carries.
 //! - `runtime`: the shared async runtime, and how a Python thread waits on
 //!   work with the GIL released and Ctrl-C honoured.
 

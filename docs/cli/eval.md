@@ -2,6 +2,12 @@
 
 Evaluate a model: perplexity on a dataset, or a benchmark task.
 
+Perplexity is `exp` of the average negative log-likelihood per token of the dataset's text, rendered
+with the model's chat template and cut at `--max-seq-len`. Lower is better. The dataset is read in
+the formats `pmetal train` reads; `--lora` scores a model with an adapter on top, to compare it with
+the base model on the same data. With `--json` the result is `model`, `dataset`, `num_samples`,
+`total_tokens`, `avg_nll` and `perplexity`.
+
 ## Usage
 
 ```bash
@@ -116,7 +122,7 @@ of each choice, and the verdict.
 | `--dataset` | — | Perplexity: the text to score. With `--task`: a local file of the task's data |
 | `--task` | — | `gsm8k`, `mmlu`, `arc_challenge`, `hellaswag`, `ifeval-lite` or `custom`; without it, perplexity |
 | `--fewshot` | the task's | Examples shown before each question |
-| `--lora` | — | LoRA adapter to attach |
+| `--lora` | — | LoRA adapter to attach: a directory written by `pmetal train`, or its weights file |
 | `--max-seq-len` | `0` | Longest sequence in tokens (0 = 1024 for perplexity, 8192 for a task); a longer one loses the start of its context |
 | `--num-samples`, `--limit` | `0` | Score this many samples (0 = all) |
 | `--seed` | `1234` | Which items a limit keeps and which few-shot examples are drawn |

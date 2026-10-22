@@ -1,13 +1,15 @@
 [package]
 name = "pmetal-mcp"
-description = "MCP server exposing PMetal ML toolkit"
+description = "MCP server for PMetal: train, run and manage models from Claude and other MCP clients"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["mcp", "model-context-protocol", "llm", "fine-tuning", "apple-silicon"]
+categories = ["development-tools", "science"]
 
 [[bin]]
 name = "pmetal-mcp"

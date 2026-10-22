@@ -19,7 +19,8 @@ use crate::LoraError;
 /// - Parameter access (for autodiff and checkpointing)
 /// - LoRA adapter management
 ///
-/// Both `LlamaLoraForCausalLM` and `LlamaQloraForCausalLM` implement this trait.
+/// [`AdaptedModel`](crate::AdaptedModel) and [`DynamicLoraModel`](crate::DynamicLoraModel)
+/// implement this trait.
 pub trait TrainableModel: ModuleParameters {
     /// Perform forward pass through the model.
     ///

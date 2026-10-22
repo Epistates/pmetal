@@ -4,6 +4,8 @@ Preference optimization with LoRA: DPO, IPO, hinge, SimPO and ORPO on prompt/cho
 
 The reference model costs no memory. DPO, IPO, hinge and KTO compare the policy with the model as it was before training, and a fresh LoRA adapter starts at zero, so the policy is the reference until its first update. Every example is scored once before training and the log-probabilities are kept: one forward pass per sequence and no second copy of the model.
 
+Ctrl-C (SIGINT) or SIGTERM finishes the step in flight, saves the adapter and exits with status 130. `--log-events` (a global option) writes the run's events as JSONL.
+
 ## Usage
 
 ```bash
@@ -14,24 +16,39 @@ pmetal preference \
   [OPTIONS]
 ```
 
-## Examples
+## Options
 
-```bash
-# DPO on a local preference file
-pmetal preference --model Qwen/Qwen3-0.6B --dataset pairs.jsonl
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-m`, `--model` | required | Model ID or local path |
+| `-d`, `--dataset` | required | JSONL / JSON / Parquet file or Hugging Face dataset ID |
+| `-o`, `--output` | `./output/preference` | Where `adapter_model.safetensors` and `adapter_config.json` go |
+| `--loss` | `dpo` | `dpo`, `ipo`, `hinge`, `simpo`, `orpo` or `kto` |
+| `--beta` | 2.5 for SimPO, 0.1 otherwise | β |
+| `--simpo-gamma-ratio` | `0.5` | SimPO's target margin over β (γ/β) |
+| `--label-smoothing` | `0.0` | DPO: share of labels assumed flipped; above 0 trains Robust DPO |
+| `--desirable-weight` | `1.0` | KTO weight of desirable examples |
+| `--undesirable-weight` | `1.0` | KTO weight of undesirable examples |
+| `--learning-rate` | `1e-5` | Peak learning rate (cosine decay after warmup) |
+| `--batch-size` | `2` | Pairs or KTO examples per micro-batch |
+| `--gradient-accumulation-steps` | `8` | Micro-batches per optimizer step |
+| `--epochs` | `1` | Passes over the dataset |
+| `--max-steps` | none | Stop after this many optimizer steps |
+| `--warmup-ratio` | `0.1` | Share of steps spent warming up |
+| `--max-grad-norm` | `1.0` | Global gradient-norm clip (0 disables) |
+| `--weight-decay` | `0.0` | Weight decay |
+| `--optimizer` | `adamw` | `adamw`, `sgd` (momentum 0.9), `lion`, `adafactor`, `muon`, `adamw_schedule_free`, `adamw_8bit`. Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW; schedule-free AdamW wants a constant rate |
+| `--lora-r` | `16` | LoRA rank |
+| `--lora-alpha` | `32` | LoRA alpha |
+| `--full` | `false` | Train every weight and save a whole model instead of an adapter (see below) |
+| `--freeze-embeddings` | `false` | With `--full`, keep the input token embedding as loaded |
+| `--no-memory-check` | `false` | With `--full`, skip the check of the memory estimate against the device |
+| `--max-prompt-length` | `512` | Prompt tokens kept |
+| `--max-length` | `1024` | Prompt plus completion tokens kept |
+| `--seed` | `42` | Adapter initialization and shuffling |
+| `--log-metrics` | none | Write per-step metrics as JSONL to this path (relative to `--output`) |
 
-# SimPO (reference-free, length-normalized)
-pmetal preference --model Qwen/Qwen3-0.6B --dataset pairs.jsonl --loss simpo
-
-# Robust DPO for noisy labels (10% assumed flipped)
-pmetal dpo --model Qwen/Qwen3-0.6B --dataset pairs.jsonl --label-smoothing 0.1
-
-# KTO on thumbs-up / thumbs-down data
-pmetal preference --model Qwen/Qwen3-0.6B --dataset feedback.jsonl --loss kto --batch-size 4
-
-# Use the trained adapter
-pmetal infer --model Qwen/Qwen3-0.6B --lora ./output/preference/adapter_model.safetensors
-```
+Each step logs the loss, the mean implicit reward of chosen and rejected completions, their margin, the share of pairs ranked correctly, and for KTO the KL estimate.
 
 ## Objectives
 
@@ -59,39 +76,24 @@ Rows come from JSONL, a JSON array, Parquet, or a Hugging Face dataset ID.
 
 The last shape is KTO's. KTO also reads paired rows, taking the chosen completion as desirable and the rejected one as undesirable. Prompts go through the model's chat template, as `pmetal train` renders them, so the completion is the assistant's turn including its end-of-turn token. Prompts longer than `--max-prompt-length` keep their last tokens; sequences longer than `--max-length` are cut at the end.
 
-## Parameters
+## Examples
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--model` | *required* | Model ID or local path |
-| `--dataset` | *required* | JSONL / JSON / Parquet file or Hugging Face dataset ID |
-| `--output` | `./output/preference` | Where `adapter_model.safetensors` and `adapter_config.json` go |
-| `--loss` | `dpo` | `dpo`, `ipo`, `hinge`, `simpo`, `orpo` or `kto` |
-| `--beta` | 2.5 for SimPO, 0.1 otherwise | β |
-| `--simpo-gamma-ratio` | `0.5` | SimPO's target margin over β (γ/β) |
-| `--label-smoothing` | `0.0` | DPO: share of labels assumed flipped; above 0 trains Robust DPO |
-| `--desirable-weight` | `1.0` | KTO weight of desirable examples |
-| `--undesirable-weight` | `1.0` | KTO weight of undesirable examples |
-| `--learning-rate` | `1e-5` | Peak learning rate (cosine decay after warmup) |
-| `--batch-size` | `2` | Pairs or KTO examples per micro-batch |
-| `--gradient-accumulation-steps` | `8` | Micro-batches per optimizer step |
-| `--epochs` | `1` | Passes over the dataset |
-| `--max-steps` | — | Stop after this many optimizer steps |
-| `--warmup-ratio` | `0.1` | Share of steps spent warming up |
-| `--max-grad-norm` | `1.0` | Global gradient-norm clip (0 disables) |
-| `--weight-decay` | `0.0` | Weight decay |
-| `--optimizer` | `adamw` | `adamw`, `sgd` (momentum 0.9), `lion`, `adafactor`, `muon`, `adamw_schedule_free`, `adamw_8bit`. Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW; schedule-free AdamW wants a constant rate |
-| `--lora-r` | `16` | LoRA rank |
-| `--lora-alpha` | `32` | LoRA alpha |
-| `--full` | `false` | Train every weight and save a whole model instead of an adapter (see below) |
-| `--freeze-embeddings` | `false` | With `--full`, keep the input token embedding as loaded |
-| `--no-memory-check` | `false` | With `--full`, skip the check of the memory estimate against the device |
-| `--max-prompt-length` | `512` | Prompt tokens kept |
-| `--max-length` | `1024` | Prompt plus completion tokens kept |
-| `--seed` | `42` | Adapter initialization and shuffling |
-| `--log-metrics` | — | Per-step metrics as JSONL |
+```bash
+# DPO on a local preference file
+pmetal preference --model Qwen/Qwen3-0.6B --dataset pairs.jsonl
 
-Each step logs the loss, the mean implicit reward of chosen and rejected completions, their margin, the share of pairs ranked correctly, and for KTO the KL estimate.
+# SimPO (reference-free, length-normalized)
+pmetal preference --model Qwen/Qwen3-0.6B --dataset pairs.jsonl --loss simpo
+
+# Robust DPO for noisy labels (10% assumed flipped)
+pmetal dpo --model Qwen/Qwen3-0.6B --dataset pairs.jsonl --label-smoothing 0.1
+
+# KTO on thumbs-up / thumbs-down data
+pmetal preference --model Qwen/Qwen3-0.6B --dataset feedback.jsonl --loss kto --batch-size 4
+
+# Use the trained adapter
+pmetal infer --model Qwen/Qwen3-0.6B --lora ./output/preference --chat --prompt "What is 2 + 2?"
+```
 
 ## Full-parameter preference tuning
 
@@ -99,7 +101,7 @@ Each step logs the loss, the mean implicit reward of chosen and rejected complet
 the checkpoint's config, tokenizer and chat template) that `infer` and `serve` load. The reference
 still costs no memory: it is the model as it starts, scored once before the first update, exactly as
 with LoRA's zero adapters. Everything else about full fine-tuning is as for
-[`pmetal train --full`](train.md#full-parameter-fine-tuning): the run is refused before the model
+[`pmetal train --full`](/cli/train/#full-parameter-fine-tuning): the run is refused before the model
 loads if its memory estimate does not fit the device's working set (a pair is two sequences, and
 activations are not recomputed here), a learning rate above `1e-4` is refused (use `1e-6` to `1e-5`),
 and a quantized or GGUF checkpoint cannot be used.
@@ -110,7 +112,8 @@ and a quantized or GGUF checkpoint cannot be used.
 - The learning rate is the setting that matters most. `1e-5` suits LoRA adapters; full fine-tunes in the papers use 5e-7 to 1e-6. Lower it for reasoning-heavy data.
 - KTO estimates its reference point from each micro-batch, so give it `--batch-size 4` or more, and an effective batch (batch size times accumulation) of 16 to 128. If one kind of example outnumbers the other, weight them so that `desirable-weight × desirable / (undesirable-weight × undesirable)` is between 1 and 4/3.
 
-## See also
+## See Also
 
-- [Training methods](../training/methods.md)
-- [`pmetal grpo`](grpo.md) for online reinforcement learning with reward functions
+- [Training Methods](/training/methods/): All training method details
+- [pmetal grpo](/cli/grpo/): Online reinforcement learning with reward functions
+- [pmetal train](/cli/train/): Supervised fine-tuning

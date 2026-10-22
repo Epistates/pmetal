@@ -12,6 +12,11 @@ low-communication training; pipeline, tensor, expert and context parallelism;
 and a local UltraFusion planner that wires same-process stage links over
 in-memory channels instead of TCP.
 
+`pmetal-trainer` uses it to synchronise data-parallel gradients (with
+compression) and the `pmetal` CLI for the `cluster` subcommands, including the
+pipeline benchmark. It depends on
+`pmetal-runtime` only for the `mlx-collectives` feature family.
+
 ## Security
 
 Anything on the LAN can open a TCP connection to a rank, so a link is trusted
@@ -63,6 +68,13 @@ member.
             └───────────────────┘
 ```
 
+## Installation
+
+```toml
+[dependencies]
+pmetal-distributed = "0.7"
+```
+
 ## Usage
 
 ### Auto-Discovery (Zero-Config)
@@ -103,6 +115,46 @@ async fn manual() -> Result<DistributedContext, Box<dyn std::error::Error>> {
 }
 ```
 
+### A Ring in One Process
+
+`RingBackend::with_listener` takes a socket the caller has already bound, so a
+program that picks free ports (a test, a supervisor) keeps each port from the
+moment it chooses it. Two ranks over loopback:
+
+```rust
+use std::net::TcpListener;
+
+use pmetal_distributed::{
+    ClusterSecret, DistributedConfig, DistributedContext, ReduceOp, RingBackend,
+};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let secret = ClusterSecret::generate();
+    let listeners = [TcpListener::bind("127.0.0.1:0")?, TcpListener::bind("127.0.0.1:0")?];
+    let nodes = listeners
+        .iter()
+        .map(|listener| listener.local_addr())
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut ranks = Vec::new();
+    for (rank, listener) in listeners.into_iter().enumerate() {
+        let config = DistributedConfig::new(nodes.clone(), rank).with_secret(secret.clone());
+        ranks.push(tokio::spawn(async move {
+            let backend = RingBackend::with_listener(config, listener).await?;
+            let ctx = DistributedContext::new(Box::new(backend));
+            let mut gradients = vec![rank as f32 + 1.0; 4];
+            ctx.all_reduce_f32(&mut gradients, ReduceOp::Mean).await?;
+            anyhow::Ok(gradients)
+        }));
+    }
+    for rank in ranks {
+        assert_eq!(rank.await??, [1.5; 4]); // the mean of 1.0 and 2.0
+    }
+    Ok(())
+}
+```
+
 ### Gradient Compression
 
 Compressed gradients cannot be added on the wire, so ranks exchange them and
@@ -139,15 +191,17 @@ async fn compressed(ctx: &DistributedContext, gradients: &mut [f32]) -> anyhow::
 
 Error feedback keeps `transmitted + owed = fed in` for every method.
 
-## Parallelism
+## Feature flags
+
+None is on by default: the TCP ring, discovery, compression, pipeline inference
+and the planners are always built. `full` turns on every flag below.
 
 | Feature | What it does |
 |---------|--------------|
-| (always) | Ring all-reduce / reduce-scatter / all-gather / broadcast; compression |
 | `zero` | ZeRO stage 1/2: optimizer state and update sharded across ranks (`ZeroOptimizer`) |
 | `diloco` | DiLoCo: one synchronisation per H inner steps (`DiLoCo`) |
 | `pipeline-training` | 1F1B and zero-bubble schedules, and a simulator that checks them |
-| `mlx-collectives` | MLX's collectives (ring, JACCL over Thunderbolt RDMA) as a backend |
+| `mlx-collectives` | MLX's collectives (ring, JACCL over Thunderbolt RDMA) as a backend (`MlxDistributedBackend`); pulls in `pmetal-runtime` |
 | `tensor-parallel` | Weight sharding and column/row-parallel linear layers |
 | `context-parallel` | Ring attention (pass-KV, pass-Q; causal; zig-zag layout) |
 | `expert-parallel` | Mixture-of-experts dispatch (all-to-all) and capacity control |
@@ -184,6 +238,19 @@ environment (`MLX_RANK`, `MLX_HOSTFILE`, ...); the TCP ring does not need it.
 | `identity` | Persistent Ed25519 keypair management |
 | `namespace` | Discovery protocol namespacing (not a security boundary) |
 | `metrics` | Observability counters and gauges |
+| `fabric` | What kind of link joins two peers (Thunderbolt bridge, Ethernet, Wi-Fi) and its score |
+| `apportion` | Splitting indivisible items (layers, experts) over nodes in proportion to weights |
+| `pipeline`, `pipeline_harness`, `activation_transport`, `activation_codec` | Pipeline-parallel inference: stage runtime, the activations passed between stages, their codec |
+| `ultrafusion` | Planning a dual-die Mac as a local multi-stage pipeline over in-memory channels |
+| `expert_shard` | The one expert-to-rank mapping that expert and tensor parallelism share |
+| `cluster_runtime` | The short-lived discovery session behind the `pmetal cluster` subcommands |
+| `config`, `error` | `DistributedConfig`, `DistributedError` |
+
+## Requirements
+
+- Rust 1.95 or later
+- macOS on Apple Silicon for the `mlx-collectives` features (they drive `pmetal-runtime`); the rest is plain Rust
+- Every machine in a cluster needs the same cluster secret
 
 ## License
 

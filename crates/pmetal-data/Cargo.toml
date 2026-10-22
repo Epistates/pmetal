@@ -1,13 +1,15 @@
 [package]
 name = "pmetal-data"
-description = "Dataset handling and preprocessing for PMetal"
+description = "Datasets, tokenizers, chat templates and image preprocessing for PMetal"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["dataset", "tokenizer", "chat-template", "llm", "fine-tuning"]
+categories = ["science", "text-processing"]
 
 [dependencies]
 pmetal-core = { workspace = true }
