@@ -150,7 +150,7 @@ impl App {
             device,
             device_spec: crate::tui::tabs::query_device_spec(),
             installed_memory: pmetal_runtime::memory::get_system_memory().unwrap_or(0),
-            binary: crate::tui::jobs::pmetal_binary(),
+            binary: pmetal_supervisor::resolve_pmetal_binary(),
             metrics_file,
             start_tab,
         })

@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use pmetal_supervisor::{Event, JobId, JobRequest, Limits, ProcessStatus, Supervisor};
+use pmetal_supervisor::{Event, JobId, Limits, ProcessStatus, Supervisor};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::tui::event::AppMsg;
@@ -29,68 +29,26 @@ pub enum Owner {
     Fuse,
 }
 
-/// A command ready to run.
-#[derive(Debug, Clone, Default)]
-pub struct LaunchPlan {
-    /// The `pmetal` subcommand.
-    pub subcommand: String,
-    /// Its arguments, as the spec spells them.
-    pub argv: Vec<String>,
-    /// Where it writes its results.
-    pub output_dir: Option<PathBuf>,
-    /// The `--log-events` file the argv asks for, so the supervisor follows it.
-    pub events_file: Option<PathBuf>,
-    /// Publish standard output as it arrives (a reply being typed).
-    pub deltas: bool,
-    /// Show this job's steps on the dashboard.
-    pub dashboard: bool,
-    /// The model the run starts from, to record next to its output.
-    pub base_model: Option<String>,
-}
+pub use pmetal_supervisor::LaunchPlan;
 
-impl LaunchPlan {
-    /// Why this binary cannot run the command, if it cannot: `pmetal` is built
-    /// with only the commands its features include, and the interface shows a
-    /// form for every one of them.
-    pub fn missing_command(&self) -> Option<String> {
-        use clap::CommandFactory;
-        crate::cli::Cli::command()
-            .find_subcommand(&self.subcommand)
-            .is_none()
-            .then(|| {
-                format!(
-                    "This build of pmetal has no `{}` command. Rebuild with the cargo feature that includes it (for the server, `--features serve`).",
-                    self.subcommand
-                )
-            })
-    }
-
-    /// The command line as a person would type it, for the log's first line.
-    /// Credentials are hidden.
-    pub fn command_line(&self) -> String {
-        let mut words = vec!["pmetal".to_string(), self.subcommand.clone()];
-        words.extend(self.argv.iter().cloned());
-        pmetal_supervisor::redact_argv(&words).join(" ")
-    }
+/// Why this binary cannot run the command, if it cannot: `pmetal` is built with
+/// only the commands its features include, and the interface shows a form for
+/// every one of them.
+pub fn missing_command(plan: &LaunchPlan) -> Option<String> {
+    use clap::CommandFactory;
+    crate::cli::Cli::command()
+        .find_subcommand(&plan.subcommand)
+        .is_none()
+        .then(|| {
+            format!(
+                "This build of pmetal has no `{}` command. Rebuild with the cargo feature that includes it (for the server, `--features serve`).",
+                plan.subcommand
+            )
+        })
 }
 
 /// Jobs the interface lets run at once.
 pub const MAX_RUNNING: usize = 8;
-
-/// The `pmetal` binary jobs run: the one running this interface, which is
-/// `pmetal` itself, unless `PMETAL_BIN` says otherwise or the interface is
-/// hosted by another program (then the `pmetal` beside it, or on `PATH`).
-pub fn pmetal_binary() -> PathBuf {
-    if let Some(bin) = std::env::var_os("PMETAL_BIN") {
-        return PathBuf::from(bin);
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if exe.file_stem().is_some_and(|name| name == "pmetal") {
-            return exe;
-        }
-    }
-    pmetal_supervisor::resolve_pmetal_binary()
-}
 
 /// The interface's view of the supervisor.
 pub struct JobHub {
@@ -127,21 +85,8 @@ impl JobHub {
     pub fn launch(&mut self, plan: &LaunchPlan, owner: Owner) -> Result<JobId, String> {
         let id = self
             .supervisor
-            .spawn(JobRequest {
-                subcommand: plan.subcommand.clone(),
-                argv: plan.argv.clone(),
-                output: plan.output_dir.clone(),
-                events_file: plan.events_file.clone(),
-                metrics_file: None,
-                deltas: plan.deltas,
-                env: Vec::new(),
-            })
-            .map_err(|e| match e {
-                pmetal_supervisor::Error::TooManyRunning { limit, .. } => format!(
-                    "{limit} jobs are already running. Stop one, or wait for one to finish."
-                ),
-                other => other.to_string(),
-            })?;
+            .spawn(plan.clone().into())
+            .map_err(|e| e.to_string())?;
         self.owners.insert(id.clone(), owner);
         // The supervisor forgets old finished jobs; so do we.
         let supervisor = &self.supervisor;
@@ -382,26 +327,9 @@ mod tests {
         let mut plan = plan("train");
         // `train` needs the trainer feature, `info` is always there.
         plan.subcommand = "info".into();
-        assert_eq!(plan.missing_command(), None);
+        assert_eq!(missing_command(&plan), None);
         plan.subcommand = "no-such-command".into();
-        let why = plan.missing_command().unwrap();
+        let why = missing_command(&plan).unwrap();
         assert!(why.contains("`no-such-command`"), "{why}");
-    }
-
-    #[test]
-    fn the_command_line_hides_credentials() {
-        let plan = LaunchPlan {
-            subcommand: "serve".into(),
-            argv: vec![
-                "--model".into(),
-                "m".into(),
-                "--api-key".into(),
-                "sk-secret".into(),
-            ],
-            ..LaunchPlan::default()
-        };
-        let line = plan.command_line();
-        assert!(line.starts_with("pmetal serve --model m"), "{line}");
-        assert!(!line.contains("sk-secret"), "{line}");
     }
 }

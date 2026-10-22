@@ -27,7 +27,7 @@ pub use inference::{InferenceFocus, InferenceTab};
 pub use jobs::{JobEntry, JobsTab, Selection as JobSelection, history_roots, scan_history};
 pub use models::{
     ModelEntry, ModelSource, ModelsTab, fit_style, is_lora_adapter, query_device_spec,
-    scan as scan_models, write_training_info,
+    record_base_model, scan as scan_models,
 };
 pub use ollama::OllamaTab;
 pub use panel::{Applied, FormTab, Pick, RunState};

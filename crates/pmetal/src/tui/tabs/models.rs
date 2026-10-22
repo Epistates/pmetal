@@ -718,28 +718,18 @@ fn detect_weight_format(path: &Path) -> Option<String> {
     }
 }
 
-/// Read training metadata from a trained model output directory.
-/// Returns the base model ID/path if available.
+/// The base model a trained model's output directory records, if it does.
 fn read_training_info(path: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(path.join("training_info.json")).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-    json.get("base_model")
-        .and_then(|v| v.as_str())
-        .map(String::from)
+    pmetal_core::TrainingInfo::read(path)?.base_model
 }
 
-/// Write training metadata to an output directory.
-pub fn write_training_info(output_dir: &Path, base_model: &str, base_model_path: &str) {
-    let info = serde_json::json!({
-        "base_model": base_model,
-        "base_model_path": base_model_path,
-        "created": chrono::Local::now().to_rfc3339(),
-    });
-    let _ = std::fs::create_dir_all(output_dir);
-    let _ = std::fs::write(
-        output_dir.join("training_info.json"),
-        serde_json::to_string_pretty(&info).unwrap_or_default(),
-    );
+/// Record, for an adapter that does not say, the base model it was trained from.
+/// What the folder already records (a dataset, a start time) is kept.
+pub fn record_base_model(output_dir: &Path, base_model: &str, base_model_path: &str) {
+    let mut info = pmetal_core::TrainingInfo::read(output_dir).unwrap_or_default();
+    info.base_model = Some(base_model.to_string());
+    info.base_model_path = Some(base_model_path.to_string());
+    info.write_or_warn(output_dir);
 }
 
 #[cfg(test)]
@@ -903,10 +893,19 @@ mod tests {
     }
 
     #[test]
-    fn training_info_is_written_and_read_back() {
+    fn a_base_model_is_recorded_and_read_back_without_losing_the_rest() {
         let dir = tempfile::tempdir().unwrap();
-        write_training_info(dir.path(), "org/base", "/cache/base");
+        pmetal_core::TrainingInfo {
+            dataset: Some("acme/data".into()),
+            ..Default::default()
+        }
+        .write(dir.path())
+        .unwrap();
+        record_base_model(dir.path(), "org/base", "/cache/base");
         assert_eq!(read_training_info(dir.path()).as_deref(), Some("org/base"));
+        let info = pmetal_core::TrainingInfo::read(dir.path()).unwrap();
+        assert_eq!(info.dataset.as_deref(), Some("acme/data"));
+        assert_eq!(info.base_model_path.as_deref(), Some("/cache/base"));
     }
 
     #[test]

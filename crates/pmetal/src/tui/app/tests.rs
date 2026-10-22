@@ -346,8 +346,7 @@ async fn a_training_run_goes_from_the_form_to_a_finished_result() {
     // The monitor charted both steps and let go of the run.
     assert_eq!(app.dashboard.step_count(), 2);
     assert_eq!(app.dashboard.following(), None);
-    // Its output directory was prepared and records where the run started from.
-    assert!(out.join("training_info.json").exists());
+    // The event log was made for the run to write to.
     assert!(out.join("events.jsonl").exists());
     // The run offers to be tried.
     let text = top_modal_text(&mut app);

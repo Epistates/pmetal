@@ -8,9 +8,10 @@ use pmetal_supervisor::{EventKind, JobId, ProcessStatus, Stream};
 
 use super::{App, Pending, datasets_seq, history_seq, models_seq};
 use crate::tui::event::AppMsg;
-use crate::tui::jobs::{LaunchPlan, Owner};
+use crate::tui::jobs::{LaunchPlan, Owner, missing_command};
 use crate::tui::modal::Modal;
-use crate::tui::tabs::{self, Applied, DatasetPeek, ModelEntry, Tab, write_training_info};
+use crate::tui::tabs::{self, Applied, DatasetPeek, ModelEntry, Tab};
+use pmetal_supervisor::LaunchOptions;
 
 /// Tabs whose finished run leaves a model to chat with.
 fn leaves_a_chat_model(tab: Tab) -> bool {
@@ -391,8 +392,8 @@ impl App {
                 self.modal_stack
                     .push(Modal::error("Fix the form first", lines));
             }
-            Ok(plan) if plan.missing_command().is_some() => {
-                let why = plan.missing_command().unwrap_or_default();
+            Ok(plan) if missing_command(&plan).is_some() => {
+                let why = missing_command(&plan).unwrap_or_default();
                 self.modal_stack
                     .push(Modal::error("Not in this build", why));
             }
@@ -425,13 +426,6 @@ impl App {
                 return;
             }
         };
-        if let Err(message) = self.prepare(&plan) {
-            if let Some(form) = self.forms.get_mut(tab) {
-                form.panel_mut().failed_to_start(message.clone());
-            }
-            self.modal_stack.push(Modal::error("Cannot Start", message));
-            return;
-        }
         let command = plan.command_line();
         let launched = match self.hub.as_mut() {
             Some(hub) => hub.launch(&plan, Owner::Tab(tab)),
@@ -450,26 +444,12 @@ impl App {
                 form.panel_mut().begin(job.clone(), command.clone());
                 form.begin();
                 self.jobs.started(job.clone(), title, command);
-                if plan.dashboard {
+                if plan.events_file.is_some() {
                     self.dashboard.follow(job, title);
                     self.switch_tab(Tab::Dashboard);
                 }
             }
         }
-    }
-
-    /// What must exist before the command runs: its output directory, and a
-    /// note of the model it starts from so a later chat can find it.
-    fn prepare(&self, plan: &LaunchPlan) -> Result<(), String> {
-        let Some(dir) = &plan.output_dir else {
-            return Ok(());
-        };
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("Cannot create the output directory {}: {e}", dir.display()))?;
-        if let Some(base) = &plan.base_model {
-            write_training_info(dir, base, &self.models.resolve_path(base));
-        }
-        Ok(())
     }
 
     // ── Stopping ────────────────────────────────────────────────────────
@@ -580,11 +560,18 @@ impl App {
         };
 
         let spec = self.inference.build_infer_spec(model, prompt.clone(), lora);
-        let plan = LaunchPlan {
-            subcommand: "infer".to_string(),
-            argv: pmetal_core::JobFields::to_argv(&spec),
+        // The reply is shown as it is typed out, so standard output is streamed.
+        let options = LaunchOptions {
             deltas: true,
-            ..LaunchPlan::default()
+            ..LaunchOptions::default()
+        };
+        let plan = match LaunchPlan::for_spec(&spec, &options) {
+            Ok(plan) => plan,
+            Err(e) => {
+                self.modal_stack
+                    .push(Modal::error("Cannot Start", e.to_string()));
+                return;
+            }
         };
         let command = plan.command_line();
         let launched = match self.hub.as_mut() {
@@ -804,10 +791,13 @@ impl App {
             output: format!("./output/{name}--fused"),
             ..pmetal_core::jobs::FuseSpec::default()
         };
-        let plan = LaunchPlan {
-            subcommand: "fuse".to_string(),
-            argv: pmetal_core::JobFields::to_argv(&spec),
-            ..LaunchPlan::default()
+        let plan = match LaunchPlan::for_spec(&spec, &LaunchOptions::default()) {
+            Ok(plan) => plan,
+            Err(e) => {
+                self.modal_stack
+                    .push(Modal::error("Cannot Fuse", e.to_string()));
+                return;
+            }
         };
         self.launch_background(
             plan,

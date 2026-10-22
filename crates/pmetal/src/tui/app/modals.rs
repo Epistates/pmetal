@@ -130,7 +130,7 @@ impl App {
         let base_path = self.models.resolve_path(base);
         if let Some(entry) = self.models.models.iter_mut().find(|m| m.id == adapter_id) {
             entry.base_model = Some(base.to_string());
-            crate::tui::tabs::write_training_info(&entry.path, base, &base_path);
+            crate::tui::tabs::record_base_model(&entry.path, base, &base_path);
         }
     }
 
