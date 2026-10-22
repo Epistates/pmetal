@@ -1,11 +1,17 @@
-//! DeepSeek V3 / V3.2 / V3.2-Speciale model architecture.
+//! DeepSeek V2 / V3 (and R1) model architecture.
 //!
-//! Implements DeepSeek V3 and V3.2 variants with:
+//! Implements:
 //! - Multi-Latent Attention (MLA): LoRA-style Q/K/V compression for 28x KV cache reduction
 //! - Mixture of Experts (MoE) with shared experts and aux-free load balancing
-//! - Sparse Attention (DSA) for V3.2 (Lightning Indexer + Token Selector)
 //! - Multi-Token Prediction (MTP) for densified training signals
 //! - Multi-token prediction lookahead modules
+//!
+//! DeepSeek-V3.2's sparse-attention indexer (`index_topk`) is not implemented:
+//! its checkpoints carry an `indexer` per layer (`wq_b`, `wk`, a LayerNorm
+//! `k_norm` and `weights_proj`, with FP8 block-scaled weights) that this
+//! attention has no place for, and `ModelArchitecture::resolve_config` declines
+//! them by name rather than load a dense model that ignores the selection the
+//! checkpoint was trained with.
 
 // ModuleParameters derive via impl_module_params!
 use crate::checkpointing::checkpointed_layer;
@@ -27,19 +33,6 @@ use serde::{Deserialize, Serialize};
 
 /// Result type for DeepSeek operations.
 pub type Result<T, E = Exception> = std::result::Result<T, E>;
-
-/// DeepSeek model variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum DeepSeekVariant {
-    /// DeepSeek V3 (Standard MLA + MoE).
-    #[default]
-    V3,
-    /// DeepSeek V3.2 (MLA + MoE + Sparse Attention).
-    V32,
-    /// DeepSeek V3.2-Speciale (Thinking-optimized variant).
-    V32Speciale,
-}
 
 /// DeepSeek model configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,18 +81,6 @@ pub struct DeepSeekConfig {
     pub attention_bias: bool,
     pub tie_word_embeddings: bool,
     #[serde(default)]
-    pub use_sparse_attention: bool,
-    #[serde(default = "default_lightning_indexer_heads")]
-    pub lightning_indexer_heads: i32,
-    #[serde(default = "default_sparse_top_k")]
-    pub sparse_top_k: i32,
-    #[serde(default = "default_true")]
-    pub indexer_non_interleaved_rope: bool,
-    #[serde(default)]
-    pub indexer_use_fp8: bool,
-    #[serde(default)]
-    pub variant: DeepSeekVariant,
-    #[serde(default)]
     pub thinking_mode: bool,
     #[serde(default)]
     pub max_thinking_tokens: Option<i32>,
@@ -125,7 +106,7 @@ impl DeepSeekConfig {
     /// The rotary embedding of the `qk_rope_head_dim` channels, YaRN as
     /// `rope_scaling` gives it (frequencies and attention factor); an unknown
     /// `rope_type` is an error naming it. MLA pairs them interleaved
-    /// (`traditional`); the V3.2 indexer may not.
+    /// (`traditional`).
     pub fn rotary(&self, traditional: bool) -> Result<RotaryEmbedding> {
         crate::common::rotary_embedding(
             "deepseek",
@@ -199,12 +180,6 @@ impl Default for DeepSeekConfig {
             rope_scaling: None,
             attention_bias: false,
             tie_word_embeddings: false,
-            use_sparse_attention: false,
-            lightning_indexer_heads: 4,
-            sparse_top_k: 2048,
-            indexer_non_interleaved_rope: true,
-            indexer_use_fp8: false,
-            variant: DeepSeekVariant::V3,
             thinking_mode: false,
             max_thinking_tokens: None,
             thinking_start_token_id: None,
@@ -223,12 +198,6 @@ fn default_num_nextn_predict_layers() -> i32 {
 fn default_mtp_loss_weight() -> f32 {
     0.3
 }
-fn default_lightning_indexer_heads() -> i32 {
-    4
-}
-fn default_sparse_top_k() -> i32 {
-    2048
-}
 fn default_model_type() -> String {
     "deepseek_v3".to_string()
 }
@@ -237,9 +206,6 @@ fn default_vocab_size() -> i32 {
 }
 fn default_hidden_size() -> i32 {
     4096
-}
-fn default_true() -> bool {
-    true
 }
 fn default_one() -> i32 {
     1
@@ -473,177 +439,6 @@ impl DeepSeekAttention {
             .transpose_axes(&[0, 2, 1, 3])
             .reshape(&[batch, seq_len, -1]);
         Ok(self.o_proj.forward(&output))
-    }
-}
-
-#[derive(Debug)]
-pub struct LightningIndexer {
-    pub n_heads: i32,
-    pub q_proj: nn::Linear,
-    pub k_proj: nn::Linear,
-    pub head_dim: i32,
-    pub scale: f32,
-    /// The model's rotary embedding (YaRN included, as transformers'
-    /// `deepseek_v32` indexer takes the model's `cos`/`sin`), in the
-    /// indexer's own pair layout.
-    pub rotary: RotaryEmbedding,
-}
-impl_module_params!(LightningIndexer; q_proj, k_proj);
-
-impl LightningIndexer {
-    pub fn new(config: &DeepSeekConfig) -> Result<Self> {
-        let n_heads = config.lightning_indexer_heads;
-        let head_dim = config.qk_rope_head_dim;
-        let q_proj = nn::LinearBuilder::new(config.hidden_size, n_heads * head_dim)
-            .bias(false)
-            .build()?;
-        let k_proj = nn::LinearBuilder::new(config.hidden_size, n_heads * head_dim)
-            .bias(false)
-            .build()?;
-        Ok(Self {
-            n_heads,
-            q_proj,
-            k_proj,
-            head_dim,
-            scale: (head_dim as f32).powf(-0.5),
-            rotary: config.rotary(!config.indexer_non_interleaved_rope)?,
-        })
-    }
-    pub fn compute_scores(
-        &mut self,
-        x: &Array,
-        rope_positions: RopePositions<'_>,
-    ) -> Result<Array> {
-        let shape = x.shape();
-        let batch = shape[0];
-        let seq_len = shape[1];
-        let q = self
-            .q_proj
-            .forward(x)
-            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
-            .transpose_axes(&[0, 2, 1, 3]);
-        let k = self
-            .k_proj
-            .forward(x)
-            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
-            .transpose_axes(&[0, 2, 1, 3]);
-        let q = rope_embedding(&q, rope_positions, &self.rotary);
-        let k = rope_embedding(&k, rope_positions, &self.rotary);
-        let scores = q
-            .matmul(&k.transpose_axes(&[0, 1, 3, 2]))
-            .multiply(&Array::from_f32(self.scale));
-        Ok(scores.mean_axis(1, true).squeeze_axes(&[1]))
-    }
-}
-
-#[derive(Debug)]
-pub struct TokenSelector {
-    pub top_k: i32,
-}
-impl TokenSelector {
-    pub fn new(config: &DeepSeekConfig) -> Self {
-        Self {
-            top_k: config.sparse_top_k,
-        }
-    }
-    pub fn select_tokens(&self, scores: &Array, mask: Option<&Array>) -> Result<Array> {
-        let mask_2d = mask.map(|m| m.squeeze_axes(&[0, 1]));
-        let masked_scores = if let Some(m) = mask_2d {
-            scores.add(&m)
-        } else {
-            scores.clone()
-        };
-        let neg_k = -self.top_k;
-        // Indices carry no gradient, and MLX refuses to differentiate a gather
-        // with respect to them.
-        Ok(pmetal_runtime::compat::ops::stop_gradient(
-            &pmetal_runtime::compat::ops::slice_axis_from(
-                &pmetal_runtime::compat::ops::argpartition_axis(&masked_scores, neg_k, -1),
-                -1,
-                neg_k,
-            ),
-        ))
-    }
-}
-
-#[derive(Debug)]
-pub struct DeepSeekSparseAttention {
-    pub base_attention: DeepSeekAttention,
-    pub indexer: LightningIndexer,
-    pub selector: TokenSelector,
-    pub store_indices: bool,
-}
-impl_module_params!(DeepSeekSparseAttention; base_attention, indexer);
-
-impl DeepSeekSparseAttention {
-    pub fn new(config: &DeepSeekConfig, layer_id: usize) -> Result<Self> {
-        Ok(Self {
-            base_attention: DeepSeekAttention::new(config, layer_id)?,
-            indexer: LightningIndexer::new(config)?,
-            selector: TokenSelector::new(config),
-            store_indices: false,
-        })
-    }
-    pub fn forward(
-        &mut self,
-        x: &Array,
-        mask: Option<&Array>,
-        cache: Option<(&mut KVCache, usize)>,
-        positions: Option<&Array>,
-    ) -> Result<Array> {
-        let seq_len = x.shape()[1];
-        if seq_len < 2 * self.selector.top_k {
-            return self.base_attention.forward(x, mask, cache, positions);
-        }
-        let rope_positions = RopePositions::resolve(
-            positions,
-            cache
-                .as_ref()
-                .map_or(0, |(c, layer)| c.rope_offset_for(*layer)),
-        );
-        let scores = self.indexer.compute_scores(x, rope_positions)?;
-        let selected_indices = self.selector.select_tokens(&scores, mask)?;
-        let (queries, keys, values) = self.base_attention.project_qkv(x, cache, positions)?;
-        let (batch, n_heads, query_len, key_dim) = (
-            queries.shape()[0],
-            queries.shape()[1],
-            queries.shape()[2],
-            keys.shape()[3],
-        );
-        let val_dim = values.shape()[3];
-        let top_k = self.selector.top_k;
-        let idx = selected_indices.reshape(&[batch, 1, query_len, top_k]);
-        let idx =
-            pmetal_runtime::compat::ops::broadcast_to(&idx, &[batch, n_heads, query_len, top_k]);
-        let idx_for_keys = idx.reshape(&[batch, n_heads, query_len * top_k, 1]);
-        let idx_for_keys = pmetal_runtime::compat::ops::broadcast_to(
-            &idx_for_keys,
-            &[batch, n_heads, query_len * top_k, key_dim],
-        );
-        let gathered_keys =
-            pmetal_runtime::compat::indexing::take_along_axis(&keys, &idx_for_keys, 2)
-                .reshape(&[batch, n_heads, query_len, top_k, key_dim]);
-        let idx_for_vals = idx.reshape(&[batch, n_heads, query_len * top_k, 1]);
-        let idx_for_vals = pmetal_runtime::compat::ops::broadcast_to(
-            &idx_for_vals,
-            &[batch, n_heads, query_len * top_k, val_dim],
-        );
-        let gathered_values =
-            pmetal_runtime::compat::indexing::take_along_axis(&values, &idx_for_vals, 2)
-                .reshape(&[batch, n_heads, query_len, top_k, val_dim]);
-        let q_expanded = queries.reshape(&[batch, n_heads, query_len, 1, key_dim]);
-        let attn_scores = q_expanded
-            .matmul(&gathered_keys.transpose_axes(&[0, 1, 2, 4, 3]))
-            .squeeze_axes(&[3])
-            .multiply(&Array::from_f32(self.base_attention.scale));
-        let attn_weights = pmetal_runtime::compat::ops::softmax_axis(&attn_scores, -1)
-            .reshape(&[batch, n_heads, query_len, 1, top_k]);
-        let output = attn_weights
-            .matmul(&gathered_values)
-            .squeeze_axes(&[3])
-            .transpose_axes(&[0, 2, 1, 3])
-            .reshape(&[batch, query_len, -1]);
-        Ok(self.base_attention.o_proj.forward(&output))
     }
 }
 
