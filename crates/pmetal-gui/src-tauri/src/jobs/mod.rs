@@ -15,11 +15,12 @@ mod typegen;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use pmetal::core::SecretString;
+use pmetal::core::sync::locked;
 use pmetal::core::events::{JobEvent, MetricPayload};
 use pmetal_supervisor::{
     Error as SupervisorError, Event, EventKind, JobId, JobRequest, Limits, ProcessStatus, Stream,
@@ -191,10 +192,6 @@ struct Shared {
     /// began answering): the pump sends them on.
     touch: tokio::sync::mpsc::UnboundedSender<JobId>,
     touched: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<JobId>>>,
-}
-
-fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// The app's jobs.

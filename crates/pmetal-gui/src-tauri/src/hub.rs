@@ -5,11 +5,12 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use pmetal::core::SecretString;
+use pmetal::core::sync::locked;
 use pmetal::hub::{DeviceSpec, FitLevel, HfSearchResult, ProgressCallback, TransferProgress};
 use serde::Serialize;
 
@@ -291,10 +292,6 @@ pub struct Downloads {
     inner: Arc<Mutex<HashMap<String, Entry>>>,
     permits: Arc<tokio::sync::Semaphore>,
     sink: DownloadSink,
-}
-
-fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Downloads {

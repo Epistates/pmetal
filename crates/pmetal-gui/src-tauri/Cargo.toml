@@ -45,7 +45,6 @@ uuid = { version = "1.27", features = ["v4", "serde"] }
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Utilities
 dirs = "7"

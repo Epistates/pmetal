@@ -13,9 +13,10 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use pmetal_core::sync::locked;
 use pmetal_supervisor::{
     Event, EventKind, JobId, JobRequest, Limits, ProcessStatus, Stream, Supervisor,
 };
@@ -37,12 +38,6 @@ const SIGNAL_POLL: Duration = Duration::from_millis(50);
 /// The jobs running, for the interpreter's exit. A job a program started and
 /// let go of keeps running; one still running when the program ends is stopped.
 static LIVE: Mutex<Option<HashMap<JobId, Supervisor>>> = Mutex::new(None);
-
-fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
 
 fn live<R>(f: impl FnOnce(&mut HashMap<JobId, Supervisor>) -> R) -> R {
     f(locked(&LIVE).get_or_insert_with(HashMap::new))

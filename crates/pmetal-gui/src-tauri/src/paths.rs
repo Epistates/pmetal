@@ -14,20 +14,6 @@ pub fn output_root() -> PathBuf {
         .join("pmetal-output")
 }
 
-/// `~` and `~/x` spelled out; anything else as it was.
-pub fn expand_home(text: &str) -> PathBuf {
-    let text = text.trim();
-    if text == "~" {
-        return dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
-    }
-    if let Some(rest) = text.strip_prefix("~/")
-        && let Some(home) = dirs::home_dir()
-    {
-        return home.join(rest);
-    }
-    PathBuf::from(text)
-}
-
 /// Directories that are never a place to write into, scan or delete.
 fn protected(path: &Path) -> Option<&'static str> {
     const SYSTEM: &[&str] = &[
@@ -86,7 +72,7 @@ pub fn resolve_output(raw: &str, root: &Path) -> Result<PathBuf, String> {
     if text.contains('\0') {
         return Err("is not a valid path".to_string());
     }
-    let path = expand_home(text);
+    let path = pmetal::core::paths::expand_home(text.trim());
     if path.components().any(|c| c == Component::ParentDir) {
         return Err("must not contain '..'. Give the full path instead.".to_string());
     }
@@ -134,7 +120,7 @@ pub fn overlaps(output: &Path, other: &Path) -> bool {
 /// A directory the app may scan for models: it exists, is a directory, and
 /// is not a system location. Returns it in canonical form.
 pub fn scan_dir(raw: &str) -> Result<PathBuf, String> {
-    let path = expand_home(raw);
+    let path = pmetal::core::paths::expand_home(raw.trim());
     if !path.is_absolute() {
         return Err(format!(
             "'{raw}' is not a full path. Choose the folder with the Browse button."

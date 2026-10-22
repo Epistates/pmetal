@@ -57,9 +57,34 @@ pub fn output_path(path: &str, what: &str) -> Result<PathBuf> {
     Ok(clean)
 }
 
+/// `~` and `~/x` spelled out against the home directory; anything else (a
+/// `~user` path included) as it was.
+pub fn expand_home(text: &str) -> PathBuf {
+    if text == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+    }
+    if let Some(rest) = text.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
+    }
+    PathBuf::from(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_leading_tilde_is_the_home_directory() {
+        let home = dirs::home_dir().expect("a home directory");
+        assert_eq!(expand_home("~"), home);
+        assert_eq!(expand_home("~/models/a"), home.join("models/a"));
+        // Not the current user's home, and not a tilde at the start.
+        assert_eq!(expand_home("~other/x"), PathBuf::from("~other/x"));
+        assert_eq!(expand_home("a/~/b"), PathBuf::from("a/~/b"));
+        assert_eq!(expand_home("/abs"), PathBuf::from("/abs"));
+    }
 
     /// `..` is a path like any other, and a directory that does not exist yet
     /// is created: what `--output ../models/out.gguf` means.

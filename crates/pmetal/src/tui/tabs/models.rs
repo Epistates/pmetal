@@ -54,13 +54,7 @@ pub enum ModelSource {
 
 impl ModelEntry {
     pub fn size_display(&self) -> String {
-        let gb = self.size_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-        if gb >= 1.0 {
-            format!("{:.1} GB", gb)
-        } else {
-            let mb = self.size_bytes as f64 / (1024.0 * 1024.0);
-            format!("{:.0} MB", mb)
-        }
+        pmetal_core::format::human_size(self.size_bytes)
     }
 
     /// Whether this is a LoRA adapter (not a full model).

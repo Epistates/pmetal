@@ -49,7 +49,7 @@ fn report_text(model: &str, path: &std::path::Path, report: &ModelDirReport) -> 
         Some(format) => out.push_str(&format!(
             "  {format:?} weights: {} file(s), {}",
             report.weight_files.len(),
-            pmetal_hub::fit::format_bytes(report.weight_bytes)
+            pmetal_core::format::human_size(report.weight_bytes)
         )),
         None => out.push_str("  no weights"),
     }

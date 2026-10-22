@@ -684,7 +684,9 @@ impl App {
             return;
         };
         let input = ds.path.display().to_string();
-        let output = expand_tilde(output);
+        let output = pmetal_core::paths::expand_home(output)
+            .display()
+            .to_string();
         if let Some(parent) = Path::new(&output).parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 self.modal_stack.push(Modal::error(
@@ -846,18 +848,4 @@ fn probe_address(tx: tokio::sync::mpsc::Sender<AppMsg>, job: JobId, address: Str
             })
             .await;
     });
-}
-
-/// Expand a leading `~` to the user's home directory.
-pub(crate) fn expand_tilde(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest).display().to_string();
-        }
-    } else if path == "~" {
-        if let Some(home) = dirs::home_dir() {
-            return home.display().to_string();
-        }
-    }
-    path.to_string()
 }

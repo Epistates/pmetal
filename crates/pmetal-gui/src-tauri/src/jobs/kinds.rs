@@ -284,7 +284,7 @@ impl<S: Spec> Kind for SpecKind<S> {
                 let Some(text) = json.get(d.name).and_then(Value::as_str) else {
                     continue;
                 };
-                let input = paths::expand_home(text);
+                let input = pmetal::core::paths::expand_home(text.trim());
                 // Only a full path can be a place on disk; "Qwen/Qwen3-0.6B" is
                 // a Hub id, whatever the working directory holds.
                 if input.is_absolute() && input.exists() && paths::overlaps(out, &input) {

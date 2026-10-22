@@ -4,12 +4,13 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use pmetal_core::StepMetrics;
 use pmetal_core::events::{CompletionSummary, JobEvent, MetricPayload};
+use pmetal_core::sync::locked;
 use serde::Serialize;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -225,14 +226,6 @@ struct Job {
     logs: Mutex<LogBuffer>,
     stop_requested: AtomicBool,
     events: broadcast::Sender<Event>,
-}
-
-fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    // A panicking reader task leaves the data usable; a poisoned lock must not
-    // take the whole supervisor's job view down with it.
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Job {

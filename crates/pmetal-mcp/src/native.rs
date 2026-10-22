@@ -255,9 +255,7 @@ async fn download_model(_core: &Core, args: Value, ctx: &RequestContext) -> McpR
             Verify::Sha256 => pmetal_hub::Verification::Sha256,
         },
         progress: Some(Arc::new(move |p: &pmetal_hub::TransferProgress| {
-            *sink
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(p.clone());
+            *pmetal_core::sync::locked(&sink) = Some(p.clone());
         })),
         ..pmetal_hub::DownloadOptions::default()
     };
@@ -288,17 +286,14 @@ async fn download_model(_core: &Core, args: Value, ctx: &RequestContext) -> McpR
                     return Err(McpError::cancelled("the download was cancelled"));
                 }
                 if ctx.wants_progress() {
-                    let snapshot = progress
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clone();
+                    let snapshot = pmetal_core::sync::locked(&progress).clone();
                     if let Some(p) = snapshot {
                         let message = format!(
                             "{} of {} files, {} of {}{}",
                             p.files_done,
                             p.total_files,
-                            pmetal_hub::fit::format_bytes(p.bytes_done),
-                            pmetal_hub::fit::format_bytes(p.total_bytes),
+                            pmetal_core::format::human_size(p.bytes_done),
+                            pmetal_core::format::human_size(p.total_bytes),
                             p.current_file.as_deref().map(|f| format!(", {f}")).unwrap_or_default(),
                         );
                         let _ = ctx
