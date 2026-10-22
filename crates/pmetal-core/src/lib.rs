@@ -28,6 +28,7 @@ mod error;
 pub mod events;
 pub mod fields;
 pub mod jobs;
+pub mod model_type;
 pub mod paths;
 pub mod scheduler;
 mod secrets;
