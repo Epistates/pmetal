@@ -46,8 +46,9 @@ pub(crate) async fn run_eval(
         println!();
     }
 
-    // Load tokenizer
-    let tokenizer = Tokenizer::from_model_dir(&model_path)?;
+    // Load tokenizer: from the directory's `tokenizer.json`, or from the
+    // metadata of a GGUF file.
+    let tokenizer = Tokenizer::from_model_path(&model_path)?;
 
     // Load dataset
     let chat_template = pmetal_data::chat_templates::detect_chat_template(&model_path, model_id);

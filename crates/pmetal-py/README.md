@@ -30,7 +30,7 @@ not `--release`.
 
 Every `pmetal` subcommand has a spec class: `TrainSpec`, `GrpoSpec`,
 `PreferenceSpec`, `DistillSpec`, `RlkdSpec`, `EmbedTrainSpec`, `PretrainSpec`,
-`QuantizeSpec`, `MergeSpec`, `FuseSpec`, `ServeSpec`, `InferSpec`, `EvalSpec`,
+`QuantizeSpec`, `ImatrixSpec`, `MergeSpec`, `FuseSpec`, `ServeSpec`, `InferSpec`, `EvalSpec`,
 `DflashSpec`, `TrainMtpSpec`, `TrainDraftSpec`, `TrainDiffusionSpec`, `DecideSpec`,
 `TokenizeSpec`, `VocodeSpec`, `PackExpertsSpec` and `BenchSpec`. They wrap the
 job specs of `pmetal-core`, which define every field, default, bound and check

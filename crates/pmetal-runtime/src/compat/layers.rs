@@ -288,6 +288,7 @@ impl Linear {
     }
 
     pub fn forward(&self, x: &Array) -> Array {
+        crate::activation_stats::observe_matmul(&self.weight.value, x);
         let bias = self.bias.value.as_ref();
         let quant = match &self.quant {
             Some(quant) if quant.codebook.is_none() => quant,
@@ -1025,6 +1026,7 @@ impl Embedding {
     }
 
     pub fn as_linear(&self, x: &Array) -> Array {
+        crate::activation_stats::observe_matmul(&self.weight.value, x);
         linear_forward_array(x, &self.weight.value, None)
     }
 }

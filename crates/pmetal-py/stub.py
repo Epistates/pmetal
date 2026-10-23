@@ -35,6 +35,7 @@ SPEC_ORDER = [
     "EmbedTrainSpec",
     "PretrainSpec",
     "QuantizeSpec",
+    "ImatrixSpec",
     "MergeSpec",
     "FuseSpec",
     "EvalSpec",

@@ -22,7 +22,8 @@ export interface JobFields {
   eval: 'model' | 'dataset' | 'lora' | 'max_seq_len' | 'num_samples' | 'json';
   merge: 'model_a' | 'model_b' | 'output' | 'method' | 'base' | 't' | 'weight_a' | 'weight_b' | 'density' | 'dtype';
   fuse: 'model' | 'lora' | 'output' | 'alpha' | 'rank' | 'low_memory';
-  quantize: 'model' | 'output' | 'imatrix' | 'method' | 'lora' | 'kl_calibrate' | 'target_bpw' | 'kl_threshold' | 'format' | 'bits' | 'group_size';
+  quantize: 'model' | 'output' | 'imatrix' | 'calibration_dataset' | 'calibration_ctx_size' | 'calibration_chunks' | 'method' | 'lora' | 'kl_calibrate' | 'target_bpw' | 'kl_threshold' | 'format' | 'bits' | 'group_size';
+  imatrix: 'model' | 'dataset' | 'output' | 'ctx_size' | 'chunks' | 'batch_size';
   pack_experts: 'model' | 'output' | 'bits';
   tokenize: 'input' | 'output' | 'tokenizer' | 'text_column' | 'docs_per_shard';
   vocode: 'model' | 'input' | 'output' | 'chunk_frames';

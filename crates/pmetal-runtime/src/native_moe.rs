@@ -359,6 +359,10 @@ pub fn switch_mlp(
 
 /// [`switch_mlp`] with per-expert adapters: `adapters.gate` on `up`,
 /// `adapters.down` on `down`.
+///
+/// The activation also sees which expert each row of its input went through
+/// (see [`switch_glu_with`] for the layout), so a caller can tell what the
+/// down projection will read for each expert.
 pub fn switch_mlp_adapted(
     x_flat: &InlineArray,
     up: &LayerWeight,
@@ -366,7 +370,7 @@ pub fn switch_mlp_adapted(
     adapters: ExpertAdapters<'_>,
     inds: &InlineArray,
     scores: &InlineArray,
-    activation: impl Fn(&InlineArray) -> InlineArray,
+    activation: impl Fn(&InlineArray, &InlineArray) -> InlineArray,
 ) -> InlineArray {
     let grouped = x_flat.dim(0) * inds.dim(1) >= GROUPING_THRESHOLD;
     switch_glu_projected(
@@ -375,7 +379,7 @@ pub fn switch_mlp_adapted(
         down,
         inds,
         scores,
-        |projected, _, _| activation(projected),
+        |projected, _, expert_ids| activation(projected, expert_ids),
         grouped,
         adapters,
     )

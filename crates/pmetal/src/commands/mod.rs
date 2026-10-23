@@ -17,8 +17,10 @@ pub(crate) mod eval;
 pub(crate) mod events;
 #[cfg(feature = "lora")]
 pub(crate) mod fuse;
+pub(crate) mod gguf_export;
 #[cfg(feature = "trainer")]
 pub(crate) mod grpo;
+pub(crate) mod imatrix;
 pub(crate) mod infer;
 pub(crate) mod info;
 #[cfg(feature = "trainer")]

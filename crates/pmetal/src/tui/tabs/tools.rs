@@ -49,10 +49,15 @@ pub struct ToolTab {
     readout: Readout,
 }
 
-/// MLX knobs show only for MLX output, the KL settings only with calibration.
+/// MLX knobs show only for MLX output, the KL settings only with calibration,
+/// and the importance matrix (a GGUF quantizer's weighting) not for MLX output.
 fn quantize_visibility(view: &FormView<'_>, field: &FormField) -> bool {
     match field.label.as_str() {
         "MLX Bits" | "MLX Group Size" => view.value("Format") == "mlx",
+        "IMatrix" | "Calibration Data" => view.value("Format") != "mlx",
+        "Calibration Context" | "Calibration Chunks" => {
+            view.value("Format") != "mlx" && !view.value("Calibration Data").is_empty()
+        }
         "Target BPW" | "KL Threshold" => view.value("KL Calibration") == "Enabled",
         _ => true,
     }

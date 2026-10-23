@@ -47,6 +47,7 @@
 #[cfg(feature = "ane")]
 mod ane_worker;
 pub mod architectures;
+pub mod calibration;
 pub(crate) mod checkpointing;
 pub mod common;
 pub mod ddtree;
