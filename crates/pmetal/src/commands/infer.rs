@@ -259,6 +259,68 @@ fn run_qwen3_next_layer_profile(
     Ok(())
 }
 
+/// Continue the conversation in `--messages-file` instead of answering a
+/// prompt: read and checked (`pmetal_core::jobs::parse_messages`), then handed
+/// to the runner as its history, the last user message being the prompt, so a
+/// one-message conversation is exactly the prompt it stands for.
+fn apply_messages_file(
+    config: &mut pmetal::inference_runner::InferenceRunnerConfig,
+    path: &str,
+) -> anyhow::Result<()> {
+    use pmetal_core::jobs::MAX_MESSAGES_BYTES;
+
+    let size = std::fs::metadata(path)
+        .map_err(|e| anyhow::anyhow!("--messages-file: could not read '{path}': {e}"))?
+        .len();
+    if size > MAX_MESSAGES_BYTES as u64 {
+        anyhow::bail!(
+            "--messages-file: '{path}' is larger than {} MiB",
+            MAX_MESSAGES_BYTES >> 20
+        );
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("--messages-file: could not read '{path}': {e}"))?;
+    let messages = pmetal_core::jobs::parse_messages(&text)
+        .map_err(|e| anyhow::anyhow!("--messages-file: '{path}' {e}"))?;
+    config.chat = true;
+    (config.chat_messages, config.prompt) = conversation(messages, config.system_message.is_some())
+        .map_err(|e| anyhow::anyhow!("--messages-file: '{path}': {e}"))?;
+    Ok(())
+}
+
+/// A checked conversation as the runner takes it: the history, and the prompt
+/// (the last message if it is a user's, else empty and the history ends with a
+/// tool's result). `has_system` is whether `--system` was also given.
+fn conversation(
+    messages: Vec<pmetal_core::jobs::ChatMessage>,
+    has_system: bool,
+) -> Result<(Option<Vec<pmetal_data::chat_templates::Message>>, String), String> {
+    use pmetal_data::chat_templates::{Message, ToolCall};
+
+    if has_system && messages.first().is_some_and(|m| m.role == "system") {
+        return Err(
+            "it has a system message and --system was given too; use one of them".to_string(),
+        );
+    }
+    let mut history = Vec::with_capacity(messages.len());
+    for (i, wire) in messages.into_iter().enumerate() {
+        let mut message = Message::new(wire.role, wire.content);
+        message.reasoning_content = wire.reasoning_content;
+        message.tool_call_id = wire.tool_call_id;
+        if let Some(calls) = wire.tool_calls {
+            let calls: Vec<ToolCall> = serde_json::from_value(serde_json::Value::Array(calls))
+                .map_err(|e| format!("message {}: tool_calls are not tool calls: {e}", i + 1))?;
+            message.tool_calls = Some(calls);
+        }
+        history.push(message);
+    }
+    let prompt = match history.last() {
+        Some(last) if last.role == "user" => history.pop().map(|m| m.content).unwrap_or_default(),
+        _ => String::new(),
+    };
+    Ok(((!history.is_empty()).then_some(history), prompt))
+}
+
 /// Run inference with a model.
 ///
 /// Uses the shared `InferenceRunner` for model loading, tokenization, chat
@@ -292,6 +354,9 @@ pub(crate) async fn run_inference(spec: InferSpec) -> anyhow::Result<()> {
     // once they are resolved.
     let mut runner_config = InferenceRunnerConfig::from_spec(&spec).map_err(anyhow::Error::msg)?;
     runner_config.tools = tool_defs;
+    if let Some(path) = spec.messages_file.as_deref() {
+        apply_messages_file(&mut runner_config, path)?;
+    }
     let backend: InferenceBackend = spec.backend.parse().map_err(anyhow::Error::msg)?;
 
     let InferSpec {
@@ -582,17 +647,10 @@ pub(crate) async fn run_inference(spec: InferSpec) -> anyhow::Result<()> {
 
     // ── Generation dispatch ────────────────────────────────────────────────
     let start = std::time::Instant::now();
-    // Ctrl-C stops the generation after the token in flight, so the text so
-    // far is complete and the statistics are printed; the exit status is 130.
-    let interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    {
-        let interrupted = std::sync::Arc::clone(&interrupted);
-        tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                interrupted.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-        });
-    }
+    // Ctrl-C, or the SIGTERM a supervisor stops a job with (the desktop app's
+    // Stop button), ends the generation after the token in flight, so the text
+    // so far is complete and the statistics are printed; the exit status is 130.
+    let interrupted = super::stop::StopFlag::watch().handle();
     // The text: on stdout as it is generated, or kept for the JSON object.
     let collected = std::cell::RefCell::new(String::new());
     let emit = |delta: &str| {
@@ -930,5 +988,88 @@ mod tests {
         );
         assert_eq!(summary.top_sections[0].name, "gdn_input_qkv");
         assert_eq!(summary.top_sections[0].total_us, 190);
+    }
+}
+
+#[cfg(test)]
+mod messages_file_tests {
+    use super::*;
+    use pmetal_core::jobs::{ChatMessage, parse_messages};
+
+    fn chat(json: &str) -> Vec<ChatMessage> {
+        parse_messages(json).unwrap()
+    }
+
+    /// A one-message conversation is the prompt it stands for, so the two
+    /// produce the same text.
+    #[test]
+    fn a_single_user_message_is_the_prompt() {
+        let (history, prompt) =
+            conversation(chat(r#"[{"role":"user","content":"hello"}]"#), false).unwrap();
+        assert!(history.is_none());
+        assert_eq!(prompt, "hello");
+    }
+
+    #[test]
+    fn earlier_turns_are_history_and_the_last_user_message_is_the_prompt() {
+        let (history, prompt) = conversation(
+            chat(
+                r#"[{"role":"system","content":"be brief"},{"role":"user","content":"a"},
+                    {"role":"assistant","content":"b","reasoning_content":"thought"},
+                    {"role":"user","content":"c"}]"#,
+            ),
+            false,
+        )
+        .unwrap();
+        let history = history.unwrap();
+        let roles: Vec<&str> = history.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["system", "user", "assistant"]);
+        assert_eq!(history[2].reasoning_content.as_deref(), Some("thought"));
+        assert_eq!(prompt, "c");
+    }
+
+    #[test]
+    fn a_conversation_ending_in_a_tool_result_has_no_prompt() {
+        let (history, prompt) = conversation(
+            chat(
+                r#"[{"role":"user","content":"weather?"},
+                    {"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"SF\"}"}}]},
+                    {"role":"tool","content":"sunny","tool_call_id":"c1"}]"#,
+            ),
+            false,
+        )
+        .unwrap();
+        assert_eq!(prompt, "");
+        let history = history.unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(
+            history[1].tool_calls.as_ref().unwrap()[0].function.name,
+            "get_weather"
+        );
+        assert_eq!(history[2].tool_call_id.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn a_system_message_and_the_system_flag_are_one_too_many() {
+        let err = conversation(
+            chat(r#"[{"role":"system","content":"s"},{"role":"user","content":"a"}]"#),
+            true,
+        )
+        .unwrap_err();
+        assert!(err.contains("--system"), "{err}");
+        assert!(
+            conversation(chat(r#"[{"role":"user","content":"a"}]"#), true).is_ok(),
+            "the flag alone is fine"
+        );
+    }
+
+    #[test]
+    fn a_bad_tool_call_names_its_message() {
+        let err = conversation(
+            chat(r#"[{"role":"user","content":"a"},{"role":"assistant","content":"","tool_calls":[{"nope":1}]},{"role":"tool","content":"x"}]"#),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("message 2"), "{err}");
     }
 }

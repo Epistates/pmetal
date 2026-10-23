@@ -217,12 +217,26 @@ where
 /// NVFP4 or per-tensor FP8 checkpoint come back still packed, for the loader
 /// to put on the model's `Linear`s ([`quant::PackedLinears::install`]) instead
 /// of a dense copy four times the size.
+///
+/// With `mlx_linears` (the model's `Linear` paths), an MLX-quantized
+/// checkpoint's projections stay packed as well; see
+/// [`quant::take_packed_mlx_linears`].
 pub(crate) fn load_weights_keeping_packed(
     model_dir: &Path,
+    mlx_linears: Option<&[String]>,
 ) -> Result<(HashMap<String, Array>, quant::PackedLinears), LoadError> {
     let mut weights = load_weights_filtered_raw(model_dir, |_| true)?;
+    let mut mlx_packed = match mlx_linears {
+        Some(paths) => quant::take_packed_mlx_linears(
+            &mut weights,
+            QuantConfig::read(model_dir)?.as_ref(),
+            paths,
+        )?,
+        None => PackedLinears::default(),
+    };
     unpack_mlx_quantized_weights(model_dir, &mut weights)?;
-    let packed = quant::take_packed_linears(&mut weights)?;
+    let mut packed = quant::take_packed_linears(&mut weights)?;
+    packed.absorb(&mut mlx_packed);
     dequantize_sidecar_weights(&mut weights)?;
     Ok((weights, packed))
 }

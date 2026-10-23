@@ -81,10 +81,28 @@ pub struct ServeArgs {
     #[arg(long = "ane-max-seq-len", default_value_t = 4096)]
     pub ane_max_seq_len: usize,
 
-    /// DFlash draft model (HF id or local path) drafting for the model on the
-    /// ANE: it runs on the GPU and the ANE verifies its guesses. Needs --ane.
+    /// Draft model (HF id or local path) that speeds decoding up without
+    /// changing the output: a Gemma 4 assistant, or a DFlash draft model. The
+    /// target model checks every token, so a reply is what the model alone
+    /// gives (greedy) or is drawn from the same distribution (sampled). With
+    /// --ane, a DFlash draft model drafts on the GPU for the model on the ANE.
     #[arg(long = "draft-model")]
     pub draft_model: Option<String>,
+
+    /// Draft with a Qwen3.5/3.6/3.8 model's own multi-token-prediction head,
+    /// the mtp.* weights bundled in the model. Not with --draft-model.
+    #[arg(long = "mtp")]
+    pub mtp: bool,
+
+    /// Qwen MTP checkpoint directory; defaults to the mtp.* weights bundled
+    /// in the model.
+    #[arg(long = "mtp-model")]
+    pub mtp_model: Option<String>,
+
+    /// Tokens a draft round proposes (default: 3 for MTP, the assistant's own
+    /// setting, the DFlash block size).
+    #[arg(long = "draft-tokens")]
+    pub draft_tokens: Option<usize>,
 
     /// Enable continuous batching.
     #[arg(long = "continuous-batch")]
@@ -139,6 +157,9 @@ impl ServeArgs {
             ane: self.ane,
             ane_max_seq_len: self.ane_max_seq_len,
             draft_model: self.draft_model,
+            mtp: self.mtp,
+            mtp_model: self.mtp_model,
+            draft_tokens: self.draft_tokens,
             continuous_batch: self.continuous_batch,
             cb_max_slots: self.cb_max_slots,
             cb_max_queue_depth: self.cb_max_queue_depth,

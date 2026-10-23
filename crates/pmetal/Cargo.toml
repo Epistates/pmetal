@@ -55,7 +55,7 @@ full = [
 # CLI: adds the pmetal binary + all CLI-specific dependencies
 cli = [
     "core", "gguf", "metal", "hub", "runtime", "cache", "models", "data",
-    "dep:clap", "dep:clap_complete", "dep:tokio", "dep:tracing-subscriber",
+    "dep:clap", "dep:clap_complete", "dep:tokio",
     "dep:serde", "dep:serde-saphyr", "dep:indicatif", "dep:anyhow",
     "dep:safetensors", "dep:dirs", "dep:chrono",
     "dep:rand", "dep:regex", "dep:tempfile", "dep:tokenizers",
@@ -101,7 +101,6 @@ half = { workspace = true }
 clap = { workspace = true, optional = true }
 clap_complete = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
-tracing-subscriber = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde-saphyr = { workspace = true, optional = true }
 indicatif = { workspace = true, optional = true }

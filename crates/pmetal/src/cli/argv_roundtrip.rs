@@ -903,6 +903,7 @@ fn infer_spec_round_trips_every_field() {
         model: "m".into(),
         lora: Some("adapter".into()),
         prompt: "hello there".into(),
+        messages_file: None,
         image: vec!["a.png".into(), "b.png".into()],
         video: vec!["frames".into()],
         video_fps: Some(2.5),
@@ -955,7 +956,13 @@ fn infer_spec_round_trips_every_field() {
         prompt: "hi".into(),
         ..Default::default()
     };
-    for spec in [plain, busy] {
+    // A conversation instead of a prompt.
+    let conversation = InferSpec {
+        model: "m".into(),
+        messages_file: Some("chat.json".into()),
+        ..Default::default()
+    };
+    for spec in [plain, busy, conversation] {
         let parsed = match try_parse("infer", spec.to_argv()) {
             Ok(Commands::Infer(a)) => InferSpec::from(a),
             other => panic!("{other:?}"),
@@ -1295,6 +1302,9 @@ fn serve_spec_round_trips_every_field_but_the_keys() {
         ane: true,
         ane_max_seq_len: 2048,
         draft_model: Some("draft".into()),
+        mtp: true,
+        mtp_model: Some("head".into()),
+        draft_tokens: Some(5),
         continuous_batch: true,
         cb_max_slots: 4,
         cb_max_queue_depth: 16,

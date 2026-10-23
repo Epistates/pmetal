@@ -180,7 +180,7 @@ pub struct GrpoArgs {
     #[arg(long = "grpo-kv-bits")]
     pub grpo_kv_bits: Option<u8>,
 
-    /// Path to write JSONL metrics log (for TUI dashboard)
+    /// Write per-step metrics as JSONL to this file (a relative path is relative to --output).
     #[arg(long = "log-metrics")]
     pub log_metrics: Option<String>,
 }

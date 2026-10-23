@@ -31,6 +31,16 @@ where
     _arr: [u8; N],
 }
 
+impl<T: Clone + Default, const N: usize> Default for Generic<T, N> {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            _marker: PhantomData,
+            _arr: [0; N],
+        }
+    }
+}
+
 #[test]
 fn derive_supports_generics_and_where_clauses() {
     let spec = Generic::<u8, 2> {
@@ -43,7 +53,7 @@ fn derive_supports_generics_and_where_clauses() {
     assert_eq!(Generic::<u8, 2>::field_descriptors().len(), 1);
 }
 
-#[derive(JobSpec)]
+#[derive(JobSpec, Default)]
 #[spec(kind = "Eval", subcommand = "empty")]
 struct Empty {}
 
@@ -56,7 +66,7 @@ fn derive_on_an_empty_struct_is_lint_clean() {
     assert!(matches!(Empty::job_kind(), JobKind::Eval));
 }
 
-#[derive(JobSpec)]
+#[derive(JobSpec, Default)]
 #[spec(kind = "Train", subcommand = "raw")]
 struct RawIdent {
     #[job(label = "Type", group = "G", argv = "--type")]
@@ -76,7 +86,7 @@ fn raw_identifier_fields_are_named_without_the_prefix() {
 // Validation semantics
 // ---------------------------------------------------------------------------
 
-#[derive(JobSpec)]
+#[derive(JobSpec, Default)]
 #[spec(kind = "Train", subcommand = "ranges")]
 struct Ranges {
     #[job(label = "LR", group = "G", argv = "--lr", min = 0.0, max = 1.0)]
@@ -187,6 +197,22 @@ struct Argv {
     cli_only: bool,
 }
 
+impl Default for Argv {
+    fn default() -> Self {
+        Self {
+            a: false,
+            b: true,
+            c: Vec::new(),
+            d: None,
+            e: 0,
+            f: String::new(),
+            h: String::new(),
+            v: true,
+            cli_only: false,
+        }
+    }
+}
+
 #[test]
 fn argv_follows_flag_csv_option_and_skip_rules() {
     let s = Argv {
@@ -227,7 +253,84 @@ fn argv_follows_flag_csv_option_and_skip_rules() {
         v: true,
         cli_only: false,
     };
-    assert_eq!(s.to_argv(), ["--e", "0", "--v", "true"]);
+    // Settings at their defaults are not passed, so the command's own
+    // defaults (or a config file's) apply.
+    assert!(s.to_argv().is_empty(), "{:?}", s.to_argv());
+    assert_eq!(Argv { e: 1, ..s }.to_argv(), ["--e", "1"]);
+}
+
+#[derive(JobSpec)]
+#[spec(kind = "Train", subcommand = "defaults")]
+struct Defaulted {
+    #[job(label = "N", group = "G", argv = "--n", default_int = 5)]
+    n: u32,
+    #[job(label = "L", group = "G", argv = "--l", default_float = 0.5)]
+    l: f64,
+    #[job(label = "S", group = "G", argv = "--s", default = "adamw")]
+    s: String,
+    #[job(label = "V", group = "G", argv = "--v", valued, default_bool = true)]
+    v: bool,
+    #[job(
+        label = "H",
+        group = "G",
+        argv = "--host",
+        default = "127.0.0.1",
+        always
+    )]
+    host: String,
+}
+
+impl Default for Defaulted {
+    fn default() -> Self {
+        Self {
+            n: 5,
+            l: 0.5,
+            s: "adamw".into(),
+            v: true,
+            host: "127.0.0.1".into(),
+        }
+    }
+}
+
+/// A flag passed with the default's value would beat a `--config` file that
+/// names another, so a setting nobody changed is not passed.
+#[test]
+fn a_setting_left_at_its_default_is_not_passed() {
+    // Except a setting that must be stated: a bind address is never left to
+    // the command's own default.
+    assert_eq!(Defaulted::default().to_argv(), ["--host", "127.0.0.1"]);
+    // Changed: passed, whichever way it moved.
+    let moved = Defaulted {
+        n: 4,
+        l: 0.25,
+        s: "x".into(),
+        v: false,
+        host: "localhost".into(),
+    };
+    assert_eq!(
+        moved.to_argv(),
+        [
+            "--n",
+            "4",
+            "--l",
+            "0.25",
+            "--s",
+            "x",
+            "--v",
+            "false",
+            "--host",
+            "localhost"
+        ]
+    );
+    // One at a time: the others stay out.
+    assert_eq!(
+        Defaulted {
+            n: 6,
+            ..Defaulted::default()
+        }
+        .to_argv(),
+        ["--n", "6", "--host", "127.0.0.1"]
+    );
 }
 
 /// A descriptor says whether a field holds one value, one that may be absent,

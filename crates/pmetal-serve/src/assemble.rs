@@ -291,6 +291,9 @@ pub struct ChoiceDone {
 #[derive(Debug, Clone)]
 pub enum ChoiceEvent {
     Piece(Piece),
+    /// The prompt's own log-probabilities, ahead of every piece, when the
+    /// request asked for them (see [`crate::engine::TokenEvent::PromptLogprobs`]).
+    PromptLogprobs(Vec<TokenLogprobEntry>),
     Done(ChoiceDone),
     Failed(Failure),
 }
@@ -351,6 +354,9 @@ pub fn run_choice(
                         run.rx = None;
                         run.finish("stop", None);
                     }
+                }
+                Some(TokenEvent::PromptLogprobs(entries)) => {
+                    run.queue.push_back(ChoiceEvent::PromptLogprobs(entries));
                 }
                 Some(TokenEvent::Done {
                     finish_reason,

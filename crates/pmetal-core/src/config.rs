@@ -9,6 +9,7 @@
 //! file loader, which also keeps files written by earlier releases readable.
 
 use crate::defaults;
+use crate::jobs::{default_lora_alpha, default_lora_r, default_seed};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -778,12 +779,6 @@ fn default_max_seq_len() -> usize {
 fn default_true() -> bool {
     true
 }
-fn default_lora_r() -> usize {
-    defaults::LORA_R
-}
-fn default_lora_alpha() -> f32 {
-    defaults::LORA_ALPHA
-}
 /// `target_modules` as a list of names, or as the bare string `all-linear`
 /// the way a PEFT `adapter_config.json` can spell it.
 fn deserialize_target_modules<'de, D: Deserializer<'de>>(
@@ -820,9 +815,6 @@ fn default_weight_decay() -> f64 {
 }
 fn default_grad_clip() -> f64 {
     defaults::MAX_GRAD_NORM
-}
-fn default_seed() -> u64 {
-    defaults::SEED
 }
 fn default_logging_steps() -> usize {
     defaults::LOGGING_STEPS

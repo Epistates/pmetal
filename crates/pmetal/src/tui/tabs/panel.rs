@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use pmetal_core::events::JobEvent;
 use pmetal_core::jobs::Spec;
-use pmetal_supervisor::{EventKind, JobId, JobMetrics, ProcessStatus};
+use pmetal_supervisor::{EventKind, JobId, JobMetrics, LaunchOptions, ProcessStatus};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
@@ -113,24 +113,16 @@ impl JobPanel {
     }
 
     /// The panel's command for the form as it stands, for the common case: the
-    /// spec `S`, run as `pmetal <S::subcommand> <S::to_argv>`. `customize`
-    /// adjusts the spec and the plan (an output directory, a log file) before
-    /// the argv is spelled; anything it pushes to `plan.argv` follows the
-    /// spec's own flags.
-    pub fn plan_for<S: Spec>(
-        &self,
-        customize: impl FnOnce(&mut S, &mut LaunchPlan),
-    ) -> Result<LaunchPlan, Vec<FormIssue>> {
-        let mut spec = self.form.to_spec::<S>()?;
-        let mut plan = LaunchPlan {
-            subcommand: S::subcommand().to_string(),
-            ..LaunchPlan::default()
-        };
-        customize(&mut spec, &mut plan);
-        let mut argv = spec.to_argv();
-        argv.append(&mut plan.argv);
-        plan.argv = argv;
-        Ok(plan)
+    /// spec `S`, run as `pmetal <S::subcommand> <S::to_argv>`, asking for the
+    /// event log and metrics file the spec's command writes (`LaunchPlan`).
+    pub fn plan_for<S: Spec>(&self) -> Result<LaunchPlan, Vec<FormIssue>> {
+        let spec = self.form.to_spec::<S>()?;
+        LaunchPlan::for_spec(&spec, &LaunchOptions::default()).map_err(|e| {
+            vec![FormIssue {
+                field: String::new(),
+                message: e.to_string(),
+            }]
+        })
     }
 
     /// The job was started.
@@ -401,15 +393,14 @@ mod tests {
     }
 
     #[test]
-    fn the_plan_is_the_specs_command_with_the_tabs_additions() {
+    fn the_plan_is_the_specs_command() {
         let mut p = panel();
         p.form.set_value("Model", "Qwen/Qwen3-0.6B");
         p.form.set_value("Output Path", "./out.gguf");
-        let plan = p
-            .plan_for::<QuantizeSpec>(|_, plan| plan.argv.push("--extra".into()))
-            .unwrap();
+        let plan = p.plan_for::<QuantizeSpec>().unwrap();
         assert_eq!(plan.subcommand, "quantize");
         assert_eq!(plan.argv.first().map(String::as_str), Some("--model"));
-        assert_eq!(plan.argv.last().map(String::as_str), Some("--extra"));
+        // A command with no event log is not asked for one.
+        assert_eq!(plan.events_file, None);
     }
 }

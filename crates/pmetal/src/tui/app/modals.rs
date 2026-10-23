@@ -1,8 +1,5 @@
 //! What the dialogs answer, and the dialogs the app opens for itself.
 
-use std::path::PathBuf;
-
-use super::runs::expand_tilde;
 use super::{App, Pending};
 use crate::tui::event::AppMsg;
 use crate::tui::modal::{HfSearchEntry, Modal, ModalAction, PickerEntry};
@@ -133,7 +130,7 @@ impl App {
         let base_path = self.models.resolve_path(base);
         if let Some(entry) = self.models.models.iter_mut().find(|m| m.id == adapter_id) {
             entry.base_model = Some(base.to_string());
-            crate::tui::tabs::write_training_info(&entry.path, base, &base_path);
+            crate::tui::tabs::record_base_model(&entry.path, base, &base_path);
         }
     }
 
@@ -222,7 +219,7 @@ impl App {
             Some(Pending::HfSearch) => self.search_hf(&text),
             Some(Pending::DownloadModel) => self.download_model(text.trim()),
             Some(Pending::AddModelDir) => {
-                let path = PathBuf::from(expand_tilde(text.trim()));
+                let path = pmetal_core::paths::expand_home(text.trim());
                 if path.is_dir() {
                     if self.models.add_custom_dir(path) {
                         self.rescan_models();
@@ -235,7 +232,7 @@ impl App {
                 }
             }
             Some(Pending::AddDatasetDir) => {
-                let path = PathBuf::from(expand_tilde(text.trim()));
+                let path = pmetal_core::paths::expand_home(text.trim());
                 if path.is_dir() {
                     if self.datasets.add_custom_dir(path) {
                         self.rescan_datasets();
@@ -337,7 +334,7 @@ impl App {
                     ),
                     None => (
                         r.safetensors_bytes
-                            .map(pmetal_hub::fit::format_bytes)
+                            .map(pmetal_core::format::human_size)
                             .unwrap_or_else(|| "?".to_string()),
                         pmetal_hub::FitLevel::Fits,
                         "-".to_string(),

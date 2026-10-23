@@ -68,7 +68,7 @@ pub struct TrainArgs {
     pub batch_size: usize,
 
     /// Number of epochs
-    #[arg(long = "epochs", default_value_t = defaults::CLI_EPOCHS)]
+    #[arg(long = "epochs", default_value_t = defaults::EPOCHS)]
     pub epochs: usize,
 
     /// Stop after this many optimizer steps, whatever --epochs says
@@ -115,7 +115,7 @@ pub struct TrainArgs {
     #[arg(long = "no-gradient-checkpointing")]
     pub no_gradient_checkpointing: bool,
 
-    /// Write per-step metrics as JSONL to this path.
+    /// Write per-step metrics as JSONL to this file (a relative path is relative to --output).
     #[arg(long = "log-metrics")]
     pub log_metrics: Option<String>,
 

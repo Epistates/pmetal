@@ -301,6 +301,7 @@ async fn collect(mut rx: tokio::sync::mpsc::Receiver<TokenEvent>) -> (Vec<u32>, 
                 logprobs.push(logprob.expect("logprobs requested").logprob);
             }
             TokenEvent::Done { .. } => return (tokens, logprobs),
+            TokenEvent::PromptLogprobs(_) => {}
             TokenEvent::Error(e) => panic!("stream failed: {e}"),
         }
     }
@@ -612,6 +613,18 @@ async fn images_over_http() {
     assert_eq!(
         reply["usage"]["input_tokens"].as_u64().unwrap() as usize,
         prompt.input_ids.len()
+    );
+    // count_tokens sees the image as the model does: the expanded run of
+    // image tokens, the prompt length the request above ran.
+    let mut counted = messages_request(false);
+    counted.as_object_mut().unwrap().remove("max_tokens");
+    let (status, body) = post(port, "/v1/messages/count_tokens", &counted).await;
+    assert_eq!(status, 200, "{body}");
+    let reply: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        reply["input_tokens"].as_u64().unwrap() as usize,
+        prompt.input_ids.len(),
+        "count_tokens with an image"
     );
     let (status, body) = post(port, "/v1/messages", &messages_request(true)).await;
     assert_eq!(status, 200, "{body}");

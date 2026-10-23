@@ -619,26 +619,63 @@ pub fn token_logprobs(
     token: u32,
     top_n: usize,
 ) -> Result<(f32, Vec<(u32, f32)>), Exception> {
-    use pmetal_runtime::compat::ops::{argpartition_axis, negative, slice_axis, take_along_axis};
-
     // Flatten every leading dim so single-row and batched callers both land
-    // on a [1, vocab] view. The sampler path only ever has one active
+    // on a one-row view. The sampler path only ever has one active
     // prediction per step so this is safe.
     let vocab = *logits
         .shape()
         .last()
         .ok_or_else(|| Exception::custom("token_logprobs: empty logits shape"))?;
-    if token as i64 >= i64::from(vocab) {
+    let mut rows = row_logprobs(&logits.reshape(&[1, vocab]), &[token], top_n)?;
+    Ok(rows.remove(0))
+}
+
+/// One position's log-probabilities: the chosen token's, and the likeliest
+/// tokens (id, log-probability), descending.
+pub type LogprobRow = (f32, Vec<(u32, f32)>);
+
+/// The log-probability of `targets[i]` under row `i` of `logits`, with each
+/// row's `top_n` highest-logprob tokens: [`token_logprobs`] for many rows at
+/// once, as prompt scoring needs it.
+///
+/// `logits` is `[rows, vocab]` or `[1, rows, vocab]`, one row per target. The
+/// log-softmax runs in float32 whatever the logits' dtype, and the gathers run
+/// on the device, so what comes back is `rows * (1 + 2 * top_n)` numbers, not
+/// the vocabulary. Each row's alternatives are sorted descending by
+/// log-probability, ties by token id.
+pub fn row_logprobs(
+    logits: &Array,
+    targets: &[u32],
+    top_n: usize,
+) -> Result<Vec<LogprobRow>, Exception> {
+    use pmetal_runtime::compat::ops::{argpartition_axis, negative, slice_axis, take_along_axis};
+
+    let vocab = *logits
+        .shape()
+        .last()
+        .ok_or_else(|| Exception::custom("row_logprobs: empty logits shape"))?;
+    let rows = targets.len() as i32;
+    if rows == 0 {
+        return Ok(Vec::new());
+    }
+    if logits.size() != (rows as usize) * (vocab as usize) {
         return Err(Exception::custom(format!(
-            "token_logprobs: token {token} out of range"
+            "row_logprobs: {} logits for {rows} targets over a vocabulary of {vocab}",
+            logits.size()
         )));
     }
-    let log_probs = logits_to_log_probs(logits).reshape(&[1, vocab]);
+    if let Some(bad) = targets.iter().find(|&&t| i64::from(t) >= i64::from(vocab)) {
+        return Err(Exception::custom(format!(
+            "row_logprobs: token {bad} out of range"
+        )));
+    }
+    let log_probs = logits_to_log_probs(logits).reshape(&[rows, vocab]);
 
     // The chosen token's log-probability, and the `top_n` largest ones,
-    // gathered on the device: only a handful of values come back, not the
-    // vocabulary (600 KB per token over a 152k vocabulary).
-    let chosen = take_along_axis(&log_probs, &Array::from_slice(&[token as i32], &[1, 1]), -1);
+    // gathered on the device: only a handful of values come back per row,
+    // not the vocabulary (600 KB per token over a 152k vocabulary).
+    let ids: Vec<i32> = targets.iter().map(|&t| t as i32).collect();
+    let chosen = take_along_axis(&log_probs, &Array::from_slice(&ids, &[rows, 1]), -1);
     let k = top_n.min(vocab as usize);
     let top = (k > 0).then(|| {
         // The first k columns of a partition of the negated log-probs at
@@ -653,17 +690,25 @@ pub fn token_logprobs(
         ids.eval();
     }
     pmetal_runtime::check_unobserved_error()
-        .map_err(|e| Exception::custom(format!("token_logprobs: {e}")))?;
-    let chosen = chosen.as_slice::<f32>()[0];
+        .map_err(|e| Exception::custom(format!("row_logprobs: {e}")))?;
+    let chosen = chosen.as_slice::<f32>();
 
-    let mut alternatives = Vec::new();
-    if let Some((values, ids)) = &top {
-        let (values, ids) = (values.as_slice::<f32>(), ids.as_slice::<u32>());
-        alternatives = ids.iter().copied().zip(values.iter().copied()).collect();
-        // Descending by log-probability, ties by token id.
-        alternatives.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-    }
-    Ok((chosen, alternatives))
+    Ok((0..rows as usize)
+        .map(|row| {
+            let mut alternatives = Vec::new();
+            if let Some((values, ids)) = &top {
+                let range = row * k..(row + 1) * k;
+                alternatives = ids.as_slice::<u32>()[range.clone()]
+                    .iter()
+                    .copied()
+                    .zip(values.as_slice::<f32>()[range].iter().copied())
+                    .collect();
+                // Descending by log-probability, ties by token id.
+                alternatives.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            }
+            (chosen[row], alternatives)
+        })
+        .collect())
 }
 
 /// Simple generation function that works with any model that has a `forward` method.
@@ -1127,6 +1172,38 @@ mod tests {
     }
 
     const PROMPT: [u32; 4] = [3, 9, 1, 20];
+
+    /// `row_logprobs` over many rows is `token_logprobs` row by row, and agrees
+    /// with a direct log-softmax on the host.
+    #[test]
+    fn row_logprobs_match_one_row_at_a_time() {
+        let tokens: Vec<i32> = (0..9).map(|i| (i * 5 + 2) % 32).collect();
+        let logits = table_logits(&tokens);
+        let targets: Vec<u32> = tokens.iter().map(|&t| ((t * 3 + 1) % 32) as u32).collect();
+        for top_n in [0usize, 1, 4] {
+            let rows = row_logprobs(&logits, &targets, top_n).unwrap();
+            assert_eq!(rows.len(), targets.len());
+            for (i, (lp, top)) in rows.iter().enumerate() {
+                let row = logits.reshape(&[9, 32]);
+                let row = pmetal_runtime::compat::ops::slice_axis(&row, 0, i as i32, i as i32 + 1);
+                let (want_lp, want_top) = token_logprobs(&row, targets[i], top_n).unwrap();
+                assert_eq!(*lp, want_lp, "row {i}, top {top_n}");
+                assert_eq!(*top, want_top, "row {i}, top {top_n}");
+                assert_eq!(top.len(), top_n);
+
+                // The host's own log-softmax.
+                row.eval();
+                let r = row.as_slice::<f32>();
+                let max = r.iter().copied().fold(f32::MIN, f32::max);
+                let lse = max + r.iter().map(|x| (x - max).exp()).sum::<f32>().ln();
+                assert!((lp - (r[targets[i] as usize] - lse)).abs() < 1e-5);
+            }
+        }
+        // A target outside the vocabulary, and rows that do not line up.
+        assert!(row_logprobs(&logits, &[99; 9], 0).is_err());
+        assert!(row_logprobs(&logits, &targets[..3], 0).is_err());
+        assert!(row_logprobs(&logits, &[], 0).unwrap().is_empty());
+    }
 
     /// All three generators on `config`: the uncached reference, the
     /// cached one and the pipelined one (streaming into the returned vec).

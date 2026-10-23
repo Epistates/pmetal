@@ -86,6 +86,13 @@ pub(crate) async fn run_preference(spec: PreferenceSpec, ctx: RunContext) -> any
     let dataset_path = pmetal_trainer::resolve_dataset_path(&spec.dataset).await?;
     let output_dir = PathBuf::from(&spec.output_dir);
     std::fs::create_dir_all(&output_dir)?;
+    super::record_training(
+        &output_dir,
+        &spec.model,
+        &model_path,
+        &spec.dataset,
+        &spec.loss,
+    );
 
     if emit_console_output {
         println!("========================================");
@@ -169,11 +176,7 @@ pub(crate) async fn run_preference(spec: PreferenceSpec, ctx: RunContext) -> any
 
     let mut callbacks = extra_callbacks;
     if let Some(metrics_path) = &spec.log_metrics {
-        let path = if metrics_path.contains('/') || metrics_path.contains('\\') {
-            PathBuf::from(metrics_path)
-        } else {
-            output_dir.join(metrics_path)
-        };
+        let path = pmetal_core::paths::resolve_in(&output_dir, metrics_path);
         let model_name = spec.model.rsplit('/').next().unwrap_or(&spec.model);
         callbacks.push(Box::new(
             pmetal_trainer::MetricsJsonCallback::new(&path)?

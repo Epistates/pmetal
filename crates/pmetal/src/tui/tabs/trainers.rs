@@ -5,8 +5,6 @@
 //! tab: a form of the spec's fields, a job started from it, the run's progress
 //! on the right. One struct serves all seven; each constructor names its spec.
 
-use std::path::PathBuf;
-
 use pmetal_core::jobs::{
     DistillSpec, EmbedTrainSpec, GrpoSpec, PreferenceSpec, PretrainSpec, RlkdSpec, Spec, TrainSpec,
 };
@@ -24,72 +22,6 @@ use crate::tui::tabs::status_panel::{render_standard, render_training_status};
 use crate::tui::theme::THEME;
 use crate::tui::widgets::{FieldKind, FormField, FormIssue};
 
-/// What a trainer's spec says about where it writes and what it starts from.
-trait TrainerSpec: Spec {
-    /// The run reports `JobEvent`s to a file (`--log-events`).
-    const EVENTS: bool;
-    fn output_dir(&self) -> &str;
-    /// The model the run starts from, if it names one.
-    fn base_model(&self) -> Option<&str>;
-    /// Where the spec's own `--log-metrics` goes, if it has one.
-    fn log_metrics(&mut self) -> Option<&mut Option<String>> {
-        None
-    }
-}
-
-macro_rules! trainer_spec {
-    ($spec:ty, events: $events:expr, base: |$s:ident| $base:expr, metrics: $metrics:tt) => {
-        impl TrainerSpec for $spec {
-            const EVENTS: bool = $events;
-            fn output_dir(&self) -> &str {
-                &self.output_dir
-            }
-            fn base_model(&self) -> Option<&str> {
-                let $s = self;
-                $base
-            }
-            trainer_spec!(@metrics $metrics);
-        }
-    };
-    (@metrics yes) => {
-        fn log_metrics(&mut self) -> Option<&mut Option<String>> {
-            Some(&mut self.log_metrics)
-        }
-    };
-    (@metrics no) => {};
-}
-
-trainer_spec!(TrainSpec, events: true, base: |s| Some(&s.model), metrics: yes);
-trainer_spec!(DistillSpec, events: true, base: |s| Some(&s.student), metrics: yes);
-trainer_spec!(GrpoSpec, events: true, base: |s| Some(&s.model), metrics: yes);
-trainer_spec!(RlkdSpec, events: true, base: |s| Some(&s.model), metrics: yes);
-trainer_spec!(PreferenceSpec, events: true, base: |s| Some(&s.model), metrics: yes);
-trainer_spec!(PretrainSpec, events: false, base: |_s| None, metrics: no);
-trainer_spec!(EmbedTrainSpec, events: false, base: |s| Some(&s.model), metrics: no);
-
-/// The command a trainer tab runs: the spec's, writing its events and metrics
-/// into the output directory so the monitor and the run's own records agree.
-fn trainer_plan<S: TrainerSpec>(panel: &JobPanel) -> Result<LaunchPlan, Vec<FormIssue>> {
-    panel.plan_for::<S>(|spec, plan| {
-        let out = PathBuf::from(spec.output_dir());
-        plan.output_dir = Some(out.clone());
-        plan.base_model = spec
-            .base_model()
-            .filter(|m| !m.is_empty())
-            .map(str::to_string);
-        if let Some(slot) = spec.log_metrics() {
-            *slot = Some(out.join("metrics.jsonl").display().to_string());
-        }
-        if S::EVENTS {
-            let events = out.join("events.jsonl");
-            plan.argv
-                .extend(["--log-events".to_string(), events.display().to_string()]);
-            plan.events_file = Some(events);
-            plan.dashboard = true;
-        }
-    })
-}
-
 /// One of the training tabs.
 pub struct TrainerTab {
     panel: JobPanel,
@@ -105,17 +37,13 @@ pub struct TrainerTab {
 }
 
 impl TrainerTab {
-    fn build<S: TrainerSpec>(
-        title: &'static str,
-        primary: &'static str,
-        suffix: &'static str,
-    ) -> Self {
+    fn build<S: Spec>(title: &'static str, primary: &'static str, suffix: &'static str) -> Self {
         Self {
             panel: JobPanel::new::<S>(title),
             primary,
             suffix,
-            plan: trainer_plan::<S>,
-            monitored: S::EVENTS,
+            plan: |panel| panel.plan_for::<S>(),
+            monitored: S::REPORTS_EVENTS,
             peek: None,
         }
     }
@@ -414,13 +342,11 @@ mod tests {
         tab.panel.form.set_value("Output Dir", "/out/run");
         let plan = tab.plan().unwrap();
         assert_eq!(plan.subcommand, "train");
-        assert_eq!(plan.output_dir, Some(PathBuf::from("/out/run")));
+        assert_eq!(plan.output, Some(std::path::PathBuf::from("/out/run")));
         assert_eq!(
             plan.events_file,
-            Some(PathBuf::from("/out/run/events.jsonl"))
+            Some(std::path::PathBuf::from("/out/run/events.jsonl"))
         );
-        assert!(plan.dashboard);
-        assert_eq!(plan.base_model.as_deref(), Some("Qwen/Qwen3-0.6B"));
         let at = plan.argv.iter().position(|a| a == "--log-events").unwrap();
         assert_eq!(plan.argv[at + 1], "/out/run/events.jsonl");
         let at = plan.argv.iter().position(|a| a == "--log-metrics").unwrap();
@@ -434,7 +360,6 @@ mod tests {
         let plan = tab.plan();
         let plan = plan.unwrap_or_else(|e| panic!("{e:?}"));
         assert!(plan.events_file.is_none());
-        assert!(!plan.dashboard);
         assert!(!plan.argv.iter().any(|a| a == "--log-events"));
     }
 

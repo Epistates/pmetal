@@ -1,11 +1,12 @@
 //! `pmetal rlkd` — Reinforcement Learning with Knowledge Distillation.
 
+use super::{default_lora_alpha, default_lora_r, default_seed};
 use crate::{FieldError, JobFields};
 use pmetal_core_derive::JobSpec;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JobSpec)]
-#[spec(kind = "Rlkd", subcommand = "rlkd")]
+#[spec(kind = "Rlkd", subcommand = "rlkd", events)]
 #[serde(rename_all = "snake_case")]
 pub struct RlkdSpec {
     #[job(
@@ -264,22 +265,13 @@ fn default_lr() -> f64 {
     5e-6
 }
 fn default_epochs() -> usize {
-    1
-}
-fn default_lora_r() -> usize {
-    16
-}
-fn default_lora_alpha() -> f32 {
-    32.0
+    crate::defaults::EPOCHS
 }
 fn default_max_seq_len() -> usize {
     512
 }
 fn default_max_completion() -> usize {
     512
-}
-fn default_seed() -> u64 {
-    42
 }
 
 #[cfg(test)]

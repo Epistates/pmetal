@@ -4,7 +4,6 @@ use pmetal::hub::{DeviceSpec, FitEstimate, ModelSpec};
 use serde::Serialize;
 
 use crate::hub::fit_name;
-use crate::models::format_size;
 
 /// The Mac, as the Settings page and the dashboard show it.
 #[derive(Debug, Serialize)]
@@ -44,8 +43,8 @@ pub fn system_info() -> SystemInfo {
         chip_tier: None,
         total_memory,
         available_memory,
-        total_memory_formatted: format_size(total_memory),
-        available_memory_formatted: format_size(available_memory),
+        total_memory_formatted: pmetal::core::format::human_memory(total_memory),
+        available_memory_formatted: pmetal::core::format::human_memory(available_memory),
         gpu_cores: None,
         ane_cores: None,
         memory_bandwidth_gbps: None,

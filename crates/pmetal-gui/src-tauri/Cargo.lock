@@ -1659,9 +1659,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.3"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03bb0e1cc970d482d121d9a1744999169b69a07470b3d644a7894e53fcaf4574"
+checksum = "12218662ccac37d9714f2191252553d67585b97df8c839cbe49e0bde278dc865"
 dependencies = [
  "cmov",
 ]
@@ -6149,7 +6149,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-subscriber",
  "walkdir",
 ]
 
@@ -6165,6 +6164,8 @@ dependencies = [
 name = "pmetal-core"
 version = "0.7.0"
 dependencies = [
+ "chrono",
+ "dirs 7.0.0",
  "pmetal-core-derive",
  "secrecy",
  "serde",
@@ -6172,6 +6173,8 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "thiserror 2.0.21",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -6284,7 +6287,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 
@@ -6415,6 +6417,7 @@ version = "0.7.0"
 dependencies = [
  "anstream",
  "chrono",
+ "dirs 7.0.0",
  "pmetal-core",
  "rustix",
  "serde",

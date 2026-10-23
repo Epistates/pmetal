@@ -172,6 +172,15 @@ PMetal prioritizes performance. When contributing:
 - Leverage Metal's parallel capabilities appropriately
 - Avoid unnecessary allocations in hot paths
 
+## Dependencies
+
+Every dependency is declared once, in the root `[workspace.dependencies]`, and kept at its latest release, but not its newest hour:
+
+- **Wait a week for a new release.** Most malicious releases are caught and pulled within days, so a version younger than seven days is not taken unless it fixes a security advisory. Bun enforces this when it resolves (`minimumReleaseAge` in `crates/pmetal-gui/bunfig.toml`), as does pip in CI (`PIP_UPLOADED_PRIOR_TO`); for crates, check with `just audit-deps`.
+- **No install scripts.** `package.json` trusts no dependency, so bun runs no package's install scripts. A package that needs one is a new dependency to discuss in the pull request.
+- **Lockfiles are the install.** CI installs with `bun install --frozen-lockfile` and builds against the committed `Cargo.lock` files; GitHub Actions are pinned to a commit, with the release in a comment.
+- **Check before you push a dependency change.** `just audit-deps` checks every pinned crate and npm package against OSV's malware and advisory records and lists the versions younger than a week; `just deny` checks advisories, licenses and sources for the crates the macOS build compiles. `just deps-check` reports what is behind.
+
 ## Licensing
 
 By contributing, you agree that your contributions will be licensed under the same dual MIT/Apache 2.0 license as the project. New dependencies must have a permissive license (`just deny` checks this against `deny.toml`), and third-party code you adapt needs an attribution in `THIRD_PARTY_NOTICES`.

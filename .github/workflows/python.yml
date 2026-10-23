@@ -11,6 +11,10 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Install nothing from PyPI that is younger than a week: most malicious
+  # releases are caught and pulled within days. pip reads a duration here from
+  # 26.1, which each job installs first with this unset.
+  PIP_UPLOADED_PRIOR_TO: P7D
 
 jobs:
   wheel:
@@ -23,19 +27,24 @@ jobs:
         # tested on the oldest and the newest.
         python: ["3.11", "3.14"]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: just
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python }}
+
+      - name: Upgrade pip
+        run: env -u PIP_UPLOADED_PRIOR_TO python -m pip install --upgrade "pip>=26.1"
 
       - name: Install maturin
         run: pip install "maturin>=1.15,<2.0"
@@ -59,14 +68,14 @@ jobs:
 
       - name: Upload the wheel
         if: matrix.python == '3.11'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pmetal-wheel-macos-aarch64
           path: target/wheels/*.whl
 
       - name: Fetch the wheel built on 3.11
         if: matrix.python != '3.11'
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: pmetal-wheel-macos-aarch64
           path: target/wheels
@@ -95,19 +104,24 @@ jobs:
     name: Wheel and tests (macOS aarch64, Python 3.14t)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: just
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.14t"
+
+      - name: Upgrade pip
+        run: env -u PIP_UPLOADED_PRIOR_TO python -m pip install --upgrade "pip>=26.1"
 
       - name: Install maturin
         run: pip install "maturin>=1.15,<2.0"

@@ -1,5 +1,4 @@
 mod adapters;
-mod binary;
 mod commands;
 mod datasets;
 mod error;
@@ -41,7 +40,7 @@ pub fn run() {
             }
         }),
     );
-    let binary = binary::locate();
+    let binary = pmetal_supervisor::locate_pmetal_binary();
     match &binary {
         Ok(path) => tracing::info!(path = %path.display(), "using the pmetal command-line tool"),
         Err(reason) => tracing::error!("{reason}"),

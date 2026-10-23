@@ -23,7 +23,8 @@ pub struct ServeSpec {
         label = "Host",
         group = "Server",
         argv = "--host",
-        default = "127.0.0.1"
+        default = "127.0.0.1",
+        always
     )]
     #[serde(default = "default_host")]
     pub host: String,
@@ -160,12 +161,45 @@ pub struct ServeSpec {
 
     #[job(
         label = "Draft Model",
-        group = "Compute",
+        group = "Speculative decoding",
         argv = "--draft-model",
-        kind = "model_picker"
+        kind = "model_picker",
+        help = "A draft model that speeds decoding up without changing the output: a Gemma 4 assistant, or a DFlash draft model (with --ane, DFlash only)"
     )]
     #[serde(default)]
     pub draft_model: Option<String>,
+
+    #[job(
+        label = "Qwen MTP",
+        group = "Speculative decoding",
+        argv = "--mtp",
+        flag,
+        default_bool = false,
+        help = "Draft with a Qwen3.5/3.6/3.8 model's multi-token-prediction head (the mtp.* weights bundled in the model)"
+    )]
+    #[serde(default)]
+    pub mtp: bool,
+
+    #[job(
+        label = "MTP Checkpoint",
+        group = "Speculative decoding",
+        argv = "--mtp-model",
+        kind = "path",
+        help = "Qwen MTP checkpoint directory; defaults to the mtp.* weights bundled in the model"
+    )]
+    #[serde(default)]
+    pub mtp_model: Option<String>,
+
+    #[job(
+        label = "Draft Tokens",
+        group = "Speculative decoding",
+        argv = "--draft-tokens",
+        min = 1,
+        max = 32,
+        help = "Tokens a draft round proposes (default: 3 for MTP, the assistant's own setting, the DFlash block size)"
+    )]
+    #[serde(default)]
+    pub draft_tokens: Option<usize>,
 
     #[job(
         label = "Continuous Batch",
@@ -251,6 +285,9 @@ impl Default for ServeSpec {
             ane: false,
             ane_max_seq_len: default_ane_max_seq_len(),
             draft_model: None,
+            mtp: false,
+            mtp_model: None,
+            draft_tokens: None,
             continuous_batch: false,
             cb_max_slots: default_cb_slots(),
             cb_max_queue_depth: default_cb_queue(),
@@ -265,11 +302,42 @@ impl ServeSpec {
     /// Run descriptor + cross-field validation.
     pub fn normalize(&mut self) -> Result<(), Vec<FieldError>> {
         let mut errs = self.validate_descriptors();
-        if self.draft_model.is_some() && !self.ane {
+        let drafting = self.mtp || self.draft_model.is_some();
+        if self.mtp && self.draft_model.is_some() {
             errs.push(FieldError::new(
                 "draft_model",
-                "a DFlash draft model drafts for the ANE engine; enable ANE",
+                "use either --mtp (a Qwen model's own head) or --draft-model, not both",
             ));
+        }
+        if self.mtp_model.is_some() && !self.mtp {
+            errs.push(FieldError::new("mtp_model", "needs --mtp"));
+        }
+        if self.draft_tokens.is_some() && !drafting {
+            errs.push(FieldError::new(
+                "draft_tokens",
+                "needs --mtp or --draft-model",
+            ));
+        }
+        if self.mtp && self.ane {
+            errs.push(FieldError::new(
+                "mtp",
+                "MTP drafts on the GPU; the ANE engine drafts with a DFlash --draft-model",
+            ));
+        }
+        if drafting && self.continuous_batch {
+            errs.push(FieldError::new(
+                "continuous_batch",
+                "speculative decoding runs one request at a time, and continuous batching serves many: use one of them",
+            ));
+        }
+        // On the GPU the target runs on the float KV cache a rewind needs.
+        if drafting && !self.ane {
+            if self.kv_quant.is_some_and(|bits| bits != 0) || self.kv_turboquant {
+                errs.push(FieldError::new(
+                    "kv_quant",
+                    "speculative decoding runs the model on a float KV cache; drop --kv-quant and --kv-turboquant, or drop the drafter",
+                ));
+            }
         }
         if errs.is_empty() { Ok(()) } else { Err(errs) }
     }
@@ -317,12 +385,13 @@ mod tests {
     fn argv_emits_required_fields() {
         let spec = ServeSpec {
             model: "model".into(),
+            port: 9090,
             ..Default::default()
         };
         let argv = spec.to_argv();
         assert!(argv.contains(&"--model".to_string()));
         assert!(argv.contains(&"--port".to_string()));
-        assert!(argv.contains(&"8080".to_string()));
+        assert!(argv.contains(&"9090".to_string()));
     }
 
     #[test]
@@ -335,6 +404,119 @@ mod tests {
         assert!(!argv.contains(&"--fp8".to_string()));
         assert!(!argv.contains(&"--ane".to_string()));
         assert!(!argv.contains(&"--continuous-batch".to_string()));
+    }
+
+    fn invalid(mut spec: ServeSpec) -> Vec<String> {
+        spec.model = "m".into();
+        match spec.normalize() {
+            Ok(()) => Vec::new(),
+            Err(errs) => errs.into_iter().map(|e| e.field.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_drafter_runs_on_the_gpu_or_the_ane() {
+        // On the GPU a draft model or the model's own MTP head drafts.
+        for spec in [
+            ServeSpec {
+                draft_model: Some("d".into()),
+                ..Default::default()
+            },
+            ServeSpec {
+                mtp: true,
+                mtp_model: Some("head".into()),
+                draft_tokens: Some(4),
+                ..Default::default()
+            },
+            // On the ANE, a DFlash draft model.
+            ServeSpec {
+                ane: true,
+                draft_model: Some("d".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(invalid(spec.clone()).is_empty(), "{spec:?}");
+        }
+        assert_eq!(
+            invalid(ServeSpec {
+                mtp: true,
+                ane: true,
+                ..Default::default()
+            }),
+            ["mtp"]
+        );
+    }
+
+    #[test]
+    fn drafting_options_need_a_drafter_and_exclude_each_other() {
+        assert_eq!(
+            invalid(ServeSpec {
+                mtp: true,
+                draft_model: Some("d".into()),
+                ..Default::default()
+            }),
+            ["draft_model"]
+        );
+        assert_eq!(
+            invalid(ServeSpec {
+                mtp_model: Some("head".into()),
+                ..Default::default()
+            }),
+            ["mtp_model"]
+        );
+        assert_eq!(
+            invalid(ServeSpec {
+                draft_tokens: Some(3),
+                ..Default::default()
+            }),
+            ["draft_tokens"]
+        );
+    }
+
+    #[test]
+    fn a_drafter_and_continuous_batching_are_one_or_the_other() {
+        for spec in [
+            ServeSpec {
+                mtp: true,
+                continuous_batch: true,
+                ..Default::default()
+            },
+            ServeSpec {
+                draft_model: Some("d".into()),
+                continuous_batch: true,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(invalid(spec), ["continuous_batch"]);
+        }
+    }
+
+    #[test]
+    fn a_drafter_needs_the_float_kv_cache() {
+        for spec in [
+            ServeSpec {
+                mtp: true,
+                kv_quant: Some(4),
+                ..Default::default()
+            },
+            ServeSpec {
+                draft_model: Some("d".into()),
+                kv_turboquant: true,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(invalid(spec), ["kv_quant"]);
+        }
+        // Float is what it asks for anyway.
+        assert!(
+            invalid(ServeSpec {
+                mtp: true,
+                kv_quant: Some(0),
+                no_kv_quant: true,
+                ..Default::default()
+            })
+            .is_empty()
+        );
     }
 
     #[test]

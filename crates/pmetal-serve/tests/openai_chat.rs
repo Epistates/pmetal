@@ -629,7 +629,6 @@ async fn completions_stream_with_usage_and_refuse_what_they_cannot_do() {
     for (extra, param) in [
         (json!({"suffix": "tail"}), "suffix"),
         (json!({"best_of": 3}), "best_of"),
-        (json!({"echo": true, "logprobs": 1}), "echo"),
         (json!({"prompt": []}), "prompt"),
         (json!({"prompt": ""}), "prompt"),
         (json!({"prompt": ["hi", ""]}), "prompt"),

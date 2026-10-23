@@ -528,6 +528,44 @@ mod tests {
         AUX.iter().map(|p| f(p, 100)).collect()
     }
 
+    /// A sentence-transformers repository (all-MiniLM-L6-v2's layout): the
+    /// files that say how the encoder is pooled and normalized come with it, and
+    /// the alternative exports do not.
+    #[test]
+    fn a_sentence_transformers_model_comes_with_its_pipeline_files() {
+        let files = [
+            ("1_Pooling/config.json", 190),
+            ("2_Normalize/.gitkeep", 0),
+            ("config.json", 612),
+            ("config_sentence_transformers.json", 116),
+            ("data_config.json", 39_500),
+            ("model.safetensors", 90_868_376),
+            ("modules.json", 349),
+            ("onnx/model.onnx", 90_405_214),
+            ("openvino/openvino_model.xml", 211_000),
+            ("pytorch_model.bin", 90_888_945),
+            ("sentence_bert_config.json", 53),
+            ("special_tokens_map.json", 112),
+            ("tokenizer.json", 466_247),
+            ("tokenizer_config.json", 350),
+            ("vocab.txt", 231_508),
+        ]
+        .map(|(path, size)| f(path, size));
+        let plan = plan_model(&files, &HashMap::new(), WeightFormat::Auto, None).unwrap();
+        let got = paths(&plan);
+        for needed in [
+            "modules.json",
+            "1_Pooling/config.json",
+            "sentence_bert_config.json",
+            "config_sentence_transformers.json",
+            "model.safetensors",
+            "tokenizer.json",
+        ] {
+            assert!(got.contains(&needed), "{needed} is not fetched: {got:?}");
+        }
+        assert!(!got.contains(&"onnx/model.onnx") && !got.contains(&"pytorch_model.bin"));
+    }
+
     #[test]
     fn single_file_safetensors_takes_the_weights_and_the_configs() {
         let mut files = aux();

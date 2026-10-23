@@ -1,3 +1,32 @@
+/// The merge method a name stands for: one of `MergeSpec`'s `method` options
+/// (the one list every surface offers), spelled with underscores or hyphens.
+fn parse_method(name: &str) -> anyhow::Result<pmetal_merge::MergeMethodConfig> {
+    use pmetal_merge::MergeMethodConfig;
+    let name = name.trim().to_lowercase().replace('-', "_");
+    match name.as_str() {
+        // The library's name for it has an inner underscore.
+        "multislerp" | "multi_slerp" => Ok(MergeMethodConfig::MultiSlerp),
+        _ => serde_json::from_value(serde_json::Value::String(name.clone())).map_err(|_| {
+            anyhow::anyhow!(
+                "Unknown merge method '{name}'. Valid options: {}",
+                merge_method_names().join(", ")
+            )
+        }),
+    }
+}
+
+/// The method names `MergeSpec` offers.
+fn merge_method_names() -> Vec<&'static str> {
+    use pmetal_core::{FieldKind, JobFields};
+    pmetal_core::jobs::MergeSpec::field_descriptors()
+        .iter()
+        .find_map(|d| match d.kind {
+            FieldKind::Enum { options } if d.name == "method" => Some(options.to_vec()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
 /// Merge two models using the pmetal-merge crate.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_merge_command(
@@ -13,8 +42,8 @@ pub(crate) async fn run_merge_command(
     dtype: &str,
 ) -> anyhow::Result<()> {
     use pmetal_merge::{
-        MergeConfig, MergeMethodConfig, MergeParameters, ModelConfig as MergeModelConfig,
-        ParameterSetting, TokenizerConfig,
+        MergeConfig, MergeParameters, ModelConfig as MergeModelConfig, ParameterSetting,
+        TokenizerConfig,
     };
 
     println!("PMetal Model Merge");
@@ -44,27 +73,7 @@ pub(crate) async fn run_merge_command(
         None
     };
 
-    let merge_method = match method.to_lowercase().as_str() {
-        "linear" => MergeMethodConfig::Linear,
-        "slerp" => MergeMethodConfig::Slerp,
-        "task_arithmetic" | "task-arithmetic" => MergeMethodConfig::TaskArithmetic,
-        "ties" => MergeMethodConfig::Ties,
-        "dare_ties" | "dare-ties" => MergeMethodConfig::DareTies,
-        "dare_linear" | "dare-linear" => MergeMethodConfig::DareLinear,
-        "della" => MergeMethodConfig::Della,
-        "della_linear" | "della-linear" => MergeMethodConfig::DellaLinear,
-        "breadcrumbs" => MergeMethodConfig::Breadcrumbs,
-        "model_stock" | "model-stock" => MergeMethodConfig::ModelStock,
-        "consensus" => MergeMethodConfig::Consensus,
-        "multislerp" | "multi_slerp" | "multi-slerp" => MergeMethodConfig::MultiSlerp,
-        "nearswap" => MergeMethodConfig::Nearswap,
-        "passthrough" => MergeMethodConfig::Passthrough,
-        other => anyhow::bail!(
-            "Unknown merge method '{}'. Valid options: linear, slerp, task_arithmetic, ties, \
-             dare_ties, dare_linear, della, della_linear, breadcrumbs, model_stock, consensus, multislerp, nearswap, passthrough",
-            other
-        ),
-    };
+    let merge_method = parse_method(method)?;
 
     let config = MergeConfig {
         merge_method,
@@ -114,4 +123,49 @@ pub(crate) async fn run_merge_command(
         result_path.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every method the spec offers is one the command runs, and the base
+    /// model rule the spec checks is the library's own.
+    #[test]
+    fn every_offered_method_is_a_method_the_command_runs() {
+        let names = merge_method_names();
+        assert_eq!(names.len(), 16);
+        for name in &names {
+            let config = parse_method(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let library_needs_base =
+                pmetal_merge::create_merge_method(&config).requires_base_model();
+            assert_eq!(
+                library_needs_base,
+                !pmetal_core::jobs::merge::METHODS_WITHOUT_BASE.contains(name),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_method_is_spelled_with_underscores_or_hyphens_and_any_case() {
+        for (typed, wanted) in [
+            ("dare-ties", "dare_ties"),
+            ("Task_Arithmetic", "task_arithmetic"),
+            ("multi-slerp", "multislerp"),
+            ("ram-plus", "ram_plus"),
+        ] {
+            let got = parse_method(typed).unwrap();
+            assert_eq!(
+                format!("{got:?}"),
+                format!("{:?}", parse_method(wanted).unwrap()),
+                "{typed}"
+            );
+        }
+        let err = parse_method("fisher").unwrap_err().to_string();
+        assert!(
+            err.contains("Unknown merge method 'fisher'") && err.contains("ram_plus"),
+            "{err}"
+        );
+    }
 }

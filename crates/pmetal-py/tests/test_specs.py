@@ -43,9 +43,9 @@ def different_value(info: pmetal.FieldInfo) -> Any:
 
 
 def test_there_is_a_class_for_every_subcommand_spec():
-    # One class per spec in pmetal_core::jobs (22), each with a distinct subcommand.
-    assert len(SPECS) == 22
-    assert len({cls.subcommand for cls in SPECS}) == 22
+    # One class per spec in pmetal_core::jobs (23), each with a distinct subcommand.
+    assert len(SPECS) == 23
+    assert len({cls.subcommand for cls in SPECS}) == 23
 
 
 @pytest.mark.parametrize("cls", SPECS, ids=SPEC_NAMES)

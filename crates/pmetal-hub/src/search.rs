@@ -354,6 +354,105 @@ fn license_from_tags(tags: &[String]) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// A dataset search result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatasetSearchResult {
+    /// The repository id, `owner/name` or a bare name.
+    pub dataset_id: String,
+    /// The owner, for an id that has one.
+    pub author: Option<String>,
+    /// Downloads in the last 30 days.
+    pub downloads: u64,
+    /// Likes.
+    pub likes: u64,
+    /// The Hub's tags (task, language, size, license, ...).
+    pub tags: Vec<String>,
+    /// The card's one-line description, when the Hub gives one.
+    pub description: Option<String>,
+}
+
+/// Search the Hub for datasets, most downloaded first, or list the trending
+/// ones when `query` is empty. Returns at most `limit` (up to 100).
+pub async fn search_datasets(
+    query: &str,
+    limit: usize,
+    token: Option<&SecretString>,
+) -> Result<Vec<DatasetSearchResult>> {
+    search_datasets_with(query, limit, &HubOptions::from_token(token)).await
+}
+
+/// [`search_datasets`] with explicit connection settings.
+pub async fn search_datasets_with(
+    query: &str,
+    limit: usize,
+    hub: &HubOptions,
+) -> Result<Vec<DatasetSearchResult>> {
+    let query = query.trim();
+    let mut params = vec![
+        ("limit".to_owned(), limit.clamp(1, MAX_RESULTS).to_string()),
+        (
+            "sort".to_owned(),
+            if query.is_empty() {
+                "trendingScore"
+            } else {
+                "downloads"
+            }
+            .to_owned(),
+        ),
+        ("direction".to_owned(), "-1".to_owned()),
+    ];
+    if !query.is_empty() {
+        params.push(("search".to_owned(), query.to_owned()));
+    }
+    let body = get_json(
+        hub,
+        "/api/datasets",
+        &params,
+        MAX_SEARCH_BYTES,
+        Some("dataset search"),
+    )
+    .await?;
+    parse_dataset_results(&body)
+}
+
+/// Parse a dataset-list response, tolerating what [`parse_search_results`]
+/// tolerates.
+pub(crate) fn parse_dataset_results(body: &[u8]) -> Result<Vec<DatasetSearchResult>> {
+    let entries: Vec<Value> = serde_json::from_slice(body).map_err(|e| {
+        PMetalError::Hub(format!(
+            "the Hub's search response is not a dataset list: {e}"
+        ))
+    })?;
+    Ok(entries
+        .iter()
+        .filter_map(|entry| {
+            let dataset_id = entry.get("id").and_then(Value::as_str)?.to_owned();
+            validate_repo_id(&dataset_id).ok()?;
+            Some(DatasetSearchResult {
+                author: dataset_id
+                    .split_once('/')
+                    .map(|(owner, _)| owner.to_owned()),
+                downloads: entry.get("downloads").and_then(Value::as_u64).unwrap_or(0),
+                likes: entry.get("likes").and_then(Value::as_u64).unwrap_or(0),
+                tags: entry
+                    .get("tags")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|t| t.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                description: entry
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                dataset_id,
+            })
+        })
+        .collect())
+}
+
 /// Detailed model metadata fetched from HuggingFace Hub.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HfModelMeta {
@@ -709,6 +808,20 @@ pub fn format_downloads(count: u64) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn dataset_results_are_read_leniently() {
+        let body =
+            br#"[{"id":"acme/data","downloads":1500,"likes":3,"tags":["a","b"],"description":"d"},
+            {"downloads":1}, {"id":"../escape"}, {"id":"plain"}]"#;
+        let results = parse_dataset_results(body).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].dataset_id, "acme/data");
+        assert_eq!(results[0].author.as_deref(), Some("acme"));
+        assert_eq!(results[0].tags, ["a", "b"]);
+        assert_eq!(results[1].author, None);
+        assert!(parse_dataset_results(b"{}").is_err());
+    }
 
     #[test]
     fn a_result_is_read_with_its_real_weight_size() {

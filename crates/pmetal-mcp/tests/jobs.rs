@@ -124,12 +124,15 @@ async fn a_token_in_a_jobs_output_never_reaches_the_model() {
 
 #[tokio::test]
 async fn metrics_come_from_the_file_the_server_asked_the_job_to_write() {
-    // The fake trainer writes steps to the path it was given as --log-metrics.
+    // The fake trainer writes steps to the path it was given as --log-metrics,
+    // as the real one does besides its --log-events. The steps are read from the
+    // events: they are not counted a second time from the metrics file.
     let h = Harness::new(
-        r#"while [ $# -gt 0 ]; do [ "$1" = "--log-metrics" ] && f="$2"; shift; done
+        r#"while [ $# -gt 0 ]; do [ "$1" = "--log-metrics" ] && f="$2"; [ "$1" = "--log-events" ] && e="$2"; shift; done
 echo '{"event":"train_start"}' > "$f"
 echo '{"step":1,"epoch":0,"total_epochs":2,"total_steps":40,"loss":3.0,"lr":0.0002,"tok_sec":900.0}' >> "$f"
 echo '{"step":2,"epoch":0,"total_epochs":2,"total_steps":40,"loss":2.5,"lr":0.0002,"tok_sec":910.0}' >> "$f"
+cp "$f" "$e"
 sleep 5"#,
     );
     let id = start(&h).await;
@@ -150,6 +153,8 @@ sleep 5"#,
         .collect();
     let at = args.iter().position(|a| *a == "--log-metrics").unwrap();
     assert_eq!(args[at + 1], h.path("out/metrics.jsonl"));
+    let at = args.iter().position(|a| *a == "--log-events").unwrap();
+    assert_eq!(args[at + 1], h.path("out/events.jsonl"));
     h.call_ok("stop_job", json!({"job_id": id})).await;
 }
 

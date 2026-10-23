@@ -310,6 +310,11 @@ audit:
     cargo deny check advisories
     cargo deny --manifest-path crates/pmetal-gui/src-tauri/Cargo.toml check advisories
 
+# CI: Dependencies, daily. Before a release, run it with --fail-on-young.
+# Malware and advisories (OSV) for every pinned crate and npm package, and versions younger than a week
+audit-deps *ARGS:
+    python3 scripts/audit-lockfiles.py {{ARGS}}
+
 # ─── Benchmarks ─────────────────────────────────────────────────────
 
 # Run all pmetal-metal benchmarks

@@ -13,6 +13,7 @@
   },
   "license": "MIT OR Apache-2.0",
   "packageManager": "bun@1.4.4",
+  "trustedDependencies": [],
   "dependencies": {
     "@tauri-apps/api": "^2.12.4"
   },

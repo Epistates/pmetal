@@ -62,17 +62,12 @@ fn add(dir: &Path, adapters: &mut Vec<TrainedAdapter>, seen: &mut HashSet<PathBu
     } else {
         None
     };
-    let info = read_json("training_info.json");
+    let info = pmetal::core::TrainingInfo::read(dir);
     let base_model = config
         .as_ref()
         .and_then(pmetal::lora::peft::adapter_base_model)
-        .or_else(|| {
-            info.as_ref()
-                .and_then(|i| i["base_model"].as_str().map(String::from))
-        });
-    let dataset = info
-        .as_ref()
-        .and_then(|i| i["dataset"].as_str().map(String::from));
+        .or_else(|| info.as_ref().and_then(|i| i.base_model.clone()));
+    let dataset = info.and_then(|i| i.dataset);
     let folder = dir.file_name().map_or_else(
         || dir.display().to_string(),
         |n| n.to_string_lossy().into_owned(),

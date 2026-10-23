@@ -23,9 +23,11 @@ PMetal streams merges tensor by tensor from memory-mapped checkpoints (peak memo
 | `consensus` | TALL-mask consensus merging |
 | `multislerp` | Weighted spherical (Karcher) mean of 3+ models |
 | `nearswap` | Per-parameter selection of the value nearest the base |
+| `ram` | RAM (Reinforced Agent Merging) |
+| `ram_plus` | RAM+ variant |
 | `passthrough` | Layer passthrough composition |
 
-The job spec that the GUI, the MCP server and the Python bindings share lists the first eleven (everything above except `della_linear`, `consensus` and `multislerp`); the command line parses all fourteen.
+The command line, the terminal UI, the desktop app, the MCP server and the Python bindings all offer these sixteen: they read one list, the job spec's.
 
 ## Library-Only Strategies
 
@@ -34,8 +36,6 @@ Reachable by setting `MergeConfig.merge_method` directly (or `merge_method:` in 
 
 | `merge_method` | Description |
 |----------------|-------------|
-| `ram` | RAM (Reinforced Agent Merging) |
-| `ram_plus` | RAM+ variant |
 | `fisher` | Fisher-weighted averaging; needs per-model `fisher_paths` |
 | `regmean` | RegMean; needs per-model `gram_paths` |
 

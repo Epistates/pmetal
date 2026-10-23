@@ -8,6 +8,8 @@
 use std::collections::{BTreeMap, HashSet};
 
 use super::form::{FieldInfo, FormInfo, Input};
+use pmetal_supervisor::LaunchPlan;
+
 use super::kinds::{FieldIssue, Kind, Launch, LaunchContext};
 use crate::paths;
 
@@ -206,14 +208,12 @@ impl Kind for TableKind {
             return Err(issues);
         }
         Ok(Launch {
-            subcommand: self.subcommand.to_string(),
-            argv,
-            output,
-            events_file: None,
-            metrics_file: None,
+            plan: LaunchPlan {
+                output,
+                ..LaunchPlan::command(self.subcommand, argv)
+            },
             title,
             exclusive: None,
-            record: None,
         })
     }
 }
@@ -512,18 +512,28 @@ mod tests {
                 &ctx(root.path()),
             )
             .unwrap();
-        assert_eq!(launch.subcommand, "ollama");
-        assert_eq!(&launch.argv[..3], ["modelfile", "--base", "/models/m.gguf"]);
+        assert_eq!(launch.plan.subcommand, "ollama");
+        assert_eq!(
+            &launch.plan.argv[..3],
+            ["modelfile", "--base", "/models/m.gguf"]
+        );
         assert!(
             launch
+                .plan
                 .argv
                 .windows(2)
                 .any(|w| w == ["--temperature", "0.7"])
         );
-        assert!(launch.argv.windows(2).any(|w| w == ["--template", "qwen3"]));
+        assert!(
+            launch
+                .plan
+                .argv
+                .windows(2)
+                .any(|w| w == ["--template", "qwen3"])
+        );
         // The default output is a bare "Modelfile": placed under the output root.
-        assert_eq!(launch.output.unwrap(), root.path().join("Modelfile"));
-        assert!(!launch.argv.iter().any(|a| a == "--top-k"));
+        assert_eq!(launch.plan.output.unwrap(), root.path().join("Modelfile"));
+        assert!(!launch.plan.argv.iter().any(|a| a == "--top-k"));
     }
 
     #[test]
@@ -532,21 +542,23 @@ mod tests {
         let launch = bench_workload()
             .prepare(&values(&[]), &ctx(root.path()))
             .unwrap();
-        assert_eq!(launch.subcommand, "bench-workload");
+        assert_eq!(launch.plan.subcommand, "bench-workload");
         assert!(
             launch
+                .plan
                 .argv
                 .windows(2)
                 .any(|w| w == ["--decode-steps", "32"])
         );
         assert!(
             launch
+                .plan
                 .argv
                 .windows(2)
                 .any(|w| w == ["--model", "Qwen/Qwen3-0.6B"])
         );
-        assert!(!launch.argv.iter().any(|a| a == "--json"));
-        assert!(launch.output.is_none());
+        assert!(!launch.plan.argv.iter().any(|a| a == "--json"));
+        assert!(launch.plan.output.is_none());
     }
 
     #[test]

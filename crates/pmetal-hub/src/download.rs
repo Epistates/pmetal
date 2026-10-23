@@ -201,7 +201,7 @@ async fn fetch_model(model_id: &str, options: &DownloadOptions) -> Result<PathBu
     tracing::info!(
         "Downloading {} files ({}) of {model_id} at {}",
         plan.model.files.len(),
-        crate::fit::format_bytes(plan.model.total_bytes()),
+        pmetal_core::format::human_size(plan.model.total_bytes()),
         &plan.commit[..plan.commit.len().min(8)],
     );
     let progress = options

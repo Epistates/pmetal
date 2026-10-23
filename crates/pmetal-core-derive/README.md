@@ -21,6 +21,8 @@ You do not depend on this crate directly. `pmetal-core` re-exports the macro as
 - **One description per field**: `#[job(label, group, help, default, min, max, kind, argv, ...)]` produces the
   `FieldDescriptor` a form is drawn from, the flag `to_argv` emits and the checks
   `validate_descriptors` runs.
+- **Defaults stay out of the argv**: a setting equal to the struct's `Default`
+  is not passed (the struct must implement `Default`).
 - **Typed argv**: switches (`flag`, `invert`), valued booleans (`valued`),
   comma-joined lists (`csv`) and repeated flags (`repeat`).
 - **Compile-time checking**: a key that would silently do nothing (an `invert`
@@ -57,9 +59,17 @@ struct MySpec {
     resume: bool,
 }
 
+// `to_argv` leaves out a setting that is at its default, so the command's own
+// default (or a config file's value) applies; the struct must be `Default`.
+impl Default for MySpec {
+    fn default() -> Self {
+        Self { model: String::new(), learning_rate: 2e-4, tags: Vec::new(), resume: false }
+    }
+}
+
 let spec = MySpec {
     model: "Qwen/Qwen3-4B".into(),
-    learning_rate: 2e-4,
+    learning_rate: 1e-3,
     tags: vec!["a".into(), "b".into()],
     resume: true,
 };
@@ -67,7 +77,7 @@ let spec = MySpec {
 assert!(spec.validate_descriptors().is_empty());
 assert_eq!(
     spec.to_argv(),
-    ["--model", "Qwen/Qwen3-4B", "--learning-rate", "0.0002", "--tag", "a", "--tag", "b", "--resume"],
+    ["--model", "Qwen/Qwen3-4B", "--learning-rate", "0.001", "--tag", "a", "--tag", "b", "--resume"],
 );
 assert_eq!(MySpec::subcommand(), "train");
 assert!(matches!(MySpec::job_kind(), JobKind::Train));

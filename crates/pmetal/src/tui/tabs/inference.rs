@@ -19,8 +19,8 @@ use ratatui::widgets::{
     Widget,
 };
 
-use crate::tui::tabs::infer_stream::{InferStream, split_reasoning};
 use crate::tui::theme::THEME;
+use pmetal_data::infer_stream::{GenerationStats, InferStream, split_reasoning};
 
 /// A chat message.
 #[derive(Debug, Clone)]
@@ -441,10 +441,7 @@ impl InferenceTab {
     /// The generation ended. `stdout` is everything the job printed, which is
     /// read afresh: it is authoritative, where the pieces that streamed in may
     /// have missed some. Returns the statistics if the footer was reached.
-    pub fn finish_generation(
-        &mut self,
-        stdout: &str,
-    ) -> Option<crate::tui::tabs::infer_stream::GenerationStats> {
+    pub fn finish_generation(&mut self, stdout: &str) -> Option<GenerationStats> {
         let mut stream = InferStream::new();
         stream.push(stdout);
         let stats = stream.finish();

@@ -41,6 +41,9 @@ pub(crate) async fn run_serve(spec: ServeSpec, api_keys: Vec<String>) -> anyhow:
         ane: ane_enabled,
         ane_max_seq_len,
         ref draft_model,
+        mtp,
+        ref mtp_model,
+        draft_tokens,
         continuous_batch,
         cb_max_slots,
         cb_max_queue_depth,
@@ -53,15 +56,14 @@ pub(crate) async fn run_serve(spec: ServeSpec, api_keys: Vec<String>) -> anyhow:
     let experts_dir = experts_dir.clone();
     let kv_turboquant_preset = kv_turboquant_preset.clone();
     let draft_model = draft_model.clone();
+    let mtp_model = mtp_model.clone();
     #[cfg(not(feature = "ane"))]
     if ane_enabled {
         anyhow::bail!("--ane needs the 'ane' feature: cargo build --features ane");
     }
-    use pmetal::inference_runner::{
-        CacheModeRequest, TurboQuantPreset, explicit_cache_mode_override,
-    };
+    use pmetal::inference_runner::{CacheModeRequest, TurboQuantPreset};
     use pmetal_models::dispatcher::DynamicModel;
-    use pmetal_serve::{BatcherConfig, InferenceEngine, ServeConfig};
+    use pmetal_serve::{BatcherConfig, InferenceEngine, ServeConfig, SpeculatorSpec};
 
     // Resolve model path
     tracing::info!("Resolving model: {}", model_id);
@@ -89,18 +91,38 @@ pub(crate) async fn run_serve(spec: ServeSpec, api_keys: Vec<String>) -> anyhow:
             default.tokens
         }
     };
+    // A draft model drafts for the ANE engine with --ane (a DFlash draft
+    // model, run on the GPU), and for the GPU engine without it.
     let draft_path = match draft_model {
         Some(draft) => {
             let path = pmetal_hub::resolve_model_path(&draft, None, None).await?;
-            if !ane_enabled || !pmetal_models::dflash_drafter::is_dflash_draft(&path) {
+            if ane_enabled && !pmetal_models::dflash_drafter::is_dflash_draft(&path) {
                 anyhow::bail!(
-                    "--draft-model takes a DFlash draft model, which drafts for the ANE \
-                     engine with --ane; {draft} isn't one, or --ane is off"
+                    "with --ane, --draft-model takes a DFlash draft model, which drafts for the \
+                     ANE engine; {draft} isn't one"
                 );
             }
             Some(path)
         }
         None => None,
+    };
+    let speculation = if mtp {
+        let checkpoint = match &mtp_model {
+            Some(head) => pmetal_hub::resolve_model_path(head, None, None).await?,
+            None => model_path.clone(),
+        };
+        Some(SpeculatorSpec::QwenMtp {
+            checkpoint,
+            draft_tokens: draft_tokens.unwrap_or(3),
+        })
+    } else {
+        draft_path
+            .clone()
+            .filter(|_| !ane_enabled)
+            .map(|path| SpeculatorSpec::Draft {
+                path,
+                tokens: draft_tokens,
+            })
     };
 
     // Load tokenizer — use pmetal_data::Tokenizer for config-aware special token
@@ -128,13 +150,15 @@ pub(crate) async fn run_serve(spec: ServeSpec, api_keys: Vec<String>) -> anyhow:
     // The model loads on the engine's own thread, where every request will
     // run: arrays it leaves unevaluated can't be evaluated anywhere else.
     tracing::info!("Loading model from {:?}...", model_path);
-    let (cache_mode_tx, cache_mode_rx) = std::sync::mpsc::channel();
     let load_path = model_path.clone();
     let load = move || -> anyhow::Result<DynamicModel> {
         let mut model = DynamicModel::load_with_options(
             &load_path,
             pmetal_models::dispatcher::DynamicModelLoadOptions {
                 prefer_expert_offload: experts_dir.is_some(),
+                // A decode step reads every weight: a quantized checkpoint
+                // stays packed, unless FP8 is asked for on top.
+                keep_quantized: !fp8,
             },
         )?;
 
@@ -152,15 +176,6 @@ pub(crate) async fn run_serve(spec: ServeSpec, api_keys: Vec<String>) -> anyhow:
                 "this model requires expert offloading; repack routed experts with `pmetal pack-experts` and pass --experts-dir <packed_dir>"
             );
         }
-
-        // Resolve the KV cache mode override from the model's own cache
-        // configuration, as CLI/GUI inference does, so dense and MoE models
-        // share one TurboQuant/KV selection policy.
-        let base_cache = model.create_cache(max_seq_len);
-        let _ = cache_mode_tx.send(explicit_cache_mode_override(
-            base_cache.config(),
-            cache_mode_request,
-        ));
         Ok(model)
     };
 
@@ -174,17 +189,23 @@ pub(crate) async fn run_serve(spec: ServeSpec, api_keys: Vec<String>) -> anyhow:
         ane_max_seq_len,
     )?;
     tracing::info!("Model loaded successfully");
-    let engine = match cache_mode_rx.recv().ok().flatten() {
-        Some(mode) => {
-            tracing::info!(mode = %mode.describe(), "KV cache override");
-            engine.with_cache_mode_override(mode)
-        }
-        None => engine,
-    };
-    let engine = match draft_path {
+    // Each request's cache is chosen on the model thread by the policy
+    // `pmetal infer` uses, from the model's own cache layout.
+    let engine = engine.with_cache_request(cache_mode_request);
+    let engine = match draft_path.filter(|_| ane_enabled) {
         Some(path) => engine.with_ane_drafter(path),
         None => engine,
     };
+    if let Some(spec) = speculation {
+        // Loaded and checked against the model on its own thread: a drafter
+        // that does not fit it is an error here, not on the first request.
+        let info = engine.enable_speculation(spec)?;
+        tracing::info!(
+            drafter = info.kind,
+            draft_tokens = info.draft_tokens,
+            "Speculative decoding on; a request's tokens are the model's own, sooner"
+        );
+    }
 
     // Start server
     let continuous_batching = if continuous_batch {

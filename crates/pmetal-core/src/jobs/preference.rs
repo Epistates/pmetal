@@ -1,6 +1,7 @@
 //! `pmetal preference` — offline preference optimization (DPO, IPO, hinge,
 //! SimPO, ORPO, KTO) with LoRA.
 
+use super::{default_lora_alpha, default_lora_r, default_seed};
 use crate::{FieldError, JobFields};
 use pmetal_core_derive::JobSpec;
 use serde::{Deserialize, Serialize};
@@ -9,7 +10,7 @@ use serde::{Deserialize, Serialize};
 pub const PREFERENCE_LOSSES: &[&str] = &["dpo", "ipo", "hinge", "simpo", "orpo", "kto"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, JobSpec)]
-#[spec(kind = "Preference", subcommand = "preference")]
+#[spec(kind = "Preference", subcommand = "preference", events)]
 #[serde(rename_all = "snake_case")]
 pub struct PreferenceSpec {
     #[job(
@@ -412,7 +413,7 @@ fn default_grad_accum() -> usize {
     8
 }
 fn default_epochs() -> usize {
-    1
+    crate::defaults::EPOCHS
 }
 fn default_warmup_ratio() -> f64 {
     0.1
@@ -420,20 +421,11 @@ fn default_warmup_ratio() -> f64 {
 fn default_max_grad_norm() -> f64 {
     1.0
 }
-fn default_lora_r() -> usize {
-    16
-}
-fn default_lora_alpha() -> f32 {
-    32.0
-}
 fn default_max_prompt_length() -> usize {
     512
 }
 fn default_max_length() -> usize {
     1024
-}
-fn default_seed() -> u64 {
-    42
 }
 
 #[cfg(test)]
