@@ -87,19 +87,47 @@ fn checkpoint(generation: Generation) -> Vec<(String, Vec<usize>, Vec<f32>)> {
     for layer in 0..generation.layers() {
         let p = format!("model.layers.{layer}");
         add(format!("{p}.input_layernorm.weight"), &[HIDDEN], 0.5);
-        add(format!("{p}.post_attention_layernorm.weight"), &[HIDDEN], 0.5);
+        add(
+            format!("{p}.post_attention_layernorm.weight"),
+            &[HIDDEN],
+            0.5,
+        );
         if generation != Generation::Gemma1 {
-            add(format!("{p}.pre_feedforward_layernorm.weight"), &[HIDDEN], 0.5);
-            add(format!("{p}.post_feedforward_layernorm.weight"), &[HIDDEN], 0.5);
+            add(
+                format!("{p}.pre_feedforward_layernorm.weight"),
+                &[HIDDEN],
+                0.5,
+            );
+            add(
+                format!("{p}.post_feedforward_layernorm.weight"),
+                &[HIDDEN],
+                0.5,
+            );
         }
         if generation == Generation::Gemma3 {
             add(format!("{p}.self_attn.q_norm.weight"), &[HEAD_DIM], 0.5);
             add(format!("{p}.self_attn.k_norm.weight"), &[HEAD_DIM], 0.5);
         }
-        add(format!("{p}.self_attn.q_proj.weight"), &[HEADS * HEAD_DIM, HIDDEN], 0.4);
-        add(format!("{p}.self_attn.k_proj.weight"), &[KV_HEADS * HEAD_DIM, HIDDEN], 0.4);
-        add(format!("{p}.self_attn.v_proj.weight"), &[KV_HEADS * HEAD_DIM, HIDDEN], 0.4);
-        add(format!("{p}.self_attn.o_proj.weight"), &[HIDDEN, HEADS * HEAD_DIM], 0.4);
+        add(
+            format!("{p}.self_attn.q_proj.weight"),
+            &[HEADS * HEAD_DIM, HIDDEN],
+            0.4,
+        );
+        add(
+            format!("{p}.self_attn.k_proj.weight"),
+            &[KV_HEADS * HEAD_DIM, HIDDEN],
+            0.4,
+        );
+        add(
+            format!("{p}.self_attn.v_proj.weight"),
+            &[KV_HEADS * HEAD_DIM, HIDDEN],
+            0.4,
+        );
+        add(
+            format!("{p}.self_attn.o_proj.weight"),
+            &[HIDDEN, HEADS * HEAD_DIM],
+            0.4,
+        );
         add(format!("{p}.mlp.gate_proj.weight"), &[FFN, HIDDEN], 0.4);
         add(format!("{p}.mlp.up_proj.weight"), &[FFN, HIDDEN], 0.4);
         add(format!("{p}.mlp.down_proj.weight"), &[HIDDEN, FFN], 0.4);
@@ -212,7 +240,9 @@ fn load_gguf(bytes: Vec<u8>) -> Result<DynamicModel, String> {
 }
 
 fn logits(model: &mut DynamicModel) -> Vec<f32> {
-    let ids: Vec<i32> = (0..SEQUENCE as i32).map(|i| (i * 5 + 3) % VOCAB as i32).collect();
+    let ids: Vec<i32> = (0..SEQUENCE as i32)
+        .map(|i| (i * 5 + 3) % VOCAB as i32)
+        .collect();
     let ids = Array::from_slice(&ids, &[1, SEQUENCE as i32]);
     let out = model.forward(&ids, None).expect("forward");
     let mut out = out.as_dtype(Dtype::Float32.as_i32());
@@ -334,6 +364,9 @@ fn each_metadata_value_the_file_states_moves_the_logits() {
             .iter()
             .zip(&got)
             .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
-        assert!(moved > 1e-3, "the {what} did not reach the logits ({moved:e})");
+        assert!(
+            moved > 1e-3,
+            "the {what} did not reach the logits ({moved:e})"
+        );
     }
 }

@@ -355,7 +355,10 @@ pub fn unread_gemma_weights(weights: &HashMap<String, Array>) -> Vec<String> {
     let mut unread: Vec<String> = weights
         .keys()
         .filter(|key| {
-            if matches!(key.as_str(), "model.embed_tokens.weight" | "model.norm.weight") {
+            if matches!(
+                key.as_str(),
+                "model.embed_tokens.weight" | "model.norm.weight"
+            ) {
                 return false;
             }
             let layer_tensor = key

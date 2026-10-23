@@ -578,11 +578,20 @@ mod tests {
         let content = make_content(
             "gemma3",
             vec![
-                ("gemma3.attention.sliding_window", MetadataValue::Uint32(512)),
+                (
+                    "gemma3.attention.sliding_window",
+                    MetadataValue::Uint32(512),
+                ),
                 ("gemma3.rope.freq_base_swa", MetadataValue::Float32(10000.0)),
                 ("gemma3.rope.freq_base", MetadataValue::Float32(1_000_000.0)),
-                ("gemma3.final_logit_softcapping", MetadataValue::Float32(30.0)),
-                ("gemma3.attn_logit_softcapping", MetadataValue::Float32(50.0)),
+                (
+                    "gemma3.final_logit_softcapping",
+                    MetadataValue::Float32(30.0),
+                ),
+                (
+                    "gemma3.attn_logit_softcapping",
+                    MetadataValue::Float32(50.0),
+                ),
             ],
         );
         let arch = GgufArchConfig::from_gguf(&content).unwrap();
@@ -596,7 +605,12 @@ mod tests {
         assert_eq!(config["final_logit_softcapping"], 30.0);
         // Absent stays absent.
         let plain = make_content("llama", vec![]);
-        assert!(config_from_gguf(&plain).unwrap().get("sliding_window").is_none());
+        assert!(
+            config_from_gguf(&plain)
+                .unwrap()
+                .get("sliding_window")
+                .is_none()
+        );
     }
 
     #[test]
