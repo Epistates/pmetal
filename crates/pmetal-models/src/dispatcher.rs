@@ -98,7 +98,7 @@ fn load_with_stacked_experts<M: ModuleParametersExt + VisitLinears>(
 ///
 /// A multimodal wrapper nests the language model: `model.language_model.…` in
 /// Hugging Face's save, `language_model.model.…` in an MLX conversion.
-fn gemma_text_key(key: &str) -> Option<String> {
+pub fn gemma_text_key(key: &str) -> Option<String> {
     const OTHER_TOWERS: [&str; 7] = [
         "model.embed_vision.",
         "model.vision_tower.",
@@ -501,6 +501,45 @@ fn resolve_architecture(config_content: &str) -> Result<ModelArchitecture, Excep
     Ok(ModelArchitecture::resolve_config(&config)?)
 }
 
+/// Give a Gemma 3 text config the values `transformers` fills in for the keys
+/// it leaves out.
+///
+/// The text config nested in a Gemma 3 multimodal checkpoint released by the
+/// authors (`Gemma3ForConditionalGeneration`) states only what differs from
+/// `Gemma3TextConfig`'s defaults: the 4B model's lists `hidden_size`,
+/// `intermediate_size`, `num_hidden_layers`, `rope_scaling` and
+/// `sliding_window`, and nothing of its heads, vocabulary or rope bases. A
+/// config of another `model_type`, or a key that is present, is left alone.
+pub fn with_gemma3_text_defaults(text: &mut serde_json::Value) {
+    use serde_json::json;
+    let Some(object) = text.as_object_mut() else {
+        return;
+    };
+    if object.get("model_type").and_then(|t| t.as_str()) != Some("gemma3_text") {
+        return;
+    }
+    for (key, default) in [
+        ("vocab_size", json!(262_208)),
+        ("hidden_size", json!(2304)),
+        ("intermediate_size", json!(9216)),
+        ("num_hidden_layers", json!(26)),
+        ("num_attention_heads", json!(8)),
+        ("num_key_value_heads", json!(4)),
+        ("head_dim", json!(256)),
+        ("hidden_activation", json!("gelu_pytorch_tanh")),
+        ("max_position_embeddings", json!(131_072)),
+        ("rms_norm_eps", json!(1e-6)),
+        ("rope_theta", json!(1_000_000.0)),
+        ("rope_local_base_freq", json!(10_000.0)),
+        ("sliding_window", json!(4096)),
+        ("sliding_window_pattern", json!(6)),
+        ("query_pre_attn_scalar", json!(256)),
+        ("tie_word_embeddings", json!(true)),
+    ] {
+        object.entry(key).or_insert(default);
+    }
+}
+
 /// Parse a Gemma config, deriving the generation flags from `model_type`.
 ///
 /// `is_gemma2` / `is_gemma3` are not fields any checkpoint sets; they are
@@ -513,8 +552,10 @@ fn resolve_architecture(config_content: &str) -> Result<ModelArchitecture, Excep
 /// leaves both `false`, which is a Gemma 1 model wearing a Gemma 3 checkpoint.
 pub fn parse_gemma_config(config_content: &str) -> Result<GemmaConfig, Exception> {
     let effective = unwrap_text_config(config_content)?;
+    let mut text = config_value(&effective)?;
+    with_gemma3_text_defaults(&mut text);
     let mut config: GemmaConfig =
-        json5::from_str(&effective).map_err(|e| Exception::custom(e.to_string()))?;
+        serde_json::from_value(text).map_err(|e| Exception::custom(e.to_string()))?;
     if config.model_type == "gemma3"
         || config.model_type == "gemma4"
         || config.model_type == "gemma4_text"
@@ -2845,6 +2886,46 @@ impl Module<Array> for DynamicModel {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    /// The 4B model's released config (`mlx-community/gemma-3-4b-it-4bit`
+    /// carries it as the authors wrote it) lists five text keys and leaves the
+    /// heads, vocabulary and rope bases to `Gemma3TextConfig`'s defaults.
+    #[test]
+    fn a_gemma_3_multimodal_config_that_states_only_what_differs_parses() {
+        let released = r#"{
+            "architectures": ["Gemma3ForConditionalGeneration"],
+            "model_type": "gemma3",
+            "text_config": {
+                "hidden_size": 2560, "intermediate_size": 10240,
+                "model_type": "gemma3_text", "num_hidden_layers": 34,
+                "rope_scaling": {"factor": 8.0, "rope_type": "linear"},
+                "sliding_window": 1024
+            },
+            "vision_config": {"model_type": "siglip_vision_model"}
+        }"#;
+        let config = parse_gemma_config(released).expect("the released config parses");
+        assert!(config.is_gemma3);
+        assert_eq!(
+            (config.hidden_size, config.num_hidden_layers, config.sliding_window),
+            (2560, 34, Some(1024))
+        );
+        assert_eq!(
+            (config.num_attention_heads, config.num_kv_heads(), config.head_dim),
+            (8, 4, Some(256))
+        );
+        assert_eq!(config.vocab_size, 262_208);
+        assert_eq!(config.query_pre_attn_scalar, Some(256));
+        assert_eq!(config.rope_theta, 1_000_000.0);
+        assert_eq!(config.rope_local_base_freq, Some(10_000.0));
+        assert_eq!(config.max_position_embeddings, 131_072);
+        // A key the config states wins, and another model type is untouched.
+        let stated = r#"{"model_type": "gemma3_text", "hidden_size": 8, "intermediate_size": 8,
+            "num_hidden_layers": 2, "num_attention_heads": 2, "vocab_size": 32}"#;
+        assert_eq!(parse_gemma_config(stated).unwrap().vocab_size, 32);
+        let mut gemma2 = serde_json::json!({"model_type": "gemma2"});
+        with_gemma3_text_defaults(&mut gemma2);
+        assert_eq!(gemma2, serde_json::json!({"model_type": "gemma2"}));
+    }
 
     /// A bundled-MTP checkpoint is its base architecture plus draft layers.
     /// `mlx-community/Qwen3.8-27B-MTP-4bit` states `qwen3_5_mtp` with no
