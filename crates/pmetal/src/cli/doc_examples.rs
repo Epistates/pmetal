@@ -243,6 +243,8 @@ fn doc_files(root: &Path) -> Vec<PathBuf> {
 /// Whether this build has the command a doc names (`serve` and `mcp` are
 /// opt-in features).
 fn command_is_built(argv: &[String]) -> bool {
+    // Not a `match`: with both features off its arms are all constants, and
+    // clippy asks for `matches!`, which reads worse with them on.
     let command = argv.get(1).map(String::as_str);
     (command != Some("serve") || cfg!(feature = "serve"))
         && (command != Some("mcp") || cfg!(feature = "mcp"))

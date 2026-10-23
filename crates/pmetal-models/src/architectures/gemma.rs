@@ -7,6 +7,7 @@
 //! - Embedding scaling by sqrt(hidden_size)
 //! - Gemma2: Attention logit softcapping, sliding window, extra normalization
 use pmetal_runtime::compat::{Array, Dtype, Exception, Module, Param, nn};
+use pmetal_runtime::decode::last_token_hidden;
 use pmetal_runtime::impl_module_params;
 
 use pmetal_cache::kv_cache::KVCache;
@@ -1091,6 +1092,21 @@ impl GemmaForCausalLM {
     ) -> Result<Array, Exception> {
         let hidden_states = self.model.forward_with_cache(input_ids, mask, cache)?;
         Ok(self.lm_head(&hidden_states))
+    }
+
+    /// [`forward_with_cache`](Self::forward_with_cache) returning the last
+    /// position's logits, `[B, 1, vocab]`: the tied head and its softcap run on
+    /// one hidden state per sequence instead of every prompt token's, for a
+    /// caller that samples from the last position alone (a prefill, a decode
+    /// step).
+    pub fn forward_with_cache_last(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, Exception> {
+        let hidden_states = self.model.forward_with_cache(input_ids, mask, cache)?;
+        Ok(self.lm_head(&last_token_hidden(&hidden_states)))
     }
 
     /// Forward pass with one rotary position per token; see

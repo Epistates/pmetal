@@ -215,7 +215,7 @@ For step-by-step control use the crates directly (`pmetal_trainer::TrainingLoop`
 
 ### Language models
 
-Loaded from the Hugging Face Hub or a local directory; the architecture is detected from `config.json`. All of them work with the CLI, TUI, GUI, server and SDK.
+Loaded from the Hugging Face Hub or a local directory; the architecture is detected from `config.json`. All of them work with the CLI, TUI, GUI, server and SDK. A `model_type` that is not listed is refused by name and never run as a similar family (see [Not supported yet](docs/models/supported.md#not-supported-yet)).
 
 | Family | Variants | `model_type` values |
 |--------|----------|---------------------|
@@ -227,8 +227,8 @@ Loaded from the Hugging Face Hub or a local directory; the architecture is detec
 | Qwen 3 MoE | e.g. Qwen3-30B-A3B | `qwen3_moe` |
 | Qwen 3.5 / 3.6 / 3.8 | hybrid Gated DeltaNet, dense and MoE (image and video input) | `qwen3_next`, `qwen3_5`, `qwen3_5_moe`, `qwen3_6`, `qwen3_6_moe` |
 | Qwen 3.8 Flash Next | text tower | `qwen4_exp` |
-| DeepSeek | V2, V3, R1 (V3.2 checkpoints are refused: its sparse-attention indexer is not implemented) | `deepseek`, `deepseek_v2`, `deepseek_v3` |
-| Mistral | 7B, Mixtral | `mistral`, `mixtral` |
+| DeepSeek | V2, V3, R1 (V3.2 and V4 are refused by name: the sparse-attention indexer is not implemented) | `deepseek_v2`, `deepseek_v3` |
+| Mistral | 7B and the other dense Mistral decoders (Mixtral and the Mistral3 vision wrapper are refused by name) | `mistral` |
 | Gemma | 1, 2, 3 | `gemma`, `gemma2`, `gemma3` |
 | Gemma 4 | dense and MoE | `gemma4`, `gemma4_text` |
 | DiffusionGemma | dense, MoE | `diffusion_gemma`, `diffusion_gemma_text` |

@@ -286,195 +286,6 @@ impl ModelArchitecture {
         }
     }
 
-    pub fn from_model_type(model_type: &str) -> Option<Self> {
-        let lower = model_type.to_lowercase();
-        // A `*_mtp` checkpoint is the base architecture plus bundled
-        // multi-token-prediction layers, which `--mtp` loads separately as a
-        // speculative draft. `mlx-community/Qwen3.8-27B-MTP-4bit` states
-        // `qwen3_5_mtp` and carries no `architectures` array, so without this
-        // the whole checkpoint failed detection rather than running as its
-        // own target model.
-        let lower = lower.strip_suffix("_mtp").unwrap_or(&lower);
-        match lower {
-            "llama4" | "llama4_text" => Some(Self::Llama4),
-            // Before the generic llama arms: Mllama's text sub-config is
-            // `mllama_text_model`, which must not fall through to plain Llama
-            // (it would drop every cross-attention layer).
-            "mllama" | "mllama_text_model" => Some(Self::Mllama),
-            "llama" | "llama3" => Some(Self::Llama),
-            "qwen3_moe" => Some(Self::Qwen3MoE),
-            "gpt_oss" | "gptoss" | "gpt-oss" => Some(Self::GptOss),
-            "qwen3_next" | "qwen3_5" | "qwen3.5" | "qwen3_5_text" | "qwen3_5_moe"
-            | "qwen3_5_moe_text" | "qwen3_6" | "qwen3.6" | "qwen3_6_text" | "qwen3_6_moe"
-            | "qwen3_6_moe_text" => Some(Self::Qwen3Next),
-            "qwen4_exp" | "qwen4_exp_text" => Some(Self::Qwen4Exp),
-            "qwen3" => Some(Self::Qwen3),
-            "qwen2" | "qwen2_5" => Some(Self::Qwen2),
-            "gemma" | "gemma2" | "gemma3" => Some(Self::Gemma),
-            // Gemma 4 has its own architecture module (separate attention
-            // variants per layer type, k_eq_v for full-attention, layer
-            // scalar, final logit softcapping). Multimodal wrappers nest
-            // the text backbone under `text_config`; the loader unwraps.
-            "gemma4" | "gemma4_text" | "gemma4_unified" => Some(Self::Gemma4),
-            // DiffusionGemma must be matched before the generic gemma fallbacks
-            // (its model_type is distinct, but keep it explicit).
-            "diffusion_gemma" | "diffusion_gemma_text" => Some(Self::DiffusionGemma),
-            "mistral" | "mixtral" => Some(Self::Mistral),
-            "phi4" => Some(Self::Phi4),
-            // `Self::Phi` is a Phi-3 implementation: `self_attn.o_proj`, a
-            // fused `mlp.gate_up_proj` SwiGLU, RMSNorm, no biases, and a
-            // sequential attention-then-MLP residual.
-            //
-            // `model_type: "phi"` is Phi-1 / Phi-1.5 / Phi-2, which share none
-            // of that. They ship `self_attn.dense`, `mlp.fc1` + `mlp.fc2` with
-            // a single GELU, LayerNorm *with bias*, a bias on every projection
-            // and on `lm_head`, `model.final_layernorm` rather than
-            // `model.norm`, no `post_attention_layernorm` at all, and a
-            // parallel block: `x + attn(ln(x)) + mlp(ln(x))`.
-            //
-            // Routing them here matched almost no weights and returned noise
-            // that was finite and correctly shaped. Declining is the honest
-            // answer until the architecture exists; map this back the day it
-            // does.
-            "phi3" => Some(Self::Phi),
-            "deepseek" | "deepseek2" | "deepseek_v2" | "deepseek_v3" => Some(Self::DeepSeek),
-            "cohere" | "cohere2" | "command_r" | "command-r" => Some(Self::Cohere),
-            // The four families `GraniteForCausalLM` computes. Every other
-            // `granite*` model_type is refused by name; see `granite_refusal`.
-            "granite" | "granitemoe" | "granitemoeshared" | "granitemoehybrid" => {
-                Some(Self::Granite)
-            }
-            "nemotron_h" | "nemotronh" | "nemotron-h" => Some(Self::NemotronH),
-            "flux" | "flux-1" | "flux.1" => Some(Self::Flux),
-            // The encoders `EncoderModel` computes: the BERT family (BERT,
-            // RoBERTa, DistilBERT) and ModernBERT. The BERT family shares the
-            // architecture, not the config spelling, the checkpoint prefix or
-            // the position ids (RoBERTa counts from its padding index); see
-            // `BertConfig` and `loader::bert_param_name`. ALBERT and DeBERTa
-            // are different architectures and stay refused.
-            "bert" | "roberta" | "xlm-roberta" | "xlm_roberta" | "camembert" | "distilbert"
-            | "modernbert" => Some(Self::Bert),
-            _ => None,
-        }
-    }
-
-    pub fn from_architectures(archs: &[String]) -> Option<Self> {
-        for arch in archs {
-            let lower = arch.to_lowercase();
-            // Before the llama checks: `MllamaForConditionalGeneration`
-            // contains "llama".
-            if lower.contains("mllama") {
-                return Some(Self::Mllama);
-            }
-            if lower.contains("llama4") {
-                return Some(Self::Llama4);
-            }
-            if lower.contains("llama") {
-                return Some(Self::Llama);
-            }
-            // Before the generic "qwen" fallback below, which would take it
-            // for Qwen 2.
-            if lower.contains("qwen4exp") || lower.contains("qwen4_exp") {
-                return Some(Self::Qwen4Exp);
-            }
-            if lower.contains("qwen3moe") || lower.contains("qwen3_moe") {
-                return Some(Self::Qwen3MoE);
-            }
-            if lower.contains("qwen3next")
-                || lower.contains("qwen3_next")
-                || lower.contains("qwen35")
-                || lower.contains("qwen3_5")
-                || lower.contains("qwen3.5")
-                || lower.contains("qwen35moe")
-                || lower.contains("qwen3_5_moe")
-                || lower.contains("qwen36")
-                || lower.contains("qwen3_6")
-                || lower.contains("qwen3.6")
-                || lower.contains("qwen36moe")
-                || lower.contains("qwen3_6_moe")
-            {
-                return Some(Self::Qwen3Next);
-            }
-            if lower.contains("qwen3") {
-                return Some(Self::Qwen3);
-            }
-            if lower.contains("qwen2") || lower.contains("qwen") {
-                return Some(Self::Qwen2);
-            }
-            // DiffusionGemma before the generic gemma checks: its arch string
-            // (`DiffusionGemmaForBlockDiffusion`) contains "gemma".
-            if lower.contains("diffusiongemma") || lower.contains("diffusion_gemma") {
-                return Some(Self::DiffusionGemma);
-            }
-            if lower.contains("gemma4assistant") || lower.contains("gemma4_assistant") {
-                return None;
-            }
-            if lower.contains("gemma4") {
-                return Some(Self::Gemma4);
-            }
-            if lower.contains("gemma") {
-                return Some(Self::Gemma);
-            }
-            if lower.contains("mistral") || lower.contains("mixtral") {
-                return Some(Self::Mistral);
-            }
-            if lower.contains("phi4") {
-                return Some(Self::Phi4);
-            }
-            // Only Phi-3. A bare `PhiForCausalLM` is Phi-1 / Phi-1.5 / Phi-2,
-            // a different architecture — see the `from_model_type` note.
-            if lower.contains("phi3") {
-                return Some(Self::Phi);
-            }
-            if lower.contains("deepseek") {
-                return Some(Self::DeepSeek);
-            }
-            if lower.contains("cohere") || lower.contains("commandr") || lower.contains("command_r")
-            {
-                return Some(Self::Cohere);
-            }
-            // Exact class names only. A substring match sent every
-            // `Granite*` class here, including the sliding-window, speech and
-            // vision variants this does not compute.
-            if matches!(
-                lower.as_str(),
-                "graniteforcausallm"
-                    | "granitemoeforcausallm"
-                    | "granitemoesharedforcausallm"
-                    | "granitemoehybridforcausallm"
-            ) {
-                return Some(Self::Granite);
-            }
-            if lower.contains("gptoss") || lower.contains("gpt_oss") || lower.contains("gpt-oss") {
-                return Some(Self::GptOss);
-            }
-            if lower.contains("nemotronhforcausallm") || lower.contains("nemotron_h") {
-                return Some(Self::NemotronH);
-            }
-            if lower.contains("flux") {
-                return Some(Self::Flux);
-            }
-            // The encoders `EncoderModel` computes, by class-name prefix
-            // (`BertModel`, `BertForMaskedLM`, `RobertaForSequenceClassification`,
-            // `XLMRobertaModel`, `DistilBertForMaskedLM`, `ModernBertModel`,
-            // ...). Not a substring match: "albert" and "deberta" contain "bert".
-            if [
-                "bert",
-                "roberta",
-                "xlmroberta",
-                "camembert",
-                "distilbert",
-                "modernbert",
-            ]
-            .iter()
-            .any(|prefix| lower.starts_with(prefix))
-            {
-                return Some(Self::Bert);
-            }
-        }
-        None
-    }
-
     /// Deserialize a `config.json` into this architecture's config struct and
     /// hand back the round-tripped JSON, without reading a single weight.
     ///
@@ -558,27 +369,7 @@ impl ModelArchitecture {
         }
         let config_content = std::fs::read_to_string(config_path)
             .map_err(|e| Exception::custom(format!("{}", e)))?;
-        let config = config_value(&config_content)?;
-
-        let architectures = config["architectures"].as_array().map(|a| {
-            a.iter()
-                .map(|v| v.as_str().unwrap_or("").to_string())
-                .collect::<Vec<_>>()
-        });
-        let model_type = config["model_type"].as_str().unwrap_or("");
-
-        Self::from_model_type(model_type)
-            .or_else(|| {
-                architectures
-                    .as_ref()
-                    .and_then(|a| Self::from_architectures(a))
-            })
-            .ok_or_else(|| {
-                Exception::custom(
-                    granite_refusal(model_type)
-                        .unwrap_or_else(|| format!("Unsupported model type: {}", model_type)),
-                )
-            })
+        resolve_architecture(&config_content)
     }
 }
 
@@ -643,46 +434,17 @@ macro_rules! dispatch_architecture {
     };
 }
 
-/// Shared body for the common architecture load path:
-///
-/// 1. Parse config JSON into the architecture's config type.
-/// 2. Construct the model via the provided constructor expression.
-/// 3. Run the HuggingFace-style generic weight loader.
-/// 4. Batched-eval every `ModuleParameters` so weights materialise on GPU.
-/// 5. Wrap in the given `DynamicModel` variant and return.
-///
-/// Used for architectures that don't need config unwrapping, custom weight
-/// remapping, or post-load fast-path initialisation. Replaces ~13 hand-rolled
-/// copy-paste match arms in `DynamicModel::load_with_options`.
-///
-/// `$new` accepts any callable returning `Result<Model, Exception>` — most
-/// architectures pass `TypeName::new`; Qwen3 passes `Qwen3ForCausalLM::new_for_loading`.
 /// Resolve a `config.json` body to the architecture that should run it.
 ///
-/// `model_type` decides; the `architectures` array is the fallback for
-/// checkpoints that omit it. Shared by [`DynamicModel::load_with_options`] and
+/// `model_type` decides; the `architectures` class names are the fallback
+/// for one that states no type pmetal knows, and a family pmetal does not
+/// implement is an [`UnsupportedModel`](crate::resolve::UnsupportedModel) naming it, never the nearest family
+/// that is. Shared by [`DynamicModel::load_with_options`] and
 /// [`DynamicModel::from_config`] so the two cannot disagree about what a
 /// checkpoint is.
 fn resolve_architecture(config_content: &str) -> Result<ModelArchitecture, Exception> {
-    let base_config = config_value(config_content)?;
-    let architectures = base_config["architectures"].as_array().map(|a| {
-        a.iter()
-            .map(|v| v.as_str().unwrap_or("").to_string())
-            .collect::<Vec<_>>()
-    });
-    let model_type = base_config["model_type"].as_str().unwrap_or("");
-    ModelArchitecture::from_model_type(model_type)
-        .or_else(|| {
-            architectures
-                .as_ref()
-                .and_then(|a| ModelArchitecture::from_architectures(a))
-        })
-        .ok_or_else(|| {
-            Exception::custom(
-                granite_refusal(model_type)
-                    .unwrap_or_else(|| format!("Unsupported architecture: {}", model_type)),
-            )
-        })
+    let config = config_value(config_content)?;
+    Ok(ModelArchitecture::resolve_config(&config)?)
 }
 
 /// Parse a Gemma config, deriving the generation flags from `model_type`.
@@ -724,6 +486,20 @@ macro_rules! simple_new {
     }};
 }
 
+/// Shared body for the common architecture load path:
+///
+/// 1. Parse config JSON into the architecture's config type.
+/// 2. Construct the model via the provided constructor expression.
+/// 3. Run the HuggingFace-style generic weight loader.
+/// 4. Batched-eval every `ModuleParameters` so weights materialise on GPU.
+/// 5. Wrap in the given `DynamicModel` variant and return.
+///
+/// Used for architectures that don't need config unwrapping, custom weight
+/// remapping, or post-load fast-path initialisation. Replaces ~13 hand-rolled
+/// copy-paste match arms in `DynamicModel::load_with_options`.
+///
+/// `$new` accepts any callable returning `Result<Model, Exception>` — most
+/// architectures pass `TypeName::new`; Qwen3 passes `Qwen3ForCausalLM::new_for_loading`.
 macro_rules! simple_load {
     ($config_ty:ty, $new:expr, $content:expr, $model_dir:expr, $variant:ident) => {{
         let config: $config_ty =
@@ -1478,12 +1254,13 @@ impl DynamicModel {
     /// architecture, then assigns the dequantized (F32), HuggingFace-named
     /// weights produced by [`WeightLoader::load_gguf`].
     ///
-    /// Phase B coverage is the dense Llama-family decoders (Llama, Qwen2,
-    /// Qwen3, Mistral, Phi) — the architectures whose HF parameter trees map
-    /// 1:1 onto GGUF tensor names and that already have metadata→config
-    /// converters. Gemma / Gemma 4 (extra norm blocks, embedding scaling,
-    /// softcapping, MoE) are handled in later phases and return a typed error
-    /// here rather than loading incorrectly.
+    /// The dense decoders whose HuggingFace parameter trees map one to one onto
+    /// GGUF tensor names load: Llama, Qwen2, Qwen3, Mistral and Phi-3 / Phi-4.
+    /// Every other architecture returns a typed error naming it. Gemma and
+    /// Gemma 4 map their tensor names ([`WeightLoader::gguf_to_hf_name_gemma4`])
+    /// but are not loaded here, and neither are the mixture-of-experts and
+    /// hybrid architectures: their config and weight wiring has no GGUF
+    /// artifact to be verified against.
     pub fn load_gguf(
         path: impl AsRef<Path>,
         _options: DynamicModelLoadOptions,
@@ -1491,13 +1268,8 @@ impl DynamicModel {
         let path = path.as_ref();
         let gguf_config = GgufModelConfig::from_path(path)
             .map_err(|e| Exception::custom(format!("GGUF config: {e}")))?;
-        let arch =
-            ModelArchitecture::from_model_type(&gguf_config.architecture).ok_or_else(|| {
-                Exception::custom(format!(
-                    "GGUF architecture '{}' is not supported for inference loading",
-                    gguf_config.architecture
-                ))
-            })?;
+        let arch = ModelArchitecture::resolve(&gguf_config.architecture, &[])
+            .map_err(|e| Exception::custom(format!("GGUF architecture: {e}")))?;
 
         let mut weights =
             WeightLoader::load_gguf(path).map_err(|e| Exception::custom(format!("GGUF: {e}")))?;
@@ -1594,8 +1366,10 @@ impl DynamicModel {
                 })
             }
             other => Err(Exception::custom(format!(
-                "GGUF inference loading is not yet implemented for {other} \
-                 (supported: dense Llama, Qwen2, Qwen3, Mistral, Phi-3)."
+                "GGUF architecture {:?} ({other}) cannot be loaded from a GGUF file. \
+                 GGUF loading covers the dense Llama, Qwen2, Qwen3, Mistral and Phi-3 / \
+                 Phi-4 decoders; load the {other} checkpoint from its safetensors weights.",
+                gguf_config.architecture
             ))),
         }
     }
@@ -1921,11 +1695,13 @@ impl DynamicModel {
     /// position's logits, `[B, 1, vocab]`, for a caller that samples from them
     /// alone: a prefill, or a decode step.
     ///
-    /// The LM head runs on that one position where the architecture has this
-    /// path (Llama, Qwen 2/3, Qwen3-MoE, Mistral, Phi, Cohere, Granite); the
-    /// others compute every position's logits and slice, which is the same
-    /// numbers at the cost of the `[B, T, vocab]` allocation. The cache is
-    /// filled as the full forward fills it.
+    /// The LM head runs on that one position, so a long prompt never
+    /// materialises the `[B, T, vocab]` logits. The cache is filled as the full
+    /// forward fills it. The hybrid architectures answer through
+    /// [`forward_with_hybrid_cache_last`](Self::forward_with_hybrid_cache_last),
+    /// and the encoder, diffusion and image architectures have no cached
+    /// decode, so they take the error [`forward_with_cache`](Self::forward_with_cache)
+    /// gives (BERT's last hidden state, which is not logits).
     pub fn forward_with_cache_last(
         &mut self,
         input_ids: &Array,
@@ -1934,14 +1710,26 @@ impl DynamicModel {
     ) -> Result<Array, Exception> {
         match self {
             Self::Llama(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::Llama4(m) => m.forward_with_cache_last(input_ids, mask, cache),
             Self::Qwen2(m) => m.forward_with_cache_last(input_ids, mask, cache),
             Self::Qwen3(m) => m.forward_with_cache_last(input_ids, mask, cache),
             Self::Qwen3MoE(m) => m.forward_with_cache_last(input_ids, mask, cache),
-            Self::Cohere(m) => m.forward_with_cache_last(input_ids, mask, cache),
-            Self::Granite(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::Gemma(m) => m.forward_with_cache_last(input_ids, mask, cache),
             Self::Mistral(m) => m.forward_with_cache_last(input_ids, mask, cache),
             Self::Phi(m) | Self::Phi4(m) => m.forward_with_cache_last(input_ids, mask, cache),
-            _ => Ok(last_token_hidden(
+            Self::DeepSeek(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::Cohere(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::Granite(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::GptOss(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::Gemma4(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            // Text-only, as for `forward_with_cache`.
+            Self::Mllama(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::NemotronH(_)
+            | Self::Qwen3Next(_)
+            | Self::Qwen4Exp(_)
+            | Self::Flux(_)
+            | Self::Bert(_)
+            | Self::DiffusionGemma(_) => Ok(last_token_hidden(
                 &self.forward_with_cache(input_ids, mask, cache)?,
             )),
         }
@@ -1955,18 +1743,17 @@ impl DynamicModel {
     ) -> Result<Array, Exception> {
         match self {
             Self::Llama(m) => m.forward_with_cache(input_ids, mask, cache),
+            Self::Llama4(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::Qwen2(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::Qwen3(m) => m.forward_with_cache(input_ids, mask, cache),
-            Self::Qwen3MoE(m) => m.forward(input_ids, mask, cache),
-            Self::DeepSeek(m) => m.forward(input_ids, mask, cache),
-            Self::Cohere(m) => m.forward_with_cache(input_ids, mask, cache),
-            Self::Granite(m) => m.forward_with_cache(input_ids, mask, cache),
-            Self::Llama4(m) => m.forward_with_cache(input_ids, mask, cache),
+            Self::Qwen3MoE(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::Gemma(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::Mistral(m) => m.forward_with_cache(input_ids, mask, cache),
-            Self::Phi(m) => m.forward_with_cache(input_ids, mask, cache),
-            Self::Phi4(m) => m.forward_with_cache(input_ids, mask, cache),
-            Self::GptOss(m) => m.forward(input_ids, mask, cache),
+            Self::Phi(m) | Self::Phi4(m) => m.forward_with_cache(input_ids, mask, cache),
+            Self::DeepSeek(m) => m.forward_with_cache(input_ids, mask, cache),
+            Self::Cohere(m) => m.forward_with_cache(input_ids, mask, cache),
+            Self::Granite(m) => m.forward_with_cache(input_ids, mask, cache),
+            Self::GptOss(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::Gemma4(m) => m.forward_with_cache(input_ids, mask, cache),
             // Text-only cached decode. Image-conditioned decoding needs the
             // vision features re-supplied every step, which this signature
@@ -2432,10 +2219,10 @@ impl DynamicModel {
 
     /// [`forward_with_hybrid_cache`](Self::forward_with_hybrid_cache) returning
     /// the last position's logits, `[B, 1, vocab]`, for a caller that samples
-    /// from them alone: a prefill, or a decode step. Qwen 3.5, Granite and the
-    /// architectures of [`forward_with_cache_last`](Self::forward_with_cache_last)
-    /// run their head on that one position; the others compute every position's
-    /// and slice.
+    /// from them alone: a prefill, or a decode step. Every causal architecture
+    /// runs its head on that one position: the hybrids (Qwen 3.5, Qwen4-Exp,
+    /// Nemotron-H, and Granite with Mamba layers) here, the rest through
+    /// [`forward_with_cache_last`](Self::forward_with_cache_last).
     pub fn forward_with_hybrid_cache_last(
         &mut self,
         input_ids: &Array,
@@ -3059,7 +2846,7 @@ mod tests {
 
     #[test]
     fn qwen35_moe_architecture_string_detects_as_qwen3_next() {
-        let architectures = vec!["Qwen3_5_MoeForConditionalGeneration".to_string()];
+        let architectures = vec!["Qwen3_5MoeForConditionalGeneration".to_string()];
         assert_eq!(
             ModelArchitecture::from_architectures(&architectures),
             Some(ModelArchitecture::Qwen3Next)
@@ -3068,7 +2855,7 @@ mod tests {
 
     #[test]
     fn qwen36_moe_architecture_string_detects_as_qwen3_next() {
-        let architectures = vec!["Qwen3_6_MoeForConditionalGeneration".to_string()];
+        let architectures = vec!["Qwen3_6MoeForConditionalGeneration".to_string()];
         assert_eq!(
             ModelArchitecture::from_architectures(&architectures),
             Some(ModelArchitecture::Qwen3Next)

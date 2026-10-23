@@ -142,6 +142,8 @@ export interface ModelFitInfo {
   estimated_tps: number | null;
   recommended_batch_size: number;
   notes: string[];
+  /** Why pmetal cannot run this model, when its architecture is one pmetal declines. */
+  unsupported: string | null;
 }
 
 export interface ModelDefaults {

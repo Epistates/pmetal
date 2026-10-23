@@ -2,7 +2,8 @@
 //!
 //! These functions generate [`ShardingPlan`]s by inspecting model configuration
 //! (as `serde_json::Value`) without depending on pmetal-models types. This keeps
-//! the dependency direction clean: pmetal-distributed → (no model deps).
+//! the dependency direction clean: pmetal-distributed → pmetal-core only, for
+//! the one reading of a config's `model_type` and `architectures`.
 //!
 //! # Supported Block Types
 //!
@@ -457,6 +458,20 @@ pub fn plan_gpt_oss_moe(prefix: &str, total_experts: usize) -> Vec<(String, Shar
     directives
 }
 
+/// Every name that says which family a checkpoint is, lower-cased: the caller's
+/// `arch` (a class name or a `model_type`), the config's effective
+/// `model_type`, and the classes of its `architectures` array.
+fn identifying_names(arch: &str, config: &serde_json::Value) -> Vec<String> {
+    let mut names = vec![pmetal_core::model_type::canonical_model_type(arch)];
+    names.extend(pmetal_core::model_type::effective_model_type(config));
+    names.extend(
+        pmetal_core::model_type::config_architectures(config)
+            .iter()
+            .map(|class| class.to_lowercase()),
+    );
+    names
+}
+
 /// Build a full model sharding plan from architecture type and config.json.
 ///
 /// Reads the architecture type and config fields to produce a complete
@@ -511,33 +526,39 @@ pub fn build_plan(
         .and_then(|v| v.as_u64())
         .unwrap_or(128) as usize;
 
+    // A family is named exactly, never by a substring: the `arch` argument, the
+    // config's `model_type` and its `architectures` classes are each compared
+    // whole (through the same reading every other surface uses), so
+    // `deepseek_v4` or `qwen3_moe_vl` is not mistaken for the family it
+    // resembles.
+    let names = identifying_names(arch, config);
+    let named = |family: &[&str]| names.iter().any(|n| family.contains(&n.as_str()));
+
     // Detect hybrid GDN+Attention models by checking for GDN-specific config
     let is_hybrid_gdn = config.get("gdn_heads").is_some()
         || config.get("mixer_pattern").is_some()
-        || arch.contains("qwen3_next")
-        || arch.contains("Qwen3Next");
+        || named(&["qwen3_next", "qwen3nextforcausallm"]);
 
     // Detect DeepSeek-V2/V3 (MLA attention + specialized MoE naming).
-    let model_type = config
-        .get("model_type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let is_deepseek = arch.contains("Deepseek")
-        || arch.contains("deepseek")
-        || model_type == "deepseek_v2"
-        || model_type == "deepseek_v3";
+    let is_deepseek = named(&[
+        "deepseek_v2",
+        "deepseek_v3",
+        "deepseekv2forcausallm",
+        "deepseekv3forcausallm",
+    ]);
 
     // MoE family detection. Every family has its own block name, router
     // key, and expert-stacking convention — see the per-arch planners.
-    let is_llama4 = arch.contains("Llama4") || model_type == "llama4";
-    let is_gpt_oss = arch.contains("GptOss") || arch.contains("gpt_oss") || model_type == "gpt_oss";
+    let is_llama4 = named(&["llama4", "llama4_text", "llama4forcausallm"]);
+    let is_gpt_oss = named(&["gpt_oss", "gptossforcausallm"]);
     // Qwen-family MoE covers Qwen2-MoE, Qwen3-MoE, and Qwen3-Next's sparse
     // block. `is_hybrid_gdn` already routes Qwen3-Next's recurrent layers.
-    let is_qwen_moe = arch.contains("Qwen2Moe")
-        || arch.contains("qwen2_moe")
-        || arch.contains("Qwen3Moe")
-        || arch.contains("qwen3_moe")
-        || is_hybrid_gdn;
+    let is_qwen_moe = named(&[
+        "qwen2_moe",
+        "qwen2moeforcausallm",
+        "qwen3_moe",
+        "qwen3moeforcausallm",
+    ]) || is_hybrid_gdn;
 
     // MoE layer frequency. Qwen-family uses `decoder_sparse_step` (1-based:
     // a layer is MoE when `(layer + 1) % step == 0`). Llama4 uses
@@ -1223,6 +1244,44 @@ mod tests {
         assert!(
             plan.directives
                 .contains_key("model.layers.0.linear_attn.in_proj_qkv.weight")
+        );
+    }
+
+    #[test]
+    fn a_family_is_named_whole_not_by_a_substring() {
+        // A DeepSeek that is not V2 or V3 has a different attention; it must
+        // not be planned as MLA because its name contains `deepseek`.
+        let config = serde_json::json!({
+            "model_type": "deepseek_v4",
+            "architectures": ["DeepseekV4ForCausalLM"],
+            "num_hidden_layers": 2,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 8,
+            "q_lora_rank": 64,
+            "n_routed_experts": 8,
+        });
+        let plan = build_plan("DeepseekV4ForCausalLM", &config, 2).unwrap();
+        assert!(
+            plan.directives
+                .keys()
+                .all(|k| !k.contains("q_b_proj") && !k.contains("kv_a_proj_with_mqa")),
+            "planned as MLA"
+        );
+        // The config's own `model_type` names the family when the caller's
+        // `arch` is generic.
+        let config = serde_json::json!({
+            "model_type": "gpt_oss",
+            "num_hidden_layers": 2,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 8,
+            "num_local_experts": 8,
+        });
+        assert!(
+            build_plan("auto", &config, 2)
+                .unwrap()
+                .directives
+                .keys()
+                .any(|k| k.contains("router"))
         );
     }
 

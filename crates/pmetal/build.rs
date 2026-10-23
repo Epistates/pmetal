@@ -15,6 +15,15 @@ fn main() {
     println!("cargo:rerun-if-env-changed=DEP_PMETAL_RUNTIME_MLX_METALLIB");
     println!("cargo:rerun-if-env-changed=DEP_PMETAL_RUNTIME_MIN_MACOS");
 
+    println!("cargo:rerun-if-env-changed=DOCS_RS");
+    // docs.rs: pmetal-runtime builds no MLX there, so there is nothing to
+    // embed or link; an empty blob keeps `include_bytes!` compiling.
+    if env::var_os("DOCS_RS").is_some() {
+        let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+        std::fs::write(out_dir.join("mlx.metallib.gz"), b"").unwrap();
+        return;
+    }
+
     if env::var("CARGO_CFG_TARGET_OS").unwrap() != "macos" {
         return;
     }

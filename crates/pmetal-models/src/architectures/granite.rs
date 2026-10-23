@@ -72,23 +72,16 @@ impl GraniteFamily {
 /// attention, and a speech or vision wrapper loaded its text weights under a
 /// prefix nothing matched.
 pub fn granite_refusal(model_type: &str) -> Option<String> {
-    let reason = match model_type {
-        "granite_swa" | "granitemoe_swa" => {
-            "its sliding-window attention layers are not implemented"
-        }
-        "granite_switch" => "the granite_switch architecture is not implemented",
-        "granite4_vision" | "granite_vision" => {
-            "it is a vision-language wrapper; pmetal runs Granite text models only"
-        }
-        t if t.starts_with("granite_speech") => {
-            "it is a speech model; pmetal runs Granite text models only"
-        }
-        t if t.starts_with("granite") && GraniteFamily::from_model_type(t).is_none() => {
+    if !model_type.starts_with("granite") || GraniteFamily::from_model_type(model_type).is_some() {
+        return None;
+    }
+    // The named families carry their reason in the shared refusal table.
+    let reason = pmetal_core::model_type::unsupported_family(model_type, &[])
+        .map(|family| family.reason)
+        .unwrap_or(
             "it is not one of the Granite families pmetal implements \
-             (granite, granitemoe, granitemoeshared, granitemoehybrid)"
-        }
-        _ => return None,
-    };
+             (granite, granitemoe, granitemoeshared, granitemoehybrid)",
+        );
     Some(format!(
         "Unsupported Granite model_type {model_type:?}: {reason}"
     ))

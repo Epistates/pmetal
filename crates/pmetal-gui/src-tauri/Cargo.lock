@@ -6235,6 +6235,7 @@ dependencies = [
  "libp2p",
  "parking_lot 0.13.0",
  "petgraph",
+ "pmetal-core",
  "rand 0.10.3",
  "rayon",
  "secrecy",
