@@ -152,6 +152,15 @@ fn run() -> anyhow::Result<()> {
         );
     }
 
+    // A training run keeps less of the GPU's work pinned (and so fits more, and
+    // gradient checkpointing saves what it should). Every command that writes
+    // an event log is one. MLX reads the setting when it first touches the GPU,
+    // so it comes before anything else here does.
+    #[cfg(feature = "trainer")]
+    if cli.command.writes_event_log() {
+        pmetal_runtime::memory::bound_command_buffer_memory();
+    }
+
     // The TUI owns the terminal, so it logs to the file only.
     #[cfg(feature = "dashboard")]
     let is_tui = matches!(
