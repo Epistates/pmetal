@@ -259,6 +259,7 @@ mod tests {
         let spec = EmbedTrainSpec {
             model: "m".into(),
             dataset: "d".into(),
+            loss: "triplet".into(),
             ..Default::default()
         };
         let argv = spec.to_argv();

@@ -172,6 +172,12 @@ pub trait JobFields: Sized {
     /// - MCP tools to spawn the CLI subprocess for the same job.
     /// - TUI subprocess fallback when the in-process trainer cannot be used.
     /// - CLI's own round-trip tests (parse → spec → argv → parse → equals).
+    ///
+    /// A setting equal to the spec's default is left out, so the command's own
+    /// default applies, and so does a `--config` file that names another
+    /// value: a flag given beats the file, and a default is not a flag. (A
+    /// default is a statement only where something says so; a form pre-fills
+    /// every field, so a value left alone is not one.)
     fn to_argv(&self) -> Vec<String>;
 
     /// Every command-line flag [`to_argv`](Self::to_argv) can emit, including

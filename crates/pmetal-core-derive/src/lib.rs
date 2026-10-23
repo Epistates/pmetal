@@ -35,7 +35,11 @@
 //! - `invert` — pair with `flag`; emit `--flag` when `false`, omit when `true`
 //!   (for `--no-foo` semantics).
 //! - `valued` — `bool` field whose flag takes a value, `--flag true|false`;
-//!   always emitted. For a default of `true` that a switch could not turn off.
+//!   emitted unless it is the default. For a default of `true` that a switch
+//!   could not turn off.
+//! - `always` — emit the flag even at the default, for a setting that must be
+//!   stated and never left to the command (a bind address). Valid on plain
+//!   numeric, `String` and `valued` fields.
 //! - `csv` — `Vec<String>` field; emit `--flag a,b,c` joined with commas.
 //! - `repeat` — `Vec<String>` field; emit `--flag a --flag b`, one per item.
 //! - `required` — non-empty / non-default validation. Valid on `String`,
@@ -187,6 +191,11 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
             fn to_argv(&self) -> ::std::vec::Vec<::std::string::String> {
                 #[allow(unused_mut)]
                 let mut args: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
+                // A setting at its default is left to the command's own: a
+                // flag passed with the default's value would beat a config
+                // file that names another.
+                #[allow(unused_variables)]
+                let default = <Self as ::std::default::Default>::default();
                 #(#argv_items)*
                 args
             }
@@ -339,6 +348,7 @@ struct FieldAttrs {
     csv: Option<Span>,
     repeat: Option<Span>,
     valued: Option<Span>,
+    always: Option<Span>,
 
     required: Option<Span>,
     skip_descriptor: bool,
@@ -596,6 +606,9 @@ fn parse_field_attrs(attrs: &[Attribute]) -> syn::Result<FieldAttrs> {
             } else if path.is_ident("valued") {
                 reject_duplicate(&meta, out.valued.is_some())?;
                 out.valued = Some(path.span());
+            } else if path.is_ident("always") {
+                reject_duplicate(&meta, out.always.is_some())?;
+                out.always = Some(path.span());
             } else if path.is_ident("csv") {
                 reject_duplicate(&meta, out.csv.is_some())?;
                 out.csv = Some(path.span());
@@ -754,6 +767,18 @@ fn check_attr_consistency(field: &ParsedField) -> syn::Result<()> {
             return Err(syn::Error::new(
                 span,
                 "`valued` cannot be combined with `flag`, `invert` or `csv`",
+            ));
+        }
+    }
+    if let Some(span) = a.always {
+        if a.argv.is_none() {
+            return Err(syn::Error::new(span, "`always` needs `argv = \"...\"`"));
+        }
+        if a.flag.is_some() || a.csv.is_some() || a.repeat.is_some() || ty.is_option() {
+            return Err(syn::Error::new(
+                span,
+                "`always` cannot be combined with `flag`, `csv` or `repeat`, or applied to an \
+                 `Option` field",
             ));
         }
     }
@@ -1064,11 +1089,21 @@ fn emit_argv(field: &ParsedField) -> TokenStream2 {
         };
     }
 
+    // A setting is passed when it differs from the default, or always if the
+    // field says it must be stated.
+    let differs = if attrs.always.is_some() {
+        quote! { true }
+    } else {
+        quote! { self.#name != default.#name }
+    };
+
     // Bool that takes `true` / `false`, so a default of true can be turned off.
     if attrs.valued.is_some() {
         return quote! {
-            args.push(::std::string::ToString::to_string(#argv));
-            args.push(::std::string::ToString::to_string(&self.#name));
+            if #differs {
+                args.push(::std::string::ToString::to_string(#argv));
+                args.push(::std::string::ToString::to_string(&self.#name));
+            }
         };
     }
 
@@ -1110,7 +1145,7 @@ fn emit_argv(field: &ParsedField) -> TokenStream2 {
     // Plain string
     if field.ty.is_string_like() {
         return quote! {
-            if !self.#name.is_empty() {
+            if !self.#name.is_empty() && #differs {
                 args.push(::std::string::ToString::to_string(#argv));
                 args.push(::std::clone::Clone::clone(&self.#name));
             }
@@ -1119,8 +1154,10 @@ fn emit_argv(field: &ParsedField) -> TokenStream2 {
 
     // Plain numeric (or any `Display` type with an explicit kind override).
     quote! {
-        args.push(::std::string::ToString::to_string(#argv));
-        args.push(::std::string::ToString::to_string(&self.#name));
+        if #differs {
+            args.push(::std::string::ToString::to_string(#argv));
+            args.push(::std::string::ToString::to_string(&self.#name));
+        }
     }
 }
 

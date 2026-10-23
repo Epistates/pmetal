@@ -312,6 +312,7 @@ mod tests {
     fn argv_round_trip() {
         let spec = PretrainSpec {
             arch: "gpt-oss".into(),
+            steps: 7,
             ..Default::default()
         };
         let argv = spec.to_argv();

@@ -619,12 +619,11 @@ mod tests {
         );
         assert_eq!(arg_after(&launch.plan.argv, "--epochs"), Some("2"));
         assert_eq!(arg_after(&launch.plan.argv, "--lora-r"), Some("8"));
-        // Not entered, so the spec's own default, not a number of the app's.
-        let default = TrainSpec::default();
-        assert_eq!(
-            arg_after(&launch.plan.argv, "--batch-size").map(str::to_string),
-            Some(default.batch_size.to_string())
-        );
+        // Not entered, so not passed: the command's own default applies (and a
+        // config file's value would, which a flag at the default's value would
+        // have overridden).
+        assert_eq!(arg_after(&launch.plan.argv, "--batch-size"), None);
+        assert_eq!(arg_after(&launch.plan.argv, "--learning-rate"), None);
         // A folder of its own, named for the model, the job and the time.
         let out = launch.plan.output.unwrap();
         assert_eq!(out, root.path().join("Qwen3-0.6B-train-20260318-214507"));

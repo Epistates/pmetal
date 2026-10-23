@@ -114,9 +114,19 @@ mod tests {
         let spec = ImatrixSpec {
             model: "m".into(),
             dataset: "d.jsonl".into(),
+            output: "out.gguf".into(),
+            ctx_size: 1024,
+            batch_size: 2,
             ..Default::default()
         };
         let argv = spec.to_argv();
+        // What was not changed is left to the command's own defaults.
+        let plain = ImatrixSpec {
+            model: "m".into(),
+            dataset: "d.jsonl".into(),
+            ..Default::default()
+        };
+        assert_eq!(plain.to_argv(), ["--model", "m", "--dataset", "d.jsonl"]);
         for flag in [
             "--model",
             "--dataset",

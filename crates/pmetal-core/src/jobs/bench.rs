@@ -74,7 +74,13 @@ mod tests {
 
     #[test]
     fn defaults_emit_argv() {
-        let spec = BenchSpec::default();
+        // The defaults are the command's own, so nothing is passed.
+        assert!(BenchSpec::default().to_argv().is_empty());
+        let spec = BenchSpec {
+            model: "m".into(),
+            batch_size: 3,
+            ..Default::default()
+        };
         let argv = spec.to_argv();
         assert!(argv.contains(&"--model".to_string()));
         assert!(argv.contains(&"--batch-size".to_string()));

@@ -25,7 +25,9 @@ rate schedules. It depends on no other workspace crate except its own
   form is drawn from (label, group, kind, default, range), the `argv` that
   reproduces it on the command line, and its validation, so a front end never
   holds a default or a flag name of its own. `default_text` and
-  `spec_from_text` turn a spec into form text and back.
+  `spec_from_text` turn a spec into form text and back. `to_argv` leaves out a
+  setting that is at its default: the command's own default applies, and so does
+  a `--config` file's value, which a flag at the default's value would override.
 - **Job events**: `JobEvent` (started, phase, metric, token, log, progress,
   completed, failed, cancelled) with a JSONL codec, `JobEventSink` and its
   sinks, and `JobStatus` to fold a stream into a state.
@@ -77,6 +79,8 @@ let mut spec = ServeSpec {
 spec.normalize().unwrap();
 let argv = spec.to_argv();
 assert_eq!(&argv[..2], ["--model", "Qwen/Qwen3-4B"]);
+// Only what differs from the default is passed.
+assert!(argv.contains(&"--port".to_string()) && !argv.contains(&"--host".to_string()));
 assert_eq!(ServeSpec::subcommand(), "serve");
 
 // A job's events, one JSON object per line.

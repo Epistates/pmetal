@@ -1041,6 +1041,8 @@ mod tests {
         let spec = TrainSpec {
             model: "Qwen/Qwen3-0.6B".into(),
             dataset: "data/train.jsonl".into(),
+            output_dir: "runs/a".into(),
+            learning_rate: 1e-4,
             ..Default::default()
         };
         let argv = spec.to_argv();

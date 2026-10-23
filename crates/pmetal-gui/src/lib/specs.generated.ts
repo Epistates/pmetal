@@ -61,6 +61,7 @@ export interface InferSpec {
   kv_v_bits?: number | null;
   lora?: string | null;
   max_tokens?: number | null;
+  messages_file?: string | null;
   min_p?: number | null;
   mode?: 'auto' | 'thinking-general' | 'thinking-coding' | 'instruct-general' | 'instruct-reasoning';
   model?: string;
