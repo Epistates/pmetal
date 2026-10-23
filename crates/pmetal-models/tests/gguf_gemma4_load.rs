@@ -69,9 +69,12 @@ fn values(seed: &mut u64, n: usize, scale: f32) -> Vec<f32> {
         .collect()
 }
 
+/// A checkpoint's tensors: `(name, shape, values)`.
+type Checkpoint = Vec<(String, Vec<usize>, Vec<f32>)>;
+
 /// The reference model, loaded from checkpoint tensors the model itself names:
 /// `(name, shape, values)` for every parameter, so none is left out.
-fn reference() -> (DynamicModel, Vec<(String, Vec<usize>, Vec<f32>)>) {
+fn reference() -> (DynamicModel, Checkpoint) {
     let mut model = DynamicModel::from_config(&config_json()).expect("config");
     let mut seed = 0x9E37_79B9_7F4A_7C15u64;
     let mut tensors = Vec::new();
