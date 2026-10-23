@@ -1,5 +1,7 @@
 # Build artifacts
 target/
+# Extra build directories (a second target dir for the GUI, a toolchain check)
+target-*/
 *.rlib
 *.rmeta
 
