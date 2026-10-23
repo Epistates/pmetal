@@ -65,10 +65,11 @@ fn add_arch_bool(
 
 pub(crate) fn add_hf_config_metadata(
     builder: &mut pmetal_gguf::GgufBuilder,
-    architecture: &str,
+    arch: &super::ExportArch,
     config_json: Option<&serde_json::Value>,
     method: crate::cli::quantize::QuantizeMethod,
 ) {
+    let architecture = arch.name;
     builder.add_string("general.type", "model");
     builder.add_u32(
         pmetal_gguf::keys::GENERAL_FILE_TYPE,
@@ -125,6 +126,11 @@ pub(crate) fn add_hf_config_metadata(
     );
     add_u32(&["n_group"], "expert_group_count");
     add_u32(&["topk_group"], "expert_group_used_count");
+    add_u32(&["moe_intermediate_size"], "expert_feed_forward_length");
+    add_u32(
+        &["shared_expert_intermediate_size"],
+        "expert_shared_feed_forward_length",
+    );
 
     if let Some(false) = json_bool(json, "is_causal") {
         add_arch_bool(builder, architecture, "attention.causal", false);
@@ -139,17 +145,41 @@ pub(crate) fn add_hf_config_metadata(
         let heads = json_u32(json, "num_attention_heads")?;
         (heads != 0).then_some(hidden / heads)
     });
+    // Transformers 5 moves the rope settings into `rope_parameters`; older
+    // configs keep `rope_theta` at the top and any scaling in `rope_scaling`.
+    let rope_parameters = json
+        .get("rope_scaling")
+        .filter(|value| value.is_object())
+        .or_else(|| {
+            json.get("rope_parameters")
+                .filter(|value| value.is_object())
+        });
+    let rope_number = |key: &str| {
+        json_f64(json, key).or_else(|| rope_parameters.and_then(|params| json_f64(params, key)))
+    };
     if let Some(value) = head_dim {
-        // The GGUF convention is key_length/value_length. Keep the older pmetal
-        // compatibility key until all internal loaders consume the standard one.
-        add_arch_u32(builder, architecture, "attention.head_dim", value);
         add_arch_u32(builder, architecture, "attention.key_length", value);
         add_arch_u32(builder, architecture, "attention.value_length", value);
-        add_arch_u32(builder, architecture, "rope.dimension_count", value);
+        // The channels the rotation spans: the whole head unless the model
+        // rotates a fraction of it.
+        let rotary = (value as f64 * rope_number("partial_rotary_factor").unwrap_or(1.0)).round();
+        add_arch_u32(builder, architecture, "rope.dimension_count", rotary as u32);
     }
 
-    if let Some(value) = json_f64(json, "rope_theta") {
+    if let Some(value) = rope_number("rope_theta") {
         add_arch_f32(builder, architecture, "rope.freq_base", value as f32);
+    }
+    // Gemma 3's sliding-window layers rotate with a base of their own.
+    if let Some(value) = json_f64(json, "rope_local_base_freq") {
+        add_arch_f32(builder, architecture, "rope.freq_base_swa", value as f32);
+    }
+    for (key, suffix) in [
+        ("attn_logit_softcapping", "attn_logit_softcapping"),
+        ("final_logit_softcapping", "final_logit_softcapping"),
+    ] {
+        if let Some(value) = json_f64(json, key) {
+            add_arch_f32(builder, architecture, suffix, value as f32);
+        }
     }
     if let Some(value) = json_f64(json, "rms_norm_eps") {
         add_arch_f32(
@@ -171,7 +201,12 @@ pub(crate) fn add_hf_config_metadata(
         );
     }
 
-    if let Some(rope_scaling) = json.get("rope_scaling").and_then(|value| value.as_object()) {
+    // Llama 3.x's banded scaling is a tensor of the file (`rope_freqs`): stating
+    // it as metadata too would apply it twice.
+    let rope_scaling = rope_parameters
+        .and_then(|value| value.as_object())
+        .filter(|_| !arch.scales_rope_by_tensor());
+    if let Some(rope_scaling) = rope_scaling {
         let rope_type = rope_scaling
             .get("rope_type")
             .or_else(|| rope_scaling.get("type"))
@@ -274,8 +309,9 @@ mod tests {
     }
 
     #[test]
-    fn hf_config_metadata_writes_standard_llama_cpp_head_keys() {
+    fn hf_config_metadata_writes_the_standard_head_keys() {
         let config = serde_json::json!({
+            "architectures": ["Qwen3ForCausalLM"],
             "hidden_size": 4096,
             "num_hidden_layers": 32,
             "num_attention_heads": 32,
@@ -288,9 +324,10 @@ mod tests {
             "rms_norm_eps": 0.000001
         });
         let mut builder = GgufBuilder::with_model("qwen3", "test");
+        let arch = super::super::ExportArch::detect(Some(&config)).unwrap();
         add_hf_config_metadata(
             &mut builder,
-            "qwen3",
+            &arch,
             Some(&config),
             crate::cli::quantize::QuantizeMethod::Q4KM,
         );

@@ -228,6 +228,17 @@ impl WeightLoader {
     /// GGUF uses names like `blk.0.attn_q.weight`
     /// HuggingFace uses names like `model.layers.0.self_attn.q_proj.weight`
     pub fn gguf_to_hf_name(gguf_name: &str) -> String {
+        // A bias is named as the weight beside it: `attn_q.bias` is the bias of
+        // `attn_q.weight`.
+        if let Some(stem) = gguf_name.strip_suffix(".bias") {
+            let weight = format!("{stem}.weight");
+            let mapped = Self::gguf_to_hf_name(&weight);
+            return match mapped.strip_suffix(".weight") {
+                Some(hf_stem) if mapped != weight => format!("{hf_stem}.bias"),
+                _ => gguf_name.to_string(),
+            };
+        }
+
         // Handle special cases first
         match gguf_name {
             "token_embd.weight" => return "model.embed_tokens.weight".to_string(),
@@ -340,6 +351,16 @@ impl WeightLoader {
     /// HuggingFace uses names like `model.layers.0.self_attn.q_proj.weight`;
     /// GGUF uses names like `blk.0.attn_q.weight`.
     pub fn hf_to_gguf_name(hf_name: &str) -> String {
+        // A bias is named as the weight beside it.
+        if let Some(stem) = hf_name.strip_suffix(".bias") {
+            let weight = format!("{stem}.weight");
+            let mapped = Self::hf_to_gguf_name(&weight);
+            return match mapped.strip_suffix(".weight") {
+                Some(gguf_stem) if mapped != weight => format!("{gguf_stem}.bias"),
+                _ => hf_name.to_string(),
+            };
+        }
+
         match hf_name {
             "model.embed_tokens.weight" => return "token_embd.weight".to_string(),
             "model.norm.weight" => return "output_norm.weight".to_string(),
@@ -366,6 +387,7 @@ impl WeightLoader {
             "post_attention_layernorm.weight" => "ffn_norm.weight",
             "mlp.gate.weight" => "ffn_gate_inp.weight",
             "mlp.router.weight" => "ffn_gate_inp.weight",
+            "block_sparse_moe.gate.weight" => "ffn_gate_inp.weight",
             "mlp.gate_proj.weight" => "ffn_gate.weight",
             "mlp.up_proj.weight" => "ffn_up.weight",
             "mlp.down_proj.weight" => "ffn_down.weight",
@@ -390,6 +412,32 @@ impl WeightLoader {
         };
 
         format!("blk.{layer_idx}.{gguf_suffix}")
+    }
+
+    /// [`hf_to_gguf_name`](Self::hf_to_gguf_name) for Gemma 2 and Gemma 3, the
+    /// inverse of [`gguf_to_hf_name_gemma4`](Self::gguf_to_hf_name_gemma4).
+    ///
+    /// Their four norms per block are named by what they wrap: the Hugging
+    /// Face `post_attention_layernorm` is the norm *after* attention
+    /// (`post_attention_norm`), and the feed-forward block has a pre- and a
+    /// post-norm of its own (`ffn_norm`, `post_ffw_norm`). Gemma 1 has the
+    /// Llama layout and uses the generic map.
+    pub fn hf_to_gguf_name_gemma(hf_name: &str) -> String {
+        if let Some(rest) = hf_name.strip_prefix("model.layers.")
+            && let Some((layer, suffix)) = rest.split_once('.')
+            && layer.parse::<usize>().is_ok()
+        {
+            let gguf_suffix = match suffix {
+                "post_attention_layernorm.weight" => Some("post_attention_norm.weight"),
+                "pre_feedforward_layernorm.weight" => Some("ffn_norm.weight"),
+                "post_feedforward_layernorm.weight" => Some("post_ffw_norm.weight"),
+                _ => None,
+            };
+            if let Some(gguf_suffix) = gguf_suffix {
+                return format!("blk.{layer}.{gguf_suffix}");
+            }
+        }
+        Self::hf_to_gguf_name(hf_name)
     }
 }
 
@@ -816,6 +864,58 @@ mod tests {
         for name in names {
             let gguf = WeightLoader::hf_to_gguf_name(name);
             assert_eq!(WeightLoader::gguf_to_hf_name(&gguf), name);
+        }
+    }
+
+    /// A bias is named as the weight beside it, both ways: Qwen 2 has query,
+    /// key and value biases, and a file that names them `blk.N.self_attn.q_proj.bias`
+    /// has tensors no engine looks for.
+    #[test]
+    fn test_biases_follow_their_weights() {
+        for (hf, gguf) in [
+            ("model.layers.3.self_attn.q_proj.bias", "blk.3.attn_q.bias"),
+            ("model.layers.3.self_attn.k_proj.bias", "blk.3.attn_k.bias"),
+            ("model.layers.3.self_attn.v_proj.bias", "blk.3.attn_v.bias"),
+        ] {
+            assert_eq!(WeightLoader::hf_to_gguf_name(hf), gguf);
+            assert_eq!(WeightLoader::gguf_to_hf_name(gguf), hf);
+        }
+        // A bias outside the layers, with no weight of that name, is left as it is.
+        assert_eq!(
+            WeightLoader::hf_to_gguf_name("model.mystery.bias"),
+            "model.mystery.bias"
+        );
+    }
+
+    /// Gemma 2 and 3 name their four norms by what they wrap, and the reader
+    /// maps the names back.
+    #[test]
+    fn test_hf_to_gguf_name_gemma_round_trips_with_the_reader() {
+        for (hf, gguf) in [
+            (
+                "model.layers.4.post_attention_layernorm.weight",
+                "blk.4.post_attention_norm.weight",
+            ),
+            (
+                "model.layers.4.pre_feedforward_layernorm.weight",
+                "blk.4.ffn_norm.weight",
+            ),
+            (
+                "model.layers.4.post_feedforward_layernorm.weight",
+                "blk.4.post_ffw_norm.weight",
+            ),
+            (
+                "model.layers.4.input_layernorm.weight",
+                "blk.4.attn_norm.weight",
+            ),
+            (
+                "model.layers.4.self_attn.q_norm.weight",
+                "blk.4.attn_q_norm.weight",
+            ),
+            ("model.layers.4.mlp.up_proj.weight", "blk.4.ffn_up.weight"),
+        ] {
+            assert_eq!(WeightLoader::hf_to_gguf_name_gemma(hf), gguf);
+            assert_eq!(WeightLoader::gguf_to_hf_name_gemma4(gguf), hf);
         }
     }
 

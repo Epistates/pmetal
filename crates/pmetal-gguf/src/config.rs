@@ -357,6 +357,42 @@ pub fn longrope_scaling(
     Ok(Some(dict))
 }
 
+/// The per-frequency divisors of Llama 3.x's banded RoPE scaling, the values of
+/// a `rope_freqs` tensor: what a converter writes for a model whose
+/// `rope_scaling` has `rope_type` `"llama3"`.
+///
+/// There is one divisor per rotated frequency (`head_dim / 2` of them): 1 for a
+/// frequency whose wavelength is shorter than `original_context /
+/// high_freq_factor`, `factor` for one longer than `original_context /
+/// low_freq_factor`, and a smooth blend between.
+pub fn llama3_frequency_factors(
+    theta: f64,
+    head_dim: usize,
+    factor: f64,
+    low_freq_factor: f64,
+    high_freq_factor: f64,
+    original_context_length: f64,
+) -> Vec<f32> {
+    let low_wavelength = original_context_length / low_freq_factor;
+    let high_wavelength = original_context_length / high_freq_factor;
+    (0..head_dim / 2)
+        .map(|i| {
+            let frequency = 1.0 / theta.powf(2.0 * i as f64 / head_dim as f64);
+            let wavelength = 2.0 * std::f64::consts::PI / frequency;
+            let divisor = if wavelength < high_wavelength {
+                1.0
+            } else if wavelength > low_wavelength {
+                factor
+            } else {
+                let smooth = (original_context_length / wavelength - low_freq_factor)
+                    / (high_freq_factor - low_freq_factor);
+                1.0 / ((1.0 - smooth) / factor + smooth)
+            };
+            divisor as f32
+        })
+        .collect()
+}
+
 /// A one-dimensional `F32` tensor's values, or `None` when the file has no
 /// such tensor.
 fn read_f32_tensor(model: &GgufModel, name: &str) -> Result<Option<Vec<f32>>, GgufConfigError> {
@@ -536,6 +572,23 @@ mod tests {
 mod rope_tests {
     use super::*;
     use crate::{GgufBuilder, GgufModel};
+
+    /// Llama-3.2-1B-Instruct's `rope_freqs.weight`, as the reference converter
+    /// writes it: 15 untouched frequencies, three in the blend, 14 divided by
+    /// the full factor.
+    #[test]
+    fn llama3_factors_are_what_the_reference_converter_writes() {
+        let factors = llama3_frequency_factors(500_000.0, 64, 32.0, 1.0, 4.0, 8192.0);
+        assert_eq!(factors.len(), 32);
+        assert!(factors[..15].iter().all(|&f| f == 1.0));
+        for (got, want) in factors[15..18]
+            .iter()
+            .zip([1.651_329_3_f32, 3.292_262_8, 9.666_731])
+        {
+            assert!((got - want).abs() < 1e-5 * want, "{got} vs {want}");
+        }
+        assert!(factors[18..].iter().all(|&f| f == 32.0));
+    }
 
     const HEAD_DIM: u32 = 8;
 

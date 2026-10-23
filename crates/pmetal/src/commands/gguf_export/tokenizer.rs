@@ -9,7 +9,7 @@ const TOKEN_TYPE_CONTROL: i32 = 3;
 const TOKEN_TYPE_USER_DEFINED: i32 = 4;
 const TOKEN_TYPE_UNUSED: i32 = 5;
 
-const LLAMA_PRETOKENIZER_CHECK: &str = "\n \n\n \n\n\n \t \t\t \t\n  \n   \n    \n     \n🚀 (normal) 😶‍🌫️ (multiple emojis concatenated) ✅ 🦙🦙 3 33 333 3333 33333 333333 3333333 33333333 3.3 3..3 3...3 កាន់តែពិសេសអាច😁 ?我想在apple工作1314151天～ ------======= нещо на Български ''''''```````\"\"\"\"......!!!!!!?????? I've been 'told he's there, 'RE you sure? 'M not sure I'll make it, 'D you like some tea? We'Ve a'lL";
+pub(super) const LLAMA_PRETOKENIZER_CHECK: &str = "\n \n\n \n\n\n \t \t\t \t\n  \n   \n    \n     \n🚀 (normal) 😶‍🌫️ (multiple emojis concatenated) ✅ 🦙🦙 3 33 333 3333 33333 333333 3333333 33333333 3.3 3..3 3...3 កាន់តែពិសេសអាច😁 ?我想在apple工作1314151天～ ------======= нещо на Български ''''''```````\"\"\"\"......!!!!!!?????? I've been 'told he's there, 'RE you sure? 'M not sure I'll make it, 'D you like some tea? We'Ve a'lL";
 
 fn lower_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -51,8 +51,13 @@ fn tokenizer_model_kind(
                 .to_ascii_lowercase();
             if model_type.contains("gemma4") {
                 "gemma4".to_string()
-            } else {
+            } else if is_byte_level(tokenizer_json) {
                 "gpt2".to_string()
+            } else {
+                // BPE over SentencePiece pieces (Gemma 1 to 3, Llama 2,
+                // Mistral): the engine tokenizes these with its SentencePiece
+                // tokenizer, from the pieces and their scores.
+                "llama".to_string()
             }
         }
         "WordPiece" => "bert".to_string(),
@@ -166,6 +171,25 @@ fn known_pre_tokenizer(hash: &str) -> Option<&'static str> {
     }
 }
 
+/// The hash that names a tokenizer's pre-tokenizer: of the ids the check text
+/// encodes to.
+///
+/// The reference hashes what `AutoTokenizer.encode` returns, which adds the
+/// special tokens the tokenizer's template does. A Llama 3 tokenizer encodes
+/// the check text with its beginning-of-text token in front; hashed without
+/// it, the text matches another family's pre-tokenizer (`smaug-bpe`), whose
+/// splitting differs and so tokenizes differently in the engine.
+pub(super) fn pre_tokenizer_hash(tokenizer: &tokenizers::Tokenizer) -> Option<String> {
+    let ids = tokenizer.encode(LLAMA_PRETOKENIZER_CHECK, true).ok()?;
+    Some(hash_token_ids(ids.get_ids()))
+}
+
+/// The hash of a list of token ids, as the reference spells the list.
+pub(super) fn hash_token_ids(token_ids: &[u32]) -> String {
+    let digest = Sha256::digest(format!("{token_ids:?}").as_bytes());
+    lower_hex(digest.as_ref())
+}
+
 fn infer_pre_tokenizer(
     tokenizer: &tokenizers::Tokenizer,
     config_json: Option<&serde_json::Value>,
@@ -176,13 +200,14 @@ fn infer_pre_tokenizer(
         return Some(value.to_string());
     }
 
-    let ids = tokenizer.encode(LLAMA_PRETOKENIZER_CHECK, false).ok()?;
-    let token_ids = ids.get_ids();
-    let digest = Sha256::digest(format!("{token_ids:?}").as_bytes());
-    let hash = lower_hex(digest.as_ref());
+    let hash = pre_tokenizer_hash(tokenizer)?;
     if let Some(pre) = known_pre_tokenizer(&hash) {
         return Some(pre.to_string());
     }
+    tracing::warn!(
+        "the pre-tokenizer of this tokenizer is not one the reference tools know (hash {hash}); \
+         it is guessed from the model family, and the engine may split text differently"
+    );
 
     let model_type = config_json
         .and_then(|json| json_str(json, "model_type"))
@@ -228,21 +253,38 @@ fn tokenizer_config_bool(tokenizer_config: Option<&serde_json::Value>, key: &str
     tokenizer_config.and_then(|json| json_bool(json, key))
 }
 
+/// The chat template: in `tokenizer_config.json`, or, where Hugging Face moved
+/// it out of there, in `chat_template.jinja` (or `chat_template.json`).
 fn add_chat_template_metadata(
     builder: &mut pmetal_gguf::GgufBuilder,
+    model_dir: &Path,
     tokenizer_config: Option<&serde_json::Value>,
-) {
-    let Some(field) = tokenizer_config.and_then(|json| json.get("chat_template")) else {
-        return;
+) -> anyhow::Result<()> {
+    let from_file = if tokenizer_config.is_some_and(|json| json.get("chat_template").is_some()) {
+        None
+    } else if let Some(text) = std::fs::read_to_string(model_dir.join("chat_template.jinja"))
+        .ok()
+        .filter(|text| !text.trim().is_empty())
+    {
+        Some(serde_json::Value::String(text))
+    } else {
+        read_json_file(&model_dir.join("chat_template.json"))?
+            .and_then(|json| json.get("chat_template").cloned())
+    };
+    let Some(field) = from_file
+        .as_ref()
+        .or_else(|| tokenizer_config.and_then(|json| json.get("chat_template")))
+    else {
+        return Ok(());
     };
 
     if let Some(template) = field.as_str() {
         builder.add_string(pmetal_gguf::keys::TOKENIZER_CHAT_TEMPLATE, template);
-        return;
+        return Ok(());
     }
 
     let Some(choices) = field.as_array() else {
-        return;
+        return Ok(());
     };
 
     let mut names = Vec::new();
@@ -278,6 +320,7 @@ fn add_chat_template_metadata(
     if let Some(template) = default_template {
         builder.add_string(pmetal_gguf::keys::TOKENIZER_CHAT_TEMPLATE, template);
     }
+    Ok(())
 }
 
 fn parse_merges(
@@ -338,6 +381,226 @@ fn parse_unigram_scores(tokenizer_json: &serde_json::Value, vocab_size: usize) -
     Some(scores)
 }
 
+/// Whether the reference converter treats an added token that its tokenizer
+/// does not flag as special as a control token all the same.
+///
+/// Only a few spellings qualify. Every other added token (`<tool_call>`,
+/// `<think>`, the whitespace runs of Gemma) is a user-defined one, which an
+/// engine renders as text; a control token is hidden from the output, so
+/// marking too many silences words the model means to say.
+fn does_token_look_special(token: &str) -> bool {
+    matches!(token, "<pad>" | "<mask>" | "<2mass>" | "[@BOS@]")
+        || (token.starts_with("<|") && token.ends_with("|>"))
+        || (token.starts_with("<\u{ff5c}") && token.ends_with("\u{ff5c}>"))
+        || (token.starts_with("<unused") && token.ends_with('>'))
+}
+
+/// The token a config file names for `kind` (`bos`, `eos`, ...), as a string.
+fn configured_token<'a>(
+    kind: &str,
+    tokenizer_config: Option<&'a serde_json::Value>,
+    special_tokens_map: Option<&'a serde_json::Value>,
+) -> Option<&'a str> {
+    let key = format!("{kind}_token");
+    [tokenizer_config, special_tokens_map]
+        .into_iter()
+        .flatten()
+        .find_map(|json| json.get(&key).and_then(extract_token_string))
+}
+
+/// The id of the special token `kind` names, resolved as the reference
+/// converter does: the token a tokenizer config names, looked up among the
+/// tokenizer's added tokens, else the id `config.json` states.
+///
+/// Nothing is guessed from the vocabulary. A BPE vocabulary holds ordinary
+/// tokens spelled `<s>`, `</s>` and `<unk>` (a Qwen vocabulary has all three,
+/// at ids nothing treats specially), so looking those up when no config names
+/// a token marks a piece of text as the beginning of the sequence.
+fn special_token_id(
+    kind: &str,
+    tokenizer: &tokenizers::Tokenizer,
+    tokenizer_config: Option<&serde_json::Value>,
+    special_tokens_map: Option<&serde_json::Value>,
+    config_json: Option<&serde_json::Value>,
+    vocab_size: usize,
+) -> Option<u32> {
+    let in_vocab = |id: u32| (id as usize) < vocab_size;
+    if let Some(token) = configured_token(kind, tokenizer_config, special_tokens_map) {
+        let added = tokenizer
+            .get_added_tokens_decoder()
+            .into_iter()
+            .find_map(|(id, added)| (added.content == token).then_some(id));
+        if let Some(id) = added.or_else(|| tokenizer.token_to_id(token)) {
+            return in_vocab(id).then_some(id);
+        }
+    }
+    config_json
+        .and_then(|json| json.get(format!("{kind}_token_id")))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|id| u32::try_from(id).ok())
+        .filter(|&id| in_vocab(id))
+}
+
+/// Whether the tokenizer's post-processing template puts `token` at the front
+/// (or the back) of a single sequence: `None` when it has no template.
+fn template_adds(tokenizer_json: &serde_json::Value, token: &str, front: bool) -> Option<bool> {
+    fn find_template(value: &serde_json::Value) -> Option<&serde_json::Value> {
+        if value.get("type").and_then(|t| t.as_str()) == Some("TemplateProcessing") {
+            return Some(value);
+        }
+        value
+            .get("processors")
+            .and_then(|p| p.as_array())
+            .and_then(|processors| processors.iter().find_map(find_template))
+    }
+    let template = find_template(tokenizer_json.get("post_processor")?)?;
+    let single = template.get("single")?.as_array()?;
+    let edge = if front { single.first() } else { single.last() }?;
+    Some(
+        edge.pointer("/SpecialToken/id")
+            .and_then(|id| id.as_str())
+            .is_some_and(|id| id == token),
+    )
+}
+
+/// Whether the tokenizer's pre-tokenizer or decoder works on bytes (GPT-2
+/// style byte-level BPE), as opposed to the pieces of a SentencePiece model.
+fn is_byte_level(tokenizer_json: &serde_json::Value) -> bool {
+    ["pre_tokenizer", "decoder"].iter().any(|key| {
+        tokenizer_json
+            .get(*key)
+            .is_some_and(|value| value.to_string().contains("\"ByteLevel\""))
+    })
+}
+
+/// The vocabulary of a byte-level BPE tokenizer, as `(tokens, types)`.
+fn byte_level_vocab(
+    tokenizer: &tokenizers::Tokenizer,
+    vocab_size: usize,
+) -> (Vec<String>, Vec<i32>) {
+    let mut tokens = vec![String::new(); vocab_size];
+    let mut types = vec![TOKEN_TYPE_UNUSED; vocab_size];
+    let added = tokenizer.get_added_tokens_decoder();
+    for (token, id) in tokenizer.get_vocab(true) {
+        let idx = id as usize;
+        if idx >= vocab_size {
+            continue;
+        }
+        let (text, kind) = match added.get(&id) {
+            Some(added) if added.special || does_token_look_special(&added.content) => {
+                (token, TOKEN_TYPE_CONTROL)
+            }
+            Some(_) => (token.replace('\u{2581}', " "), TOKEN_TYPE_USER_DEFINED),
+            None => (token, TOKEN_TYPE_NORMAL),
+        };
+        tokens[idx] = text;
+        types[idx] = kind;
+    }
+    for (idx, token) in tokens.iter_mut().enumerate() {
+        if token.is_empty() {
+            *token = format!("[PAD{idx}]");
+        }
+    }
+    (tokens, types)
+}
+
+/// The vocabulary of a SentencePiece tokenizer.
+struct SentencePieceVocab {
+    tokens: Vec<String>,
+    scores: Vec<f32>,
+    types: Vec<i32>,
+    /// What the model says about prepending a space, when there is a model.
+    add_dummy_prefix: Option<bool>,
+}
+
+/// The vocabulary of a SentencePiece tokenizer.
+///
+/// The pieces, scores and types come from `tokenizer.model` when the model
+/// has one. Without it they are rebuilt from `tokenizer.json`, whose BPE
+/// merges are in the order the SentencePiece model learned them, so a piece's
+/// score is the negation of its id: the engine merges the pair of highest
+/// score first, which replays the merges in order.
+///
+/// Tokens the tokenizer added on top (Gemma's whitespace runs and image
+/// markers) override what the model has, as they do in Hugging Face.
+fn sentencepiece_vocab(
+    tokenizer: &tokenizers::Tokenizer,
+    model_dir: &Path,
+    vocab_size: usize,
+) -> anyhow::Result<SentencePieceVocab> {
+    let mut tokens = vec![String::new(); vocab_size];
+    let mut scores = vec![-1000.0f32; vocab_size];
+    let mut types = vec![TOKEN_TYPE_UNUSED; vocab_size];
+    let model_path = model_dir.join("tokenizer.model");
+    let mut add_dummy_prefix = None;
+    if model_path.exists() {
+        let model = super::sentencepiece::SentencePieceModel::parse(&std::fs::read(&model_path)?)?;
+        if model.pieces.len() > vocab_size {
+            anyhow::bail!(
+                "tokenizer.model has {} pieces for a vocabulary of {vocab_size}",
+                model.pieces.len()
+            );
+        }
+        for (id, piece) in model.pieces.into_iter().enumerate() {
+            tokens[id] = piece.text;
+            scores[id] = piece.score;
+            types[id] = piece.kind;
+        }
+        add_dummy_prefix = Some(model.add_dummy_prefix);
+    } else {
+        tracing::warn!(
+            "tokenizer.model not found: the SentencePiece scores are rebuilt from the order of \
+             tokenizer.json's merges"
+        );
+        let byte_piece = |token: &str| {
+            token.len() == 6
+                && token.starts_with("<0x")
+                && token.ends_with('>')
+                && token[3..5].bytes().all(|b| b.is_ascii_hexdigit())
+        };
+        for (token, id) in tokenizer.get_vocab(false) {
+            let idx = id as usize;
+            if idx < vocab_size {
+                types[idx] = if byte_piece(&token) {
+                    6
+                } else {
+                    TOKEN_TYPE_NORMAL
+                };
+                scores[idx] = -(id as f32);
+                tokens[idx] = token;
+            }
+        }
+    }
+    // The added tokens: control when flagged (or spelled like one), else the
+    // user-defined text they stand for, with SentencePiece's space marker
+    // turned into the space it means.
+    for (id, added) in tokenizer.get_added_tokens_decoder() {
+        let idx = id as usize;
+        if idx >= vocab_size {
+            continue;
+        }
+        if added.special || does_token_look_special(&added.content) {
+            types[idx] = TOKEN_TYPE_CONTROL;
+            tokens[idx] = added.content;
+        } else {
+            types[idx] = TOKEN_TYPE_USER_DEFINED;
+            tokens[idx] = added.content.replace('\u{2581}', " ");
+        }
+        scores[idx] = -1000.0;
+    }
+    for (idx, token) in tokens.iter_mut().enumerate() {
+        if token.is_empty() {
+            *token = format!("[PAD{idx}]");
+        }
+    }
+    Ok(SentencePieceVocab {
+        tokens,
+        scores,
+        types,
+        add_dummy_prefix,
+    })
+}
+
 pub(crate) fn add_tokenizer_metadata(
     builder: &mut pmetal_gguf::GgufBuilder,
     model_dir: &Path,
@@ -358,205 +621,111 @@ pub(crate) fn add_tokenizer_metadata(
     let tokenizer_config = read_json_file(&model_dir.join("tokenizer_config.json"))?;
     let special_tokens_map = read_json_file(&model_dir.join("special_tokens_map.json"))?;
 
-    let vocab = tokenizer.get_vocab(true);
     let vocab_size = config_json
         .and_then(|json| json_usize(json, "vocab_size"))
         .unwrap_or_else(|| tokenizer.get_vocab_size(true));
-    let mut tokens = vec![String::new(); vocab_size];
-    let mut token_types = vec![TOKEN_TYPE_UNUSED; vocab_size];
-    let added = tokenizer.get_added_tokens_decoder();
-
-    for (token, id) in vocab {
-        let idx = id as usize;
-        if idx >= vocab_size {
-            continue;
-        }
-        let token_type = match added.get(&id) {
-            Some(added_token)
-                if added_token.special || looks_special_token(&added_token.content) =>
-            {
-                TOKEN_TYPE_CONTROL
-            }
-            Some(_) => TOKEN_TYPE_USER_DEFINED,
-            None => TOKEN_TYPE_NORMAL,
-        };
-        tokens[idx] = token;
-        token_types[idx] = token_type;
-    }
-
-    for (idx, token) in tokens.iter_mut().enumerate() {
-        if token.is_empty() {
-            *token = format!("[PAD{idx}]");
-        }
-    }
 
     let tokenizer_model = tokenizer_model_kind(&tokenizer_json, config_json);
     builder.add_string(pmetal_gguf::keys::TOKENIZER_MODEL, tokenizer_model.as_str());
-    if tokenizer_model == "gpt2" || tokenizer_model == "gemma4" {
-        if let Some(pre) = infer_pre_tokenizer(
-            &tokenizer,
-            config_json,
-            tokenizer_config.as_ref(),
-            &tokenizer_json,
-        ) {
-            builder.add_string(pmetal_gguf::keys::TOKENIZER_PRE, pre);
-        }
-    } else if tokenizer_model == "bert" {
-        builder.add_string(pmetal_gguf::keys::TOKENIZER_PRE, "default");
-        if let Some(type_vocab_size) =
-            config_json.and_then(|json| json_u32(json, "type_vocab_size"))
-        {
-            builder.add_u32(
-                pmetal_gguf::keys::TOKENIZER_TOKEN_TYPE_COUNT,
-                type_vocab_size,
-            );
-        }
-    } else if tokenizer_model == "llama" || tokenizer_model == "t5" {
-        builder.add_string(pmetal_gguf::keys::TOKENIZER_PRE, "default");
-    }
 
+    let mut add_space_prefix = None;
+    let (tokens, types) = if tokenizer_model == "llama" && !is_unigram(&tokenizer_json) {
+        let vocab = sentencepiece_vocab(&tokenizer, model_dir, vocab_size)?;
+        builder.add_string(pmetal_gguf::keys::TOKENIZER_PRE, "default");
+        builder.add_f32_array(pmetal_gguf::keys::TOKENIZER_SCORES, vocab.scores);
+        add_space_prefix = vocab.add_dummy_prefix;
+        (vocab.tokens, vocab.types)
+    } else {
+        let (tokens, types) = byte_level_vocab(&tokenizer, vocab_size);
+        if tokenizer_model == "gpt2" || tokenizer_model == "gemma4" {
+            if let Some(pre) = infer_pre_tokenizer(
+                &tokenizer,
+                config_json,
+                tokenizer_config.as_ref(),
+                &tokenizer_json,
+            ) {
+                builder.add_string(pmetal_gguf::keys::TOKENIZER_PRE, pre);
+            }
+        } else if tokenizer_model == "bert" {
+            builder.add_string(pmetal_gguf::keys::TOKENIZER_PRE, "default");
+            if let Some(type_vocab_size) =
+                config_json.and_then(|json| json_u32(json, "type_vocab_size"))
+            {
+                builder.add_u32(
+                    pmetal_gguf::keys::TOKENIZER_TOKEN_TYPE_COUNT,
+                    type_vocab_size,
+                );
+            }
+        } else if tokenizer_model == "llama" || tokenizer_model == "t5" {
+            builder.add_string(pmetal_gguf::keys::TOKENIZER_PRE, "default");
+            if let Some(scores) = parse_unigram_scores(&tokenizer_json, vocab_size) {
+                builder.add_f32_array(pmetal_gguf::keys::TOKENIZER_SCORES, scores);
+            }
+        }
+        let merges = parse_merges(&tokenizer_json, model_dir)?;
+        if !merges.is_empty() {
+            builder.add_string_array(pmetal_gguf::keys::TOKENIZER_MERGES, merges);
+        }
+        (tokens, types)
+    };
     builder.add_string_array(pmetal_gguf::keys::TOKENIZER_TOKENS, tokens);
-    builder.add_i32_array(pmetal_gguf::keys::TOKENIZER_TOKEN_TYPE, token_types);
-
-    let merges = parse_merges(&tokenizer_json, model_dir)?;
-    if !merges.is_empty() {
-        builder.add_string_array(pmetal_gguf::keys::TOKENIZER_MERGES, merges);
-    }
-    if let Some(scores) = parse_unigram_scores(&tokenizer_json, vocab_size) {
-        builder.add_f32_array(pmetal_gguf::keys::TOKENIZER_SCORES, scores);
+    builder.add_i32_array(pmetal_gguf::keys::TOKENIZER_TOKEN_TYPE, types);
+    if let Some(prefix) = add_space_prefix {
+        builder.add_bool(pmetal_gguf::keys::TOKENIZER_ADD_SPACE_PREFIX, prefix);
     }
 
-    if let Some(id) = resolve_special_id(
-        "bos_token",
-        &["<s>", "<|begin_of_text|>", "<bos>"],
-        &tokenizer,
-        tokenizer_config.as_ref(),
-        special_tokens_map.as_ref(),
-    ) {
-        builder.add_u32(pmetal_gguf::keys::TOKENIZER_BOS_TOKEN_ID, id);
+    for (kind, key) in [
+        ("bos", pmetal_gguf::keys::TOKENIZER_BOS_TOKEN_ID),
+        ("eos", pmetal_gguf::keys::TOKENIZER_EOS_TOKEN_ID),
+        ("unk", pmetal_gguf::keys::TOKENIZER_UNK_TOKEN_ID),
+        ("pad", pmetal_gguf::keys::TOKENIZER_PAD_TOKEN_ID),
+        ("sep", pmetal_gguf::keys::TOKENIZER_SEP_TOKEN_ID),
+        ("mask", pmetal_gguf::keys::TOKENIZER_MASK_TOKEN_ID),
+        ("eot", pmetal_gguf::keys::TOKENIZER_EOT_TOKEN_ID),
+        ("eom", pmetal_gguf::keys::TOKENIZER_EOM_TOKEN_ID),
+    ] {
+        if let Some(id) = special_token_id(
+            kind,
+            &tokenizer,
+            tokenizer_config.as_ref(),
+            special_tokens_map.as_ref(),
+            config_json,
+            vocab_size,
+        ) {
+            builder.add_u32(key, id);
+        }
     }
-    if let Some(id) = resolve_special_id(
-        "eos_token",
-        &["</s>", "<|endoftext|>", "<|end_of_text|>", "<eos>"],
-        &tokenizer,
-        tokenizer_config.as_ref(),
-        special_tokens_map.as_ref(),
-    ) {
-        builder.add_u32(pmetal_gguf::keys::TOKENIZER_EOS_TOKEN_ID, id);
-    }
-    if let Some(id) = resolve_special_id(
-        "unk_token",
-        &["<unk>", "[UNK]"],
-        &tokenizer,
-        tokenizer_config.as_ref(),
-        special_tokens_map.as_ref(),
-    ) {
-        builder.add_u32(pmetal_gguf::keys::TOKENIZER_UNK_TOKEN_ID, id);
-    }
-    if let Some(id) = resolve_special_id(
-        "pad_token",
-        &["<pad>", "[PAD]", "<|pad|>", "<|finetune_right_pad_id|>"],
-        &tokenizer,
-        tokenizer_config.as_ref(),
-        special_tokens_map.as_ref(),
-    ) {
-        builder.add_u32(pmetal_gguf::keys::TOKENIZER_PAD_TOKEN_ID, id);
-    }
-    add_special_id_from_configs(
-        builder,
-        "sep_token",
-        pmetal_gguf::keys::TOKENIZER_SEP_TOKEN_ID,
-        &tokenizer,
-        tokenizer_config.as_ref(),
-        special_tokens_map.as_ref(),
-    );
-    add_special_id_from_configs(
-        builder,
-        "mask_token",
-        pmetal_gguf::keys::TOKENIZER_MASK_TOKEN_ID,
-        &tokenizer,
-        tokenizer_config.as_ref(),
-        special_tokens_map.as_ref(),
-    );
-    add_special_id_from_configs(
-        builder,
-        "eot_token",
-        pmetal_gguf::keys::TOKENIZER_EOT_TOKEN_ID,
-        &tokenizer,
-        tokenizer_config.as_ref(),
-        special_tokens_map.as_ref(),
-    );
-    add_special_id_from_configs(
-        builder,
-        "eom_token",
-        pmetal_gguf::keys::TOKENIZER_EOM_TOKEN_ID,
-        &tokenizer,
-        tokenizer_config.as_ref(),
-        special_tokens_map.as_ref(),
-    );
 
-    if let Some(value) = tokenizer_config_bool(tokenizer_config.as_ref(), "add_bos_token") {
+    // Whether the engine adds the beginning- and end-of-sequence tokens when it
+    // tokenizes: the tokenizer config says, else the post-processing template
+    // does. The engine's own default depends on the tokenizer family, so an
+    // absent flag is not a safe "no".
+    let add_special = |kind: &str, front: bool| {
+        tokenizer_config_bool(tokenizer_config.as_ref(), &format!("add_{kind}_token")).or_else(
+            || {
+                let token =
+                    configured_token(kind, tokenizer_config.as_ref(), special_tokens_map.as_ref())?;
+                Some(template_adds(&tokenizer_json, token, front).unwrap_or(false))
+            },
+        )
+    };
+    if let Some(value) = add_special("bos", true) {
         builder.add_bool(pmetal_gguf::keys::TOKENIZER_ADD_BOS, value);
     }
-    if let Some(value) = tokenizer_config_bool(tokenizer_config.as_ref(), "add_eos_token") {
+    if let Some(value) = add_special("eos", false) {
         builder.add_bool(pmetal_gguf::keys::TOKENIZER_ADD_EOS, value);
     }
 
-    add_chat_template_metadata(builder, tokenizer_config.as_ref());
+    add_chat_template_metadata(builder, model_dir, tokenizer_config.as_ref())?;
 
     Ok(())
 }
 
-fn looks_special_token(token: &str) -> bool {
-    (token.starts_with('<') && token.ends_with('>'))
-        || (token.starts_with('[') && token.ends_with(']'))
-}
-
-fn add_special_id_from_configs(
-    builder: &mut pmetal_gguf::GgufBuilder,
-    token_key: &str,
-    gguf_key: &str,
-    tokenizer: &tokenizers::Tokenizer,
-    tokenizer_config: Option<&serde_json::Value>,
-    special_tokens_map: Option<&serde_json::Value>,
-) {
-    let token = special_tokens_map
-        .and_then(|json| json.get(token_key))
-        .and_then(extract_token_string)
-        .or_else(|| {
-            tokenizer_config
-                .and_then(|json| json.get(token_key))
-                .and_then(extract_token_string)
-        });
-    if let Some(token) = token {
-        if let Some(id) = tokenizer.token_to_id(token) {
-            builder.add_u32(gguf_key, id);
-        }
-    }
-}
-
-fn resolve_special_id(
-    token_key: &str,
-    fallback_tokens: &[&str],
-    tokenizer: &tokenizers::Tokenizer,
-    tokenizer_config: Option<&serde_json::Value>,
-    special_tokens_map: Option<&serde_json::Value>,
-) -> Option<u32> {
-    let configured = special_tokens_map
-        .and_then(|json| json.get(token_key))
-        .and_then(extract_token_string)
-        .or_else(|| {
-            tokenizer_config
-                .and_then(|json| json.get(token_key))
-                .and_then(extract_token_string)
-        });
-    configured
-        .and_then(|token| tokenizer.token_to_id(token))
-        .or_else(|| {
-            fallback_tokens
-                .iter()
-                .find_map(|token| tokenizer.token_to_id(token))
-        })
+fn is_unigram(tokenizer_json: &serde_json::Value) -> bool {
+    tokenizer_json
+        .pointer("/model/type")
+        .and_then(|value| value.as_str())
+        == Some("Unigram")
 }
 
 #[cfg(test)]

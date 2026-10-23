@@ -60,6 +60,21 @@ These are the values `--method` accepts.
 
 The output head and token embedding are written as `q6_k` for the K-quant and 4-bit non-linear methods, and a tensor whose rows are not a whole number of blocks falls back to a smaller block format (`iq4_nl`, `q5_0`, `q5_1` or `q8_0`) as the format requires. An importance matrix applies to GGUF output; `--imatrix` and `--calibration-dataset` are refused with `--format mlx`.
 
+## Architectures
+
+A GGUF file names and lays out its tensors per architecture, and an engine loads whatever it finds under the names it looks for. `pmetal quantize` therefore writes only the architectures whose layout it reproduces from the reference converter, and refuses any other before it reads the model:
+
+| Hugging Face architecture | GGUF architecture |
+|---------------------------|-------------------|
+| `LlamaForCausalLM`, `MistralForCausalLM`, `MixtralForCausalLM` | `llama` |
+| `Qwen2ForCausalLM`, `Qwen2MoeForCausalLM` | `qwen2`, `qwen2moe` |
+| `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM` | `qwen3`, `qwen3moe` |
+| `GemmaForCausalLM`, `Gemma2ForCausalLM`, `Gemma3ForCausalLM` | `gemma`, `gemma2`, `gemma3` |
+
+The file holds what an engine expects, which is not always what the checkpoint holds: the query and key rows of a `llama` model are reordered for its rotary pairing, Llama 3.x's rope scaling is a `rope_freqs` tensor, Gemma's norms have 1 added, a tied output head is not written beside the embedding, and norm weights and biases are f32 whatever `--method` is. The tokenizer comes with the file: byte-level BPE for Qwen and Llama 3, SentencePiece pieces and scores (from `tokenizer.model`) for Gemma, with the special tokens, `add_bos_token`, the pre-tokenizer and the chat template.
+
+An `f16` export saturates a weight beyond the range of f16 and says so; `bf16` holds every weight of a model published in bf16 without loss.
+
 ## Examples
 
 ```bash

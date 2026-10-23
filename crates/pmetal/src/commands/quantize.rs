@@ -1,4 +1,6 @@
-use crate::commands::gguf_export::{add_hf_config_metadata, add_tokenizer_metadata, json_usize};
+use crate::commands::gguf_export::{
+    ExportArch, add_hf_config_metadata, add_tokenizer_metadata, json_usize, model_name,
+};
 use crate::commands::quantize_source::TensorMeta;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -189,6 +191,15 @@ fn llama_style_tensor_type(
     proposed: pmetal_gguf::GgmlType,
 ) -> pmetal_gguf::GgmlType {
     use pmetal_gguf::GgmlType;
+
+    // A vector (a norm weight, a bias) is kept in f32 whatever the type of the
+    // file. An engine multiplies activations by it element-wise, and the ops
+    // that do so take it as f32 (the reference engine aborts on a bf16 one),
+    // so a half-precision norm is a file no engine will run. A vector is a
+    // negligible share of the bytes.
+    if shape.len() <= 1 {
+        return GgmlType::F32;
+    }
 
     if matches!(
         method,
@@ -486,6 +497,17 @@ pub(crate) async fn run_quantization(
     let resolved_model_path: PathBuf =
         pmetal_hub::resolve_model_path(model_path, None, None).await?;
 
+    // 0. The architecture the file will name. Checked first: a model that
+    // cannot be exported should not be measured, or read, before it is refused.
+    let config_json: Option<serde_json::Value> =
+        std::fs::read_to_string(resolved_model_path.join("config.json"))
+            .ok()
+            .map(|text| serde_json::from_str(&text))
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("config.json is not valid JSON: {e}"))?;
+    let arch = ExportArch::detect(config_json.as_ref())?;
+    tracing::info!("GGUF architecture: {}", arch.name);
+
     // 1. The importance matrix: read, or measured on the model being quantized
     // (which is loaded for that and dropped before any weight is quantized).
     let imatrix = match importance {
@@ -543,70 +565,25 @@ pub(crate) async fn run_quantization(
     let metas: Vec<TensorMeta> = source.tensors().to_vec();
     tracing::info!("Found {} float tensors", metas.len());
 
-    // 4. Detect Architecture
-    let config_path = resolved_model_path.join("config.json");
-    let mut architecture = "llama".to_string();
-    let mut config_json: Option<serde_json::Value> = None;
-
-    if config_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(archs) = json.get("architectures").and_then(|v| v.as_array()) {
-                    if let Some(arch_str) = archs.first().and_then(|v| v.as_str()) {
-                        architecture = match arch_str {
-                            "LlamaForCausalLM" | "LlamaModel" => "llama".to_string(),
-                            "MistralForCausalLM" | "MixtralForCausalLM" => "mistral".to_string(),
-                            "Qwen2ForCausalLM" | "Qwen2Model" => "qwen2".to_string(),
-                            "Qwen2MoeForCausalLM" => "qwen2moe".to_string(),
-                            "Qwen3ForCausalLM" | "Qwen3Model" => "qwen3".to_string(),
-                            "Qwen3MoeForCausalLM" => "qwen3moe".to_string(),
-                            "Qwen3NextForCausalLM" => "qwen3next".to_string(),
-                            "Qwen3_5ForCausalLM" | "Qwen3_5ForConditionalGeneration" => {
-                                "qwen35".to_string()
-                            }
-                            "Qwen3_5MoeForCausalLM" | "Qwen3_5MoeForConditionalGeneration" => {
-                                "qwen35moe".to_string()
-                            }
-                            "GemmaForCausalLM" | "Gemma2ForCausalLM" => "gemma".to_string(),
-                            "PhiForCausalLM" | "Phi3ForCausalLM" => "phi".to_string(),
-                            "DeepseekV2ForCausalLM" | "DeepseekV3ForCausalLM" => {
-                                "deepseek2".to_string()
-                            }
-                            "GptOssForCausalLM" => "gpt-oss".to_string(),
-                            _ => {
-                                tracing::warn!(
-                                    "Unknown architecture '{}', defaulting to 'llama'",
-                                    arch_str
-                                );
-                                "llama".to_string()
-                            }
-                        };
-                        tracing::info!(
-                            "Detected architecture: {} (from {})",
-                            architecture,
-                            arch_str
-                        );
-                    }
-                }
-                config_json = Some(json);
-            }
-        }
-    } else {
-        tracing::warn!("config.json not found, defaulting architecture to 'llama'");
-    }
-
     // 5. Plan: which tensors the file holds and in what order, under the names
     // it gives them (the names the imatrix and the calibration are keyed by).
     // The routed experts of a layer's projection are one stacked tensor, which
     // is how they are scored and weighted below as well as how they are
     // written.
     tracing::info!("Planning the quantization...");
-    let entries = plan_entries(&metas)?;
+    let entries = plan_entries(&metas, &arch)?;
+    // A tensor's values as the file keeps them: in the layout the architecture
+    // stores them in, which is not always the one the checkpoint publishes.
     let read_entry = |source: &mut dyn crate::commands::quantize_source::TensorSource,
-                      from: &Origin|
+                      from: &Origin,
+                      shape: &[u64]|
      -> anyhow::Result<Vec<f32>> {
         match from {
-            Origin::Tensor(name) => source.read_f32(name),
+            Origin::Tensor(name) => {
+                let mut values = source.read_f32(name)?;
+                arch.lay_out(name, shape, &mut values);
+                Ok(values)
+            }
             Origin::Experts(experts) => {
                 let mut stacked = Vec::new();
                 for expert in experts {
@@ -614,6 +591,7 @@ pub(crate) async fn run_quantization(
                 }
                 Ok(stacked)
             }
+            Origin::Computed(values) => Ok(values.clone()),
         }
     };
 
@@ -626,6 +604,7 @@ pub(crate) async fn run_quantization(
         );
         let listing: Vec<(String, Vec<i32>)> = entries
             .iter()
+            .filter(|e| !matches!(e.from, Origin::Computed(_)))
             .map(|e| {
                 (
                     e.gguf_name.clone(),
@@ -633,9 +612,9 @@ pub(crate) async fn run_quantization(
                 )
             })
             .collect();
-        let by_name: HashMap<&str, &Origin> = entries
+        let by_name: HashMap<&str, (&Origin, &[u64])> = entries
             .iter()
-            .map(|e| (e.gguf_name.as_str(), &e.from))
+            .map(|e| (e.gguf_name.as_str(), (&e.from, e.shape.as_slice())))
             .collect();
         let kl_config = KlCalibrationConfig {
             kl_threshold,
@@ -644,7 +623,10 @@ pub(crate) async fn run_quantization(
         };
         let map = quantizer.calibrate_streaming(
             &listing,
-            |gguf_name| read_entry(&mut *source, by_name[gguf_name]),
+            |gguf_name| {
+                let (from, shape) = by_name[gguf_name];
+                read_entry(&mut *source, from, shape)
+            },
             &kl_config,
         )?;
 
@@ -678,8 +660,11 @@ pub(crate) async fn run_quantization(
     };
 
     // 7. Metadata
-    let mut builder = GgufBuilder::with_model(&architecture, "quantized-model");
-    add_hf_config_metadata(&mut builder, &architecture, config_json.as_ref(), method);
+    let mut builder = GgufBuilder::with_model(
+        arch.name,
+        model_name(model_path, &resolved_model_path).as_str(),
+    );
+    add_hf_config_metadata(&mut builder, &arch, config_json.as_ref(), method);
     add_tokenizer_metadata(&mut builder, &resolved_model_path, config_json.as_ref())?;
 
     // Each tensor's type. The header of a GGUF file comes first and names every
@@ -718,9 +703,18 @@ pub(crate) async fn run_quantization(
         .map_err(|e| anyhow::anyhow!("could not start '{}': {e}", validated_output.display()))?;
     let total = plan.len();
     for (done, planned) in plan.iter().enumerate() {
-        let data_f32 = read_entry(&mut *source, &planned.from)?;
+        let mut data_f32 = read_entry(&mut *source, &planned.from, &planned.shape)?;
         let n_per_row = planned.shape.last().copied().unwrap_or(1) as usize;
+        if planned.dtype == pmetal_gguf::GgmlType::F16 {
+            clamp_to_f16(&mut data_f32, &planned.gguf_name);
+        }
         match &planned.from {
+            Origin::Computed(_) => tracing::info!(
+                "[{}/{total}] Writing {} to {:?}",
+                done + 1,
+                planned.gguf_name,
+                planned.dtype
+            ),
             Origin::Tensor(name) => tracing::info!(
                 "[{}/{total}] Quantizing {} ({}) to {:?}",
                 done + 1,
@@ -749,6 +743,7 @@ pub(crate) async fn run_quantization(
                     source.done_with(&expert.name);
                 }
             }
+            Origin::Computed(_) => {}
         }
         writer
             .write_tensor(&planned.gguf_name, &quantized)
@@ -766,7 +761,7 @@ pub(crate) async fn run_quantization(
 /// gives them. The per-expert tensors of a layer's projection are one stacked
 /// `[experts, out, in]` tensor, listed first in layer order; everything else
 /// follows in the order of `metas`.
-fn plan_entries(metas: &[TensorMeta]) -> anyhow::Result<Vec<PlanEntry>> {
+fn plan_entries(metas: &[TensorMeta], arch: &ExportArch) -> anyhow::Result<Vec<PlanEntry>> {
     let shapes: HashMap<&str, &Vec<usize>> = metas
         .iter()
         .map(|meta| (meta.name.as_str(), &meta.shape))
@@ -792,10 +787,21 @@ fn plan_entries(metas: &[TensorMeta]) -> anyhow::Result<Vec<PlanEntry>> {
         if expert_source_keys.contains(meta.name.as_str()) {
             continue;
         }
+        // A tensor the file does not hold (a tied head) is left out.
+        let Some(gguf_name) = arch.tensor_name(&meta.name)? else {
+            continue;
+        };
         entries.push(PlanEntry {
-            gguf_name: pmetal_models::weight_format::WeightLoader::hf_to_gguf_name(&meta.name),
+            gguf_name,
             shape: meta.shape.iter().map(|&d| d as u64).collect(),
             from: Origin::Tensor(meta.name.clone()),
+        });
+    }
+    for (gguf_name, shape, values) in arch.extra_tensors() {
+        entries.push(PlanEntry {
+            gguf_name,
+            shape,
+            from: Origin::Computed(values),
         });
     }
     Ok(entries)
@@ -824,6 +830,33 @@ enum Origin {
     Tensor(String),
     /// The experts of a layer's projection, stacked, in expert order.
     Experts(Vec<ExpertTensor>),
+    /// Values the model has no tensor for, worked out from its config.
+    Computed(Vec<f32>),
+}
+
+/// The largest finite value an `f16` holds.
+const F16_MAX: f32 = 65504.0;
+
+/// Bring the values of a tensor that is stored as `f16` into its range.
+///
+/// A value beyond it would be written as infinity, and one infinite weight
+/// turns every output that reads it to NaN. Saturating changes the weight, but
+/// by far less than that does; it is reported so that the choice of `f16` for
+/// a model with such weights is not a silent one.
+fn clamp_to_f16(values: &mut [f32], name: &str) {
+    let mut clamped = 0usize;
+    for value in values.iter_mut() {
+        if value.abs() > F16_MAX && value.is_finite() {
+            *value = value.clamp(-F16_MAX, F16_MAX);
+            clamped += 1;
+        }
+    }
+    if clamped > 0 {
+        tracing::warn!(
+            "{name}: {clamped} values are beyond the range of f16 and were saturated; \
+             bf16 holds this model's weights without loss"
+        );
+    }
 }
 
 // ── MLX safetensors path ──────────────────────────────────────────────────────
@@ -972,7 +1005,7 @@ mod tests {
                 Some(&config),
                 GgmlType::Q4K,
             ),
-            GgmlType::F16
+            GgmlType::F32
         );
         assert_eq!(
             llama_style_tensor_type(
@@ -1072,7 +1105,7 @@ mod tests {
 
         std::fs::write(
             dir.join("config.json"),
-            r#"{"architectures":["LlamaForCausalLM"],"hidden_size":64,"num_hidden_layers":1,
+            r#"{"architectures":["Qwen2ForCausalLM"],"hidden_size":64,"num_hidden_layers":1,
                "num_attention_heads":4,"num_key_value_heads":2,"intermediate_size":128,
                "vocab_size":32,"max_position_embeddings":128}"#,
         )
@@ -1185,11 +1218,8 @@ mod tests {
                 assert_eq!(dtype, GgmlType::Q8_0, "{gguf_name}");
                 assert!(worst < 0.01, "{gguf_name}: q8_0 differs by {worst}");
             } else {
-                // A norm weight stays dense.
-                assert!(
-                    matches!(dtype, GgmlType::F32 | GgmlType::F16),
-                    "{gguf_name}: {dtype:?}"
-                );
+                // A norm weight stays dense, in f32.
+                assert_eq!(dtype, GgmlType::F32, "{gguf_name}");
                 assert!(worst < 1e-3, "{gguf_name}: differs by {worst}");
             }
         }
@@ -1253,7 +1283,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_tiny_model(dir.path(), true);
         let source = crate::commands::quantize_source::open(dir.path()).unwrap();
-        let entries = plan_entries(source.tensors()).unwrap();
+        let config =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("config.json")).unwrap())
+                .unwrap();
+        let arch = ExportArch::detect(Some(&config)).unwrap();
+        let entries = plan_entries(source.tensors(), &arch).unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.gguf_name.as_str()).collect();
         for proj in ["gate", "up", "down"] {
             let name = format!("blk.0.ffn_{proj}_exps.weight");
@@ -1467,6 +1501,104 @@ mod tests {
             let error = run_quantize(spec).await.unwrap_err().to_string();
             assert!(error.contains("--format mlx"), "{error}");
         }
+    }
+
+    /// What a `llama` file holds that the checkpoint does not publish as it is:
+    /// the query and key rows reordered, the head left out when it is the
+    /// embedding, the norms in f32 whatever the type of the file, and Llama 3's
+    /// RoPE scaling as a tensor.
+    #[tokio::test]
+    async fn a_llama_export_is_laid_out_the_way_the_engines_read_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let tensors = write_tiny_model(dir.path(), false);
+        let config = serde_json::json!({
+            "architectures": ["LlamaForCausalLM"], "hidden_size": 64, "num_hidden_layers": 1,
+            "num_attention_heads": 4, "num_key_value_heads": 2, "intermediate_size": 128,
+            "vocab_size": 32, "max_position_embeddings": 128, "rope_theta": 500000.0,
+            "tie_word_embeddings": true,
+            "rope_scaling": {"factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0,
+                             "original_max_position_embeddings": 64, "rope_type": "llama3"},
+        });
+        std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+        let out = dir.path().join("llama.gguf");
+        quantize_dir(
+            dir.path(),
+            &out,
+            crate::cli::quantize::QuantizeMethod::Bf16,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let model = pmetal_gguf::GgufModel::open(&out).unwrap();
+
+        // The head is the embedding: it is not written.
+        assert!(model.tensor_info("output.weight").is_none());
+        // The norms are f32 although the file is bf16; the matrices are bf16.
+        let (_, _, norm) = dequantized(&model, "blk.0.attn_norm.weight");
+        assert_eq!(norm, GgmlType::F32);
+        let (_, _, output_norm) = dequantized(&model, "output_norm.weight");
+        assert_eq!(output_norm, GgmlType::F32);
+        let (_, _, up) = dequantized(&model, "blk.0.ffn_up.weight");
+        assert_eq!(up, GgmlType::Bf16);
+
+        // Query and key rows are reordered, head by head; the rest is not.
+        let arch = ExportArch::detect(Some(&config)).unwrap();
+        for (hf_name, gguf_name) in [
+            (
+                "model.layers.0.self_attn.q_proj.weight",
+                "blk.0.attn_q.weight",
+            ),
+            (
+                "model.layers.0.self_attn.k_proj.weight",
+                "blk.0.attn_k.weight",
+            ),
+            (
+                "model.layers.0.self_attn.v_proj.weight",
+                "blk.0.attn_v.weight",
+            ),
+        ] {
+            let (_, shape, values) = tensors.iter().find(|(n, ..)| n == hf_name).unwrap();
+            let shape: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
+            let mut want = values.clone();
+            arch.lay_out(hf_name, &shape, &mut want);
+            let (got, ..) = dequantized(&model, gguf_name);
+            assert_eq!(got, want, "{gguf_name}");
+            assert_eq!(got == *values, hf_name.contains("v_proj"), "{gguf_name}");
+        }
+
+        // The scaling is a tensor of 64 / 4 / 2 = 8 divisors, and not metadata.
+        let (factors, dims, dtype) = dequantized(&model, "rope_freqs.weight");
+        assert_eq!((dims, dtype), (vec![8], GgmlType::F32));
+        assert_eq!(factors.len(), 8);
+        assert!(factors.iter().all(|&f| (1.0..=8.0).contains(&f)));
+        assert!(model.get_metadata("llama.rope.scaling.factor").is_none());
+    }
+
+    /// An architecture whose tensors have no known names is refused before
+    /// anything is read, not exported under names no engine looks for.
+    #[tokio::test]
+    async fn an_architecture_with_no_gguf_layout_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tiny_model(dir.path(), false);
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"architectures":["PhiForCausalLM"]}"#,
+        )
+        .unwrap();
+        let out = dir.path().join("phi.gguf");
+        let error = quantize_dir(
+            dir.path(),
+            &out,
+            crate::cli::quantize::QuantizeMethod::Bf16,
+            false,
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("PhiForCausalLM"), "{error}");
+        assert!(!out.exists());
     }
 
     /// A shard cut short is an error, and the destination is not touched.
