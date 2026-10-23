@@ -2804,7 +2804,7 @@ mod tests {
 
     #[test]
     fn qwen35_moe_architecture_string_detects_as_qwen3_next() {
-        let architectures = vec!["Qwen3_5_MoeForConditionalGeneration".to_string()];
+        let architectures = vec!["Qwen3_5MoeForConditionalGeneration".to_string()];
         assert_eq!(
             ModelArchitecture::from_architectures(&architectures),
             Some(ModelArchitecture::Qwen3Next)
@@ -2813,7 +2813,7 @@ mod tests {
 
     #[test]
     fn qwen36_moe_architecture_string_detects_as_qwen3_next() {
-        let architectures = vec!["Qwen3_6_MoeForConditionalGeneration".to_string()];
+        let architectures = vec!["Qwen3_6MoeForConditionalGeneration".to_string()];
         assert_eq!(
             ModelArchitecture::from_architectures(&architectures),
             Some(ModelArchitecture::Qwen3Next)
