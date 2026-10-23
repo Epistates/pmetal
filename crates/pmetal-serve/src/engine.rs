@@ -625,6 +625,10 @@ impl EmbeddingDefaults {
             normalize: true,
             max_input_tokens: None,
         };
+        // A single-file model (a GGUF) has no sibling configuration to read.
+        if model_path.is_file() {
+            return defaults;
+        }
         match pmetal_models::pooling::SentenceTransformerConfig::from_dir(model_path) {
             Ok(Some(config)) => Self {
                 pooling: config.pooling,
@@ -2768,6 +2772,22 @@ mod tests {
     use pmetal_models::architectures::nemotron_h::{NemotronHConfig, NemotronHForCausalLM};
     use tokenizers::models::wordlevel::WordLevel;
     use tokenizers::pre_tokenizers::whitespace::Whitespace;
+
+    /// A single-file model (a GGUF) has no sibling configuration to read, and
+    /// serving it is not a warning about a directory it is not.
+    #[test]
+    fn a_single_file_model_has_the_default_embedding_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("model.gguf");
+        std::fs::write(&file, b"GGUF").unwrap();
+        let defaults = EmbeddingDefaults::read(&file);
+        assert!(defaults.normalize);
+        assert_eq!(defaults.max_input_tokens, None);
+        assert!(matches!(
+            defaults.pooling,
+            pmetal_models::pooling::PoolingMode::Mean
+        ));
+    }
 
     fn dense_config(hidden_size: u64, num_layers: u64, vocab_size: u64) -> serde_json::Value {
         serde_json::json!({

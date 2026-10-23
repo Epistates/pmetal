@@ -67,7 +67,7 @@ fn export(config: Value, files: &[(&str, Vec<u8>)]) -> (ExportArch, GgufContent)
     add_hf_config_metadata(
         &mut builder,
         &arch,
-        Some(&config),
+        arch.model_config(Some(&config)).as_ref(),
         crate::cli::quantize::QuantizeMethod::Bf16,
     );
     add_tokenizer_metadata(&mut builder, dir.path(), Some(&config)).unwrap();
@@ -476,6 +476,134 @@ fn gemma3_architecture_keys() {
     );
     assert_eq!(content.get_f64("gemma3.rope.freq_base"), Some(1_000_000.0));
     assert_eq!(content.get_f64("gemma3.rope.freq_base_swa"), Some(10_000.0));
+}
+
+// ── Gemma 4 ────────────────────────────────────────────────────────────────
+
+/// The language model of a Gemma 4 12B-shaped checkpoint (48 layers, five
+/// sliding-window layers to one full-attention layer, full-attention heads of
+/// 512 with a single key/value head that is also the value) in the multimodal
+/// wrapper it ships in.
+fn gemma4() -> (ExportArch, GgufContent) {
+    let layer_types: Vec<&str> = (0..48)
+        .map(|l| {
+            if l % 6 == 5 {
+                "full_attention"
+            } else {
+                "sliding_attention"
+            }
+        })
+        .collect();
+    let config = json!({
+        "architectures": ["Gemma4UnifiedForConditionalGeneration"],
+        "model_type": "gemma4_unified", "tie_word_embeddings": true,
+        "text_config": {
+            "model_type": "gemma4_unified_text", "hidden_size": 3840,
+            "intermediate_size": 15360, "num_hidden_layers": 48,
+            "num_attention_heads": 16, "num_key_value_heads": 8,
+            "num_global_key_value_heads": 1, "attention_k_eq_v": true,
+            "head_dim": 256, "global_head_dim": 512, "vocab_size": 262144,
+            "max_position_embeddings": 131072, "rms_norm_eps": 1e-6,
+            "sliding_window": 1024, "final_logit_softcapping": 30.0,
+            "hidden_size_per_layer_input": 0, "layer_types": layer_types,
+            "rope_parameters": {
+                "full_attention": {"partial_rotary_factor": 0.25, "rope_theta": 1000000.0,
+                                   "rope_type": "proportional"},
+                "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"},
+            },
+        },
+    });
+    export(config, &[])
+}
+
+/// What the reference loader reads of a Gemma 4 file, per kind of layer:
+/// the two head widths, the key/value heads of every layer, which layers
+/// slide, both rope bases, and the (zero) per-layer input width it requires.
+#[test]
+fn gemma4_architecture_keys() {
+    let (arch, content) = gemma4();
+    assert_eq!(arch.name, "gemma4");
+    assert_eq!(content.architecture(), Some("gemma4"));
+    for (key, value) in [
+        ("gemma4.embedding_length", 3840),
+        ("gemma4.block_count", 48),
+        ("gemma4.feed_forward_length", 15360),
+        ("gemma4.attention.head_count", 16),
+        ("gemma4.attention.key_length", 512),
+        ("gemma4.attention.value_length", 512),
+        ("gemma4.attention.key_length_swa", 256),
+        ("gemma4.attention.value_length_swa", 256),
+        ("gemma4.attention.sliding_window", 1024),
+        ("gemma4.rope.dimension_count", 512),
+        ("gemma4.rope.dimension_count_swa", 256),
+        ("gemma4.embedding_length_per_layer_input", 0),
+    ] {
+        assert_eq!(content.get_u64(key), Some(value), "{key}");
+    }
+    assert_eq!(content.get_f64("gemma4.rope.freq_base"), Some(1_000_000.0));
+    assert_eq!(content.get_f64("gemma4.rope.freq_base_swa"), Some(10_000.0));
+    assert_eq!(
+        content.get_f64("gemma4.final_logit_softcapping"),
+        Some(30.0)
+    );
+    let heads = match content.get_metadata("gemma4.attention.head_count_kv") {
+        Some(MetadataValue::Array(values)) => values
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        other => panic!("head_count_kv is {other:?}"),
+    };
+    assert_eq!(heads.len(), 48);
+    assert_eq!(&heads[..7], &[8, 8, 8, 8, 8, 1, 8]);
+    assert_eq!(heads[47], 1);
+    let pattern = match content.get_metadata("gemma4.attention.sliding_window_pattern") {
+        Some(MetadataValue::Array(values)) => values
+            .iter()
+            .map(|v| v.as_bool().unwrap())
+            .collect::<Vec<_>>(),
+        other => panic!("sliding_window_pattern is {other:?}"),
+    };
+    assert_eq!(pattern.iter().filter(|s| **s).count(), 40);
+    assert!(!pattern[5] && pattern[6]);
+    // The model's norm multiplies by its weight: nothing is added to a norm.
+    assert!(!arch.extra_tensors().is_empty());
+}
+
+/// Gemma 4 tokenizes raw characters (no space prefix) and its engine adds the
+/// beginning of text, which neither its tokenizer config nor its post-processor
+/// says.
+#[test]
+fn gemma4_tokenizer_adds_a_beginning_of_text_and_no_space_prefix() {
+    let tokenizer = tokenizer_json(
+        &["<pad>", "<eos>", "<bos>", "a", "b", "ab"],
+        &["a b"],
+        &[("<start_of_turn>", true)],
+        json!({}),
+        true,
+    );
+    let tokenizer_config =
+        json!({"bos_token": "<bos>", "eos_token": "<eos>", "pad_token": "<pad>"});
+    let config = json!({
+        "architectures": ["Gemma4UnifiedForConditionalGeneration"], "model_type": "gemma4_unified",
+        "text_config": {"hidden_size": 8, "vocab_size": 7, "num_attention_heads": 2},
+    });
+    let (_, content) = export(
+        config,
+        &[
+            ("tokenizer.json", tokenizer.into_bytes()),
+            (
+                "tokenizer_config.json",
+                tokenizer_config.to_string().into_bytes(),
+            ),
+        ],
+    );
+    assert_eq!(content.get_str("tokenizer.ggml.model"), Some("gemma4"));
+    assert_eq!(content.get_bool("tokenizer.ggml.add_bos_token"), Some(true));
+    assert_eq!(
+        content.get_bool("tokenizer.ggml.add_space_prefix"),
+        Some(false)
+    );
+    assert_eq!(content.get_u64("tokenizer.ggml.bos_token_id"), Some(2));
 }
 
 // ── a Mistral-family model with no beginning-of-text in its config ─────────

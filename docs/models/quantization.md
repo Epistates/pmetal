@@ -24,6 +24,8 @@ pmetal quantize --model ./output --output model.gguf --method q4_k_m
 
 The size suffixes follow GGUF naming: `s` small, `m` medium (the usual choice), `l` large. `pmetal quantize --help` lists every value.
 
+A K-quant method names a mix, not one type. `q3_k_m` stores most tensors in Q3_K and keeps the ones that matter most at more bits: `attn_v` in Q5_K for the first two layers and Q4_K after, `ffn_down` in Q5_K for the first sixteenth of the layers and Q4_K after, `attn_output` in Q4_K, and the output head in Q6_K. `q4_k_m` and `q5_k_m` raise `attn_v` and `ffn_down` to Q6_K in the first and last eighth of the layers and every third layer between. The mix is the reference quantizer's for every method, layer by layer, including the special cases for 80-layer grouped-query models and eight-expert models, so a file is the same size and quality as the one that quantizer writes under the same name. A model whose head is tied to its embedding has no `output.weight`, and the embedding is then stored as a head, in Q6_K.
+
 `iq4_nl` and `iq4_xs` store four-bit indices into a fixed non-linear table of 16 values, spaced more finely near zero where most weights are. At a similar size they usually reconstruct a tensor more closely than the linear 4-bit formats, and they benefit most from an importance matrix.
 
 ## Importance Matrix
@@ -60,6 +62,10 @@ pmetal quantize --model ./output --output model.gguf --kl-calibrate --target-bpw
 ```bash
 pmetal quantize --model ./output --output ./model-mlx --format mlx --bits 4
 ```
+
+## GGUF as Input
+
+`pmetal infer`, `pmetal eval` and `pmetal serve` load a GGUF file directly, including one written by `pmetal quantize`, for the architectures listed under [GGUF Checkpoints](/models/supported/#gguf-checkpoints). The tensors are dequantized on load, so perplexity on a GGUF is the perplexity of the quantized weights: a good check that a quantization lost little is `pmetal eval` on the safetensors model and on its GGUF.
 
 ## Quantized Checkpoints as Input
 

@@ -201,6 +201,10 @@ pub(crate) fn add_hf_config_metadata(
         );
     }
 
+    if arch.is_gemma4() {
+        add_gemma4_metadata(builder, architecture, json);
+    }
+
     // Llama 3.x's banded scaling is a tensor of the file (`rope_freqs`): stating
     // it as metadata too would apply it twice.
     let rope_scaling = rope_parameters
@@ -274,6 +278,97 @@ pub(crate) fn add_hf_config_metadata(
             );
         }
     }
+}
+
+/// What a Gemma 4 file states per kind of layer, on top of the keys every
+/// architecture has: the sliding-window pattern, the key/value heads of each
+/// layer, the head width and the rotation of the two kinds of layer, and the
+/// absence of per-layer input embeddings.
+///
+/// The head width, the rotated width and the rope base of the full-attention
+/// layers are `attention.key_length`, `rope.dimension_count` and
+/// `rope.freq_base`; the sliding-window layers' are the same keys with a `_swa`
+/// suffix. The full-attention layers rotate the whole head: the share of it that
+/// is unrotated is the `rope_freqs` tensor's, not a smaller width here.
+fn add_gemma4_metadata(
+    builder: &mut pmetal_gguf::GgufBuilder,
+    architecture: &str,
+    json: &serde_json::Value,
+) {
+    use pmetal_gguf::MetadataValue;
+    let layer_types: Vec<bool> = json
+        .get("layer_types")
+        .and_then(|types| types.as_array())
+        .map(|types| {
+            types
+                .iter()
+                .map(|t| t.as_str() == Some("sliding_attention"))
+                .collect()
+        })
+        .unwrap_or_default();
+    builder.add_metadata(
+        format!("{architecture}.attention.sliding_window_pattern"),
+        MetadataValue::Array(
+            layer_types
+                .iter()
+                .map(|s| MetadataValue::Bool(*s))
+                .collect(),
+        ),
+    );
+
+    let heads = json_u32(json, "num_key_value_heads");
+    let global_heads = json_u32(json, "num_global_key_value_heads").or(heads);
+    let k_eq_v = json_bool(json, "attention_k_eq_v").unwrap_or(false);
+    if let Some(heads) = heads {
+        let per_layer = layer_types
+            .iter()
+            .map(|sliding| {
+                let count = if *sliding || !k_eq_v {
+                    heads
+                } else {
+                    global_heads.unwrap_or(heads)
+                };
+                MetadataValue::Uint32(count)
+            })
+            .collect();
+        builder.add_metadata(
+            format!("{architecture}.attention.head_count_kv"),
+            MetadataValue::Array(per_layer),
+        );
+    }
+
+    if let Some(head_dim) = json_u32(json, "head_dim") {
+        let global = json_u32(json, "global_head_dim").unwrap_or(head_dim);
+        for (suffix, value) in [
+            ("attention.key_length", global),
+            ("attention.value_length", global),
+            ("attention.key_length_swa", head_dim),
+            ("attention.value_length_swa", head_dim),
+            ("rope.dimension_count", global),
+            ("rope.dimension_count_swa", head_dim),
+        ] {
+            add_arch_u32(builder, architecture, suffix, value);
+        }
+    }
+
+    let rope_base = |kind: &str| {
+        json.pointer(&format!("/rope_parameters/{kind}/rope_theta"))
+            .and_then(|theta| theta.as_f64())
+    };
+    if let Some(theta) = rope_base("full_attention") {
+        add_arch_f32(builder, architecture, "rope.freq_base", theta as f32);
+    }
+    if let Some(theta) = rope_base("sliding_attention") {
+        add_arch_f32(builder, architecture, "rope.freq_base_swa", theta as f32);
+    }
+
+    // Required by the reference loader; zero says the model has none.
+    add_arch_u32(
+        builder,
+        architecture,
+        "embedding_length_per_layer_input",
+        json_u32(json, "hidden_size_per_layer_input").unwrap_or(0),
+    );
 }
 
 #[cfg(test)]

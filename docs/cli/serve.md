@@ -14,7 +14,7 @@ pmetal serve --model <MODEL> [OPTIONS]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `-m`, `--model` | required | Model ID or local path |
+| `-m`, `--model` | required | Model ID or local path; a `.gguf` file serves with its tokenizer read from the file (see [GGUF Checkpoints](/models/supported/#gguf-checkpoints)) |
 | `-p`, `--port` | `8080` | Port to listen on |
 | `--host` | `127.0.0.1` | Address to bind. The default is this machine only; binding another address without `--api-key` logs a warning |
 | `--api-key` | none | API key clients must send (`Authorization: Bearer <key>` or `x-api-key: <key>`); repeatable. The `PMETAL_API_KEY` environment variable (comma-separated) sets the same without the key appearing in the process list. With none, the server is open: keep it on loopback |

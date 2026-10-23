@@ -1,0 +1,286 @@
+//! A checkpoint exported to GGUF and loaded again computes the checkpoint's
+//! logits.
+//!
+//! This is the writer and the loader held against each other on a whole model,
+//! the one thing neither's own tests can see: a tensor the writer names, lays
+//! out or offsets in a way the loader does not undo is not an error in either,
+//! only a model that answers differently.
+
+use crate::commands::quantize::{ImportanceSource, run_quantization};
+use pmetal_models::DynamicModel;
+use pmetal_runtime::compat::{Array, Dtype};
+use std::path::Path;
+
+const HIDDEN: usize = 32;
+const FFN: usize = 64;
+const HEADS: usize = 4;
+const KV_HEADS: usize = 2;
+const HEAD_DIM: usize = 8;
+const VOCAB: usize = 32;
+const LAYERS: usize = 6;
+const SEQUENCE: usize = 12;
+
+/// Deterministic, roughly normal values in `[-scale, scale]`.
+struct Rng(u64);
+
+impl Rng {
+    fn values(&mut self, n: usize, scale: f32) -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                let mut t = 0.0f32;
+                for _ in 0..4 {
+                    self.0 ^= self.0 << 13;
+                    self.0 ^= self.0 >> 7;
+                    self.0 ^= self.0 << 17;
+                    t += (self.0 >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
+                }
+                t * scale
+            })
+            .collect()
+    }
+}
+
+/// Write `tensors` as the bf16 `model.safetensors` of `dir`.
+fn write_bf16(dir: &Path, tensors: &[(String, Vec<usize>, Vec<u8>)]) {
+    use safetensors::tensor::{Dtype as StDtype, TensorView, serialize};
+    let views: Vec<(String, TensorView<'_>)> = tensors
+        .iter()
+        .map(|(name, shape, data)| {
+            (
+                name.clone(),
+                TensorView::new(StDtype::BF16, shape.clone(), data).unwrap(),
+            )
+        })
+        .collect();
+    std::fs::write(
+        dir.join("model.safetensors"),
+        serialize(views, None).unwrap(),
+    )
+    .unwrap();
+}
+
+/// `n` bf16 values in bytes.
+fn bf16_bytes(values: Vec<f32>) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|v| half::bf16::from_f32(*v).to_le_bytes())
+        .collect()
+}
+
+/// Write a tiny Gemma 3 checkpoint (bf16, one file) and its config.
+fn write_gemma3(dir: &Path) {
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    let mut tensors: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
+    let mut add = |name: String, shape: &[usize], scale: f32| {
+        let n: usize = shape.iter().product();
+        tensors.push((name, shape.to_vec(), bf16_bytes(rng.values(n, scale))));
+    };
+    add("model.embed_tokens.weight".into(), &[VOCAB, HIDDEN], 1.0);
+    add("model.norm.weight".into(), &[HIDDEN], 0.5);
+    for layer in 0..LAYERS {
+        let p = format!("model.layers.{layer}");
+        for norm in [
+            "input_layernorm",
+            "post_attention_layernorm",
+            "pre_feedforward_layernorm",
+            "post_feedforward_layernorm",
+        ] {
+            add(format!("{p}.{norm}.weight"), &[HIDDEN], 0.5);
+        }
+        add(format!("{p}.self_attn.q_norm.weight"), &[HEAD_DIM], 0.5);
+        add(format!("{p}.self_attn.k_norm.weight"), &[HEAD_DIM], 0.5);
+        add(
+            format!("{p}.self_attn.q_proj.weight"),
+            &[HEADS * HEAD_DIM, HIDDEN],
+            0.4,
+        );
+        add(
+            format!("{p}.self_attn.k_proj.weight"),
+            &[KV_HEADS * HEAD_DIM, HIDDEN],
+            0.4,
+        );
+        add(
+            format!("{p}.self_attn.v_proj.weight"),
+            &[KV_HEADS * HEAD_DIM, HIDDEN],
+            0.4,
+        );
+        add(
+            format!("{p}.self_attn.o_proj.weight"),
+            &[HIDDEN, HEADS * HEAD_DIM],
+            0.4,
+        );
+        add(format!("{p}.mlp.gate_proj.weight"), &[FFN, HIDDEN], 0.4);
+        add(format!("{p}.mlp.up_proj.weight"), &[FFN, HIDDEN], 0.4);
+        add(format!("{p}.mlp.down_proj.weight"), &[HIDDEN, FFN], 0.4);
+    }
+    write_bf16(dir, &tensors);
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::json!({
+            "architectures": ["Gemma3ForCausalLM"], "model_type": "gemma3_text",
+            "vocab_size": VOCAB, "hidden_size": HIDDEN, "intermediate_size": FFN,
+            "num_hidden_layers": LAYERS, "num_attention_heads": HEADS,
+            "num_key_value_heads": KV_HEADS, "head_dim": HEAD_DIM,
+            "max_position_embeddings": 128, "rms_norm_eps": 1e-6,
+            "hidden_activation": "gelu_pytorch_tanh", "tie_word_embeddings": true,
+            "rope_theta": 1_000_000.0, "rope_local_base_freq": 10000.0,
+            "sliding_window": 4, "query_pre_attn_scalar": HEAD_DIM,
+            "rope_scaling": {"rope_type": "linear", "factor": 8.0},
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+fn logits(model: &mut DynamicModel) -> Vec<f32> {
+    let ids: Vec<i32> = (0..SEQUENCE as i32)
+        .map(|i| (i * 5 + 3) % VOCAB as i32)
+        .collect();
+    let ids = Array::from_slice(&ids, &[1, SEQUENCE as i32]);
+    let out = model.forward(&ids, None).expect("forward");
+    let mut out = out.as_dtype(Dtype::Float32.as_i32());
+    let n = out.size();
+    out.to_f32_vec(n).expect("read the logits")
+}
+
+async fn export(dir: &Path, method: crate::cli::quantize::QuantizeMethod) -> DynamicModel {
+    let out = dir.join(format!("{}.gguf", method.as_str()));
+    run_quantization(
+        dir.to_str().unwrap(),
+        out.to_str().unwrap(),
+        ImportanceSource::None,
+        method,
+        false,
+        None,
+        0.01,
+    )
+    .await
+    .expect("export");
+    DynamicModel::load(&out).expect("the exported file loads")
+}
+
+fn worst(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b)
+        .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()))
+}
+
+/// Gemma 3, exported at bf16 (the weights as they were) and at q8_0 (their
+/// quantization), loaded back and run: the logits are the checkpoint's, within
+/// what the type loses.
+#[tokio::test]
+async fn a_gemma_3_checkpoint_survives_its_own_export() {
+    let dir = tempfile::tempdir().unwrap();
+    write_gemma3(dir.path());
+    let mut reference = DynamicModel::load(dir.path()).expect("the checkpoint loads");
+    let want = logits(&mut reference);
+    let spread = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    assert!(spread > 1e-2 && want.iter().all(|v| v.is_finite()));
+
+    let mut bf16 = export(dir.path(), crate::cli::quantize::QuantizeMethod::Bf16).await;
+    let bf16 = logits(&mut bf16);
+    let mut q8 = export(dir.path(), crate::cli::quantize::QuantizeMethod::Q8_0).await;
+    let q8 = logits(&mut q8);
+
+    // bf16 keeps every weight; what differs is the arithmetic the two models
+    // run it in (the checkpoint's own half precision against f32).
+    let bf16_error = worst(&want, &bf16) / spread;
+    // q8_0 rounds every matrix to 8 bits.
+    let q8_error = worst(&want, &q8) / spread;
+    println!("bf16: {bf16_error:e}, q8_0: {q8_error:e} (of {spread})");
+    assert!(bf16_error < 1.5e-2, "bf16 export: {bf16_error:e}");
+    assert!(q8_error < 3.5e-2, "q8_0 export: {q8_error:e}");
+}
+
+/// A tiny Gemma 4 in the multimodal wrapper the released models ship in: the
+/// language model's tensors under `model.language_model.`, a stub of a vision
+/// tower beside them, the text config nested. Full-attention layers have wider
+/// heads, one key/value head that is also the value, and a quarter of their
+/// head rotated.
+fn write_gemma4(dir: &Path) {
+    const GLOBAL_HEAD_DIM: usize = 16;
+    let sliding = [true, true, false, true, true, false];
+    let text = serde_json::json!({
+        "model_type": "gemma4_text", "vocab_size": VOCAB, "hidden_size": HIDDEN,
+        "intermediate_size": FFN, "num_hidden_layers": sliding.len(),
+        "num_attention_heads": HEADS, "num_key_value_heads": KV_HEADS,
+        "head_dim": HEAD_DIM, "global_head_dim": GLOBAL_HEAD_DIM,
+        "num_global_key_value_heads": 1, "attention_k_eq_v": true,
+        "max_position_embeddings": 128, "rms_norm_eps": 1e-6,
+        "sliding_window": 4, "final_logit_softcapping": 30.0,
+        "hidden_size_per_layer_input": 0, "hidden_activation": "gelu_pytorch_tanh",
+        "layer_types": sliding.iter()
+            .map(|s| if *s { "sliding_attention" } else { "full_attention" })
+            .collect::<Vec<_>>(),
+        "rope_parameters": {
+            "full_attention": {"rope_type": "proportional", "rope_theta": 1_000_000.0,
+                               "partial_rotary_factor": 0.25},
+            "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+        },
+    });
+    // The parameters the model itself names, so none is left out.
+    let model = DynamicModel::from_config(&text.to_string()).expect("config");
+    let mut keys: Vec<(String, Vec<usize>)> = {
+        use pmetal_runtime::compat::ModuleParametersExt;
+        model
+            .flatten_params()
+            .into_iter()
+            .map(|(key, array)| {
+                (
+                    key.to_string(),
+                    array.shape().iter().map(|&d| d as usize).collect(),
+                )
+            })
+            .collect()
+    };
+    keys.sort();
+    let mut rng = Rng(0x1F83_D9AB_FB41_BD6B);
+    let mut tensors: Vec<(String, Vec<usize>, Vec<u8>)> = keys
+        .into_iter()
+        .map(|(key, shape)| {
+            let n: usize = shape.iter().product();
+            let mut values = rng.values(n, 0.5);
+            if key.ends_with("layer_scalar") {
+                values.iter_mut().for_each(|v| *v = 1.0 + *v * 0.2);
+            }
+            let name = key.replacen("model.", "model.language_model.", 1);
+            (name, shape, bf16_bytes(values))
+        })
+        .collect();
+    tensors.push((
+        "model.vision_tower.patch_embedder.weight".into(),
+        vec![4, 4],
+        bf16_bytes(vec![0.5; 16]),
+    ));
+    write_bf16(dir, &tensors);
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::json!({
+            "architectures": ["Gemma4UnifiedForConditionalGeneration"],
+            "model_type": "gemma4_unified", "tie_word_embeddings": true,
+            "text_config": text,
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+/// The dense Gemma 4 text model, exported from its multimodal checkpoint and
+/// loaded back: the logits are the checkpoint's, within what the type loses.
+#[tokio::test]
+async fn a_gemma_4_checkpoint_survives_its_own_export() {
+    let dir = tempfile::tempdir().unwrap();
+    write_gemma4(dir.path());
+    let mut reference = DynamicModel::load(dir.path()).expect("the checkpoint loads");
+    let want = logits(&mut reference);
+    let spread = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    assert!(spread > 1e-2 && want.iter().all(|v| v.is_finite()));
+
+    let mut bf16 = export(dir.path(), crate::cli::quantize::QuantizeMethod::Bf16).await;
+    let bf16_error = worst(&want, &logits(&mut bf16)) / spread;
+    let mut q8 = export(dir.path(), crate::cli::quantize::QuantizeMethod::Q8_0).await;
+    let q8_error = worst(&want, &logits(&mut q8)) / spread;
+    println!("gemma4 bf16: {bf16_error:e}, q8_0: {q8_error:e} (of {spread})");
+    assert!(bf16_error < 1.5e-2, "bf16 export: {bf16_error:e}");
+    assert!(q8_error < 3.5e-2, "q8_0 export: {q8_error:e}");
+}
