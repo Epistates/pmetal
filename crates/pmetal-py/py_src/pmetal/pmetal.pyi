@@ -128,6 +128,10 @@ class _Spec:
 
     subcommand: ClassVar[str]
     """The ``pmetal`` subcommand this spec runs."""
+    reports_events: ClassVar[bool]
+    """Whether the command writes a ``--log-events`` stream of progress events."""
+    def _launch(self, events_dir: str | os.PathLike[str] | None = None) -> tuple[str, list[str], str | None]:
+        """The command that runs the spec as ``(subcommand, argv, events_file)``; the event log is in ``events_dir``."""
     @staticmethod
     def fields() -> list[FieldInfo]:
         """Every field with its type, default, bounds and help."""
@@ -367,6 +371,7 @@ class InferOptions(TypedDict, total=False):
     model: str
     lora: str | None
     prompt: str
+    messages_file: str | None
     max_tokens: int | None
     temperature: float | None
     top_k: int | None
@@ -432,7 +437,9 @@ class InferSpec(_Spec):
     lora: str | None
     """LoRA Adapter. Flag: ``--lora``. Default: ``None``."""
     prompt: str
-    """Prompt. Flag: ``--prompt``. Default: ``''``."""
+    """Prompt. The text to answer; give this or a messages file. Flag: ``--prompt``. Default: ``''``."""
+    messages_file: str | None
+    """Messages File. A JSON array of chat messages ({"role": "user", "content": "..."}) to continue instead of a prompt; the chat template, tools and images apply. Flag: ``--messages-file``. Default: ``None``."""
     max_tokens: int | None
     """Max Tokens. Default: the model's generation_config.json, else 32768 for a thinking model, else 256. Flag: ``--max-tokens``. From 1 to 1.04858e+06. Default: ``None``."""
     temperature: float | None
@@ -1224,7 +1231,10 @@ class QuantizeOptions(TypedDict, total=False):
     model: str
     output: str
     imatrix: str | None
-    method: Literal['dynamic', 'q1_0', 'q2_k', 'q3_k_s', 'q3_k_m', 'q3_k_l', 'q4_0', 'q4_1', 'q4_k_s', 'q4_k_m', 'q5_0', 'q5_1', 'q5_k_s', 'q5_k_m', 'q6_k', 'q8_0', 'q8_1', 'tq1_0', 'tq2_0', 'mxfp4', 'nvfp4', 'bf16', 'f16', 'f32']
+    calibration_dataset: str | None
+    calibration_ctx_size: int
+    calibration_chunks: int
+    method: Literal['dynamic', 'q1_0', 'q2_k', 'q3_k_s', 'q3_k_m', 'q3_k_l', 'q4_0', 'q4_1', 'q4_k_s', 'q4_k_m', 'q5_0', 'q5_1', 'q5_k_s', 'q5_k_m', 'q6_k', 'q8_0', 'q8_1', 'iq4_nl', 'iq4_xs', 'tq1_0', 'tq2_0', 'mxfp4', 'nvfp4', 'bf16', 'f16', 'f32']
     lora: str | None
     kl_calibrate: bool
     target_bpw: float | None
@@ -1251,9 +1261,15 @@ class QuantizeSpec(_Spec):
     output: str
     """Output Path. Flag: ``--output``. Default: ``''``."""
     imatrix: str | None
-    """IMatrix. Flag: ``--imatrix``. Default: ``None``."""
-    method: Literal['dynamic', 'q1_0', 'q2_k', 'q3_k_s', 'q3_k_m', 'q3_k_l', 'q4_0', 'q4_1', 'q4_k_s', 'q4_k_m', 'q5_0', 'q5_1', 'q5_k_s', 'q5_k_m', 'q6_k', 'q8_0', 'q8_1', 'tq1_0', 'tq2_0', 'mxfp4', 'nvfp4', 'bf16', 'f16', 'f32']
-    """Method. Flag: ``--method``. One of: ``dynamic``, ``q1_0``, ``q2_k``, ``q3_k_s``, ``q3_k_m``, ``q3_k_l``, ``q4_0``, ``q4_1``, ``q4_k_s``, ``q4_k_m``, ``q5_0``, ``q5_1``, ``q5_k_s``, ``q5_k_m``, ``q6_k``, ``q8_0``, ``q8_1``, ``tq1_0``, ``tq2_0``, ``mxfp4``, ``nvfp4``, ``bf16``, ``f16``, ``f32``. Default: ``'dynamic'``."""
+    """IMatrix. An importance matrix file (GGUF or legacy .dat), from `pmetal imatrix`. Flag: ``--imatrix``. Default: ``None``."""
+    calibration_dataset: str | None
+    """Calibration Data. Measure the importance matrix on this data first (a text file, or a JSONL / Parquet dataset), instead of reading one with --imatrix. Flag: ``--calibration-dataset``. Default: ``None``."""
+    calibration_ctx_size: int
+    """Calibration Context. Tokens per calibration chunk. Flag: ``--calibration-ctx-size``. From 8 to 131072. Default: ``512``."""
+    calibration_chunks: int
+    """Calibration Chunks. Calibration chunks to run (0 = all the data makes). Flag: ``--calibration-chunks``. From 0 to 9.22337e+18. Default: ``0``."""
+    method: Literal['dynamic', 'q1_0', 'q2_k', 'q3_k_s', 'q3_k_m', 'q3_k_l', 'q4_0', 'q4_1', 'q4_k_s', 'q4_k_m', 'q5_0', 'q5_1', 'q5_k_s', 'q5_k_m', 'q6_k', 'q8_0', 'q8_1', 'iq4_nl', 'iq4_xs', 'tq1_0', 'tq2_0', 'mxfp4', 'nvfp4', 'bf16', 'f16', 'f32']
+    """Method. Flag: ``--method``. One of: ``dynamic``, ``q1_0``, ``q2_k``, ``q3_k_s``, ``q3_k_m``, ``q3_k_l``, ``q4_0``, ``q4_1``, ``q4_k_s``, ``q4_k_m``, ``q5_0``, ``q5_1``, ``q5_k_s``, ``q5_k_m``, ``q6_k``, ``q8_0``, ``q8_1``, ``iq4_nl``, ``iq4_xs``, ``tq1_0``, ``tq2_0``, ``mxfp4``, ``nvfp4``, ``bf16``, ``f16``, ``f32``. Default: ``'dynamic'``."""
     lora: str | None
     """LoRA Adapter. Flag: ``--lora``. Default: ``None``."""
     kl_calibrate: bool
@@ -1270,13 +1286,50 @@ class QuantizeSpec(_Spec):
     """MLX Group Size. Flag: ``--group-size``. From -2.14748e+09 to 2.14748e+09. Default: ``64``."""
 
 @type_check_only
+class ImatrixOptions(TypedDict, total=False):
+    """The fields of ``ImatrixSpec``, as keyword arguments."""
+
+    model: str
+    dataset: str
+    output: str
+    ctx_size: int
+    chunks: int
+    batch_size: int
+
+@final
+class ImatrixSpec(_Spec):
+    """Importance-matrix measurement on calibration data (`pmetal imatrix`)."""
+    def __new__(cls, **options: Unpack[ImatrixOptions]) -> Self:
+        """Args:
+            **options: Any field of the spec; the rest keep their defaults.
+
+        Raises:
+            TypeError: An unknown field, or a value of the wrong type.
+        """
+    def copy(self, **changes: Unpack[ImatrixOptions]) -> Self:
+        """A copy with the given fields replaced."""
+
+    model: str
+    """Model. Flag: ``--model``. Default: ``''``."""
+    dataset: str
+    """Calibration Data. A text file (one document), or a JSONL / Parquet dataset: a local path or a Hub dataset id. Flag: ``--dataset``. Default: ``''``."""
+    output: str
+    """Output Path. A .gguf file (the imatrix format of current tools) or a .dat file (the legacy format). Flag: ``--output``. Default: ``'./imatrix.gguf'``."""
+    ctx_size: int
+    """Context Size. Tokens per chunk: the context each forward runs at. Flag: ``--ctx-size``. From 8 to 131072. Default: ``512``."""
+    chunks: int
+    """Chunks. Chunks to run (0 = all the data makes). Flag: ``--chunks``. From 0 to 9.22337e+18. Default: ``0``."""
+    batch_size: int
+    """Batch Size. Chunks per forward pass. Flag: ``--batch-size``. From 1 to 256. Default: ``4``."""
+
+@type_check_only
 class MergeOptions(TypedDict, total=False):
     """The fields of ``MergeSpec``, as keyword arguments."""
 
     model_a: str
     model_b: str
     output: str
-    method: Literal['linear', 'slerp', 'ties', 'dare_ties', 'dare_linear', 'task_arithmetic', 'della', 'breadcrumbs', 'model_stock', 'nearswap', 'passthrough']
+    method: Literal['linear', 'slerp', 'ties', 'dare_ties', 'dare_linear', 'task_arithmetic', 'della', 'della_linear', 'breadcrumbs', 'model_stock', 'consensus', 'multislerp', 'nearswap', 'ram', 'ram_plus', 'passthrough']
     base: str | None
     t: float
     weight_a: float
@@ -1303,8 +1356,8 @@ class MergeSpec(_Spec):
     """Model B. Flag: ``--model-b``. Default: ``''``."""
     output: str
     """Output Dir. Flag: ``--output``. Default: ``''``."""
-    method: Literal['linear', 'slerp', 'ties', 'dare_ties', 'dare_linear', 'task_arithmetic', 'della', 'breadcrumbs', 'model_stock', 'nearswap', 'passthrough']
-    """Method. Flag: ``--method``. One of: ``linear``, ``slerp``, ``ties``, ``dare_ties``, ``dare_linear``, ``task_arithmetic``, ``della``, ``breadcrumbs``, ``model_stock``, ``nearswap``, ``passthrough``. Default: ``'slerp'``."""
+    method: Literal['linear', 'slerp', 'ties', 'dare_ties', 'dare_linear', 'task_arithmetic', 'della', 'della_linear', 'breadcrumbs', 'model_stock', 'consensus', 'multislerp', 'nearswap', 'ram', 'ram_plus', 'passthrough']
+    """Method. Every method but linear, slerp, multislerp and passthrough merges what each model changed from a base model, which it then needs. Flag: ``--method``. One of: ``linear``, ``slerp``, ``ties``, ``dare_ties``, ``dare_linear``, ``task_arithmetic``, ``della``, ``della_linear``, ``breadcrumbs``, ``model_stock``, ``consensus``, ``multislerp``, ``nearswap``, ``ram``, ``ram_plus``, ``passthrough``. Default: ``'slerp'``."""
     base: str | None
     """Base Model. Flag: ``--base``. Default: ``None``."""
     t: float
@@ -2465,6 +2518,7 @@ class InferCallOptions(TypedDict, total=False):
     """The fields of ``InferSpec`` that ``infer`` takes as keyword arguments."""
 
     lora: str | None
+    messages_file: str | None
     max_tokens: int | None
     temperature: float | None
     top_k: int | None
@@ -2560,7 +2614,8 @@ def _start_job(
     binary: str | os.PathLike[str],
     subcommand: str,
     argv: Sequence[str],
-    log_events: bool = False,
+    events_file: str | os.PathLike[str] | None = None,
+    events_dir: str | os.PathLike[str] | None = None,
     stop_grace: float = 30.0,
     on_event: Callable[[dict[str, Any]], object] | None = None,
 ) -> _Job: ...

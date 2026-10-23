@@ -296,12 +296,16 @@ def test_credentials_are_hidden_in_the_output_and_the_command(fake_cli):
         """A spec whose command line carries a credential (the real specs keep keys out of argv)."""
 
         subcommand = "serve"
+        reports_events = False
 
         def normalize(self) -> None:
             pass
 
         def to_argv(self) -> list[str]:
             return ["--api-key", "super-secret-value", "--hf-token=hf_abcdefghijklmnop1234", "--port", "8080"]
+
+        def _launch(self, events_dir: str | None) -> tuple[str, list[str], str | None]:
+            return self.subcommand, self.to_argv(), None
 
     spec = Secretive()
     with pytest.raises(pmetal.JobFailedError) as caught:
