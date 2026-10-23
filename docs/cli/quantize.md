@@ -62,7 +62,7 @@ The output head and token embedding are written as `q6_k` for the K-quant and 4-
 
 ## Architectures
 
-A GGUF file names and lays out its tensors per architecture, and an engine loads whatever it finds under the names it looks for. `pmetal quantize` therefore writes only the architectures whose layout it reproduces from the reference converter, and refuses any other before it reads the model:
+A GGUF file names and lays out its tensors per architecture, and an engine loads whatever it finds under the names it looks for. `pmetal quantize` therefore writes only the architectures whose layout it knows, and refuses any other before it reads the model. Llama 3.2, Qwen3 and Gemma 3 are checked tensor for tensor against the reference converter's files; the others use the same tables and have not been compared against real checkpoints.
 
 | Hugging Face architecture | GGUF architecture |
 |---------------------------|-------------------|
