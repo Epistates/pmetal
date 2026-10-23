@@ -121,6 +121,11 @@ fn run(model_dir: &str, input_tokens: &[u32]) -> Result<Vec<u32>, Exception> {
 (`pytorch_model.bin`, through the restricted reader in `pmetal_hub::torch`) and GGUF, and
 unpacks quantized checkpoints to dense tensors as it reads them: MLX affine and float modes
 (mxfp4, nvfp4, mxfp8, per-module widths included), NVIDIA ModelOpt and block-scaled FP8.
+For inference, `DynamicModel::load_with_options` with `keep_quantized` instead leaves an
+MLX-quantized checkpoint's projections, embedding tables and stacked experts packed on their
+layers, where MLX's quantized (gather) matmul reads them: a quarter of the memory and of the
+bytes a decode step reads. An architecture that cannot (Mllama, Qwen4-Exp, the encoder and
+diffusion models) unpacks and logs what it unpacked.
 
 A load must account for the whole model. It fails, naming the tensors and parameters, when a
 checkpoint tensor reaches no parameter or when a parameter is never filled; the only

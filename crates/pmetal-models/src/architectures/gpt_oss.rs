@@ -797,6 +797,12 @@ impl GptOssMoE {
         self.ensure_stacked()
     }
 
+    /// Whether the experts run from packed weights (the release's MXFP4, or an
+    /// MLX-quantized checkpoint's).
+    pub fn experts_packed(&self) -> bool {
+        self.fused.as_ref().is_some_and(GptOssExperts::is_packed)
+    }
+
     /// Whether the stacked expert cache is populated.
     pub fn has_stacked_moe(&self) -> bool {
         self.stacked.is_some()
@@ -1098,6 +1104,40 @@ impl GptOssModel {
     }
 }
 
+/// A layer's experts from the layout MLX conversions ship: one stacked tensor
+/// per projection under `prefix` (`gate_proj.weight`, ...), each with its bias.
+/// A projection `packed` holds stays packed; one too narrow for a quantization
+/// group is dense beside the others.
+fn stacked_experts(
+    raw: &mut std::collections::HashMap<String, Array>,
+    packed: &mut crate::loader::PackedLinears,
+    prefix: &str,
+) -> Result<GptOssExperts, Exception> {
+    let missing = |key: &str| Exception::custom(format!("gpt_oss: missing weight key: {key}"));
+    let mut projection = |name: &str| -> Result<LayerWeight, Exception> {
+        let module = format!("{prefix}.{name}_proj");
+        if let Some(words) = packed.take(&module) {
+            return Ok(words.into_layer_weight());
+        }
+        let key = format!("{module}.weight");
+        let weight = raw.remove(&key).ok_or_else(|| missing(&key))?;
+        Ok(LayerWeight::Dense(weight.transpose_axes(&[0, 2, 1])))
+    };
+    let (gate, up, down) = (projection("gate")?, projection("up")?, projection("down")?);
+    let mut bias = |name: &str| {
+        let key = format!("{prefix}.{name}_proj.bias");
+        raw.remove(&key).ok_or_else(|| missing(&key))
+    };
+    Ok(GptOssExperts {
+        gate,
+        up,
+        down,
+        gate_bias: bias("gate")?,
+        up_bias: bias("up")?,
+        down_bias: bias("down")?,
+    })
+}
+
 /// GPT-OSS for causal language modeling.
 #[derive(Debug)]
 pub struct GptOssForCausalLM {
@@ -1218,18 +1258,70 @@ impl GptOssForCausalLM {
         &mut self,
         model_dir: &std::path::Path,
     ) -> Result<bool, Exception> {
+        self.load_fused_checkpoint_with(model_dir, false)
+    }
+
+    /// [`load_fused_checkpoint`](Self::load_fused_checkpoint), which also reads
+    /// the layout MLX conversions ship: the experts stacked one tensor per
+    /// projection (`mlp.experts.{gate,up,down}_proj.weight` and their
+    /// biases), dense or quantized.
+    ///
+    /// With `keep_quantized`, an MLX-quantized checkpoint's experts, projections
+    /// and embedding table stay packed; otherwise they are unpacked to dense.
+    pub fn load_fused_checkpoint_with(
+        &mut self,
+        model_dir: &std::path::Path,
+        keep_quantized: bool,
+    ) -> Result<bool, Exception> {
+        use crate::loader::PackedLinears;
         use pmetal_runtime::native_loader::{discover_safetensors_shards, load_shards_into_map};
         let shards = discover_safetensors_shards(model_dir).map_err(Exception::from)?;
         let mut raw = load_shards_into_map(&shards, model_dir).map_err(Exception::from)?;
-        if !raw.keys().any(|k| k.contains(".mlp.experts.gate_up_proj")) {
+        let fused = raw.keys().any(|k| k.contains(".mlp.experts.gate_up_proj"));
+        let stacked = raw
+            .keys()
+            .any(|k| k.contains(".mlp.experts.gate_proj.") && !k.contains(".mlp.experts.0."));
+        if !fused && !stacked {
             return Ok(false);
         }
+
+        // An MLX-quantized checkpoint: the packed modules come out first (the
+        // router under its checkpoint name, `mlp.router`), and what is left
+        // is unpacked to dense.
+        let mut packed = PackedLinears::default();
+        if raw.keys().any(|k| k.ends_with(".scales")) {
+            if keep_quantized {
+                let mut paths = crate::loader::packable_paths(self);
+                let routers: Vec<String> = paths
+                    .iter()
+                    .filter_map(|p| p.strip_suffix(".mlp.gate"))
+                    .map(|layer| format!("{layer}.mlp.router"))
+                    .collect();
+                paths.extend(routers);
+                for layer in 0..self.model.layers.len() {
+                    for projection in ["gate_proj", "up_proj", "down_proj"] {
+                        paths.push(format!("model.layers.{layer}.mlp.experts.{projection}"));
+                    }
+                }
+                packed = crate::loader::lift_packed_mlx(&mut raw, model_dir, &paths)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+            }
+            let unpacked = crate::loader::unpack_mlx_quantized_weights(model_dir, &mut raw)
+                .map_err(|e| Exception::custom(e.to_string()))?;
+            if keep_quantized {
+                crate::loader::report_unpacked(&unpacked);
+            }
+        }
+
         let zero = Array::from_f32(0.0);
         for (i, layer) in self.model.layers.iter_mut().enumerate() {
             let prefix = format!("model.layers.{i}.mlp.experts");
-            let experts = GptOssExperts::from_checkpoint(&raw, &prefix)
-                .map_err(Exception::from)?
-                .copy_fresh(&zero);
+            let experts = if stacked {
+                stacked_experts(&mut raw, &mut packed, &prefix)?
+            } else {
+                GptOssExperts::from_checkpoint(&raw, &prefix).map_err(Exception::from)?
+            }
+            .copy_fresh(&zero);
             raw.retain(|k, _| !k.starts_with(&format!("{prefix}.")));
             layer.mlp.set_fused_experts(experts);
         }
@@ -1245,11 +1337,19 @@ impl GptOssForCausalLM {
                 None => unread.push(key),
             }
         }
+        drop(params);
         if !unread.is_empty() {
             unread.sort();
             return Err(Exception::custom(format!(
                 "gpt_oss: checkpoint tensors nothing reads: {unread:?}"
             )));
+        }
+        if !packed.is_empty() {
+            packed.rename(|module| module.replace(".mlp.router", ".mlp.gate"));
+            let count = packed
+                .install(self)
+                .map_err(|e| Exception::custom(e.to_string()))?;
+            tracing::info!("{count} projections and tables stay packed");
         }
         Ok(true)
     }

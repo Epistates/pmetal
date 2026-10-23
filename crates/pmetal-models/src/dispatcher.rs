@@ -17,7 +17,7 @@ use pmetal_cache::kv_cache::{
     sanitize_cache_mode_for_config,
 };
 use pmetal_runtime::compat::{
-    Array, Dtype, Exception, Module, ModuleParameters, ModuleParametersExt, nn, ops,
+    Array, Dtype, Exception, Module, ModuleParameters, ModuleParametersExt, VisitLinears, nn, ops,
 };
 use pmetal_runtime::decode::last_token_hidden;
 use std::path::Path;
@@ -27,12 +27,16 @@ const PARAM_EVAL_BATCH_SIZE: usize = 128;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DynamicModelLoadOptions {
     pub prefer_expert_offload: bool,
-    /// Keep a quantized (MLX) checkpoint's projections packed on their
-    /// layers, run by MLX's quantized matmul, instead of unpacking them to a
-    /// dense copy: a quarter of the memory and of the bytes a decode step
-    /// reads. For inference; training wants the dense base (or QLoRA, asked
-    /// for). Honoured by the architectures that load through the generic
-    /// loader (Llama, Qwen 2 and 3, Mistral, Cohere); the rest unpack.
+    /// Keep a quantized (MLX) checkpoint's projections, embedding tables and
+    /// stacked experts packed on their layers, run by MLX's quantized (gather)
+    /// matmul, instead of unpacking them to a dense copy: a quarter of the
+    /// memory and of the bytes a decode step reads. For inference; training
+    /// wants the dense base (or QLoRA, asked for).
+    ///
+    /// Honoured by every decoder architecture except Qwen4-Exp, Mllama and the
+    /// encoder, diffusion and image models
+    /// ([`ModelArchitecture::keeps_quantized_packed`]); those unpack, and log
+    /// that they did.
     pub keep_quantized: bool,
 }
 
@@ -72,16 +76,48 @@ fn load_checked<M: ModuleParametersExt, T>(
 /// ([`stack_experts`](crate::loader::experts::stack_experts)), then assigned
 /// under `policy`, which fails unless checkpoint and model account for each
 /// other.
-fn load_with_stacked_experts<M: ModuleParametersExt>(
+///
+/// With `policy.keep_quantized`, the experts of an MLX-quantized checkpoint
+/// (already stacked, as a conversion stores them) stay packed for the gather
+/// matmuls, as do its projections.
+fn load_with_stacked_experts<M: ModuleParametersExt + VisitLinears>(
     family: &str,
     model: &mut M,
     model_dir: &Path,
     policy: &LoadPolicy,
 ) -> Result<(), Exception> {
-    let weights = load_weights(model_dir).map_err(|e| Exception::custom(e.to_string()))?;
-    let weights = crate::loader::experts::stack_experts(family, weights)?;
-    assign_weights(model, weights, policy)
-        .map_err(|e| Exception::custom(e.with_quantization_hint(model_dir).to_string()))
+    crate::loader::load_prepared(model, model_dir, policy, |weights, _| {
+        crate::loader::experts::stack_experts(family, weights)
+            .map_err(|e| crate::loader::LoadError::SafeTensors(e.to_string()))
+    })
+    .map_err(|e| Exception::custom(e.to_string()))
+}
+
+/// The name the text tower's model tree gives a Gemma checkpoint key, or `None`
+/// for a key of another tower (vision, audio).
+///
+/// A multimodal wrapper nests the language model: `model.language_model.…` in
+/// Hugging Face's save, `language_model.model.…` in an MLX conversion.
+fn gemma_text_key(key: &str) -> Option<String> {
+    const OTHER_TOWERS: [&str; 7] = [
+        "model.embed_vision.",
+        "model.vision_tower.",
+        "model.audio_tower.",
+        "model.multi_modal_projector.",
+        "embed_vision.",
+        "vision_tower.",
+        "multi_modal_projector.",
+    ];
+    if OTHER_TOWERS.iter().any(|tower| key.starts_with(tower)) {
+        return None;
+    }
+    if let Some(rest) = key.strip_prefix("model.language_model.") {
+        return Some(format!("model.{rest}"));
+    }
+    if let Some(rest) = key.strip_prefix("language_model.") {
+        return Some(rest.to_string());
+    }
+    Some(key.to_string())
 }
 
 /// Rewrite the bare `Infinity` / `NaN` literals some released configs contain
@@ -260,6 +296,17 @@ impl ModelArchitecture {
             )]),
             _ => policy,
         }
+    }
+
+    /// Whether the loader of this architecture honours
+    /// [`DynamicModelLoadOptions::keep_quantized`], keeping an MLX-quantized
+    /// checkpoint's weights packed. The others unpack every quantized tensor to
+    /// dense, and say so when they were asked not to.
+    pub fn keeps_quantized_packed(self) -> bool {
+        !matches!(
+            self,
+            Self::Flux | Self::Bert | Self::DiffusionGemma | Self::Mllama | Self::Qwen4Exp
+        )
     }
 
     /// The variant's name as a bare identifier, with no spacing or branding.
@@ -838,6 +885,17 @@ impl DynamicModel {
         let config_content = std::fs::read_to_string(&config_path)
             .map_err(|e| Exception::custom(format!("{}", e)))?;
         let arch = resolve_architecture(&config_content)?;
+        if options.keep_quantized
+            && !arch.keeps_quantized_packed()
+            && crate::loader::is_mlx_quantized(model_dir)
+        {
+            tracing::warn!(
+                architecture = %arch,
+                "keep_quantized: this architecture's loader unpacks an MLX-quantized checkpoint \
+                 to dense weights, which take several times the memory and read several times \
+                 the bytes per token"
+            );
+        }
 
         match arch {
             ModelArchitecture::Llama => simple_load!(
@@ -853,15 +911,25 @@ impl DynamicModel {
                 let config: Llama4TextConfig =
                     json5::from_str(&effective).map_err(|e| Exception::custom(e.to_string()))?;
                 let mut model = Llama4ForCausalLM::new(config)?;
-                let weights = crate::loader::load_weights(model_dir)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let weights = crate::architectures::llama4::sanitize_checkpoint(weights);
-                assign_weights(
+                // The fused experts are in transformers' layout, which an MLX
+                // conversion does not use, so they are dense either way; the
+                // projections and tables of a quantized checkpoint stay packed.
+                crate::loader::load_prepared(
                     &mut model,
-                    weights,
-                    &ModelArchitecture::Llama4.load_policy(),
+                    model_dir,
+                    &ModelArchitecture::Llama4
+                        .load_policy()
+                        .keeping_quantized(options.keep_quantized),
+                    |weights, packed| {
+                        packed.rename(|module| {
+                            crate::architectures::llama4::sanitize_key(&format!("{module}.weight"))
+                                .and_then(|key| key.strip_suffix(".weight").map(str::to_owned))
+                                .unwrap_or_else(|| module.to_string())
+                        });
+                        Ok(crate::architectures::llama4::sanitize_checkpoint(weights))
+                    },
                 )
-                .map_err(|e| Exception::custom(e.with_quantization_hint(model_dir).to_string()))?;
+                .map_err(|e| Exception::custom(e.to_string()))?;
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::Llama4(model))
             }
@@ -893,7 +961,9 @@ impl DynamicModel {
                     "qwen3_moe",
                     &mut model,
                     model_dir,
-                    &ModelArchitecture::Qwen3MoE.load_policy(),
+                    &ModelArchitecture::Qwen3MoE
+                        .load_policy()
+                        .keeping_quantized(options.keep_quantized),
                 )?;
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::Qwen3MoE(model))
@@ -901,45 +971,64 @@ impl DynamicModel {
             ModelArchitecture::Gemma => {
                 let config = parse_gemma_config(&config_content)?;
                 let mut model = GemmaForCausalLM::new(config)?;
-                let weights = crate::loader::load_weights(model_dir)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                // Gemma 4 stores the language-tower weights under
-                // `model.language_model.…` (multimodal wrapper). Strip the
-                // infix so the existing loader's `model.…` keys match.
-                // Also drop vision / audio tower weights — pmetal only
-                // runs the language stack today.
-                let needs_lm_strip = weights
-                    .keys()
-                    .any(|k| k.starts_with("model.language_model."));
-                let weights_effective = if needs_lm_strip {
-                    let mut remapped: std::collections::HashMap<String, Array> =
-                        std::collections::HashMap::with_capacity(weights.len());
-                    for (key, value) in &weights {
-                        if let Some(rest) = key.strip_prefix("model.language_model.") {
-                            remapped.insert(format!("model.{rest}"), value.clone());
-                        } else if key.starts_with("model.embed_vision.")
-                            || key.starts_with("model.vision_tower.")
-                            || key.starts_with("model.audio_tower.")
-                            || key.starts_with("model.multi_modal_projector.")
-                        {
-                            // Skip non-language towers.
-                        } else if key == "lm_head.weight" {
-                            // Gemma ties, but some checkpoints carry an
-                            // explicit head. Keep it under its own key; the
-                            // loader will ignore it because Gemma uses
-                            // tied embeddings.
-                            remapped.insert(key.clone(), value.clone());
-                        } else {
-                            remapped.insert(key.clone(), value.clone());
-                        }
-                    }
-                    remapped
+                // With `keep_quantized`, an MLX-quantized checkpoint's projections
+                // and embedding table come back still packed. Their words stand
+                // in the tensors under the name the loader looks for, and
+                // `PackedLinears::install` gives them their scales.
+                // The model's tree holds the layers under `gemma1` or `gemma2`
+                // (`model.layers.gemma2.3.…`), which a checkpoint does not name.
+                let layer_kind = if model.model.layers.gemma1.is_some() {
+                    "gemma1"
                 } else {
-                    weights
+                    "gemma2"
                 };
+                let paths = options.keep_quantized.then(|| {
+                    let mut paths: Vec<String> = crate::loader::packable_paths(&mut model)
+                        .into_iter()
+                        .map(|p| p.replace(&format!("layers.{layer_kind}."), "layers."))
+                        .collect();
+                    // The HF multimodal wrapper nests the text tower one level
+                    // deeper than the model's tree does.
+                    let nested: Vec<String> = paths
+                        .iter()
+                        .filter_map(|p| p.strip_prefix("model."))
+                        .map(|rest| format!("model.language_model.{rest}"))
+                        .collect();
+                    paths.extend(nested);
+                    paths
+                });
+                let (mut weights, mut packed) =
+                    crate::loader::load_weights_keeping_packed(model_dir, paths.as_deref())
+                        .map_err(|e| Exception::custom(e.to_string()))?;
+                weights.extend(packed.words());
+                // Drop the vision and audio towers (pmetal runs the language
+                // stack) and bring the text tower's names to the model's.
+                let weights_effective: std::collections::HashMap<String, Array> = weights
+                    .into_iter()
+                    .filter_map(|(key, value)| Some((gemma_text_key(&key)?, value)))
+                    .collect();
+                packed.rename(|module| {
+                    let module = gemma_text_key(&format!("{module}.weight"))
+                        .and_then(|key| key.strip_suffix(".weight").map(str::to_owned))
+                        .unwrap_or_else(|| module.to_string());
+                    // `model.layers.3.…` is `model.layers.gemma2.3.…` in the tree.
+                    match module.strip_prefix("model.layers.") {
+                        Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => {
+                            format!("model.layers.{layer_kind}.{rest}")
+                        }
+                        _ => module,
+                    }
+                });
                 load_checked(&mut model, model_dir, &LoadPolicy::strict(), |model| {
                     crate::loader::load_gemma_weights(model, &weights_effective)
-                        .map_err(|e| Exception::custom(e.to_string()))
+                        .map_err(|e| Exception::custom(e.to_string()))?;
+                    if !packed.is_empty() {
+                        let count = packed
+                            .install(model)
+                            .map_err(|e| Exception::custom(e.to_string()))?;
+                        tracing::info!("{count} projections and tables stay packed");
+                    }
+                    Ok(())
                 })?;
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::Gemma(model))
@@ -955,8 +1044,12 @@ impl DynamicModel {
             // Phi cannot use `simple_load!`: Phi-3 fuses q/k/v into a single
             // `self_attn.qkv_proj`, which the generic name-matching loader has
             // no parameter for and therefore discards without a word.
-            ModelArchitecture::Phi => Self::load_phi_variant(&config_content, model_dir, false),
-            ModelArchitecture::Phi4 => Self::load_phi_variant(&config_content, model_dir, true),
+            ModelArchitecture::Phi => {
+                Self::load_phi_variant(&config_content, model_dir, false, options.keep_quantized)
+            }
+            ModelArchitecture::Phi4 => {
+                Self::load_phi_variant(&config_content, model_dir, true, options.keep_quantized)
+            }
             // The parameter tree is the checkpoint's layout (router and
             // `e_score_correction_bias` under `mlp.gate`, `mlp.shared_experts`)
             // with each layer's experts stacked, which is how a released
@@ -967,7 +1060,7 @@ impl DynamicModel {
             ModelArchitecture::DeepSeek => {
                 let config: DeepSeekConfig = json5::from_str(&config_content)
                     .map_err(|e| Exception::custom(e.to_string()))?;
-                let mut policy = LoadPolicy::strict();
+                let mut policy = LoadPolicy::strict().keeping_quantized(options.keep_quantized);
                 // V3 ships its multi-token-prediction layers after the trunk, as
                 // `model.layers.{num_hidden_layers + i}.*`. They are a separate
                 // draft head, not part of the model that decodes.
@@ -1002,8 +1095,10 @@ impl DynamicModel {
             ModelArchitecture::Granite => {
                 let mut model =
                     GraniteForCausalLM::new(GraniteConfig::from_config_json(&config_content)?)?;
-                let report = crate::architectures::granite_hybrid::load_granite_weights(
-                    &mut model, model_dir,
+                let report = crate::architectures::granite_hybrid::load_granite_weights_with(
+                    &mut model,
+                    model_dir,
+                    options.keep_quantized,
                 )?;
                 tracing::debug!(
                     "Granite weight load: {} loaded, {} ignored by design",
@@ -1020,12 +1115,14 @@ impl DynamicModel {
                 let config: NemotronHConfig = json5::from_str(&config_content)
                     .map_err(|e| Exception::custom(e.to_string()))?;
                 let mut model = NemotronHForCausalLM::new(config)?;
-                let weights =
-                    load_weights(model_dir).map_err(|e| Exception::custom(e.to_string()))?;
-                crate::architectures::nemotron_h::assign_nemotron_h_weights(&mut model, weights)
-                    .map_err(|e| {
-                        Exception::custom(e.with_quantization_hint(model_dir).to_string())
-                    })?;
+                crate::architectures::nemotron_h::load_nemotron_h_weights(
+                    &mut model,
+                    model_dir,
+                    &ModelArchitecture::NemotronH
+                        .load_policy()
+                        .keeping_quantized(options.keep_quantized),
+                )
+                .map_err(|e| Exception::custom(e.to_string()))?;
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::NemotronH(model))
             }
@@ -1041,13 +1138,10 @@ impl DynamicModel {
                     config.clone(),
                     routed_expert_mode,
                 )?;
-                let load_options = if skip_routed_experts {
-                    Qwen3NextLoadOptions {
-                        skip_routed_experts: true,
-                        ..Default::default()
-                    }
-                } else {
-                    Qwen3NextLoadOptions::default()
+                let load_options = Qwen3NextLoadOptions {
+                    skip_routed_experts,
+                    keep_quantized: options.keep_quantized,
+                    ..Default::default()
                 };
                 load_qwen3_next_weights_with_options(&mut model, model_dir, &config, load_options)
                     .map_err(|e| Exception::custom(e.to_string()))?;
@@ -1095,7 +1189,7 @@ impl DynamicModel {
                 // generic loader.
                 let policy = ModelArchitecture::GptOss.load_policy();
                 let snapshot = ParamSnapshot::of(&model);
-                if model.load_fused_checkpoint(model_dir)? {
+                if model.load_fused_checkpoint_with(model_dir, options.keep_quantized)? {
                     snapshot
                         .require_complete(&model, &policy, Vec::new())
                         .map_err(|e| {
@@ -1127,11 +1221,20 @@ impl DynamicModel {
                     }
                 }
                 let mut model = crate::architectures::gemma4::Gemma4ForCausalLM::new(config)?;
-                let weights = crate::loader::load_weights(model_dir)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
+                // With `keep_quantized`, an MLX-quantized checkpoint's
+                // projections, tables and experts come back still packed.
+                let (weights, packed) = crate::loader::read_gemma4_checkpoint(
+                    &mut model,
+                    model_dir,
+                    options.keep_quantized,
+                )
+                .map_err(|e| Exception::custom(e.to_string()))?;
                 let report = load_checked(&mut model, model_dir, &policy, |model| {
-                    crate::architectures::gemma4::load_gemma4_weights(model, &weights)
-                        .map_err(|e| Exception::custom(e.to_string()))
+                    let report = crate::architectures::gemma4::load_gemma4_weights(model, &weights)
+                        .map_err(|e| Exception::custom(e.to_string()))?;
+                    crate::loader::install_gemma4_packed(model, packed)
+                        .map_err(|e| Exception::custom(e.to_string()))?;
+                    Ok(report)
                 })?;
                 if !report.skipped.is_empty() {
                     tracing::info!(
@@ -1245,15 +1348,37 @@ impl DynamicModel {
         config_content: &str,
         model_dir: &Path,
         is_phi4: bool,
+        keep_quantized: bool,
     ) -> Result<Self, Exception> {
         let config: PhiConfig =
             json5::from_str(config_content).map_err(|e| Exception::custom(e.to_string()))?;
         let mut model = PhiForCausalLM::new(config.clone())?;
-        let mut weights =
-            crate::loader::load_weights(model_dir).map_err(|e| Exception::custom(e.to_string()))?;
-        crate::loader::split_phi_fused_qkv(&mut weights, &config);
-        crate::loader::assign_weights(&mut model, weights, &LoadPolicy::strict())
-            .map_err(|e| Exception::custom(e.with_quantization_hint(model_dir).to_string()))?;
+        // A quantized fused projection stays packed too: it splits by rows,
+        // each of which is quantized on its own.
+        let fused: Vec<String> = (0..config.num_hidden_layers)
+            .map(|layer| format!("model.layers.{layer}.self_attn.qkv_proj"))
+            .collect();
+        let q_rows = config.num_attention_heads * config.head_dim();
+        let kv_rows = config.num_key_value_heads * config.head_dim();
+        crate::loader::load_prepared_with(
+            &mut model,
+            model_dir,
+            &LoadPolicy::strict().keeping_quantized(keep_quantized),
+            &fused,
+            |mut weights, packed| {
+                packed.split_rows(
+                    ".self_attn.qkv_proj",
+                    &[
+                        (".self_attn.q_proj", 0, q_rows),
+                        (".self_attn.k_proj", q_rows, q_rows + kv_rows),
+                        (".self_attn.v_proj", q_rows + kv_rows, q_rows + 2 * kv_rows),
+                    ],
+                );
+                crate::loader::split_phi_fused_qkv(&mut weights, &config);
+                Ok(weights)
+            },
+        )
+        .map_err(|e| Exception::custom(e.to_string()))?;
         eval_module_parameters_batched(&model)?;
         Ok(if is_phi4 {
             Self::Phi4(model)
@@ -2570,6 +2695,14 @@ impl pmetal_runtime::compat::VisitLinears for DynamicModel {
         f: &mut dyn FnMut(&str, &mut pmetal_runtime::compat::Linear),
     ) {
         dispatch_uniform!(self, visit_linears_mut, prefix, f)
+    }
+
+    fn visit_embeddings_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut pmetal_runtime::compat::Embedding),
+    ) {
+        dispatch_uniform!(self, visit_embeddings_mut, prefix, f)
     }
 
     fn visit_experts_mut(
