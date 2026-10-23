@@ -612,6 +612,21 @@ mod tests {
         assert!(err.to_string().contains("index_topk"), "{err}");
     }
 
+    /// The native Qwen 3.5 engine keeps its own table, since it chooses
+    /// per-family config defaults and sits below this crate; the two must name
+    /// the same types.
+    #[test]
+    fn the_native_qwen35_engine_and_the_dispatcher_name_the_same_types() {
+        use pmetal_runtime::qwen3_native::family::is_qwen35_family;
+        for (name, arch) in MODEL_TYPES {
+            assert_eq!(
+                is_qwen35_family(name),
+                *arch == ModelArchitecture::Qwen3Next,
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn a_bundled_mtp_head_runs_as_its_target() {
         assert_eq!(
