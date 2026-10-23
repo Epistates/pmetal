@@ -1079,6 +1079,77 @@ mod tests {
         }
     }
 
+    /// A weight matrix as trained ones look: rows of groups of 16 whose scales
+    /// vary by a factor of a few, and about one value in 200 an outlier. The
+    /// scale search of a K-quant has something to do on this and none of it
+    /// is a cosine.
+    fn heavy_tailed(rows: usize, cols: usize) -> Vec<f32> {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut uniform = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            ((state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+        };
+        let mut gauss = move || {
+            let (u, v) = (uniform(), uniform());
+            (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()
+        };
+        let mut out = Vec::with_capacity(rows * cols);
+        for _ in 0..rows {
+            let mut group_scale = 0.0;
+            for c in 0..cols {
+                if c % 16 == 0 {
+                    group_scale = (0.7 * gauss()).exp();
+                }
+                let mut x = 0.02 * group_scale * gauss();
+                if gauss().abs() > 2.8 {
+                    x *= 6.0;
+                }
+                out.push(x as f32);
+            }
+        }
+        out
+    }
+
+    /// The K-quants find as small an error as the reference quantizer does.
+    ///
+    /// The reference values are the relative RMS error (`|x - x'| / |x|`) of
+    /// this exact tensor quantized by the reference quantizer without an
+    /// importance matrix. They agree to about a thousandth because the scale
+    /// searches are the same computation; a weaker search (one that settles for
+    /// the first scale it tries, say) is worse by percents, and a file made
+    /// with it is worse under the same name.
+    #[test]
+    fn k_quants_lose_no_more_than_the_reference_quantizer_on_a_heavy_tailed_matrix() {
+        let (rows, cols) = (256, 1024);
+        let data = heavy_tailed(rows, cols);
+        let energy: f64 = data.iter().map(|v| f64::from(*v).powi(2)).sum();
+        for (dtype, reference) in [
+            (GgmlType::Q2K, 0.325_816),
+            (GgmlType::Q3K, 0.172_322),
+            (GgmlType::Q4K, 0.085_718),
+            (GgmlType::Q5K, 0.043_839),
+            (GgmlType::Q6K, 0.021_481),
+        ] {
+            let bytes = quantize_tensor(&data, dtype, cols, None).unwrap();
+            let back = dequantize(&bytes, dtype, &[rows as i32, cols as i32]).unwrap();
+            let error: f64 = data
+                .iter()
+                .zip(&back)
+                .map(|(a, b)| f64::from(a - b).powi(2))
+                .sum();
+            let relative = (error / energy).sqrt();
+            // Not worse (a rounding that falls the other way in a handful of
+            // blocks can make it a hair better), and not so different that the
+            // search is another one.
+            assert!(
+                relative <= reference * 1.001 && relative >= reference * 0.99,
+                "{dtype:?}: relative error {relative:.6} against the reference's {reference}"
+            );
+        }
+    }
+
     #[test]
     fn bits_buy_accuracy() {
         // Within a family, more bits must not be worse.
