@@ -162,16 +162,19 @@ fn gguf_shape_to_i32(dimensions: &[u64], tensor_name: &str) -> Result<Vec<i32>, 
 
 /// Which Gemma layout a GGUF `general.architecture` writes.
 ///
-/// Both store every norm weight with the 1 that Gemma's `x * (1 + w)` adds
-/// already applied, so the checkpoint's own `w` is the file's value less one.
-/// They differ in the block: Gemma 1 has the Llama layout (two norms), Gemma 2
-/// and 3 have four, named by what they wrap.
+/// Gemma 1 to 3 store every norm weight with the 1 that their `x * (1 + w)`
+/// adds already applied, so the checkpoint's own `w` is the file's value less
+/// one. Gemma 4's norm is `x * w`, and its weights are stored as they are. The
+/// block differs too: Gemma 1 has the Llama layout (two norms), Gemma 2, 3 and 4
+/// have four, named by what they wrap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GemmaGguf {
     /// `gemma`: the Llama tensor names.
     Gemma,
     /// `gemma2` and `gemma3`: [`WeightLoader::gguf_to_hf_name_gemma`].
     PrePostNorm,
+    /// `gemma4`: the same names, and norms stored as they are.
+    Gemma4,
 }
 
 impl GemmaGguf {
@@ -179,8 +182,14 @@ impl GemmaGguf {
         match architecture? {
             "gemma" => Some(Self::Gemma),
             "gemma2" | "gemma3" => Some(Self::PrePostNorm),
+            "gemma4" => Some(Self::Gemma4),
             _ => None,
         }
+    }
+
+    /// Whether the file's norm weights carry the 1 the model adds.
+    fn norms_include_the_offset(self) -> bool {
+        !matches!(self, Self::Gemma4)
     }
 }
 
@@ -244,10 +253,14 @@ impl WeightLoader {
 
             // Map GGUF tensor name to HuggingFace format
             let hf_name = match gemma {
-                Some(GemmaGguf::PrePostNorm) => Self::gguf_to_hf_name_gemma(&tensor_name),
+                Some(GemmaGguf::PrePostNorm | GemmaGguf::Gemma4) => {
+                    Self::gguf_to_hf_name_gemma(&tensor_name)
+                }
                 _ => Self::gguf_to_hf_name(&tensor_name),
             };
-            if gemma.is_some() && hf_name.ends_with("norm.weight") {
+            if gemma.is_some_and(GemmaGguf::norms_include_the_offset)
+                && hf_name.ends_with("norm.weight")
+            {
                 for value in &mut floats {
                     *value -= 1.0;
                 }
@@ -347,6 +360,7 @@ impl WeightLoader {
     /// | `ffn_norm`                  | `pre_feedforward_layernorm`       |
     /// | `post_ffw_norm`             | `post_feedforward_layernorm`      |
     /// | `ffn_gate/up/down`          | `mlp.{gate,up,down}_proj`         |
+    /// | `layer_output_scale`        | `layer_scalar` (Gemma 4)          |
     pub fn gguf_to_hf_name_gemma(gguf_name: &str) -> String {
         match gguf_name {
             "token_embd.weight" => return "model.embed_tokens.weight".to_string(),
@@ -375,6 +389,9 @@ impl WeightLoader {
                     "ffn_gate.weight" => "mlp.gate_proj.weight",
                     "ffn_up.weight" => "mlp.up_proj.weight",
                     "ffn_down.weight" => "mlp.down_proj.weight",
+                    // Gemma 4's per-layer output multiplier, a buffer of the
+                    // model and not a weight, named so in the checkpoint.
+                    "layer_output_scale.weight" => "layer_scalar",
                     other => other,
                 };
                 return format!("model.layers.{block_num}.{hf_rest}");
@@ -469,6 +486,7 @@ impl WeightLoader {
                 "post_attention_layernorm.weight" => Some("post_attention_norm.weight"),
                 "pre_feedforward_layernorm.weight" => Some("ffn_norm.weight"),
                 "post_feedforward_layernorm.weight" => Some("post_ffw_norm.weight"),
+                "layer_scalar" => Some("layer_output_scale.weight"),
                 _ => None,
             };
             if let Some(gguf_suffix) = gguf_suffix {
@@ -844,6 +862,176 @@ pub fn unpermute_llama_qk(
         *tensor = tensor.reshape(&grouped).swap_axes(1, 2).reshape(&shape);
     }
     Ok(())
+}
+
+/// The Gemma 4 text model a `gemma4` GGUF describes.
+///
+/// A Gemma 4 states per-layer facts as arrays (which layers slide, how many
+/// key/value heads each has) and in tensors (the rotated share of a full-attention
+/// head is the prefix of `rope_freqs` that is not `1e30`, and a layer with no
+/// `attn_v` takes its values from its keys), so this reads the file's tensor
+/// list as well as its metadata. Only the dense text model loads: per-layer input
+/// embeddings (the E2B and E4B models), experts and per-layer feed-forward
+/// widths are refused by name, not run without.
+///
+/// # Errors
+///
+/// A key the model needs is missing, or the file is of a Gemma 4 this loader does
+/// not run.
+pub fn gemma4_config_from_path(
+    path: impl AsRef<Path>,
+) -> Result<crate::architectures::gemma4::Gemma4Config, WeightFormatError> {
+    let model = pmetal_gguf::GgufModel::open(resolve_gguf_path(path.as_ref())?)
+        .map_err(|e| WeightFormatError::Gguf(e.to_string()))?;
+    let arch = pmetal_gguf::config::GgufArchConfig::from_model(&model)?;
+    let missing = |key: &str| WeightFormatError::Gguf(format!("gemma4.{key} not found"));
+    let unsupported = |what: &str| {
+        WeightFormatError::UnsupportedFormat(format!(
+            "this Gemma 4 GGUF has {what}, which is not loaded from GGUF; load the model from its \
+             safetensors weights"
+        ))
+    };
+
+    if arch.embedding_length_per_layer_input.unwrap_or(0) > 0 {
+        return Err(unsupported("per-layer input embeddings"));
+    }
+    if model
+        .tensor_names()
+        .any(|name| name.contains("ffn_gate_inp") || name.contains("_exps"))
+    {
+        return Err(unsupported("mixture-of-experts layers"));
+    }
+    let layers = arch
+        .num_hidden_layers
+        .ok_or_else(|| missing("block_count"))? as usize;
+    let intermediate_size = match (arch.intermediate_size, &arch.intermediate_size_per_layer) {
+        (Some(width), _) => width,
+        (None, Some(widths)) if widths.windows(2).all(|w| w[0] == w[1]) && !widths.is_empty() => {
+            widths[0]
+        }
+        _ => return Err(unsupported("a feed-forward width that differs by layer")),
+    };
+    let sliding = arch
+        .sliding_window_pattern
+        .filter(|pattern| pattern.len() == layers)
+        .ok_or_else(|| missing("attention.sliding_window_pattern"))?;
+    let kv_heads: Vec<u32> = match (
+        &arch.num_key_value_heads_per_layer,
+        arch.num_key_value_heads,
+    ) {
+        (Some(per_layer), _) if per_layer.len() == layers => per_layer.clone(),
+        (None, Some(heads)) => vec![heads; layers],
+        _ => return Err(missing("attention.head_count_kv")),
+    };
+    let first = |sliding_layer: bool| sliding.iter().position(|s| *s == sliding_layer);
+    let head_dim = arch
+        .head_dim_swa
+        .ok_or_else(|| missing("attention.key_length_swa"))?;
+    let global_head_dim = arch
+        .head_dim
+        .ok_or_else(|| missing("attention.key_length"))?;
+
+    // A full-attention layer without a value projection takes its values from
+    // its keys; the model states that for all of its full-attention layers or
+    // none.
+    let has_values = |layer: usize| {
+        model
+            .tensor_info(&format!("blk.{layer}.attn_v.weight"))
+            .is_some()
+    };
+    let full_layers: Vec<usize> = (0..layers).filter(|&l| !sliding[l]).collect();
+    let k_eq_v = full_layers.iter().any(|&l| !has_values(l));
+    if k_eq_v && full_layers.iter().any(|&l| has_values(l)) {
+        return Err(unsupported(
+            "full-attention layers that differ in whether they have a value projection",
+        ));
+    }
+    if (0..layers).any(|l| sliding[l] && !has_values(l)) {
+        return Err(unsupported(
+            "a sliding-window layer with no value projection",
+        ));
+    }
+    let kv_of = |sliding_layer: bool| first(sliding_layer).map(|layer| kv_heads[layer]);
+    if (0..layers).any(|l| Some(kv_heads[l]) != kv_of(sliding[l])) {
+        return Err(unsupported(
+            "key/value head counts that differ within a kind of layer",
+        ));
+    }
+    let num_key_value_heads = kv_of(true)
+        .or(kv_of(false))
+        .ok_or_else(|| missing("block_count"))?;
+    if !k_eq_v && kv_of(false).is_some_and(|heads| heads != num_key_value_heads) {
+        return Err(unsupported(
+            "full-attention layers with their own key/value head count and a value projection",
+        ));
+    }
+
+    // Proportional RoPE rotates the leading pairs of a full-attention head and
+    // leaves the rest (their frequency factors are 1e30, which divides the
+    // angle to nothing).
+    let partial_rotary_factor = match arch.rope_scaling.as_ref().and_then(|s| s.get("factors")) {
+        Some(factors) => {
+            let factors: Vec<f64> = factors
+                .as_array()
+                .map(|a| a.iter().filter_map(serde_json::Value::as_f64).collect())
+                .unwrap_or_default();
+            let rotated = factors.iter().take_while(|f| **f == 1.0).count();
+            if factors.is_empty()
+                || factors.len() * 2 != global_head_dim as usize
+                || factors[rotated..].iter().any(|f| *f < 1e20)
+            {
+                return Err(unsupported(
+                    "rope_freqs that are not a rotated prefix followed by unrotated pairs",
+                ));
+            }
+            (2 * rotated) as f64 / f64::from(global_head_dim)
+        }
+        None => 1.0,
+    };
+    let rope_theta = arch.rope_theta.unwrap_or(1_000_000.0);
+    let rope_type = if partial_rotary_factor < 1.0 {
+        "proportional"
+    } else {
+        "default"
+    };
+    let config = serde_json::json!({
+        "model_type": "gemma4_text",
+        "vocab_size": arch.vocab_size.ok_or_else(|| missing("vocab_size"))?,
+        "hidden_size": arch.hidden_size.ok_or_else(|| missing("embedding_length"))?,
+        "intermediate_size": intermediate_size,
+        "num_hidden_layers": layers,
+        "num_attention_heads": arch
+            .num_attention_heads
+            .ok_or_else(|| missing("attention.head_count"))?,
+        "num_key_value_heads": num_key_value_heads,
+        "head_dim": head_dim,
+        "global_head_dim": global_head_dim,
+        "num_global_key_value_heads": kv_of(false),
+        "attention_k_eq_v": k_eq_v,
+        "max_position_embeddings": arch.max_position_embeddings.unwrap_or(131_072),
+        "rms_norm_eps": arch.rms_norm_eps.unwrap_or(1e-6),
+        "tie_word_embeddings": model.tensor_info("output.weight").is_none(),
+        "sliding_window": arch.sliding_window.ok_or_else(|| missing("attention.sliding_window"))?,
+        "final_logit_softcapping": arch.final_logit_softcapping,
+        "layer_types": sliding
+            .iter()
+            .map(|s| if *s { "sliding_attention" } else { "full_attention" })
+            .collect::<Vec<_>>(),
+        "rope_parameters": {
+            "full_attention": {
+                "rope_type": rope_type,
+                "rope_theta": rope_theta,
+                "partial_rotary_factor": partial_rotary_factor,
+            },
+            "sliding_attention": {
+                "rope_type": "default",
+                "rope_theta": arch.rope_theta_swa.unwrap_or(10_000.0),
+            },
+        },
+        "hidden_activation": "gelu_pytorch_tanh",
+        "num_kv_shared_layers": arch.shared_kv_layers.unwrap_or(0),
+    });
+    Ok(serde_json::from_value(config)?)
 }
 
 /// Get the detected model architecture from a GGUF file.

@@ -1271,9 +1271,11 @@ impl DynamicModel {
     /// The dense decoders whose HuggingFace parameter trees map one to one onto
     /// GGUF tensor names load: Llama, Qwen2, Qwen3, Mistral and Phi-3 / Phi-4.
     /// Gemma, Gemma 2 and Gemma 3 load too ([`WeightLoader::gguf_to_hf_name_gemma`],
-    /// [`GgufModelConfig::to_gemma_config`]). Every other architecture returns a
-    /// typed error naming it: the mixture-of-experts and hybrid architectures
-    /// have no GGUF artifact to verify their config and weight wiring against.
+    /// [`GgufModelConfig::to_gemma_config`]), and so does the dense Gemma 4
+    /// text model ([`gemma4_config_from_path`](crate::weight_format::gemma4_config_from_path)).
+    /// Every other architecture returns a typed error naming it: the
+    /// mixture-of-experts and hybrid architectures have no GGUF artifact to
+    /// verify their config and weight wiring against.
     pub fn load_gguf(
         path: impl AsRef<Path>,
         _options: DynamicModelLoadOptions,
@@ -1405,9 +1407,24 @@ impl DynamicModel {
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::Gemma(model))
             }
+            ModelArchitecture::Gemma4 => {
+                if weights.contains_key("lm_head.weight") {
+                    return Err(Exception::custom(
+                        "GGUF: a gemma4 file with an output.weight of its own is not a Gemma 4 \
+                         checkpoint (Gemma 4 ties its head to the embedding)",
+                    ));
+                }
+                let config = crate::weight_format::gemma4_config_from_path(path)
+                    .map_err(|e| Exception::custom(format!("GGUF: {e}")))?;
+                let mut model = crate::architectures::gemma4::Gemma4ForCausalLM::new(config)?;
+                crate::architectures::gemma4::load_gemma4_weights(&mut model, &weights)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                eval_module_parameters_batched(&model)?;
+                Ok(Self::Gemma4(model))
+            }
             other => Err(Exception::custom(format!(
                 "GGUF architecture {:?} ({other}) cannot be loaded from a GGUF file. \
-                 GGUF loading covers the dense Llama, Qwen2, Qwen3, Mistral, Gemma (1 to 3) \
+                 GGUF loading covers the dense Llama, Qwen2, Qwen3, Mistral, Gemma (1 to 4) \
                  and Phi-3 / Phi-4 decoders; load the {other} checkpoint from its \
                  safetensors weights.",
                 gguf_config.architecture
