@@ -1261,10 +1261,9 @@ impl GraniteForCausalLM {
         let logits = if let Some(ref mut lm_head) = self.lm_head {
             Module::forward(lm_head, hidden_states)?
         } else {
-            // Tied embeddings: logits = hidden @ embed.weight.T
-            let embed_weight = self.model.embed_tokens.weight.as_ref();
-            let embed_t = embed_weight.t();
-            hidden_states.matmul(&embed_t)
+            // Tied embeddings: logits = hidden @ embed.weight.T, through the
+            // table so a packed one runs the quantized matmul.
+            self.model.embed_tokens.as_linear(hidden_states)
         };
         // `logits = logits / self.config.logits_scaling` — the line
         // `modeling_granite.py` annotates "main diff with Llama".

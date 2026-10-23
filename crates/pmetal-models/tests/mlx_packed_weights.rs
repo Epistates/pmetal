@@ -14,8 +14,8 @@ mod common;
 use std::collections::BTreeSet;
 
 use common::mlx_quant::{
-    Quantization, packed_modules, parameters, quantizable_modules, quantize_tensors,
-    quantized_checkpoint, token_ids, write_checkpoint,
+    Quantization, packed_modules, parameters, quantizable_modules, quantize_tensors, token_ids,
+    write_checkpoint,
 };
 use pmetal_cache::test_utils::{ParityReport, Tolerance, argmax_last_axis};
 use pmetal_models::DynamicModel;
@@ -61,9 +61,41 @@ fn layer_bytes(model: &DynamicModel) -> usize {
 /// quantized modules that are allowed to come back dense, each a gap this test
 /// records rather than hides.
 fn check_arch(name: &str, config: &str, unpacked: &[&str]) -> DynamicModel {
+    check_arch_in(name, config, unpacked, Layout::SAME)
+}
+
+/// How a checkpoint's names and sizes differ from the model's own parameters.
+#[derive(Clone, Copy)]
+struct Layout {
+    /// A model parameter path's name in the checkpoint.
+    rename: fn(&str) -> String,
+    /// The packed layers take at most `1 / saving` of the dense ones' bytes.
+    saving: usize,
+}
+
+impl Layout {
+    const SAME: Self = Self {
+        rename: str::to_string,
+        saving: 2,
+    };
+}
+
+fn check_arch_in(name: &str, config: &str, unpacked: &[&str], layout: Layout) -> DynamicModel {
     random::seed(7);
     let mut source = DynamicModel::from_config(config).expect("architecture builds");
-    let (dir, quantized) = quantized_checkpoint(&mut source, config, Quantization::Q4);
+    let modules: BTreeSet<String> = quantizable_modules(&mut source)
+        .iter()
+        .map(|m| (layout.rename)(m))
+        .collect();
+    let tensors: Vec<(String, Array)> = parameters(&source)
+        .into_iter()
+        .map(|(k, v)| ((layout.rename)(&k), v))
+        .collect();
+    let (tensors, quantized) = quantize_tensors(tensors, &modules, Quantization::Q4);
+    let dir = write_checkpoint(
+        &tensors,
+        &common::mlx_quant::config_with_quantization(config, Quantization::Q4),
+    );
     assert!(!quantized.is_empty(), "{name}: nothing was quantized");
 
     let mut packed = DynamicModel::load_with_options(dir.path(), PACKED)
@@ -80,7 +112,10 @@ fn check_arch(name: &str, config: &str, unpacked: &[&str]) -> DynamicModel {
         .filter(|m| !unpacked.iter().any(|u| m.as_str() == *u))
         .cloned()
         .collect();
-    let got = packed_modules(&mut packed);
+    let got: BTreeSet<String> = packed_modules(&mut packed)
+        .iter()
+        .map(|m| (layout.rename)(m))
+        .collect();
     assert_eq!(
         got.difference(&want).collect::<Vec<_>>(),
         Vec::<&String>::new(),
@@ -105,7 +140,7 @@ fn check_arch(name: &str, config: &str, unpacked: &[&str]) -> DynamicModel {
     assert_eq!(argmax_last_axis(&a), argmax_last_axis(&b), "{name}");
 
     assert!(
-        layer_bytes(&packed) * 2 < layer_bytes(&dense),
+        layer_bytes(&packed) * layout.saving < layer_bytes(&dense),
         "{name}: {} packed layer bytes against {} dense",
         layer_bytes(&packed),
         layer_bytes(&dense)
@@ -224,6 +259,221 @@ fn deepseek_keeps_its_experts_packed() {
         &[],
     );
     assert_experts_packed(model, 2 * 2);
+}
+
+/// The Gemma model's tree holds its layers under `gemma1` or `gemma2`; a
+/// checkpoint names them `layers.N`.
+const GEMMA_LAYOUT: Layout = Layout {
+    rename: |path| {
+        path.replace("layers.gemma1.", "layers.")
+            .replace("layers.gemma2.", "layers.")
+    },
+    saving: 2,
+};
+
+#[test]
+#[serial]
+fn gemma_stays_packed() {
+    check_arch_in(
+        "gemma",
+        dense_decoder!("gemma", r#", "rms_norm_eps": 1e-6"#),
+        &[],
+        GEMMA_LAYOUT,
+    );
+}
+
+#[test]
+#[serial]
+fn gemma2_stays_packed() {
+    check_arch_in(
+        "gemma2",
+        r#"{
+            "model_type": "gemma2", "vocab_size": 64, "hidden_size": 32,
+            "intermediate_size": 64, "num_hidden_layers": 2, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "head_dim": 8, "max_position_embeddings": 256,
+            "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "sliding_window": 16,
+            "attn_logit_softcapping": 50.0, "final_logit_softcapping": 30.0,
+            "query_pre_attn_scalar": 8
+        }"#,
+        &[],
+        GEMMA_LAYOUT,
+    );
+}
+
+#[test]
+#[serial]
+fn gemma3_stays_packed() {
+    check_arch_in(
+        "gemma3",
+        r#"{
+            "model_type": "gemma3_text", "vocab_size": 64, "hidden_size": 32,
+            "intermediate_size": 64, "num_hidden_layers": 2, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "head_dim": 8, "query_pre_attn_scalar": 8,
+            "sliding_window": 16, "sliding_window_pattern": 2
+        }"#,
+        &[],
+        GEMMA_LAYOUT,
+    );
+}
+
+#[test]
+#[serial]
+fn phi4_stays_packed() {
+    check_arch(
+        "phi",
+        r#"{
+            "model_type": "phi3", "vocab_size": 64, "hidden_size": 32, "intermediate_size": 64,
+            "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 4,
+            "max_position_embeddings": 256, "rms_norm_eps": 1e-5, "rope_theta": 10000.0,
+            "hidden_act": "silu", "tie_word_embeddings": false
+        }"#,
+        &[],
+    );
+}
+
+/// Phi-3 stores one `qkv_proj` where the model holds three projections: the
+/// packed fused tensor splits by rows, each of which was quantized on its own.
+#[test]
+#[serial]
+fn phi3_splits_a_packed_fused_projection() {
+    random::seed(7);
+    let config = r#"{
+        "model_type": "phi3", "vocab_size": 64, "hidden_size": 32, "intermediate_size": 64,
+        "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
+        "max_position_embeddings": 256, "rms_norm_eps": 1e-5, "rope_theta": 10000.0,
+        "hidden_act": "silu", "tie_word_embeddings": false
+    }"#;
+    let mut source = DynamicModel::from_config(config).expect("builds");
+    let modules = quantizable_modules(&mut source);
+    let mut tensors = parameters(&source);
+    // Fuse each layer's q, k and v rows into `qkv_proj`, as Phi-3 ships it.
+    let mut fused = Vec::new();
+    for layer in 0..2 {
+        let p = format!("model.layers.{layer}.self_attn");
+        let weights: Vec<Array> = ["q_proj", "k_proj", "v_proj"]
+            .iter()
+            .map(|n| {
+                let at = tensors
+                    .iter()
+                    .position(|(k, _)| *k == format!("{p}.{n}.weight"))
+                    .expect("projection");
+                tensors.remove(at).1
+            })
+            .collect();
+        let refs: Vec<&Array> = weights.iter().collect();
+        fused.push((
+            format!("{p}.qkv_proj.weight"),
+            pmetal_runtime::compat::ops::concatenate_axis(&refs, 0),
+        ));
+    }
+    tensors.extend(fused);
+    let mut modules: BTreeSet<String> = modules
+        .into_iter()
+        .filter(|m| {
+            !["q_proj", "k_proj", "v_proj"]
+                .iter()
+                .any(|n| m.ends_with(n))
+        })
+        .collect();
+    modules.extend((0..2).map(|l| format!("model.layers.{l}.self_attn.qkv_proj")));
+    let (tensors, quantized) = quantize_tensors(tensors, &modules, Quantization::Q4);
+    assert!(quantized.contains("model.layers.0.self_attn.qkv_proj"));
+    let dir = write_checkpoint(
+        &tensors,
+        &common::mlx_quant::config_with_quantization(config, Quantization::Q4),
+    );
+
+    let mut packed = DynamicModel::load_with_options(dir.path(), PACKED).expect("packed load");
+    let mut dense = DynamicModel::load_with_options(dir.path(), UNPACKED).expect("unpacked load");
+    let got = packed_modules(&mut packed);
+    for layer in 0..2 {
+        for n in ["q_proj", "k_proj", "v_proj"] {
+            assert!(
+                got.contains(&format!("model.layers.{layer}.self_attn.{n}")),
+                "layer {layer} {n} stayed packed"
+            );
+        }
+    }
+    assert!(packed_modules(&mut dense).is_empty());
+    assert_same_logits("phi3 fused", &mut packed, &mut dense, 64);
+}
+
+#[test]
+#[serial]
+fn llama4_stays_packed() {
+    // The routed experts are in transformers' fused layout, which has no MLX
+    // spelling, so they stay dense; the rest of the model packs.
+    check_arch("llama4", &fixture_config("llama4_text_config.json"), &[]);
+    // The dense experts are most of the layers' bytes.
+    check_arch_in(
+        "llama4 moe",
+        &fixture_config("llama4_moe_config.json"),
+        &[],
+        Layout {
+            saving: 1,
+            ..Layout::SAME
+        },
+    );
+}
+
+#[test]
+#[serial]
+fn granite_stays_packed() {
+    check_arch(
+        "granite",
+        dense_decoder!("granite", r#", "rms_norm_eps": 1e-5"#),
+        &[],
+    );
+    check_arch(
+        "granite hybrid",
+        &fixture_config("granite_hybrid_dense_config.json"),
+        &[],
+    );
+}
+
+/// gpt-oss in an MLX conversion's layout: the experts stacked one tensor per
+/// projection (the fixture's `[E, out, in]`, its router named `router`), every
+/// projection but the narrow ones quantized. The down projection's 48 inputs do
+/// not divide into a group, so it stays dense beside the packed gate and up.
+#[test]
+#[serial]
+fn gpt_oss_keeps_its_experts_packed() {
+    random::seed(7);
+    let config = fixture_config("gpt_oss_native_config.json");
+    let (mut packed, mut dense, quantized) = load_both(
+        &config,
+        fixture_tensors("gpt_oss_native_stacked_weights.safetensors"),
+        |m| {
+            m.ends_with("_proj")
+                || m.ends_with(".mlp.router")
+                || m.ends_with("embed_tokens")
+                || m == "lm_head"
+        },
+    );
+    let (experts, rest): (Vec<_>, Vec<_>) =
+        quantized.iter().partition(|m| m.contains(".mlp.experts."));
+    assert_eq!(experts.len(), 2 * 2, "gate and up of each layer");
+    let want: BTreeSet<String> = rest
+        .iter()
+        .map(|m| m.replace(".mlp.router", ".mlp.gate"))
+        .collect();
+    assert_eq!(packed_modules(&mut packed), want, "projections and tables");
+    assert!(packed_modules(&mut dense).is_empty());
+
+    let experts_packed = |model: &DynamicModel| -> Vec<bool> {
+        let DynamicModel::GptOss(model) = model else {
+            panic!("not a gpt-oss model");
+        };
+        model
+            .model
+            .layers
+            .iter()
+            .map(|layer| layer.mlp.experts_packed())
+            .collect()
+    };
+    assert_eq!(experts_packed(&packed), [true, true]);
+    assert_eq!(experts_packed(&dense), [false, false]);
+    assert_same_logits("gpt_oss", &mut packed, &mut dense, vocab_size(&config));
 }
 
 #[test]
@@ -545,16 +795,5 @@ fn gemma4_moe_keeps_its_experts_packed() {
         common::gemma4::moe_synthetic_config_json(),
         "gemma4_moe_synth_weights.safetensors",
         2,
-    );
-}
-
-// Silence the helpers the later architecture tests use.
-#[allow(dead_code)]
-fn _unused() {
-    let _ = (
-        parameters,
-        quantizable_modules,
-        quantize_tensors,
-        write_checkpoint,
     );
 }

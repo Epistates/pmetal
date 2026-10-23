@@ -386,6 +386,45 @@ impl PackedLinears {
             .map(|(module, packed)| (format!("{module}.weight"), packed.weight.clone()))
     }
 
+    /// Split each module named `{prefix}{fused}` into the modules
+    /// `{prefix}{suffix}` for `(suffix, start, stop)` in `parts`, by output
+    /// rows.
+    ///
+    /// Every row of a packed weight is quantized on its own (its words, and
+    /// its scales and biases per group along the input axis), so a fused
+    /// projection's rows slice apart exactly: Phi-3's `qkv_proj` into the
+    /// `q_proj`, `k_proj` and `v_proj` the model holds.
+    pub(crate) fn split_rows(&mut self, fused: &str, parts: &[(&str, i32, i32)]) {
+        let names: Vec<String> = self
+            .modules
+            .keys()
+            .filter(|m| m.ends_with(fused))
+            .cloned()
+            .collect();
+        for module in names {
+            let Some(packed) = self.modules.remove(&module) else {
+                continue;
+            };
+            let prefix = module.strip_suffix(fused).unwrap_or(&module);
+            for &(name, start, stop) in parts {
+                let rows = |a: &Array| {
+                    let cols = a.dim(1);
+                    a.slice(&[start, 0], &[stop, cols])
+                };
+                self.modules.insert(
+                    format!("{prefix}{name}"),
+                    PackedLinear {
+                        weight: rows(&packed.weight),
+                        scales: rows(&packed.scales),
+                        biases: packed.biases.as_ref().map(rows),
+                        tensor_scale: packed.tensor_scale.clone(),
+                        params: packed.params,
+                    },
+                );
+            }
+        }
+    }
+
     /// Rename the module paths (a loader that canonicalizes checkpoint keys
     /// has to canonicalize these the same way).
     pub(crate) fn rename(&mut self, f: impl Fn(&str) -> String) {

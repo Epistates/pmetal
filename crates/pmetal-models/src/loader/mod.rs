@@ -34,10 +34,12 @@ pub use diffusion::*;
 pub use encoder::*;
 pub use families::*;
 
-pub(crate) use assign::load_prepared;
+pub(crate) use assign::{load_prepared, load_prepared_with, packable_paths};
 pub(crate) use checkpoint::validate_shard_path;
 pub(crate) use families::{install_gemma4_packed, read_gemma4_checkpoint};
-pub(crate) use quant::{PackedLinears, dequantize_sidecar_weights, take_packed_linears};
+pub(crate) use quant::{
+    PackedLinears, dequantize_sidecar_weights, report_unpacked, take_packed_linears,
+};
 
 use checkpoint::Checkpoint;
 use quant::QuantConfig;
@@ -178,6 +180,22 @@ pub(crate) fn unpack_mlx_quantized_weights(
     weights: &mut HashMap<String, Array>,
 ) -> Result<Vec<String>, LoadError> {
     quant::unpack_mlx_quantized(weights, QuantConfig::read(model_dir)?.as_ref())
+}
+
+/// Whether `model_dir`'s `config.json` carries an MLX quantization block.
+pub(crate) fn is_mlx_quantized(model_dir: &Path) -> bool {
+    matches!(QuantConfig::read(model_dir), Ok(Some(_)))
+}
+
+/// Lift the MLX-quantized modules at `paths` out of `weights` still packed (see
+/// [`quant::take_packed_mlx_linears`]), for a loader that reads the checkpoint
+/// itself.
+pub(crate) fn lift_packed_mlx(
+    weights: &mut HashMap<String, Array>,
+    model_dir: &Path,
+    paths: &[String],
+) -> Result<PackedLinears, LoadError> {
+    quant::take_packed_mlx_linears(weights, QuantConfig::read(model_dir)?.as_ref(), paths)
 }
 
 pub(crate) fn load_weights_filtered<F>(

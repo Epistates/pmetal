@@ -251,11 +251,33 @@ pub(crate) fn load_prepared<
         &mut super::PackedLinears,
     ) -> Result<HashMap<String, Array>, LoadError>,
 ) -> Result<(), LoadError> {
+    load_prepared_with(model, model_dir, policy, &[], prepare)
+}
+
+/// [`load_prepared`] for a checkpoint that also names modules the model
+/// holds differently: `extra_paths` are modules (a fused projection) that may
+/// stay packed beside the model's own layers, for `prepare` to place.
+pub(crate) fn load_prepared_with<
+    M: ModuleParameters + ModuleParametersExt + pmetal_runtime::compat::VisitLinears,
+>(
+    model: &mut M,
+    model_dir: impl AsRef<Path>,
+    policy: &LoadPolicy,
+    extra_paths: &[String],
+    prepare: impl FnOnce(
+        HashMap<String, Array>,
+        &mut super::PackedLinears,
+    ) -> Result<HashMap<String, Array>, LoadError>,
+) -> Result<(), LoadError> {
     let model_dir = model_dir.as_ref();
     let snapshot = ParamSnapshot::of(model);
     // The layers a quantized tensor may stay packed on: projections, embedding
     // tables and stacked experts.
-    let linear_paths = policy.keep_quantized.then(|| packable_paths(model));
+    let linear_paths = policy.keep_quantized.then(|| {
+        let mut paths = packable_paths(model);
+        paths.extend_from_slice(extra_paths);
+        paths
+    });
     let (loaded, mut packed) =
         super::load_weights_keeping_packed(model_dir, linear_paths.as_deref())?;
     let loaded = prepare(loaded, &mut packed)?;
