@@ -909,8 +909,35 @@ void mlx_inline_checkpoint(
     };
 
     try {
-        auto checkpointed = mlx::core::checkpoint(
-            std::function<std::vector<array>(const std::vector<array>&)>(cpp_forward));
+        // `mlx::core::checkpoint(forward)` in the form that frees memory.
+        //
+        // MLX evaluates a graph from its far end, nodes furthest from the
+        // outputs first, and nothing in `checkpoint` says when a block's
+        // recompute is to run: only that it follows the block's forward. So
+        // every block's recompute ran as soon as it could, the whole chain of
+        // cotangents ahead of the parameter gradients that use each block's
+        // recomputed activations, and the interiors of all the blocks were
+        // alive at once at the start of the backward pass: a step at or above
+        // the memory of one without checkpointing (0.9x measured), the saving
+        // the forward pass made given back.
+        //
+        // Two dependencies order it. The recompute depends on the cotangent it
+        // is differentiated against, so it runs when its block's backward is
+        // due; and no gradient of the block, including the cotangent that
+        // starts the block before it, is available until all of them are
+        // computed, so a block's recompute is consumed before the next begins.
+        std::function<std::vector<array>(const std::vector<array>&)> forward(cpp_forward);
+        auto vjp_fun = [forward](
+                           const std::vector<array>& primals,
+                           const std::vector<array>& cotangents,
+                           const std::vector<array>& outputs) -> std::vector<array> {
+            std::vector<array> deps = outputs;
+            deps.insert(deps.end(), cotangents.begin(), cotangents.end());
+            auto [__, vjps] =
+                mlx::core::vjp(forward, mlx::core::depends(primals, deps), cotangents);
+            return mlx::core::depends(vjps, vjps);
+        };
+        auto checkpointed = mlx::core::custom_vjp(forward, vjp_fun);
         auto results = checkpointed(inputs);
 
         int n = (int)results.size();

@@ -81,12 +81,15 @@ impl Block {
 
 const PARAMS_PER_BLOCK: usize = 4;
 
-/// One training step: run the stack, sum to a scalar, take gradients.
+/// One training step: run the stack, sum to a scalar, take gradients, and
+/// evaluate both as a training step does. (Evaluating the loss alone only runs
+/// the forward pass, which a checkpoint always shrinks; the backward pass is
+/// where a checkpoint that frees nothing shows.)
 fn step(stack: &mut [Block], x: &Array, checkpoint: bool) -> f32 {
     let params: Vec<Array> = stack.iter().flat_map(|b| b.adapters()).collect();
     let n_params = params.len();
 
-    let (loss, _grads) = value_and_grad(
+    let (loss, grads) = value_and_grad(
         |arrays| {
             for (i, block) in stack.iter_mut().enumerate() {
                 block.set_adapters(&arrays[i * PARAMS_PER_BLOCK..(i + 1) * PARAMS_PER_BLOCK]);
@@ -109,6 +112,9 @@ fn step(stack: &mut [Block], x: &Array, checkpoint: bool) -> f32 {
         std::slice::from_ref(x),
     );
 
+    let mut outputs: Vec<&Array> = grads.iter().collect();
+    outputs.push(&loss);
+    pmetal_runtime::compat::eval(outputs).unwrap();
     loss.item_f32()
 }
 
@@ -126,6 +132,10 @@ fn peak_for(checkpoint: bool) -> (usize, f32) {
 
 #[test]
 fn checkpointing_lowers_the_peak() {
+    // As a training command starts, before MLX touches the GPU: the command
+    // queue holds on to buffers a checkpoint frees unless its limit is low.
+    pmetal_runtime::memory::bound_command_buffer_memory();
+
     let (plain_peak, plain_loss) = peak_for(false);
     let (ckpt_peak, ckpt_loss) = peak_for(true);
 
@@ -143,9 +153,11 @@ fn checkpointing_lowers_the_peak() {
         plain_peak as f64 / ckpt_peak.max(1) as f64,
     );
 
+    // Measured at 2.3x. MLX's own checkpoint measured 0.9x here: with the
+    // gradients evaluated, its recomputed blocks were all alive at once.
     assert!(
-        ckpt_peak < plain_peak,
-        "checkpointing did not lower the peak: plain {plain_peak} bytes, \
+        ckpt_peak * 8 < plain_peak * 5,
+        "checkpointing saved too little: plain {plain_peak} bytes, \
          checkpointed {ckpt_peak} bytes. A correct checkpoint that saves nothing \
          is one extra forward pass for no benefit."
     );

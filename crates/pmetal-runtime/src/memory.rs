@@ -52,6 +52,46 @@ impl MemoryStats {
 }
 
 // ---------------------------------------------------------------------------
+// Command buffers
+// ---------------------------------------------------------------------------
+
+/// The variable MLX reads, once, for how many megabytes of buffers one Metal
+/// command buffer may read before it is committed.
+const MAX_MB_PER_BUFFER: &str = "MLX_MAX_MB_PER_BUFFER";
+
+/// What a training run asks of it: a buffer is committed after reading 4 MB.
+const TRAINING_MB_PER_BUFFER: &str = "4";
+
+/// Make the GPU command queue pin less memory, for a training run.
+///
+/// MLX keeps every buffer a command buffer reads alive until the whole command
+/// buffer has finished on the GPU, and lets the CPU run ahead of the GPU by up
+/// to ten of them, each of which reads 40 to 50 MB or more before it is
+/// committed. A training step's forward and backward pass allocate faster than
+/// that window releases, so the activations a backward pass recomputes and
+/// frees, and the ones gradient checkpointing exists to throw away, are still
+/// held when the next ones are made. On Qwen3-0.6B the peak of a step came
+/// out a fifth (LoRA) to two fifths (full fine-tune) above what it needs with
+/// this limit, and gradient checkpointing saved a fraction of what it does
+/// with it. Step time did not change: a training op is large enough that
+/// committing after a few of them costs nothing.
+///
+/// MLX reads the variable once, when it first touches the GPU, so this has to
+/// run before the first MLX operation of the process, and has no effect after.
+/// A value already in the environment is left alone, so a person's setting
+/// wins. Not for inference, which wants its small ops batched. Returns whether
+/// the limit was set.
+pub fn bound_command_buffer_memory() -> bool {
+    if std::env::var_os(MAX_MB_PER_BUFFER).is_some() {
+        return false;
+    }
+    // SAFETY: called at the start of a process, before it runs threads that
+    // read the environment; MLX itself reads the variable later and once.
+    unsafe { std::env::set_var(MAX_MB_PER_BUFFER, TRAINING_MB_PER_BUFFER) };
+    true
+}
+
+// ---------------------------------------------------------------------------
 // Diagnostics
 // ---------------------------------------------------------------------------
 
