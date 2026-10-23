@@ -24,7 +24,11 @@ fn floats(a: &Array) -> Vec<f32> {
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f64 {
-    let dot: f64 = a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum();
+    let dot: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| f64::from(*x) * f64::from(*y))
+        .sum();
     let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
     dot / (norm(a) * norm(b))
 }
@@ -55,7 +59,13 @@ fn the_dynamic_target_taps_what_the_native_one_does() {
     let mut kv = DFlashTarget::make_kv_cache(&dynamic, 256);
     let mut mamba = DFlashTarget::make_mamba_cache(&dynamic);
     let dyn_logits = dynamic
-        .forward_with_capture(&input, None, Some(&mut kv), mamba.as_mut(), &mut dyn_capture)
+        .forward_with_capture(
+            &input,
+            None,
+            Some(&mut kv),
+            mamba.as_mut(),
+            &mut dyn_capture,
+        )
         .unwrap();
 
     let mut native = NativeQwen3Target::load(&dir).unwrap();
