@@ -333,7 +333,9 @@ impl PackedLinears {
                 packed.weight.dim(0),
                 packed.weight.dim(1) * 32 / packed.params.bits,
             );
-            if linear.shape() != (out, input) {
+            // A layer built "for loading" is a 1x1 placeholder that takes the
+            // shape of whatever the checkpoint puts on it.
+            if linear.shape() != (out, input) && linear.shape() != (1, 1) {
                 failure = Some(LoadError::ShapeMismatch {
                     key: format!("{path}.weight"),
                     expected: vec![linear.shape().0, linear.shape().1],

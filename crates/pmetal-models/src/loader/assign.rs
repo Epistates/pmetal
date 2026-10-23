@@ -741,7 +741,19 @@ mod tests {
 
         let mut unpacked = tiny_qwen3(false);
         load_generic_weights(&mut unpacked, dir.path()).unwrap();
-        let mut kept = tiny_qwen3(false);
+        // Built the way the dispatcher builds it, 1x1 placeholders and all.
+        let mut kept = Qwen3ForCausalLM::new_for_loading(Qwen3Config {
+            hidden_size: 32,
+            intermediate_size: 64,
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            num_key_value_heads: Some(1),
+            head_dim: 16,
+            vocab_size: 100,
+            tie_word_embeddings: false,
+            ..Default::default()
+        })
+        .unwrap();
         load_generic_weights_with(
             &mut kept,
             dir.path(),
