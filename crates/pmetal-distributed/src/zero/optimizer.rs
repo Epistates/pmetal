@@ -19,6 +19,7 @@
 
 use crate::{DistributedBackend, ReduceOp, error::DistributedError};
 use anyhow::Result;
+use pmetal_core::adamw::{AdamWStepScalars, adamw_update};
 
 /// Which parts of training state are sharded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +45,10 @@ pub trait ShardOptimizer: Send {
 
 /// AdamW (decoupled weight decay) over a shard, on the host.
 ///
+/// Pure Rust, so the crate builds without the tensor runtime; the update is
+/// `pmetal_core::adamw`, the arithmetic of the runtime's device AdamW, and a
+/// test holds the two together bit for bit.
+///
 /// Elementwise, so the result for each element does not depend on how the
 /// vector is cut into shards. `new(len)` takes the shard's length.
 #[derive(Debug, Clone)]
@@ -60,7 +65,7 @@ pub struct ShardedAdamW {
     pub weight_decay: f32,
     m: Vec<f32>,
     v: Vec<f32>,
-    steps: i32,
+    steps: u64,
 }
 
 impl ShardedAdamW {
@@ -85,19 +90,18 @@ impl ShardOptimizer for ShardedAdamW {
         assert_eq!(params.len(), self.m.len(), "shard length changed");
         assert_eq!(grads.len(), self.m.len(), "gradient/shard length mismatch");
         self.steps += 1;
-        let c1 = 1.0 - self.beta1.powi(self.steps);
-        let c2 = 1.0 - self.beta2.powi(self.steps);
-        for (((p, &g), m), v) in params
-            .iter_mut()
-            .zip(grads)
-            .zip(&mut self.m)
-            .zip(&mut self.v)
-        {
-            *m = self.beta1 * *m + (1.0 - self.beta1) * g;
-            *v = self.beta2 * *v + (1.0 - self.beta2) * g * g;
-            let update = (*m / c1) / ((*v / c2).sqrt() + self.eps);
-            *p = *p * (1.0 - self.lr * self.weight_decay) - self.lr * update;
-        }
+        // The arithmetic of `torch.optim.AdamW`, the one `pmetal-core` holds
+        // for every host-side AdamW (the ANE trainer's included), and the one
+        // the device AdamW in `pmetal-runtime` is bit-identical to.
+        let scalars = AdamWStepScalars::new(
+            self.lr,
+            self.weight_decay,
+            self.beta1,
+            self.beta2,
+            self.eps,
+            self.steps,
+        );
+        adamw_update(params, grads, &mut self.m, &mut self.v, &scalars);
     }
 
     fn state_bytes(&self) -> usize {

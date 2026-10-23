@@ -3,15 +3,14 @@
 //! This crate holds the Apple-Silicon pieces the tensor runtime
 //! (`pmetal-runtime`) has no op for:
 //!
-//! - **Training kernels** ([`kernels`]): [`FusedAdamW`](kernels::FusedAdamW),
-//!   a one-dispatch optimizer update over every parameter, and
-//!   [`DwGemm`](kernels::DwGemm), the f32 weight-gradient GEMM the ANE trainer
-//!   batches into one command buffer
+//! - **Training kernels** ([`kernels`]): [`DwGemm`](kernels::DwGemm), the f32
+//!   weight-gradient GEMM the ANE trainer batches into one
+//!   [`BatchedCommandBuffer`](kernels::BatchedCommandBuffer)
 //! - **Apple Neural Engine** ([`ane`], feature `ane`, on by default): MIL
 //!   program generation, IOSurface transfer, a compile-once training loop and
 //!   an inference engine, through the private `AppleNeuralEngine.framework`
 //! - **CPU helpers**: [`accelerate`] (vDSP and cblas wrappers for RMSNorm,
-//!   softmax, cross-entropy, Adam and GEMM) and [`neon_convert`] (bulk
+//!   softmax, cross-entropy and GEMM) and [`neon_convert`] (bulk
 //!   f16 and f32 conversion)
 //! - **Device management and buffers**: a thread-safe [`MetalContext`] with a
 //!   pipeline cache, type-safe [`MetalBuffer`]s over unified memory, and

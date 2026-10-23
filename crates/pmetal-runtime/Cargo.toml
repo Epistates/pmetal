@@ -42,6 +42,10 @@ tempfile = { workspace = true }
 # version, so publishing drops it instead of resolving the crate against
 # itself on the registry.
 pmetal-runtime = { path = ".", features = ["strict-errors"] }
+# The host AdamW, which a test holds to this crate's device AdamW. A test-only
+# edge with no version, dropped on publish: this crate has no dependency on
+# another pmetal crate.
+pmetal-core = { path = "../pmetal-core" }
 serial_test = { workspace = true }
 
 [build-dependencies]

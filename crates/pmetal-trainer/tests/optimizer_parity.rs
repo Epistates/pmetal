@@ -18,21 +18,21 @@
 //! gradients span three scales (1, 10 and 1e-3), so Adam's epsilon and
 //! Adafactor's update clipping both take part.
 //!
-//! Parameter groups (no weight decay on biases and normalization weights,
-//! an embedding learning rate, LoRA+) are held to the standard loop's
-//! grouped AdamW, which the fused Metal AdamW must match step for step.
+//! The AdamW in `pmetal-runtime` updates each parameter in one fused Metal
+//! dispatch. Its trajectories are held to PyTorch's here, and to the op-based
+//! reference it replaced, bit for bit, in the runtime's own tests.
 
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use pmetal_core::OptimizerType;
-use pmetal_metal::kernels::AdamWConfig;
+use pmetal_core::adamw::{AdamWStepScalars, adamw_update};
 use pmetal_runtime::compat::{
     Array, FlattenedModuleParam, ModuleParametersExt,
     optimizers::{AdamWBuilder, Optimizer},
 };
 use pmetal_runtime::optimizer::{AdamW as RuntimeAdamW, ParamClass, ParamSet};
-use pmetal_trainer::{MlxMetalOptimizerBuilder, ParamGroupOptimizerBuilder, TrainOptimizer};
+use pmetal_trainer::{ParamGroupOptimizerBuilder, TrainOptimizer};
 use serde::Deserialize;
 
 const NAMES: [&str; 3] = ["w0", "w1", "w2"];
@@ -261,181 +261,9 @@ fn bridge_adamw_matches_torch() {
     }
 }
 
-/// The Metal fused AdamW `pmetal train` runs by default.
+/// The host AdamW the ANE trainer updates its weights with.
 #[test]
-fn metal_fused_adamw_matches_torch() {
-    let fx = fixture();
-    for case in ["adamw", "adamw_beta2_095"] {
-        let c = &fx.optimizers[case];
-        let (b1, b2) = c.betas();
-        let mut opt = MlxMetalOptimizerBuilder::new(fx.lr[0])
-            .beta1(b1)
-            .beta2(b2)
-            .epsilon(c.f32("eps"))
-            .weight_decay(c.f32("weight_decay"))
-            .build()
-            .unwrap();
-        check(
-            &format!("Metal fused AdamW {case}"),
-            &fx,
-            case,
-            |model, s| {
-                opt.set_learning_rate(fx.lr[s]);
-                opt.update_model_fused(model, &fx.grads(s)).expect("update");
-                snapshot(model)
-            },
-        );
-    }
-}
-
-/// A parameter in every group, named as the groups recognize them.
-struct Grouped {
-    embed_tokens: Array,
-    input_layernorm: Array,
-    q_proj_bias: Array,
-    q_proj_lora_a: Array,
-    q_proj_lora_b: Array,
-    down_proj: Array,
-}
-pmetal_runtime::impl_module_params!(
-    Grouped;
-    embed_tokens,
-    input_layernorm,
-    q_proj_bias,
-    q_proj_lora_a,
-    q_proj_lora_b,
-    down_proj
-);
-
-const GROUPED: [(&str, &[i32], f32); 6] = [
-    ("embed_tokens", &[16, 8], 1.0),
-    ("input_layernorm", &[8], 10.0),
-    ("q_proj_bias", &[8], 1e-3),
-    ("q_proj_lora_a", &[4, 8], 1.0),
-    ("q_proj_lora_b", &[8, 4], 10.0),
-    ("down_proj", &[8, 8], 1e-3),
-];
-
-/// Every parameter of `model` by name.
-fn grouped_snapshot(model: &Grouped) -> HashMap<String, Vec<f32>> {
-    model
-        .flatten_params()
-        .iter()
-        .map(|(k, v)| (k.to_string(), values(v)))
-        .collect()
-}
-
-/// Largest difference between two snapshots, relative above 1.
-fn largest_difference(a: &HashMap<String, Vec<f32>>, b: &HashMap<String, Vec<f32>>) -> f64 {
-    let mut worst = 0.0f64;
-    for (name, a) in a {
-        for (&x, &y) in a.iter().zip(&b[name]) {
-            let err = (x as f64 - y as f64).abs() / (x as f64).abs().max(1.0);
-            worst = if err.is_nan() {
-                f64::INFINITY
-            } else {
-                worst.max(err)
-            };
-        }
-    }
-    worst
-}
-
-/// The fused Metal AdamW trains every parameter group as the standard loop's
-/// optimizer does: the two, over a model with no-decay parameters, an
-/// embedding learning rate and LoRA+, land on the same weights after every
-/// step, a parameter without a gradient included.
-#[test]
-fn fused_adamw_trains_the_parameter_groups_the_standard_loop_does() {
-    use pmetal_runtime::compat::random;
-    use pmetal_trainer::{TrainingLoop, TrainingLoopConfig};
-
-    let mut config = TrainingLoopConfig::default();
-    config.training.optimizer = OptimizerType::AdamW;
-    config.training.learning_rate = 1e-2;
-    config.training.weight_decay = 0.1;
-    config.embedding_lr = Some(2.5e-3);
-    config.loraplus_lr_ratio = Some(16.0);
-    let training_loop = TrainingLoop::new(config).unwrap();
-
-    random::seed(11);
-    let init: Vec<Array> = GROUPED
-        .iter()
-        .map(|&(_, shape, _)| random::normal(shape, pmetal_runtime::compat::Dtype::Float32))
-        .collect();
-    let model = || Grouped {
-        embed_tokens: init[0].clone(),
-        input_layernorm: init[1].clone(),
-        q_proj_bias: init[2].clone(),
-        q_proj_lora_a: init[3].clone(),
-        q_proj_lora_b: init[4].clone(),
-        down_proj: init[5].clone(),
-    };
-    // Warmup, then decay.
-    let lrs = [2e-3f32, 6e-3, 1e-2, 9e-3, 7e-3, 4e-3, 2e-3, 1e-3];
-    let grads: Vec<FlattenedModuleParam> = (0..lrs.len())
-        .map(|step| {
-            GROUPED
-                .iter()
-                // Step 5 has no gradient for two parameters.
-                .filter(|(name, _, _)| step != 4 || !matches!(*name, "down_proj" | "q_proj_lora_b"))
-                .map(|&(name, shape, scale)| {
-                    let g = random::normal(shape, pmetal_runtime::compat::Dtype::Float32)
-                        .multiply(&Array::from_f32(scale));
-                    g.eval();
-                    (Rc::from(name), g)
-                })
-                .collect()
-        })
-        .collect();
-
-    // `Grouped` has no output head of its own; `embed_tokens` is the
-    // embedding by name.
-    let mut standard = training_loop.build_optimizer(None);
-    let mut fused = MlxMetalOptimizerBuilder::new(1e-2)
-        .param_groups(training_loop.parameter_groups(None))
-        .build()
-        .expect("fused optimizer");
-    // The fused path at the run's weight decay, without its embedding rate
-    // and LoRA+ ratio: the update the default loop used to make.
-    let mut ungrouped = MlxMetalOptimizerBuilder::new(1e-2)
-        .weight_decay(0.1)
-        .build()
-        .expect("fused optimizer");
-    let (mut a, mut b, mut c) = (model(), model(), model());
-    let mut max_err = 0.0f64;
-    for (step, (&lr, grads)) in lrs.iter().zip(&grads).enumerate() {
-        standard.set_learning_rate(lr);
-        standard.update(&mut a, grads.clone()).expect("standard");
-        fused.set_learning_rate(lr);
-        fused.update_model_fused(&mut b, grads).expect("fused");
-        ungrouped.set_learning_rate(lr);
-        ungrouped
-            .update_model_fused(&mut c, grads)
-            .expect("ungrouped");
-
-        let want = grouped_snapshot(&a);
-        let err = largest_difference(&want, &grouped_snapshot(&b));
-        assert!(
-            err <= ATOL,
-            "step {}: the fused update is {err:.3e} off the standard loop's",
-            step + 1
-        );
-        max_err = max_err.max(err);
-    }
-    // Without the groups the two paths part: the test sees them.
-    let apart = largest_difference(&grouped_snapshot(&a), &grouped_snapshot(&c));
-    assert!(apart > 1e-3, "ungrouped fused AdamW only {apart:.3e} off");
-    pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
-    println!(
-        "fused vs standard, grouped: max error {max_err:.2e} over {} steps (ungrouped: {apart:.2e})",
-        lrs.len()
-    );
-}
-
-/// The CPU AdamW the ANE trainer updates its weights with.
-#[test]
-fn cpu_adamw_matches_torch() {
+fn host_adamw_matches_torch() {
     let fx = fixture();
     for case in ["adamw", "adamw_beta2_095"] {
         let c = &fx.optimizers[case];
@@ -450,19 +278,17 @@ fn cpu_adamw_matches_torch() {
                 (n, (p, z.clone(), z))
             })
             .collect();
-        check(&format!("CPU AdamW {case}"), &fx, case, |_, s| {
-            let scalars = AdamWConfig {
-                learning_rate: fx.lr[s],
+        check(&format!("host AdamW {case}"), &fx, case, |_, s| {
+            let scalars = AdamWStepScalars::new(
+                fx.lr[s],
+                c.f32("weight_decay"),
                 beta1,
                 beta2,
-                epsilon: c.f32("eps"),
-                weight_decay: c.f32("weight_decay"),
-                step: s as u32 + 1,
-            }
-            .scalars()
-            .unwrap();
+                c.f32("eps"),
+                s as u64 + 1,
+            );
             for (name, (p, m, v)) in state.iter_mut() {
-                pmetal_metal::accelerate::adamw_update(p, &fx.grads[s][*name], m, v, &scalars);
+                adamw_update(p, &fx.grads[s][*name], m, v, &scalars);
             }
             state
                 .iter()

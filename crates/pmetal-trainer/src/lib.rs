@@ -50,7 +50,6 @@ pub mod eval;
 pub mod full_finetune;
 pub mod grpo;
 pub mod logprob_utils;
-pub mod mlx_metal_optimizer;
 pub mod mtp_training;
 pub mod optimizer;
 pub mod param_groups;
@@ -95,10 +94,6 @@ pub use embedding_trainer::{
     EmbeddingTrainerError,
 };
 pub use grpo::*;
-pub use mlx_metal_optimizer::{
-    MlxMetalOptimizer, MlxMetalOptimizerBuilder, MlxMetalOptimizerConfig, MlxMetalOptimizerError,
-    MlxMetalOptimizerResult, is_mlx_metal_optimizer_available,
-};
 pub use mtp_training::*;
 pub use optimizer::{
     Adafactor, Lion, MomentumSgd, ParamGroupOptimizer, ParamGroupOptimizerBuilder, SecondMoment,

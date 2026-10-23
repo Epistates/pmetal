@@ -282,7 +282,6 @@ fn score(model: DynamicModel, tokenizer: &Tokenizer, data: &TaskData) -> Result<
 | `rollout`, `reward_model`, `ane_reward` | Batched completion sampling for RL and distillation; reward-model scoring, pipelined with the next step |
 | `tensorboard` | TensorBoard event files for scalar metrics (always built) |
 | `optimizer` | AdamW, SGD with momentum, Lion, Adafactor, Muon, schedule-free AdamW and 8-bit AdamW, in parameter groups |
-| `mlx_metal_optimizer` | Metal-accelerated AdamW updates |
 | `adaptive_lr` | EMA-based adaptive learning rate control |
 | `checkpoint` | Checkpoint save/load |
 | `scheduler` | Learning rate schedulers |

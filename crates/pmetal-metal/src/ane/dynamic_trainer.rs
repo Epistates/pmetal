@@ -36,8 +36,9 @@ use crate::ane::scratch::{
 use crate::buffer::{BufferUsage, MetalBuffer};
 use crate::context::MetalContext;
 use crate::error::{MetalError, Result};
+use crate::kernels::BatchedCommandBuffer;
 use crate::kernels::dw_gemm::{DwGemm, GPU_DW_MIN_DIM, ScratchPool};
-use crate::kernels::fused_training::{AdamWConfig, BatchedCommandBuffer};
+use pmetal_core::adamw::{AdamWStepScalars, adamw_update};
 use pmetal_core::{LearningRateScheduler, LrSchedulerType};
 
 /// A target [`DynamicAneTrainer::train_batch`] leaves out of the loss:
@@ -335,7 +336,9 @@ struct LayerWeights {
 /// A weight's checkpoint name, its two Adam moments and its shape.
 type AdamEntry<'a> = (String, &'a mut Vec<f32>, &'a mut Vec<f32>, Vec<usize>);
 
-/// Adam state for a single parameter.
+/// Adam state for a single parameter, stepped on the host by
+/// [`adamw_update`], the arithmetic of the device AdamW in
+/// `pmetal-runtime` (the ANE trainer keeps its weights in host memory).
 struct AdamParam {
     m: Vec<f32>,
     v: Vec<f32>,
@@ -2459,19 +2462,18 @@ impl DynamicAneTrainer {
         // from sparse token updates and magnitude drift through many layers)
         let embed_lr = self.config.embedding_lr.unwrap_or(lr);
         let scalars = |learning_rate: f32, weight_decay: f32| {
-            AdamWConfig {
+            AdamWStepScalars::new(
                 learning_rate,
-                beta1: self.config.adam_beta1,
-                beta2: self.config.adam_beta2,
-                epsilon: self.config.adam_eps,
                 weight_decay,
-                step: u32::try_from(t).unwrap_or(u32::MAX),
-            }
-            .scalars()
+                self.config.adam_beta1,
+                self.config.adam_beta2,
+                self.config.adam_eps,
+                t as u64,
+            )
         };
-        let weights = scalars(lr, self.config.weight_decay)?;
-        let norms = scalars(lr, 0.0)?;
-        let embedding = scalars(embed_lr, self.config.weight_decay)?;
+        let weights = scalars(lr, self.config.weight_decay);
+        let norms = scalars(lr, 0.0);
+        let embedding = scalars(embed_lr, self.config.weight_decay);
 
         for l in 0..self.config.n_layers {
             let lw = &mut self.layer_weights[l];
@@ -2481,7 +2483,7 @@ impl DynamicAneTrainer {
             // Weight gradient fields are MetalBuffer — access via as_slice()
             macro_rules! adam_weight {
                 ($w:ident) => {
-                    accelerate::adamw_update(
+                    adamw_update(
                         &mut lw.$w,
                         lg.$w.as_slice(),
                         &mut la.$w.m,
@@ -2493,13 +2495,7 @@ impl DynamicAneTrainer {
             // RMSNorm gradient fields are Vec<f32>
             macro_rules! adam_norm {
                 ($w:ident) => {
-                    accelerate::adamw_update(
-                        &mut lw.$w,
-                        &lg.$w,
-                        &mut la.$w.m,
-                        &mut la.$w.v,
-                        &norms,
-                    );
+                    adamw_update(&mut lw.$w, &lg.$w, &mut la.$w.m, &mut la.$w.v, &norms);
                 };
             }
 
@@ -2514,7 +2510,7 @@ impl DynamicAneTrainer {
             adam_norm!(rms_ffn);
         }
 
-        accelerate::adamw_update(
+        adamw_update(
             &mut self.embed_weights,
             &self.embed_grad,
             &mut self.embed_adam.m,
@@ -2522,7 +2518,7 @@ impl DynamicAneTrainer {
             &embedding,
         );
 
-        accelerate::adamw_update(
+        adamw_update(
             &mut self.rms_final,
             &self.rms_final_grad,
             &mut self.rms_final_adam.m,

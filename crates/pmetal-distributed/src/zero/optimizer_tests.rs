@@ -143,3 +143,31 @@ async fn mismatched_lengths_are_rejected() {
         .unwrap_err();
     assert!(err.to_string().contains("layout has"), "{err}");
 }
+
+/// The sharded optimizer's host arithmetic is the device AdamW's, bit for bit:
+/// after 100 steps the parameters are identical to those of
+/// `pmetal_runtime`'s fused-kernel AdamW (every parameter decayed alike).
+#[test]
+fn the_sharded_update_is_the_device_adamw_bit_for_bit() {
+    use pmetal_runtime::InlineArray;
+    use pmetal_runtime::optimizer::{AdamW, ParamClass};
+
+    let n = 61;
+    let mut host = ShardedAdamW::new(n, 3e-3);
+    host.weight_decay = 0.02;
+    let mut device = AdamW::new(3e-3, 0.02).with_classifier(|_| ParamClass::Regular);
+    let mut w = noise(5, n);
+    let mut param = InlineArray::from_f32_slice(&w, &[n as i32]);
+    for step in 0..100 {
+        let g = noise(1000 + step, n);
+        host.step(&mut w, &g);
+        device.advance_step();
+        device.step_single(
+            "w",
+            &InlineArray::from_f32_slice(&g, &[n as i32]),
+            &mut param,
+        );
+    }
+    param.eval();
+    assert_eq!(param.as_slice::<f32>(), w.as_slice());
+}

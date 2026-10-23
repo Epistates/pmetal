@@ -607,6 +607,12 @@ impl AdamW {
 
 /// The scalars of AdamW step `t`, computed as `torch.optim.AdamW` computes
 /// them: in f64, each rounded to f32 once.
+///
+/// `pmetal_core::adamw::AdamWStepScalars` is the same type for the host
+/// update (the ANE trainer, the sharded optimizer). This crate depends on no
+/// other pmetal crate, so it cannot share the type; a test here holds the two
+/// to the same values and the host update to this crate's device update, bit
+/// for bit.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AdamWStepScalars {
     /// `1 − lr·λ`: the decoupled weight decay, applied before the update.
@@ -1047,6 +1053,50 @@ mod tests {
             }
         }
         crate::check_unobserved_error().expect("no bridge error");
+    }
+
+    /// The host update (`pmetal-core`, what the ANE trainer and the sharded
+    /// optimizer run) is the device update's arithmetic: the scalars are the
+    /// same, and after 100 steps the weights and both moments are identical
+    /// bit for bit.
+    #[test]
+    fn the_host_update_in_core_matches_the_device_update_exactly() {
+        let n = 257usize;
+        let mut device = AdamW::new(2e-3, 0.1).with_betas(0.9, 0.98).with_eps(1e-6);
+        let mut param = InlineArray::from_f32_slice(
+            &(0..n)
+                .map(|i| (i as f32 - 100.0) / 37.0)
+                .collect::<Vec<_>>(),
+            &[n as i32],
+        );
+        let mut w: Vec<f32> = read(&param);
+        let (mut m, mut v) = (vec![0.0f32; n], vec![0.0f32; n]);
+        for step in 1..=100u64 {
+            let g: Vec<f32> = (0..n)
+                .map(|i| (((i as u64 * 31 + step * 17) % 53) as f32 - 26.0) * 0.02)
+                .collect();
+            device.advance_step();
+            device.step_single(
+                "layers.0.q_proj.weight",
+                &InlineArray::from_f32_slice(&g, &[n as i32]),
+                &mut param,
+            );
+            let s = pmetal_core::adamw::AdamWStepScalars::new(2e-3, 0.1, 0.9, 0.98, 1e-6, step);
+            let d = AdamWStepScalars::new(2e-3, 0.1, 0.9, 0.98, 1e-6, step);
+            assert_eq!(
+                [s.decay, s.one_minus_beta1, s.beta2, s.one_minus_beta2],
+                [d.decay, d.one_minus_beta1, d.beta2, d.one_minus_beta2]
+            );
+            assert_eq!(
+                [s.step_size, s.bias_correction2_sqrt, s.eps],
+                [d.step_size, d.bias_correction2_sqrt, d.eps]
+            );
+            pmetal_core::adamw::adamw_update(&mut w, &g, &mut m, &mut v, &s);
+        }
+        assert_eq!(read(&param), w, "the weights");
+        let state = &device.states["layers.0.q_proj.weight"];
+        assert_eq!(read(&state.m), m, "the first moment");
+        assert_eq!(read(&state.v), v, "the second moment");
     }
 
     /// A gradient of a different size than its parameter is left to the ops
