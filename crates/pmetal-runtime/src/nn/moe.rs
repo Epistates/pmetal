@@ -11,10 +11,11 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::compat::{
-    Array, Dtype, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue, ops,
-    random,
+    Array, Dtype, Exception, LinearQuant, ModuleParamMut, ModuleParamRef, ModuleParameters,
+    NestedValue, ops, random,
 };
 use crate::impl_module_params;
+use crate::native_weight::LayerWeight;
 
 /// A low-rank adapter on a stacked expert projection, one per expert.
 ///
@@ -124,10 +125,18 @@ impl ExpertLora {
 #[derive(Debug, Clone)]
 pub struct Linear {
     /// Weight matrix, shape `[out_features, in_features]`, or
-    /// `[experts, out_features, in_features]` stacked.
+    /// `[experts, out_features, in_features]` stacked. MLX's packed words
+    /// (`[experts, out_features, in_features * bits / 32]`) when
+    /// [`quant`](Self::quant) is set.
     pub weight: Array,
     /// Per-expert low-rank adapters, when attached to a stacked projection.
     pub adapter: Option<ExpertLora>,
+    /// Set when a stacked `weight` is kept packed for MLX's quantized gather
+    /// matmul, as a [`compat::Linear`](crate::compat::Linear)'s is for its
+    /// quantized matmul: a decode step reads only the experts a token routes
+    /// to, a quarter of the bytes at 4 bits. An adapter on it is QLoRA on the
+    /// experts.
+    pub quant: Option<Box<LinearQuant>>,
 }
 
 impl Linear {
@@ -136,6 +145,7 @@ impl Linear {
         Self {
             weight: ops::zeros(&[out_features, in_features], Dtype::Float32),
             adapter: None,
+            quant: None,
         }
     }
 
@@ -144,6 +154,7 @@ impl Linear {
         Self {
             weight,
             adapter: None,
+            quant: None,
         }
     }
 
@@ -152,12 +163,51 @@ impl Linear {
         x.matmul(&self.weight.t())
     }
 
-    /// `(experts, out_features, in_features)` of a stacked projection.
+    /// `(experts, out_features, in_features)` of a stacked projection, whether
+    /// its weight is packed or not.
     pub fn stack_shape(&self) -> Option<(i32, i32, i32)> {
-        match self.weight.shape() {
-            [e, o, i] => Some((*e, *o, *i)),
+        match (self.weight.shape(), &self.quant) {
+            ([e, o, i], Some(quant)) => Some((*e, *o, *i * 32 / quant.params.bits)),
+            ([e, o, i], None) => Some((*e, *o, *i)),
             _ => None,
         }
+    }
+
+    /// The projection as the gather matmuls read it when it is packed: the
+    /// words as stored, `[experts, out, in * bits / 32]`, with their scales.
+    /// `None` for a dense weight, which the caller transposes for the dense
+    /// kernel instead.
+    pub fn packed_weight(&self) -> Option<LayerWeight> {
+        let quant = self.quant.as_deref()?;
+        Some(LayerWeight::Quantized {
+            weight: self.weight.clone(),
+            scales: quant.scales.clone(),
+            biases: quant.biases.clone(),
+            tensor_scale: quant.tensor_scale.clone(),
+            params: quant.params,
+        })
+    }
+
+    /// The projection as a dense `[experts, out, in]` array, unpacked if it is
+    /// packed.
+    pub fn dense_weight(&self) -> Array {
+        let Some(quant) = self.quant.as_deref() else {
+            return self.weight.clone();
+        };
+        let dense = self.weight.dequantize_mode(
+            &quant.scales,
+            quant.biases.as_ref(),
+            quant.params.group_size,
+            quant.params.bits,
+            quant.params.mode,
+        );
+        let dense = match &quant.tensor_scale {
+            Some(scale) => dense
+                .as_dtype(Dtype::Float32.as_i32())
+                .multiply(&scale.reshape(&[-1, 1, 1])),
+            None => dense,
+        };
+        dense.as_dtype(quant.dtype.as_i32())
     }
 
     /// Attach a per-expert adapter of the given rank, replacing any existing
@@ -188,6 +238,11 @@ impl Linear {
         let Some(adapter) = self.adapter.as_mut().filter(|a| !a.merged) else {
             return Ok(());
         };
+        if self.quant.is_some() {
+            return Err(Exception::custom(
+                "an expert adapter folds into a floating-point weight; this one is packed",
+            ));
+        }
         if !matches!(
             self.weight.dtype(),
             Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16
@@ -225,12 +280,23 @@ impl Linear {
 // and nothing else.
 impl ModuleParameters for Linear {
     fn num_parameters(&self) -> usize {
-        1 + self.adapter.as_ref().map_or(0, |_| 2)
+        1 + self.quant.as_ref().map_or(0, |q| {
+            1 + usize::from(q.biases.is_some()) + usize::from(q.tensor_scale.is_some())
+        }) + self.adapter.as_ref().map_or(0, |_| 2)
     }
 
     fn parameters(&self) -> ModuleParamRef<'_> {
         let mut out = HashMap::new();
         out.insert(Rc::from("weight"), NestedValue::Value(&self.weight));
+        if let Some(quant) = &self.quant {
+            out.insert(Rc::from("scales"), NestedValue::Value(&quant.scales));
+            if let Some(biases) = &quant.biases {
+                out.insert(Rc::from("biases"), NestedValue::Value(biases));
+            }
+            if let Some(scale) = &quant.tensor_scale {
+                out.insert(Rc::from("tensor_scale"), NestedValue::Value(scale));
+            }
+        }
         if let Some(adapter) = &self.adapter {
             out.insert(Rc::from("lora_a"), NestedValue::Value(&adapter.a));
             out.insert(Rc::from("lora_b"), NestedValue::Value(&adapter.b));
@@ -241,6 +307,15 @@ impl ModuleParameters for Linear {
     fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
         let mut out = HashMap::new();
         out.insert(Rc::from("weight"), NestedValue::Value(&mut self.weight));
+        if let Some(quant) = &mut self.quant {
+            out.insert(Rc::from("scales"), NestedValue::Value(&mut quant.scales));
+            if let Some(biases) = &mut quant.biases {
+                out.insert(Rc::from("biases"), NestedValue::Value(biases));
+            }
+            if let Some(scale) = &mut quant.tensor_scale {
+                out.insert(Rc::from("tensor_scale"), NestedValue::Value(scale));
+            }
+        }
         if let Some(adapter) = &mut self.adapter {
             out.insert(Rc::from("lora_a"), NestedValue::Value(&mut adapter.a));
             out.insert(Rc::from("lora_b"), NestedValue::Value(&mut adapter.b));
@@ -248,8 +323,14 @@ impl ModuleParameters for Linear {
         out
     }
 
+    /// As for a [`compat::Linear`](crate::compat::Linear): an adapted
+    /// projection trains its adapter alone, and a packed weight with none trains
+    /// nothing.
     fn trainable_parameters(&self) -> ModuleParamRef<'_> {
         let Some(adapter) = &self.adapter else {
+            if self.quant.is_some() {
+                return HashMap::new();
+            }
             return self.parameters();
         };
         let mut out = HashMap::new();

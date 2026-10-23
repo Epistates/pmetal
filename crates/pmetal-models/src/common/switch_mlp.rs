@@ -38,8 +38,12 @@ fn init_stack(experts: i32, in_features: i32, out_features: i32) -> MoeLinear {
     ))
 }
 
-/// The projection as the gather matmuls take it, `[experts, in, out]`.
+/// The projection as the gather matmuls take it: dense, `[experts, in, out]`,
+/// or the packed words as stored for the quantized gather.
 fn gather_weight(linear: &MoeLinear) -> Result<LayerWeight, Exception> {
+    if let Some(packed) = linear.packed_weight() {
+        return Ok(packed);
+    }
     Ok(LayerWeight::Dense(
         dequantize_fp8_weight_for_compute(&linear.weight)?.swap_axes(-1, -2),
     ))

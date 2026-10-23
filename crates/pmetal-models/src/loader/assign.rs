@@ -182,6 +182,18 @@ pub(crate) fn assign_checked<M: ModuleParameters + ModuleParametersExt>(
     Ok(report)
 }
 
+/// The layers of `model` an MLX-quantized tensor may stay packed on: its
+/// projections, embedding tables and stacked experts, by path.
+pub(crate) fn packable_paths<M: pmetal_runtime::compat::VisitLinears>(
+    model: &mut M,
+) -> Vec<String> {
+    let mut paths = Vec::new();
+    model.visit_linears_mut("", &mut |path, _| paths.push(path.to_string()));
+    model.visit_embeddings_mut("", &mut |path, _| paths.push(path.to_string()));
+    model.visit_experts_mut("", 0, &mut |path, _, _| paths.push(path.to_string()));
+    paths
+}
+
 /// Load generic weights using safetensors.
 pub fn load_generic_weights<
     M: ModuleParameters + ModuleParametersExt + pmetal_runtime::compat::VisitLinears,
@@ -214,17 +226,39 @@ pub fn load_generic_weights_with<
     model_dir: impl AsRef<Path>,
     policy: &LoadPolicy,
 ) -> Result<(), LoadError> {
+    load_prepared(model, model_dir, policy, |weights, _| Ok(weights))
+}
+
+/// [`load_generic_weights_with`] for an architecture whose checkpoint needs
+/// reshaping before its names match the model's (experts stacked, a fused
+/// projection split, a prefix stripped).
+///
+/// `prepare` is given the dense tensors and the modules kept packed, and
+/// returns the tensors to assign. A packed module is named as the checkpoint
+/// names it (a model's tree may sit under a namespace the checkpoint omits, or
+/// the reverse; the match tolerates that), so `prepare` only touches
+/// [`PackedLinears`](super::PackedLinears) for a module it renames, splits or
+/// merges. A packed layer fills its parameters by being installed, so the
+/// audit counts it as loaded.
+pub(crate) fn load_prepared<
+    M: ModuleParameters + ModuleParametersExt + pmetal_runtime::compat::VisitLinears,
+>(
+    model: &mut M,
+    model_dir: impl AsRef<Path>,
+    policy: &LoadPolicy,
+    prepare: impl FnOnce(
+        HashMap<String, Array>,
+        &mut super::PackedLinears,
+    ) -> Result<HashMap<String, Array>, LoadError>,
+) -> Result<(), LoadError> {
     let model_dir = model_dir.as_ref();
     let snapshot = ParamSnapshot::of(model);
-    // The layers a quantized tensor may stay packed on: projections and
-    // embedding tables.
-    let linear_paths = policy.keep_quantized.then(|| {
-        let mut paths = Vec::new();
-        model.visit_linears_mut("", &mut |path, _| paths.push(path.to_string()));
-        model.visit_embeddings_mut("", &mut |path, _| paths.push(path.to_string()));
-        paths
-    });
-    let (loaded, packed) = super::load_weights_keeping_packed(model_dir, linear_paths.as_deref())?;
+    // The layers a quantized tensor may stay packed on: projections, embedding
+    // tables and stacked experts.
+    let linear_paths = policy.keep_quantized.then(|| packable_paths(model));
+    let (loaded, mut packed) =
+        super::load_weights_keeping_packed(model_dir, linear_paths.as_deref())?;
+    let loaded = prepare(loaded, &mut packed)?;
     let report = assign_checked_with_packed(model, loaded, packed, policy, &snapshot)
         .map_err(|e| e.with_quantization_hint(model_dir))?;
     eval_loaded_parameters(model)?;

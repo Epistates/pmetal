@@ -17,7 +17,7 @@ use pmetal_cache::kv_cache::{
     sanitize_cache_mode_for_config,
 };
 use pmetal_runtime::compat::{
-    Array, Dtype, Exception, Module, ModuleParameters, ModuleParametersExt, nn, ops,
+    Array, Dtype, Exception, Module, ModuleParameters, ModuleParametersExt, VisitLinears, nn, ops,
 };
 use pmetal_runtime::decode::last_token_hidden;
 use std::path::Path;
@@ -72,16 +72,21 @@ fn load_checked<M: ModuleParametersExt, T>(
 /// ([`stack_experts`](crate::loader::experts::stack_experts)), then assigned
 /// under `policy`, which fails unless checkpoint and model account for each
 /// other.
-fn load_with_stacked_experts<M: ModuleParametersExt>(
+///
+/// With `policy.keep_quantized`, the experts of an MLX-quantized checkpoint
+/// (already stacked, as a conversion stores them) stay packed for the gather
+/// matmuls, as do its projections.
+fn load_with_stacked_experts<M: ModuleParametersExt + VisitLinears>(
     family: &str,
     model: &mut M,
     model_dir: &Path,
     policy: &LoadPolicy,
 ) -> Result<(), Exception> {
-    let weights = load_weights(model_dir).map_err(|e| Exception::custom(e.to_string()))?;
-    let weights = crate::loader::experts::stack_experts(family, weights)?;
-    assign_weights(model, weights, policy)
-        .map_err(|e| Exception::custom(e.with_quantization_hint(model_dir).to_string()))
+    crate::loader::load_prepared(model, model_dir, policy, |weights, _| {
+        crate::loader::experts::stack_experts(family, weights)
+            .map_err(|e| crate::loader::LoadError::SafeTensors(e.to_string()))
+    })
+    .map_err(|e| Exception::custom(e.to_string()))
 }
 
 /// Rewrite the bare `Infinity` / `NaN` literals some released configs contain
@@ -893,7 +898,9 @@ impl DynamicModel {
                     "qwen3_moe",
                     &mut model,
                     model_dir,
-                    &ModelArchitecture::Qwen3MoE.load_policy(),
+                    &ModelArchitecture::Qwen3MoE
+                        .load_policy()
+                        .keeping_quantized(options.keep_quantized),
                 )?;
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::Qwen3MoE(model))
@@ -967,7 +974,7 @@ impl DynamicModel {
             ModelArchitecture::DeepSeek => {
                 let config: DeepSeekConfig = json5::from_str(&config_content)
                     .map_err(|e| Exception::custom(e.to_string()))?;
-                let mut policy = LoadPolicy::strict();
+                let mut policy = LoadPolicy::strict().keeping_quantized(options.keep_quantized);
                 // V3 ships its multi-token-prediction layers after the trunk, as
                 // `model.layers.{num_hidden_layers + i}.*`. They are a separate
                 // draft head, not part of the model that decodes.
@@ -1020,12 +1027,14 @@ impl DynamicModel {
                 let config: NemotronHConfig = json5::from_str(&config_content)
                     .map_err(|e| Exception::custom(e.to_string()))?;
                 let mut model = NemotronHForCausalLM::new(config)?;
-                let weights =
-                    load_weights(model_dir).map_err(|e| Exception::custom(e.to_string()))?;
-                crate::architectures::nemotron_h::assign_nemotron_h_weights(&mut model, weights)
-                    .map_err(|e| {
-                        Exception::custom(e.with_quantization_hint(model_dir).to_string())
-                    })?;
+                crate::architectures::nemotron_h::load_nemotron_h_weights(
+                    &mut model,
+                    model_dir,
+                    &ModelArchitecture::NemotronH
+                        .load_policy()
+                        .keeping_quantized(options.keep_quantized),
+                )
+                .map_err(|e| Exception::custom(e.to_string()))?;
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::NemotronH(model))
             }
@@ -1041,13 +1050,10 @@ impl DynamicModel {
                     config.clone(),
                     routed_expert_mode,
                 )?;
-                let load_options = if skip_routed_experts {
-                    Qwen3NextLoadOptions {
-                        skip_routed_experts: true,
-                        ..Default::default()
-                    }
-                } else {
-                    Qwen3NextLoadOptions::default()
+                let load_options = Qwen3NextLoadOptions {
+                    skip_routed_experts,
+                    keep_quantized: options.keep_quantized,
+                    ..Default::default()
                 };
                 load_qwen3_next_weights_with_options(&mut model, model_dir, &config, load_options)
                     .map_err(|e| Exception::custom(e.to_string()))?;
@@ -1127,11 +1133,20 @@ impl DynamicModel {
                     }
                 }
                 let mut model = crate::architectures::gemma4::Gemma4ForCausalLM::new(config)?;
-                let weights = crate::loader::load_weights(model_dir)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
+                // With `keep_quantized`, an MLX-quantized checkpoint's
+                // projections, tables and experts come back still packed.
+                let (weights, packed) = crate::loader::read_gemma4_checkpoint(
+                    &mut model,
+                    model_dir,
+                    options.keep_quantized,
+                )
+                .map_err(|e| Exception::custom(e.to_string()))?;
                 let report = load_checked(&mut model, model_dir, &policy, |model| {
-                    crate::architectures::gemma4::load_gemma4_weights(model, &weights)
-                        .map_err(|e| Exception::custom(e.to_string()))
+                    let report = crate::architectures::gemma4::load_gemma4_weights(model, &weights)
+                        .map_err(|e| Exception::custom(e.to_string()))?;
+                    crate::loader::install_gemma4_packed(model, packed)
+                        .map_err(|e| Exception::custom(e.to_string()))?;
+                    Ok(report)
                 })?;
                 if !report.skipped.is_empty() {
                     tracing::info!(
@@ -2570,6 +2585,14 @@ impl pmetal_runtime::compat::VisitLinears for DynamicModel {
         f: &mut dyn FnMut(&str, &mut pmetal_runtime::compat::Linear),
     ) {
         dispatch_uniform!(self, visit_linears_mut, prefix, f)
+    }
+
+    fn visit_embeddings_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut pmetal_runtime::compat::Embedding),
+    ) {
+        dispatch_uniform!(self, visit_embeddings_mut, prefix, f)
     }
 
     fn visit_experts_mut(

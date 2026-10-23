@@ -34,7 +34,9 @@ pub use diffusion::*;
 pub use encoder::*;
 pub use families::*;
 
+pub(crate) use assign::load_prepared;
 pub(crate) use checkpoint::validate_shard_path;
+pub(crate) use families::{install_gemma4_packed, read_gemma4_checkpoint};
 pub(crate) use quant::{PackedLinears, dequantize_sidecar_weights, take_packed_linears};
 
 use checkpoint::Checkpoint;
@@ -174,7 +176,7 @@ where
 pub(crate) fn unpack_mlx_quantized_weights(
     model_dir: &Path,
     weights: &mut HashMap<String, Array>,
-) -> Result<(), LoadError> {
+) -> Result<Vec<String>, LoadError> {
     quant::unpack_mlx_quantized(weights, QuantConfig::read(model_dir)?.as_ref())
 }
 
@@ -217,7 +219,10 @@ pub(crate) fn load_weights_keeping_packed(
         )?,
         None => PackedLinears::default(),
     };
-    unpack_mlx_quantized_weights(model_dir, &mut weights)?;
+    let unpacked = unpack_mlx_quantized_weights(model_dir, &mut weights)?;
+    if mlx_linears.is_some() {
+        quant::report_unpacked(&unpacked);
+    }
     let mut packed = quant::take_packed_linears(&mut weights)?;
     packed.absorb(&mut mlx_packed);
     dequantize_sidecar_weights(&mut weights)?;

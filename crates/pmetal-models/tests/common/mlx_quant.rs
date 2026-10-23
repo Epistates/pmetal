@@ -65,10 +65,19 @@ pub fn quantize_tensors(
     modules: &BTreeSet<String>,
     spec: Quantization,
 ) -> (Vec<(String, Array)>, BTreeSet<String>) {
+    quantize_where(tensors, spec, |module, _| modules.contains(module))
+}
+
+/// [`quantize_tensors`] for the `x.weight` that `pick(x, weight)` selects.
+pub fn quantize_where(
+    tensors: Vec<(String, Array)>,
+    spec: Quantization,
+    pick: impl Fn(&str, &Array) -> bool,
+) -> (Vec<(String, Array)>, BTreeSet<String>) {
     let mut out = Vec::with_capacity(tensors.len());
     let mut quantized = BTreeSet::new();
     for (name, value) in tensors {
-        let module = name.strip_suffix(".weight").filter(|m| modules.contains(*m));
+        let module = name.strip_suffix(".weight").filter(|m| pick(m, &value));
         let eligible = module.is_some()
             && value.ndim() >= 2
             && value.dim(value.ndim() - 1) % spec.group_size == 0;
@@ -132,6 +141,11 @@ pub fn packed_modules(model: &mut DynamicModel) -> BTreeSet<String> {
     });
     model.visit_embeddings_mut("", &mut |path, embedding| {
         if embedding.quant.is_some() {
+            packed.insert(path.to_string());
+        }
+    });
+    model.visit_experts_mut("", 1, &mut |path, _, expert| {
+        if expert.quant.is_some() {
             packed.insert(path.to_string());
         }
     });
