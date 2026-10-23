@@ -266,11 +266,14 @@ Logprobs cover the answer's tokens.
 ### Quantized checkpoints
 
 An MLX-quantized checkpoint (an `mlx-community` 4-bit model, say) keeps its
-projections and its embedding table packed in memory: MLX's quantized matmul reads
-the packed words, so a decode step reads a quarter of the bytes a bf16 copy would
-and runs that much faster. This holds for the architectures that load through the
-generic loader (Llama, Qwen 2 and 3, Mistral, Cohere); the others unpack to bf16
-as they load. `--fp8` quantizes dense weights, so it unpacks them first.
+projections, its embedding tables and its routed experts packed in memory: MLX's
+quantized matmul (and, for experts, its quantized gather) reads the packed words,
+so a decode step reads a quarter of the bytes a bf16 copy would and runs that much
+faster. This holds for Llama, Qwen 2, 3, 3-MoE and 3.5, Mistral, Cohere, Gemma 1 to
+4 (dense and mixture-of-experts), Phi-3 and 4, Llama 4, Granite, DeepSeek,
+Nemotron-H and gpt-oss. Mllama, Qwen4-Exp and the encoder and diffusion models
+unpack to bf16 as they load, and the log says so. `--fp8` quantizes dense weights,
+so it unpacks them first.
 
 ### Speculative decoding
 

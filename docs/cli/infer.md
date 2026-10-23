@@ -144,6 +144,15 @@ pmetal infer \
   --profile-output qwen35_layer_profile.json
 ```
 
+## Quantized Checkpoints
+
+An MLX-quantized checkpoint (an `mlx-community` 4-bit model) is run from its packed weights,
+not unpacked to bf16: the native engines read the packed words, and so does the shared model
+the other architectures run on (projections, embedding tables and routed experts alike). A
+decode step reads a quarter of the bytes a bf16 copy would, which is most of the time it takes.
+`--fp8` quantizes dense weights, so it unpacks a quantized checkpoint first. An architecture
+that cannot keep a quantized checkpoint packed (Mllama, Qwen4-Exp) logs what it unpacked.
+
 ## Output Length
 
 Without `--max-tokens`, the output budget is the model's own:

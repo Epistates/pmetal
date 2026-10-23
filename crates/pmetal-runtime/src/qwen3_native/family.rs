@@ -104,6 +104,9 @@ pub fn is_unused_by_text_model(key: &str) -> bool {
     let key = canonical_checkpoint_key(key);
     key.starts_with("model.visual.")
         || key.starts_with("visual.")
+        // An MLX conversion names the vision tower and its merger so.
+        || key.starts_with("vision_tower.")
+        || key.starts_with("model.vision_tower.")
         || key.starts_with("mtp.")
         || key.starts_with("model.mtp.")
 }
@@ -688,6 +691,11 @@ mod tests {
             "model.visual.blocks.0.attn.qkv.weight"
         ));
         assert!(is_unused_by_text_model("mtp.fc.weight"));
+        // An MLX conversion's vision tower sits at the top level.
+        assert!(is_unused_by_text_model("vision_tower.merger.norm.weight"));
         assert!(!is_unused_by_text_model("model.language_model.norm.weight"));
+        assert!(!is_unused_by_text_model(
+            "language_model.model.layers.0.mlp.gate_proj.weight"
+        ));
     }
 }

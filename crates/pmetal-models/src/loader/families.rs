@@ -37,6 +37,8 @@ pub struct Qwen3NextLoadOptions {
 fn is_non_text_auxiliary_weight(key: &str) -> bool {
     key.starts_with("model.visual.")
         || key.starts_with("visual.")
+        || key.starts_with("vision_tower.")
+        || key.starts_with("model.vision_tower.")
         || key.starts_with("model.audio.")
         || key.starts_with("model.multi_modal_projector.")
 }
@@ -212,7 +214,7 @@ pub fn load_qwen3_next_weights_with_options(
     drop(params);
     if !packed_linears.is_empty() {
         let count = packed_linears.install(model)?;
-        tracing::info!("{count} projections stay packed (ModelOpt)");
+        tracing::info!("{count} projections and tables stay packed");
     }
     // A packed projection's `weight` is replaced by its words, not loaded
     // from the map.

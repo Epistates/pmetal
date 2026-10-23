@@ -192,17 +192,28 @@ pub(crate) fn unpack_mlx_quantized(
 /// Say which MLX-quantized tensors a loader that was asked to keep them packed
 /// unpacked to dense instead, and why: a decode step reads four times the bytes
 /// of each, so the speed a packed checkpoint promises is short by that much.
+///
+/// A tensor of a vision or audio tower is left out: a text model drops it
+/// whatever its format, so unpacking it costs nothing.
 pub(crate) fn report_unpacked(unpacked: &[String]) {
-    if unpacked.is_empty() {
+    let used: Vec<&String> = unpacked
+        .iter()
+        .filter(|name| {
+            !["vision", "visual", "audio"]
+                .iter()
+                .any(|t| name.contains(t))
+        })
+        .collect();
+    if used.is_empty() {
         return;
     }
-    let shown = unpacked.len().min(4);
+    let shown = used.len().min(4);
     tracing::warn!(
-        count = unpacked.len(),
+        count = used.len(),
         "keep_quantized: unpacked {} quantized tensor(s) to dense (first: {:?}): the model has \
          no packed layer for them, so they run as dense weights and read more memory per token",
-        unpacked.len(),
-        &unpacked[..shown]
+        used.len(),
+        &used[..shown]
     );
 }
 

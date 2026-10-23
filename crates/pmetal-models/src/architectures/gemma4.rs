@@ -939,6 +939,10 @@ impl Gemma4Experts {
     /// Eagerly build the transposed-weight cache (optional warm-up; the forward
     /// path builds it lazily on first use anyway).
     pub fn init_expert_cache(&mut self) -> Result<(), Exception> {
+        // Packed experts run from their words; there is nothing to transpose.
+        if self.quant.is_some() {
+            return Ok(());
+        }
         self.ensure_transposed()
     }
 
