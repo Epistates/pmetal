@@ -23,6 +23,7 @@
 //! - Tool use optimization
 //! - Apache 2.0 license
 use pmetal_runtime::compat::{Array, Exception, ModuleParametersExt, Param, nn, ops};
+use pmetal_runtime::decode::last_token_hidden;
 use pmetal_runtime::impl_module_params;
 
 use crate::checkpointing::checkpointed_layer;
@@ -1135,8 +1136,8 @@ impl GptOssForCausalLM {
         }
     }
 
-    /// Forward pass returning logits.
-    pub fn forward(
+    /// Forward pass returning logits, with an optional KV cache.
+    pub fn forward_with_cache(
         &mut self,
         input_ids: &Array,
         mask: Option<&Array>,
@@ -1144,6 +1145,31 @@ impl GptOssForCausalLM {
     ) -> Result<Array, Exception> {
         let hidden = self.model.forward(input_ids, mask, cache)?;
         Ok(self.lm_head_forward(&hidden))
+    }
+
+    /// [`forward_with_cache`](Self::forward_with_cache) returning the last
+    /// position's logits, `[B, 1, vocab]`: the LM head runs on one hidden state
+    /// per sequence instead of every prompt token's, for a caller that samples
+    /// from the last position alone (a prefill, a decode step).
+    pub fn forward_with_cache_last(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, Exception> {
+        let hidden = self.model.forward(input_ids, mask, cache)?;
+        Ok(self.lm_head_forward(&last_token_hidden(&hidden)))
+    }
+
+    /// [`forward_with_cache`](Self::forward_with_cache) under the name the
+    /// cacheless callers know it by.
+    pub fn forward(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, Exception> {
+        self.forward_with_cache(input_ids, mask, cache)
     }
 
     /// Forward pass with one rotary position per token; see

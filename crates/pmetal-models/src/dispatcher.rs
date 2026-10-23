@@ -1694,11 +1694,13 @@ impl DynamicModel {
     /// position's logits, `[B, 1, vocab]`, for a caller that samples from them
     /// alone: a prefill, or a decode step.
     ///
-    /// The LM head runs on that one position where the architecture has this
-    /// path (Llama, Qwen 2/3, Qwen3-MoE, Mistral, Phi, Cohere, Granite); the
-    /// others compute every position's logits and slice, which is the same
-    /// numbers at the cost of the `[B, T, vocab]` allocation. The cache is
-    /// filled as the full forward fills it.
+    /// The LM head runs on that one position, so a long prompt never
+    /// materialises the `[B, T, vocab]` logits. The cache is filled as the full
+    /// forward fills it. The hybrid architectures answer through
+    /// [`forward_with_hybrid_cache_last`](Self::forward_with_hybrid_cache_last),
+    /// and the encoder, diffusion and image architectures have no cached
+    /// decode, so they take the error [`forward_with_cache`](Self::forward_with_cache)
+    /// gives (BERT's last hidden state, which is not logits).
     pub fn forward_with_cache_last(
         &mut self,
         input_ids: &Array,
@@ -1707,14 +1709,26 @@ impl DynamicModel {
     ) -> Result<Array, Exception> {
         match self {
             Self::Llama(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::Llama4(m) => m.forward_with_cache_last(input_ids, mask, cache),
             Self::Qwen2(m) => m.forward_with_cache_last(input_ids, mask, cache),
             Self::Qwen3(m) => m.forward_with_cache_last(input_ids, mask, cache),
             Self::Qwen3MoE(m) => m.forward_with_cache_last(input_ids, mask, cache),
-            Self::Cohere(m) => m.forward_with_cache_last(input_ids, mask, cache),
-            Self::Granite(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::Gemma(m) => m.forward_with_cache_last(input_ids, mask, cache),
             Self::Mistral(m) => m.forward_with_cache_last(input_ids, mask, cache),
             Self::Phi(m) | Self::Phi4(m) => m.forward_with_cache_last(input_ids, mask, cache),
-            _ => Ok(last_token_hidden(
+            Self::DeepSeek(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::Cohere(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::Granite(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::GptOss(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::Gemma4(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            // Text-only, as for `forward_with_cache`.
+            Self::Mllama(m) => m.forward_with_cache_last(input_ids, mask, cache),
+            Self::NemotronH(_)
+            | Self::Qwen3Next(_)
+            | Self::Qwen4Exp(_)
+            | Self::Flux(_)
+            | Self::Bert(_)
+            | Self::DiffusionGemma(_) => Ok(last_token_hidden(
                 &self.forward_with_cache(input_ids, mask, cache)?,
             )),
         }
@@ -1728,18 +1742,17 @@ impl DynamicModel {
     ) -> Result<Array, Exception> {
         match self {
             Self::Llama(m) => m.forward_with_cache(input_ids, mask, cache),
+            Self::Llama4(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::Qwen2(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::Qwen3(m) => m.forward_with_cache(input_ids, mask, cache),
-            Self::Qwen3MoE(m) => m.forward(input_ids, mask, cache),
-            Self::DeepSeek(m) => m.forward(input_ids, mask, cache),
-            Self::Cohere(m) => m.forward_with_cache(input_ids, mask, cache),
-            Self::Granite(m) => m.forward_with_cache(input_ids, mask, cache),
-            Self::Llama4(m) => m.forward_with_cache(input_ids, mask, cache),
+            Self::Qwen3MoE(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::Gemma(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::Mistral(m) => m.forward_with_cache(input_ids, mask, cache),
-            Self::Phi(m) => m.forward_with_cache(input_ids, mask, cache),
-            Self::Phi4(m) => m.forward_with_cache(input_ids, mask, cache),
-            Self::GptOss(m) => m.forward(input_ids, mask, cache),
+            Self::Phi(m) | Self::Phi4(m) => m.forward_with_cache(input_ids, mask, cache),
+            Self::DeepSeek(m) => m.forward_with_cache(input_ids, mask, cache),
+            Self::Cohere(m) => m.forward_with_cache(input_ids, mask, cache),
+            Self::Granite(m) => m.forward_with_cache(input_ids, mask, cache),
+            Self::GptOss(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::Gemma4(m) => m.forward_with_cache(input_ids, mask, cache),
             // Text-only cached decode. Image-conditioned decoding needs the
             // vision features re-supplied every step, which this signature
@@ -2205,10 +2218,10 @@ impl DynamicModel {
 
     /// [`forward_with_hybrid_cache`](Self::forward_with_hybrid_cache) returning
     /// the last position's logits, `[B, 1, vocab]`, for a caller that samples
-    /// from them alone: a prefill, or a decode step. Qwen 3.5, Granite and the
-    /// architectures of [`forward_with_cache_last`](Self::forward_with_cache_last)
-    /// run their head on that one position; the others compute every position's
-    /// and slice.
+    /// from them alone: a prefill, or a decode step. Every causal architecture
+    /// runs its head on that one position: the hybrids (Qwen 3.5, Qwen4-Exp,
+    /// Nemotron-H, and Granite with Mamba layers) here, the rest through
+    /// [`forward_with_cache_last`](Self::forward_with_cache_last).
     pub fn forward_with_hybrid_cache_last(
         &mut self,
         input_ids: &Array,

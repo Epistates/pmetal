@@ -31,6 +31,7 @@
 //! intent, so [`aspect_ratio_attention_mask`] builds the mask additively and
 //! leaves nothing masked when there is no padding.
 use pmetal_runtime::compat::{Array, Dtype, Exception, Module, Param, nn, ops, random};
+use pmetal_runtime::decode::last_token_hidden;
 use pmetal_runtime::impl_module_params;
 
 use std::collections::HashMap;
@@ -1363,6 +1364,23 @@ impl MllamaForConditionalGeneration {
         Ok(self.lm_head.forward(&hidden_states))
     }
 
+    /// [`forward_full`](Self::forward_full) returning the last position's
+    /// logits, `[B, 1, vocab]`: the LM head runs on one hidden state per
+    /// sequence instead of every prompt token's, for a caller that samples from
+    /// the last position alone (a prefill, a decode step).
+    pub fn forward_full_last(
+        &mut self,
+        input_ids: &Array,
+        cross: Option<&CrossAttentionInputs>,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, Exception> {
+        let hidden_states = self
+            .language_model
+            .forward_with_cache(input_ids, cross, mask, cache)?;
+        Ok(self.lm_head.forward(&last_token_hidden(&hidden_states)))
+    }
+
     /// Forward pass with one rotary position per token; see
     /// [`MllamaTextModel::forward_with_positions`].
     pub fn forward_with_positions(
@@ -1403,6 +1421,18 @@ impl MllamaForConditionalGeneration {
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
         self.forward_full(input_ids, None, mask, cache)
+    }
+
+    /// [`forward_with_cache`](Self::forward_with_cache) returning the last
+    /// position's logits, `[B, 1, vocab]`; see
+    /// [`forward_full_last`](Self::forward_full_last).
+    pub fn forward_with_cache_last(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, Exception> {
+        self.forward_full_last(input_ids, None, mask, cache)
     }
 
     /// Final hidden state (pre-`lm_head`), for embedding / distillation callers.

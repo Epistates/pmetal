@@ -48,6 +48,7 @@
 use std::collections::HashMap;
 
 use pmetal_runtime::compat::{Array, Exception, Param, nn, ops};
+use pmetal_runtime::decode::last_token_hidden;
 use pmetal_runtime::impl_module_params;
 use serde::{Deserialize, Serialize};
 
@@ -1721,6 +1722,21 @@ impl Gemma4ForCausalLM {
     ) -> Result<Array, Exception> {
         let hidden = self.model.forward_with_cache(input_ids, mask, cache)?;
         Ok(self.project_logits(&hidden))
+    }
+
+    /// [`forward_with_cache`](Self::forward_with_cache) returning the last
+    /// position's logits, `[B, 1, vocab]`: the tied head and its softcap run on
+    /// one hidden state per sequence instead of every prompt token's, for a
+    /// caller that samples from the last position alone (a prefill, a decode
+    /// step).
+    pub fn forward_with_cache_last(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, Exception> {
+        let hidden = self.model.forward_with_cache(input_ids, mask, cache)?;
+        Ok(self.project_logits(&last_token_hidden(&hidden)))
     }
 
     /// Forward pass with one rotary position per token; see
