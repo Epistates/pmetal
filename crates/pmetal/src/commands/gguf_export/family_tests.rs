@@ -70,7 +70,12 @@ fn export(config: Value, files: &[(&str, Vec<u8>)]) -> (ExportArch, GgufContent)
         arch.model_config(Some(&config)).as_ref(),
         crate::cli::quantize::QuantizeMethod::Bf16,
     );
-    add_tokenizer_metadata(&mut builder, dir.path(), Some(&config)).unwrap();
+    add_tokenizer_metadata(
+        &mut builder,
+        dir.path(),
+        arch.tokenizer_config(Some(&config)).as_ref(),
+    )
+    .unwrap();
     let bytes = builder.build_to_bytes().unwrap();
     (arch, GgufContent::read(&mut Cursor::new(bytes)).unwrap())
 }
@@ -646,7 +651,7 @@ fn gemma4_control_tokens_are_the_ones_the_tokenizer_flags_special() {
     });
     let config = json!({
         "architectures": ["Gemma4UnifiedForConditionalGeneration"], "model_type": "gemma4_unified",
-        "text_config": {"hidden_size": 8, "vocab_size": 13, "num_attention_heads": 2},
+        "text_config": {"hidden_size": 8, "vocab_size": 14, "num_attention_heads": 2},
     });
     let (_, content) = export(
         config,
@@ -684,6 +689,48 @@ fn gemma4_control_tokens_are_the_ones_the_tokenizer_flags_special() {
         assert_eq!(type_of(token), NORMAL, "{token}");
     }
     assert_eq!(type_of("<br>"), USER_DEFINED);
+}
+
+// ── Gemma 3, multimodal ─────────────────────────────────────────────────────
+
+/// The embedding of the multimodal Gemma 3 models has more rows than the
+/// tokenizer has tokens (262208 against 262145 for the 4B), and the file's
+/// vocabulary has to be as long as the embedding. The size is the language
+/// model's, which the wrapper's config states under `text_config` or, as the
+/// authors' released 4B config does, not at all.
+#[test]
+fn a_multimodal_gemma_3_pads_its_vocabulary_to_the_embedding_nested_in_the_wrapper() {
+    let tokenizer = tokenizer_json(
+        &["<pad>", "<eos>", "<bos>", "a", "b"],
+        &[],
+        &[("<start_of_turn>", true)],
+        json!({}),
+        true,
+    );
+    let tokenizer_config =
+        json!({"bos_token": "<bos>", "eos_token": "<eos>", "add_bos_token": true});
+    let config = json!({
+        "architectures": ["Gemma3ForConditionalGeneration"], "model_type": "gemma3",
+        "text_config": {
+            "model_type": "gemma3_text", "hidden_size": 8, "vocab_size": 9,
+            "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 4,
+        },
+        "vision_config": {"model_type": "siglip_vision_model"},
+    });
+    let (arch, content) = export(
+        config,
+        &[
+            ("tokenizer.json", tokenizer.into_bytes()),
+            (
+                "tokenizer_config.json",
+                tokenizer_config.to_string().into_bytes(),
+            ),
+        ],
+    );
+    assert_eq!(arch.name, "gemma3");
+    assert_eq!(content.get_u64("gemma3.vocab_size"), Some(9));
+    assert_eq!(array_of_strings(&content, "tokenizer.ggml.tokens").len(), 9);
+    assert_eq!(array_of_i32(&content, "tokenizer.ggml.token_type").len(), 9);
 }
 
 // ── a Mistral-family model with no beginning-of-text in its config ─────────

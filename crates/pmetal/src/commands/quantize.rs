@@ -469,7 +469,11 @@ pub(crate) async fn run_quantization(
     // checkpoint. The tokenizer is found from the checkpoint's.
     let model_config = arch.model_config(config_json.as_ref());
     add_hf_config_metadata(&mut builder, &arch, model_config.as_ref(), method);
-    add_tokenizer_metadata(&mut builder, &resolved_model_path, config_json.as_ref())?;
+    add_tokenizer_metadata(
+        &mut builder,
+        &resolved_model_path,
+        arch.tokenizer_config(config_json.as_ref()).as_ref(),
+    )?;
 
     // Each tensor's type. The header of a GGUF file comes first and names every
     // tensor's type and size, which depend on the shapes alone.

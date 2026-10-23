@@ -163,6 +163,22 @@ impl ExportArch {
         })
     }
 
+    /// The configuration the tokenizer's metadata is written from: the
+    /// checkpoint's own, with the vocabulary size of the language model where
+    /// the checkpoint's config nests it. The file's vocabulary is as long as the
+    /// embedding, and a multimodal Gemma's has rows its tokenizer has no token
+    /// for.
+    pub(crate) fn tokenizer_config(&self, config: Option<&Value>) -> Option<Value> {
+        let mut config = config?.clone();
+        let vocab_size = self
+            .model_config(Some(&config))
+            .and_then(|model| model.get("vocab_size").cloned());
+        if let (Some(object), Some(vocab_size)) = (config.as_object_mut(), vocab_size) {
+            object.entry("vocab_size").or_insert(vocab_size);
+        }
+        Some(config)
+    }
+
     /// The name `hf_name` has in the file, or `None` for a tensor the file
     /// does not hold.
     ///
