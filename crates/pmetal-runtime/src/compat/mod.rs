@@ -379,35 +379,31 @@ pub trait ModuleParameters {
 
 /// Materialise the lazy computation graph for a set of arrays.
 ///
-/// Each array is cloned (which shares the underlying MLX ref-count) and then
-/// evaluated.  The caller's originals are unaffected.
+/// The whole set goes to MLX as one evaluation: one submission and one wait,
+/// not one wait per array. The caller's arrays are unaffected beyond being
+/// evaluated.
 pub fn eval<'a>(arrays: impl IntoIterator<Item = &'a Array>) -> Result<(), Exception> {
-    for a in arrays {
-        let c = a.clone();
-        c.eval();
-    }
+    Array::eval_many(arrays);
     Ok(())
 }
 
-/// Evaluate a borrowed parameter tree in place.
+/// Evaluate a borrowed parameter tree in place, as one evaluation.
 pub fn eval_params(params: ModuleParamRef<'_>) -> Result<(), Exception> {
-    fn walk(node: &NestedValue<&Array>) {
+    fn collect<'a>(node: &NestedValue<&'a Array>, out: &mut Vec<&'a Array>) {
         match node {
-            NestedValue::Value(a) => {
-                let c = (*a).clone();
-                c.eval();
-            }
+            NestedValue::Value(a) => out.push(a),
             NestedValue::Map(m) => {
                 for v in m.values() {
-                    walk(v);
+                    collect(v, out);
                 }
             }
         }
     }
+    let mut arrays = Vec::new();
     for v in params.values() {
-        walk(v);
+        collect(v, &mut arrays);
     }
-    Ok(())
+    eval(arrays)
 }
 
 // ── random sub-module ─────────────────────────────────────────────────────────
