@@ -110,32 +110,67 @@ fn norm_of(grad: &Array) -> f32 {
         .item_f32()
 }
 
+/// Qwen3 with its output head tied to the token embedding, which no shared case is.
+const QWEN3_TIED: &str = r#"{
+    "model_type": "qwen3",
+    "vocab_size": 256,
+    "hidden_size": 64,
+    "intermediate_size": 128,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 16,
+    "max_position_embeddings": 512,
+    "rms_norm_eps": 1e-6,
+    "rope_theta": 10000.0,
+    "tie_word_embeddings": true
+}"#;
+
+/// The shared architectures, and a tied one.
+fn all_cases() -> Vec<(&'static str, &'static str)> {
+    let mut all: Vec<_> = cases()
+        .into_iter()
+        .map(|case| (case.name, case.config_json))
+        .collect();
+    all.push(("qwen3_tied", QWEN3_TIED));
+    all
+}
+
+/// An untied model and a tied one.
+fn tied_and_untied() -> [(&'static str, &'static str, bool); 2] {
+    let llama = cases()
+        .into_iter()
+        .find(|c| c.name == "llama")
+        .expect("a llama case")
+        .config_json;
+    [("llama", llama, false), ("qwen3_tied", QWEN3_TIED, true)]
+}
+
 #[test]
 fn every_parameter_of_every_architecture_gets_a_nonzero_gradient() {
     let mut problems = Vec::new();
     let mut checked = 0;
-    for case in cases() {
-        let mut model = full_model(case.config_json, FullFineTune::default());
-        let vocab = vocab_of(case.config_json);
+    for (case, config_json) in all_cases() {
+        let mut model = full_model(config_json, FullFineTune::default());
+        let vocab = vocab_of(config_json);
         let (loss, grads) = gradients(&mut model, &input_ids(vocab), &loss_weights(vocab));
-        drain(case.name);
+        drain(case);
         if !loss.is_finite() {
-            problems.push(format!("{}: loss is {loss}", case.name));
+            problems.push(format!("{case}: loss is {loss}"));
             continue;
         }
         // Every parameter the model holds is trainable, and so has a gradient.
         let all: usize = model.model().flatten_params().len();
         if grads.len() != all {
             problems.push(format!(
-                "{}: {} of the model's {all} parameters are trainable",
-                case.name,
+                "{case}: {} of the model's {all} parameters are trainable",
                 grads.len()
             ));
         }
         for (name, grad) in &grads {
             let norm = norm_of(grad);
             if !(norm.is_finite() && norm > 0.0) {
-                problems.push(format!("{}: {name} has gradient norm {norm}", case.name));
+                problems.push(format!("{case}: {name} has gradient norm {norm}"));
             }
         }
         checked += 1;
@@ -155,13 +190,10 @@ fn every_parameter_of_every_architecture_gets_a_nonzero_gradient() {
 fn the_gradients_most_easily_cut_agree_with_a_finite_difference() {
     const H: f32 = 1e-2;
     let mut problems = Vec::new();
-    // A tied head (qwen3) and an untied one (llama).
-    for case in cases()
-        .into_iter()
-        .filter(|c| matches!(c.name, "llama" | "qwen3"))
-    {
-        let mut model = full_model(case.config_json, FullFineTune::default());
-        let vocab = vocab_of(case.config_json);
+    // A tied head and an untied one.
+    for (case, config_json, _) in tied_and_untied() {
+        let mut model = full_model(config_json, FullFineTune::default());
+        let vocab = vocab_of(config_json);
         let (ids, weights) = (input_ids(vocab), loss_weights(vocab));
         let (loss, grads) = gradients(&mut model, &ids, &weights);
         let loss_rounding = 128.0 * f32::EPSILON * loss.abs().max(1.0) / H;
@@ -183,7 +215,7 @@ fn the_gradients_most_easily_cut_agree_with_a_finite_difference() {
                     Ok(loss_of(&model.forward(&ids, None).unwrap(), &weights).item_f32())
                 })
                 .unwrap();
-                drain(case.name);
+                drain(case);
                 value
             };
             let central = |h: f32, at: &mut dyn FnMut(f32) -> f32| (at(h) - at(-h)) / (2.0 * h);
@@ -203,7 +235,7 @@ fn the_gradients_most_easily_cut_agree_with_a_finite_difference() {
             if (fd - norm).abs() > 2e-2 * norm + loss_rounding {
                 problems.push(format!(
                     "{}: {key} autograd |g| {norm} vs finite difference along g {fd}",
-                    case.name
+                    case
                 ));
             }
         }
@@ -217,8 +249,8 @@ fn the_gradients_most_easily_cut_agree_with_a_finite_difference() {
 
 #[test]
 fn the_trainers_view_of_what_trains_is_the_checkpoints() {
-    for case in cases().into_iter().filter(|c| c.name == "qwen3") {
-        let model = full_model(case.config_json, FullFineTune::default());
+    for (_, config_json, _) in tied_and_untied() {
+        let model = full_model(config_json, FullFineTune::default());
         let mut trainer_keys: Vec<String> = model
             .trainable_parameters()
             .keys()
@@ -245,19 +277,15 @@ fn the_trainers_view_of_what_trains_is_the_checkpoints() {
 
 #[test]
 fn a_frozen_embedding_keeps_its_value_and_leaves_the_rest_training() {
-    for case in cases()
-        .into_iter()
-        .filter(|c| matches!(c.name, "llama" | "qwen3"))
-    {
-        let tied = case.name == "qwen3";
+    for (case, config_json, tied) in tied_and_untied() {
         let mut model = full_model(
-            case.config_json,
+            config_json,
             FullFineTune {
                 freeze_embeddings: true,
             },
         );
         let frozen = model.frozen_parameters();
-        assert_eq!(frozen, ["model.embed_tokens.weight"], "{}", case.name);
+        assert_eq!(frozen, ["model.embed_tokens.weight"], "{case}");
         let keys: Vec<String> = model
             .lora_parameters()
             .keys()
@@ -268,8 +296,7 @@ fn a_frozen_embedding_keeps_its_value_and_leaves_the_rest_training() {
         assert_eq!(
             keys.iter().any(|k| k.ends_with("lm_head.weight")),
             !tied,
-            "{}",
-            case.name
+            "{case}"
         );
         assert!(
             !model
@@ -283,7 +310,7 @@ fn a_frozen_embedding_keeps_its_value_and_leaves_the_rest_training() {
             .remove("model.embed_tokens.weight")
             .unwrap()
             .clone();
-        let ids = input_ids(vocab_of(case.config_json));
+        let ids = input_ids(vocab_of(config_json));
         let mut optimizer = AdamW::new(1e-2, 0.0);
         for _ in 0..3 {
             train_step(&mut model, &mut optimizer, &ids);
@@ -295,7 +322,7 @@ fn a_frozen_embedding_keeps_its_value_and_leaves_the_rest_training() {
             .unwrap()
             .clone();
         let moved = before.subtract(&after).abs().mean_all().item_f32();
-        assert_eq!(moved, 0.0, "{}: the frozen embedding moved", case.name);
+        assert_eq!(moved, 0.0, "{case}: the frozen embedding moved");
         // ...while something else did.
         let layer = "model.layers.0.mlp.down_proj.weight";
         let first = model.model().flatten_params()[layer].clone();

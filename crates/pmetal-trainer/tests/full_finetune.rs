@@ -85,7 +85,7 @@ fn dataset() -> TrainingDataset {
 fn loop_config(epochs: usize, checkpoint_every: usize) -> TrainingLoopConfig {
     TrainingLoopConfig {
         training: TrainingConfig {
-            learning_rate: 2e-3,
+            learning_rate: 1e-2,
             batch_size: 2,
             num_epochs: epochs,
             gradient_accumulation_steps: 1,
@@ -176,11 +176,11 @@ fn the_loss_falls_every_parameter_moves_and_the_saved_model_reloads_to_the_same_
 
         let initial = full_model(&source, FullFineTune::default());
         let mut model = full_model(&source, FullFineTune::default());
-        let losses = train(&mut model, 6);
-        assert!(losses.len() >= 12, "{name}: {} steps", losses.len());
+        let losses = train(&mut model, 20);
+        assert!(losses.len() >= 40, "{name}: {} steps", losses.len());
         let (first, last) = (losses[0], *losses.last().unwrap());
         assert!(
-            last < 0.8 * first,
+            last < 0.7 * first,
             "{name}: the loss did not fall: {first} -> {last} ({losses:?})"
         );
 

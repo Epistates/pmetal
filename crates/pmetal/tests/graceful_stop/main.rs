@@ -29,16 +29,23 @@ struct Run {
 }
 
 impl Run {
-    /// Start `pmetal args...` with `--log-events` pointing at a file.
+    /// Start `pmetal args...`, with `--log-events` pointing at a file for the
+    /// commands that write an event log (the others refuse the flag).
     fn start(dir: &Path, args: &[&str]) -> Self {
         let (stdout, stderr, events) = (
             dir.join("stdout.log"),
             dir.join("stderr.log"),
             dir.join("events.jsonl"),
         );
-        let child = Command::new(env!("CARGO_BIN_EXE_pmetal"))
-            .args(["--log-events"])
-            .arg(&events)
+        let logs_events = matches!(
+            args.first().copied(),
+            Some("train" | "distill" | "grpo" | "rlkd" | "preference")
+        );
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pmetal"));
+        if logs_events {
+            command.arg("--log-events").arg(&events);
+        }
+        let child = command
             .args(args)
             .env("RUST_LOG", "info")
             .stdin(Stdio::null())
