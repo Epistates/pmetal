@@ -35,7 +35,9 @@ dataset:
 pmetal train --config training.yaml
 ```
 
-A command-line option that differs from its default overrides the file; an option left at its default (including one typed with the default's value) leaves the file's value in force. `--model` and `--dataset` override `model.model_id` and `dataset.dataset_id` when given.
+A setting comes from the first of three places that names it: a command-line option you gave, then the file, then the default. An option you did not give leaves the file's value in force, and one you did give wins even when you typed the default's value (`--epochs 1` over a file that says `num_epochs: 3`). `--model` and `--dataset` override `model.model_id` and `dataset.dataset_id` when given.
+
+The surfaces that build a run from a form or an object (the terminal UI, the desktop app, the MCP server, the Python bindings) pass a setting only when it differs from the default, so a `config` file's value for the others is not overridden by a default they never meant to set.
 
 ## Strict loading
 
@@ -94,7 +96,7 @@ read as `training.max_seq_len` when the training section leaves it out.
 | `embedding_learning_rate` | float | unset | Separate rate for embeddings |
 | `batch_size` | integer | `1` | Micro-batch size |
 | `gradient_accumulation_steps` | integer | `4` | Micro-batches per optimizer step |
-| `num_epochs` | integer | `3` | Training epochs |
+| `num_epochs` | integer | `1` | Training epochs (the command line's `--epochs` default is the same) |
 | `max_steps` | integer | unset | Stop after this many optimizer steps |
 | `lr_scheduler` | string | `cosine` | `constant`, `linear`, `cosine`, `cosine_with_restarts`, `polynomial`, `wsd` |
 | `warmup_steps` | integer | `0` | Warmup steps |
