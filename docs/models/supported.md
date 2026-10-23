@@ -95,6 +95,12 @@ LoRA and QLoRA apply to every architecture the dispatcher loads (the table above
 | DiffusionGemma | `pmetal train-diffusion` (`--quantization nf4` for QLoRA) |
 | BERT-family encoders | `pmetal embed-train` (`--lora`) |
 
+## GGUF Checkpoints
+
+A `.gguf` file (or a directory whose weights are GGUF) loads for `pmetal infer`, `pmetal eval` and `pmetal serve` with its configuration and tokenizer read from the file. The architectures that load from GGUF are the dense decoders Llama, Qwen 2, Qwen 3, Mistral, Gemma 1, 2 and 3, and Phi 3 / Phi 4; load any other family from its safetensors weights. That includes the files `pmetal quantize` writes. Quantized tensors are dequantized on load (see [Quantization](/models/quantization/)).
+
+For Gemma the file's conventions are undone on load: the norm weights, which a GGUF stores with the 1 that Gemma's norm adds already applied, the tensor names of the four-norm block (Gemma 2 and 3), the sliding window, the local and global rope bases and the two soft caps. A Gemma 4 GGUF is not loaded yet.
+
 ## Diffusion Models
 
 | Family | Variants | Status |

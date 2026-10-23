@@ -4,6 +4,8 @@ Generate text from a model: one prompt in, one completion out, with the model's 
 
 Give `--prompt`, or `--messages-file` to continue a conversation (see [Continuing a Conversation](#continuing-a-conversation)). For an interactive conversation use the Inference tab of [`pmetal tui`](/cli/tui/) or the Chat page of the desktop app; to serve a model to other programs use [`pmetal serve`](/cli/serve/).
 
+`--model` may also be a `.gguf` file, or a directory holding one: the configuration and the tokenizer are read from the file. The dense Llama, Qwen 2, Qwen 3, Mistral, Gemma 1 to 3 and Phi 3 / Phi 4 decoders load this way (see [GGUF Checkpoints](/models/supported/#gguf-checkpoints)).
+
 Ctrl-C, or SIGTERM (how a supervisor such as the desktop app stops it), ends the generation after the token in flight; the text so far is kept and the statistics are printed (with `--json`, `stopped_by` is `interrupted`), and the command exits with status 130.
 
 ## Usage

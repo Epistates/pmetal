@@ -252,16 +252,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn recipe(
-        method: QuantizeMethod,
-        arch: &str,
-        layers: usize,
-        heads: usize,
-        kv_heads: usize,
-        experts: usize,
-        has_imatrix: bool,
-        has_output: bool,
-    ) -> Recipe {
+    /// A model as `(layers, heads, kv heads, experts, a head of its own)`.
+    type Model = (usize, usize, usize, usize, bool);
+
+    fn recipe(method: QuantizeMethod, arch: &str, model: Model, has_imatrix: bool) -> Recipe {
+        let (layers, heads, kv_heads, experts, has_output) = model;
         let mut config = json!({
             "architectures": [if arch == "llama" { "LlamaForCausalLM" } else { "Qwen3ForCausalLM" }],
             "num_hidden_layers": layers,
@@ -275,9 +270,8 @@ mod tests {
         Recipe::new(method, &arch, Some(&config), has_imatrix, has_output)
     }
 
-    /// `(layers, heads, kv heads, experts, a head of its own)` of the models
-    /// `recipe_reference.txt` is about.
-    fn reference_model(name: &str) -> (usize, usize, usize, usize, bool) {
+    /// The models `recipe_reference.txt` is about.
+    fn reference_model(name: &str) -> Model {
         match name {
             // Qwen3-0.6B's layer count, with a tied head.
             "tied28" => (28, 8, 4, 0, false),
@@ -362,12 +356,8 @@ mod tests {
                 let recipe = recipe(
                     reference_method(method_name),
                     "llama",
-                    layers,
-                    heads,
-                    kv_heads,
-                    experts,
+                    (layers, heads, kv_heads, experts, has_output),
                     has_imatrix,
-                    has_output,
                 );
                 let want = |class: &str| {
                     expected
@@ -450,7 +440,7 @@ mod tests {
             QuantizeMethod::Q8_0,
             QuantizeMethod::Dynamic,
         ] {
-            let r = recipe(method, "llama", 28, 8, 4, 0, false, false);
+            let r = recipe(method, "llama", (28, 8, 4, 0, false), false);
             assert_eq!(
                 r.tensor_type("blk.0.attn_norm.weight", &[1024], GgmlType::Q4K),
                 GgmlType::F32
@@ -469,7 +459,7 @@ mod tests {
             QuantizeMethod::F16,
             QuantizeMethod::Bf16,
         ] {
-            let r = recipe(method, "llama", 28, 8, 4, 0, false, false);
+            let r = recipe(method, "llama", (28, 8, 4, 0, false), false);
             let want = method.to_ggml_type().unwrap();
             assert_eq!(
                 r.tensor_type("blk.0.ffn_up.weight", &[512, 256], GgmlType::Q4K),
@@ -486,7 +476,7 @@ mod tests {
     /// head and the embedding at six bits; the exotic types keep both at f16.
     #[test]
     fn the_dynamic_and_exotic_methods_keep_their_head_and_embedding_out_of_the_recipe() {
-        let r = recipe(QuantizeMethod::Dynamic, "llama", 28, 8, 4, 0, false, true);
+        let r = recipe(QuantizeMethod::Dynamic, "llama", (28, 8, 4, 0, true), false);
         assert_eq!(
             r.tensor_type("blk.3.ffn_down.weight", &[512, 256], GgmlType::Q3K),
             GgmlType::Q3K
@@ -499,7 +489,7 @@ mod tests {
             r.tensor_type("token_embd.weight", &[512, 256], GgmlType::Q3K),
             GgmlType::Q6K
         );
-        let r = recipe(QuantizeMethod::Tq1_0, "llama", 28, 8, 4, 0, false, true);
+        let r = recipe(QuantizeMethod::Tq1_0, "llama", (28, 8, 4, 0, true), false);
         assert_eq!(
             r.tensor_type("output.weight", &[512, 256], GgmlType::Tq1_0),
             GgmlType::F16

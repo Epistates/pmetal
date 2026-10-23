@@ -339,7 +339,8 @@ fn a_tensor_the_model_has_no_weight_for_is_an_error() {
 /// would not be read.
 #[test]
 fn each_metadata_value_the_file_states_moves_the_logits() {
-    let cases: [(Generation, &str, fn(&mut GgufBuilder)); 5] = [
+    type Change = fn(&mut GgufBuilder);
+    let cases: [(Generation, &str, Change); 5] = [
         (Generation::Gemma3, "window", |b| {
             b.add_u32("gemma3.attention.sliding_window", 2);
         }),
