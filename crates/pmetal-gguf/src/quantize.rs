@@ -72,16 +72,16 @@ pub fn can_quantize(dtype: GgmlType) -> bool {
 ///
 /// A block never straddles a row, so a type whose block size does not divide
 /// the row cannot hold the tensor. The reference falls back to a 32-element
-/// type of similar size (Q2_K, Q3_K, IQ4_XS and the IQ1/2/3 types to IQ4_NL,
-/// Q4_K to Q5_0, Q5_K to Q5_1, Q6_K and Q8_K to Q8_0, the ternary types to
-/// Q4_0), and to F16 when even 32 does not divide the row. Returns `dtype`
-/// itself when it fits.
+/// type of similar size (Q2_K and Q3_K to Q4_0, IQ4_XS and the IQ1/2/3 types
+/// to IQ4_NL, Q4_K to Q5_0, Q5_K to Q5_1, Q6_K and Q8_K to Q8_0, the ternary
+/// types to Q4_0), and to F16 when even 32 does not divide the row. Returns
+/// `dtype` itself when it fits.
 pub fn fit_to_row_length(dtype: GgmlType, n_per_row: usize) -> GgmlType {
     if n_per_row % dtype.block_size() == 0 {
         return dtype;
     }
     let fallback = match dtype {
-        GgmlType::Tq1_0 | GgmlType::Tq2_0 => GgmlType::Q4_0,
+        GgmlType::Tq1_0 | GgmlType::Tq2_0 | GgmlType::Q2K | GgmlType::Q3K => GgmlType::Q4_0,
         GgmlType::Iq2Xxs
         | GgmlType::Iq2Xs
         | GgmlType::Iq2S
@@ -89,8 +89,6 @@ pub fn fit_to_row_length(dtype: GgmlType, n_per_row: usize) -> GgmlType {
         | GgmlType::Iq3S
         | GgmlType::Iq1S
         | GgmlType::Iq1M
-        | GgmlType::Q2K
-        | GgmlType::Q3K
         | GgmlType::Iq4Xs => GgmlType::Iq4Nl,
         GgmlType::Q4K => GgmlType::Q5_0,
         GgmlType::Q5K => GgmlType::Q5_1,
@@ -1183,7 +1181,14 @@ mod tests {
         assert_eq!(fit_to_row_length(GgmlType::Q4K, 4160), GgmlType::Q5_0);
         assert_eq!(fit_to_row_length(GgmlType::Q5K, 4160), GgmlType::Q5_1);
         assert_eq!(fit_to_row_length(GgmlType::Q6K, 4160), GgmlType::Q8_0);
-        assert_eq!(fit_to_row_length(GgmlType::Q3K, 4160), GgmlType::Iq4Nl);
+        // Gemma 3 1B's rows (1,152 = 4.5 x 256) are the case that showed these:
+        // the reference writes Q4_0 for its Q2_K and Q3_K tensors, IQ4_NL for
+        // IQ4_XS and for the IQ3 types.
+        assert_eq!(fit_to_row_length(GgmlType::Q3K, 1152), GgmlType::Q4_0);
+        assert_eq!(fit_to_row_length(GgmlType::Q2K, 1152), GgmlType::Q4_0);
+        assert_eq!(fit_to_row_length(GgmlType::Iq4Xs, 1152), GgmlType::Iq4Nl);
+        assert_eq!(fit_to_row_length(GgmlType::Iq3S, 1152), GgmlType::Iq4Nl);
+        assert_eq!(fit_to_row_length(GgmlType::Q3K, 4160), GgmlType::Q4_0);
         assert_eq!(fit_to_row_length(GgmlType::Iq2Xxs, 4160), GgmlType::Iq4Nl);
         assert_eq!(fit_to_row_length(GgmlType::Tq2_0, 4160), GgmlType::Q4_0);
         // Not even 32 divides it.
