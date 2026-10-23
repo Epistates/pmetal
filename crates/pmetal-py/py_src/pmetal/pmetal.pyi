@@ -768,6 +768,9 @@ class PreferenceOptions(TypedDict, total=False):
     optimizer: Literal['adamw', 'sgd', 'lion', 'adafactor', 'muon', 'adamw_schedule_free', 'adamw_8bit']
     lora_r: int
     lora_alpha: float
+    full_finetune: bool
+    freeze_embeddings: bool
+    no_memory_check: bool
     max_prompt_length: int
     max_length: int
     seed: int
@@ -826,6 +829,12 @@ class PreferenceSpec(_Spec):
     """LoRA r. Flag: ``--lora-r``. From 1 to 1024. Default: ``16``."""
     lora_alpha: float
     """LoRA α. Flag: ``--lora-alpha``. From 1 to 4096. Default: ``32.0``."""
+    full_finetune: bool
+    """Full Fine-Tune. Train every weight instead of a LoRA adapter, and save a whole model that `infer` and `serve` load (the reference is the model as it starts). Needs several times the model's size in memory: refused up front when it will not fit. Flag: ``--full``. Default: ``False``."""
+    freeze_embeddings: bool
+    """Freeze Embeddings. With --full, keep the input token embedding as loaded. Flag: ``--freeze-embeddings``. Default: ``False``."""
+    no_memory_check: bool
+    """No Memory Check. With --full, run without checking the memory estimate against the device's working set. Flag: ``--no-memory-check``. Default: ``False``."""
     max_prompt_length: int
     """Max Prompt Length. Flag: ``--max-prompt-length``. From 1 to 9.22337e+18. Default: ``512``."""
     max_length: int
