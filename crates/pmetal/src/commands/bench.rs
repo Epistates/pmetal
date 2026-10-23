@@ -1522,6 +1522,7 @@ fn build_gdn_decode_benchmark_setup(
         model_path,
         DynamicModelLoadOptions {
             prefer_expert_offload: true,
+            ..Default::default()
         },
     )?;
     let DynamicModel::Qwen3Next(model) = model else {
@@ -2335,6 +2336,7 @@ fn benchmark_real_inference_session(
         model_path,
         pmetal_models::dispatcher::DynamicModelLoadOptions {
             prefer_expert_offload: experts_dir.is_some(),
+            ..Default::default()
         },
     )?;
     if let Some(experts_dir) = experts_dir {

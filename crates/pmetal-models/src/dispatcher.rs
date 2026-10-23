@@ -26,6 +26,13 @@ const PARAM_EVAL_BATCH_SIZE: usize = 128;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DynamicModelLoadOptions {
     pub prefer_expert_offload: bool,
+    /// Keep a quantized (MLX) checkpoint's projections packed on their
+    /// layers, run by MLX's quantized matmul, instead of unpacking them to a
+    /// dense copy: a quarter of the memory and of the bytes a decode step
+    /// reads. For inference; training wants the dense base (or QLoRA, asked
+    /// for). Honoured by the architectures that load through the generic
+    /// loader (Llama, Qwen 2 and 3, Mistral, Cohere); the rest unpack.
+    pub keep_quantized: bool,
 }
 
 fn eval_module_parameters_batched(module: &impl ModuleParametersExt) -> Result<(), Exception> {
@@ -500,14 +507,16 @@ macro_rules! simple_new {
 /// `$new` accepts any callable returning `Result<Model, Exception>` — most
 /// architectures pass `TypeName::new`; Qwen3 passes `Qwen3ForCausalLM::new_for_loading`.
 macro_rules! simple_load {
-    ($config_ty:ty, $new:expr, $content:expr, $model_dir:expr, $variant:ident) => {{
+    ($config_ty:ty, $new:expr, $content:expr, $model_dir:expr, $variant:ident, $options:expr) => {{
         let config: $config_ty =
             json5::from_str($content).map_err(|e| Exception::custom(e.to_string()))?;
         let mut model = ($new)(config)?;
         load_generic_weights_with(
             &mut model,
             $model_dir,
-            &ModelArchitecture::$variant.load_policy(),
+            &ModelArchitecture::$variant
+                .load_policy()
+                .keeping_quantized($options.keep_quantized),
         )
         .map_err(|e| Exception::custom(e.to_string()))?;
         eval_module_parameters_batched(&model)?;
@@ -835,7 +844,8 @@ impl DynamicModel {
                 LlamaForCausalLM::new,
                 &config_content,
                 model_dir,
-                Llama
+                Llama,
+                options
             ),
             ModelArchitecture::Llama4 => {
                 let effective = unwrap_text_config(&config_content)?;
@@ -859,14 +869,16 @@ impl DynamicModel {
                 Qwen2ForCausalLM::new,
                 &config_content,
                 model_dir,
-                Qwen2
+                Qwen2,
+                options
             ),
             ModelArchitecture::Qwen3 => simple_load!(
                 Qwen3Config,
                 Qwen3ForCausalLM::new_for_loading,
                 &config_content,
                 model_dir,
-                Qwen3
+                Qwen3,
+                options
             ),
             // The parameter tree is the checkpoint's layout with each layer's
             // experts stacked: a released checkpoint's expert-per-key tensors
@@ -936,7 +948,8 @@ impl DynamicModel {
                 MistralForCausalLM::new,
                 &config_content,
                 model_dir,
-                Mistral
+                Mistral,
+                options
             ),
             // Phi cannot use `simple_load!`: Phi-3 fuses q/k/v into a single
             // `self_attn.qkv_proj`, which the generic name-matching loader has
@@ -981,7 +994,8 @@ impl DynamicModel {
                 CohereForCausalLM::new,
                 &config_content,
                 model_dir,
-                Cohere
+                Cohere,
+                options
             ),
             // All of the checkpoint or none of it: see `load_granite_weights`.
             ModelArchitecture::Granite => {

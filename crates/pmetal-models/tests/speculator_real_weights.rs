@@ -101,16 +101,10 @@ fn a_real_qwen_mtp_decode_is_plain_greedy_up_to_a_rounding() {
         let want = plain(&mut model, &prompt, &config);
         let mut got = Vec::new();
         let run = speculator
-            .generate(
-                &mut model,
-                &prompt,
-                &config,
-                config.sampler(&prompt),
-                |t| {
-                    got.push(t);
-                    true
-                },
-            )
+            .generate(&mut model, &prompt, &config, config.sampler(&prompt), |t| {
+                got.push(t);
+                true
+            })
             .unwrap();
         pmetal_runtime::check_unobserved_error().unwrap();
         eprintln!(
@@ -121,7 +115,11 @@ fn a_real_qwen_mtp_decode_is_plain_greedy_up_to_a_rounding() {
             100.0 * run.acceptance_rate()
         );
         match got.iter().zip(&want).position(|(a, b)| a != b) {
-            None => assert_eq!(got.len(), want.len(), "{text:?}: one is a prefix of the other"),
+            None => assert_eq!(
+                got.len(),
+                want.len(),
+                "{text:?}: one is a prefix of the other"
+            ),
             Some(at) => {
                 parted += 1;
                 let mut prefix = prompt.clone();

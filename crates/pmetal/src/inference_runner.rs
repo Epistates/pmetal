@@ -1416,6 +1416,10 @@ fn load_standard_model_for_inference(
         model_path,
         pmetal_models::dispatcher::DynamicModelLoadOptions {
             prefer_expert_offload: config.experts_dir.is_some(),
+            // Generation reads every weight once a token: a quantized
+            // checkpoint stays packed, unless FP8 is asked for on top, which
+            // quantizes dense weights.
+            keep_quantized: !config.fp8,
         },
     )?;
     tracing::info!(arch = %model.architecture(), "Model loaded");

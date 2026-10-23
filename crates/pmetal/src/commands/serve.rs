@@ -156,6 +156,9 @@ pub(crate) async fn run_serve(spec: ServeSpec, api_keys: Vec<String>) -> anyhow:
             &load_path,
             pmetal_models::dispatcher::DynamicModelLoadOptions {
                 prefer_expert_offload: experts_dir.is_some(),
+                // A decode step reads every weight: a quantized checkpoint
+                // stays packed, unless FP8 is asked for on top.
+                keep_quantized: !fp8,
             },
         )?;
 

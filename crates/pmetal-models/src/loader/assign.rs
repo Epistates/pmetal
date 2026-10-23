@@ -216,7 +216,12 @@ pub fn load_generic_weights_with<
 ) -> Result<(), LoadError> {
     let model_dir = model_dir.as_ref();
     let snapshot = ParamSnapshot::of(model);
-    let (loaded, packed) = super::load_weights_keeping_packed(model_dir)?;
+    let linear_paths = policy.keep_quantized.then(|| {
+        let mut paths = Vec::new();
+        model.visit_linears_mut("", &mut |path, _| paths.push(path.to_string()));
+        paths
+    });
+    let (loaded, packed) = super::load_weights_keeping_packed(model_dir, linear_paths.as_deref())?;
     let report = assign_checked_with_packed(model, loaded, packed, policy, &snapshot)
         .map_err(|e| e.with_quantization_hint(model_dir))?;
     eval_loaded_parameters(model)?;
@@ -241,7 +246,7 @@ fn assign_checked_with_packed<
     unconsumed.retain(|key| !tied_head_is_unused(model, key));
     if !packed.is_empty() {
         let count = packed.install(model)?;
-        tracing::info!("{count} projections stay packed (ModelOpt)");
+        tracing::info!("{count} projections stay packed");
     }
     snapshot.require_complete(model, policy, unconsumed)?;
     Ok(report)
@@ -712,6 +717,71 @@ mod tests {
     ///
     /// Asserted on the *parameter*, not on a returned map, because the gap was
     /// between reading the shard and assigning it.
+    #[test]
+    fn load_generic_weights_keeps_quantized_projections_packed_when_asked() {
+        let dir = tempdir().unwrap();
+        let mut weights = dump(&tiny_qwen3(false), dir.path());
+        // An MLX conversion: the projection's words, scales and biases, and
+        // the embedding quantized too (which is not a `Linear`).
+        let q = "model.layers.0.self_attn.q_proj";
+        let embed = "model.embed_tokens";
+        for module in [q, embed] {
+            let dense = weights.remove(&format!("{module}.weight")).unwrap();
+            let (packed, scales, biases) = dense.quantize_weights(32, 4);
+            weights.insert(format!("{module}.weight"), packed);
+            weights.insert(format!("{module}.scales"), scales);
+            weights.insert(format!("{module}.biases"), biases);
+        }
+        write_safetensors(&dir.path().join("model.safetensors"), &weights);
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"quantization": {"bits": 4, "group_size": 32}}"#,
+        )
+        .unwrap();
+
+        let mut unpacked = tiny_qwen3(false);
+        load_generic_weights(&mut unpacked, dir.path()).unwrap();
+        let mut kept = tiny_qwen3(false);
+        load_generic_weights_with(
+            &mut kept,
+            dir.path(),
+            &LoadPolicy::strict().keeping_quantized(true),
+        )
+        .unwrap();
+
+        // The projection runs on its packed words; the embedding is dense.
+        let layer = &kept.model.layers[0].self_attn.q_proj;
+        let quant = layer.quant.as_ref().expect("q_proj stays quantized");
+        assert_eq!((quant.params.bits, quant.params.group_size), (4, 32));
+        assert!(quant.biases.is_some(), "affine biases ride along");
+        assert_ne!(
+            layer.weight.shape(),
+            unpacked.model.layers[0].self_attn.q_proj.weight.shape()
+        );
+        assert_eq!(
+            kept.model.embed_tokens.weight.shape(),
+            unpacked.model.embed_tokens.weight.shape(),
+            "an embedding is unpacked to dense"
+        );
+        // And it computes what the unpacked layer computes.
+        let x = pmetal_runtime::compat::random::normal(
+            &[1, 3, unpacked.model.layers[0].self_attn.q_proj.shape().1],
+            pmetal_runtime::compat::Dtype::Float32,
+        );
+        let a = layer.forward(&x);
+        let b = unpacked.model.layers[0].self_attn.q_proj.forward(&x);
+        let diff = a
+            .subtract(&b.as_dtype(a.dtype().as_i32()))
+            .abs()
+            .max(None)
+            .item_f32();
+        assert!(
+            diff < 2e-2,
+            "packed and unpacked projections differ by {diff}"
+        );
+        pmetal_runtime::check_unobserved_error().unwrap();
+    }
+
     #[test]
     fn load_generic_weights_unpacks_a_quantized_checkpoint() {
         let dir = tempdir().unwrap();
