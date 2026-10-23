@@ -630,7 +630,11 @@ mod tests {
         assert_eq!(name("lm_head.weight"), None);
         // ...and a norm gains 1, as in the text-only Gemma 3.
         let mut norm = vec![0.5f32, -1.0];
-        gemma.lay_out("language_model.model.layers.0.input_layernorm.weight", &[2], &mut norm);
+        gemma.lay_out(
+            "language_model.model.layers.0.input_layernorm.weight",
+            &[2],
+            &mut norm,
+        );
         assert_eq!(norm, [1.5, 0.0]);
     }
 

@@ -285,22 +285,22 @@ impl Tokenizer {
             .get("add_bos_token")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or_else(|| {
-                let eos = self.eos_token_id().and_then(|id| self.inner.id_to_token(id));
+                let eos = self
+                    .eos_token_id()
+                    .and_then(|id| self.inner.id_to_token(id));
                 crate::chat_templates::template_opens_with_bos(model_dir, &bos, eos.as_deref())
             });
         if !expects {
             return self;
         }
-        let processor = match crate::gguf_tokenizer::special_tokens_processor(
-            Some((bos, bos_id)),
-            None,
-        ) {
-            Ok(processor) => processor,
-            Err(e) => {
-                tracing::warn!("not adding the BOS the model expects: {e}");
-                return self;
-            }
-        };
+        let processor =
+            match crate::gguf_tokenizer::special_tokens_processor(Some((bos, bos_id)), None) {
+                Ok(processor) => processor,
+                Err(e) => {
+                    tracing::warn!("not adding the BOS the model expects: {e}");
+                    return self;
+                }
+            };
         // Whatever the post-processor does already (trimming offsets, an
         // EOS) stays, and the BOS goes in front of its result.
         let combined: tokenizers::processors::PostProcessorWrapper =
@@ -910,15 +910,25 @@ mod tests {
         let enc = tk.encode_with_offsets("hi", true).unwrap();
         assert_eq!((enc.ids[0], enc.offsets[0]), (bos, (0, 0)));
         let batch = tk.encode_batch(&["hi", "hi hi"], true).unwrap();
-        assert!(batch.iter().all(|ids| ids[0] == bos && count(ids, bos) == 1));
+        assert!(
+            batch
+                .iter()
+                .all(|ids| ids[0] == bos && count(ids, bos) == 1)
+        );
         let batch = tk.encode_batch_with_offsets(&["hi"], true).unwrap();
         assert_eq!(batch[0].ids[0], bos);
         // ...and text a chat template rendered, or that opens with the BOS,
         // is never given a second.
         let rendered = "<bos><|im_start|>hi";
-        assert_eq!(count(&tk.encode_with_special_tokens(rendered).unwrap(), bos), 1);
+        assert_eq!(
+            count(&tk.encode_with_special_tokens(rendered).unwrap(), bos),
+            1
+        );
         assert_eq!(count(&tk.encode(rendered).unwrap(), bos), 1);
-        assert_eq!(count(&tk.encode_batch(&[rendered], true).unwrap()[0], bos), 1);
+        assert_eq!(
+            count(&tk.encode_batch(&[rendered], true).unwrap()[0], bos),
+            1
+        );
         // Text without special tokens asked for stays bare.
         assert_eq!(tk.encode("hi").unwrap(), none.encode("hi").unwrap());
     }

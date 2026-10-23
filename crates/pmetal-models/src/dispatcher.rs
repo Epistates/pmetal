@@ -2906,11 +2906,19 @@ mod tests {
         let config = parse_gemma_config(released).expect("the released config parses");
         assert!(config.is_gemma3);
         assert_eq!(
-            (config.hidden_size, config.num_hidden_layers, config.sliding_window),
+            (
+                config.hidden_size,
+                config.num_hidden_layers,
+                config.sliding_window
+            ),
             (2560, 34, Some(1024))
         );
         assert_eq!(
-            (config.num_attention_heads, config.num_kv_heads(), config.head_dim),
+            (
+                config.num_attention_heads,
+                config.num_kv_heads(),
+                config.head_dim
+            ),
             (8, 4, Some(256))
         );
         assert_eq!(config.vocab_size, 262_208);
