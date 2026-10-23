@@ -14,12 +14,14 @@ text generation. PMetal runs the Clef releases, `Cloudflare/clef` (Qwen3.8-27B b
 pmetal decide --model <MODEL> --request <request.json | -> [OPTIONS]
 ```
 
-| Option | Default | Meaning |
-|---|---|---|
-| `--model` | | Decision model ID or path |
-| `--request` | | Request body as a JSON file, or `-` for stdin |
-| `--max-length` | 16384 | Longest prompt in tokens; the state is truncated to fit |
-| `--compact` | off | Print the response on one line |
+## Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-m`, `--model` | required | Decision model ID or path (a Clef release, e.g. `Cloudflare/clef-flash`) |
+| `-r`, `--request` | required | Request body as a JSON file, or `-` for stdin |
+| `--max-length` | `16384` | Longest prompt in tokens; the state is truncated to fit |
+| `--compact` | `false` | Print the response on one line instead of indented |
 
 ## Request
 
@@ -85,6 +87,6 @@ backbone must be unquantized: the head reads option vectors from its LM head.
 
 ## See Also
 
-- [pmetal serve](/cli/serve/) — Serve a decision model on `/v1/systemone`
-- [pmetal mcp](/cli/mcp/) — The `decide` MCP tool, which loads the model for one call, or with
+- [pmetal serve](/cli/serve/): Serve a decision model on `/v1/systemone`
+- [pmetal mcp](/cli/mcp/): The `decide` MCP tool, which loads the model for one call, or with
   `port` asks a decision model `start_serve` is already serving

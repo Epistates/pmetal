@@ -9,7 +9,7 @@ client can drive training, inference and model management directly.
 pmetal mcp
 ```
 
-The server speaks MCP over stdio: it reads requests on stdin and writes
+The command takes no options of its own. The server speaks MCP over stdio: it reads requests on stdin and writes
 responses on stdout, so it is started by the client rather than by you. All
 logging goes to stderr, which keeps stdout clean for the protocol.
 
@@ -142,5 +142,5 @@ It is not part of the release artifacts — `pmetal mcp` is the supported path.
 
 ## See Also
 
-- [pmetal serve](/cli/serve/) — OpenAI- and Anthropic-compatible HTTP server
-- [pmetal tui](/cli/tui/) — terminal control center over the same job substrate
+- [pmetal serve](/cli/serve/): OpenAI- and Anthropic-compatible HTTP server
+- [pmetal tui](/cli/tui/): Terminal control center over the same job substrate

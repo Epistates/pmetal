@@ -1,8 +1,10 @@
 # pmetal train
 
-Fine-tune models with LoRA, QLoRA, or DoRA using supervised fine-tuning (SFT).
+Fine-tune a model with LoRA, QLoRA or DoRA using supervised fine-tuning (SFT).
 
-Fine-tune a model with LoRA/QLoRA/DoRA. Supports SFT on any supported architecture with automatic hardware detection and kernel tuning.
+Supports SFT on any supported architecture with automatic hardware detection and kernel tuning. The adapter is written to the output directory in the layout `peft` reads.
+
+Ctrl-C (SIGINT) or SIGTERM finishes the step in flight, saves the adapter and exits with status 130; `--resume` continues from the latest checkpoint. `--log-events <file>` (a global option, given before or after the command) writes the run's events as JSONL, which is how the TUI, the desktop app and the Python bindings follow a run. The option is available on `train`, `distill`, `grpo`, `rlkd` and `preference`; the other training commands refuse it.
 
 ## Usage
 
@@ -10,9 +12,99 @@ Fine-tune a model with LoRA/QLoRA/DoRA. Supports SFT on any supported architectu
 pmetal train \
   --model <MODEL> \
   --dataset <DATASET> \
-  --output <OUTPUT_DIR> \
+  [--output <OUTPUT_DIR>] \
   [OPTIONS]
 ```
+
+`--model` and `--dataset` are required unless `--config` supplies them.
+
+## Options
+
+### Model and data
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-c`, `--config` | none | Path to a YAML configuration file (see [Configuration File](/configuration/config-file/)) |
+| `-m`, `--model` | required | HuggingFace model ID or local path |
+| `-d`, `--dataset` | required | Training dataset: a JSONL, JSON, Parquet, Arrow or CSV file, or a HuggingFace dataset ID |
+| `--eval-dataset` | none | Evaluation dataset (same forms as `--dataset`) |
+| `-o`, `--output` | `./output` | Output directory for the adapter and checkpoints |
+| `--text-column` | none | Custom JSONL column holding the training text |
+| `--text-columns` | none | Multiple columns to concatenate as the training text (comma-separated, e.g. `thinking,solution`) |
+| `--column-separator` | blank line | Separator for `--text-columns` |
+| `--prompt-column` | none | Column holding the prompt (enables SFT loss masking) |
+| `--response-column` | none | Column holding the response (with prompt masking) |
+
+### LoRA
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--lora-r` | `16` | LoRA rank |
+| `--lora-alpha` | `32.0` | LoRA scaling factor (2x rank is the usual choice) |
+| `--lora-dropout` | `0.0` | Dropout applied to the LoRA branch during training |
+| `--lora-targets` | all linear layers | Projections to adapt, comma-separated (`q_proj,v_proj`); MoE routers never are |
+| `--dora` | `false` | Train DoRA (weight-decomposed LoRA) adapters: slower per step, usually better at low rank |
+| `--rslora` | `false` | Rank-stabilized scaling (`alpha/sqrt(r)` instead of `alpha/r`), which keeps the update magnitude steady as rank grows |
+| `--quantization` | `none` | QLoRA base format: `none`, `nf4`, `fp4` (NVFP4) or `int8` |
+| `--quant-block-size` | `64` | Weights per scale for `nf4` and `int8` (32, 64 or 128; `fp4`'s block is 16) |
+| `--double-quant` | `false` | Pack `nf4`'s absmax values to 8 bits as well |
+
+### Training loop
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--batch-size` | `1` | Micro-batch size |
+| `--gradient-accumulation-steps` | `4` | Gradient accumulation steps |
+| `--epochs` | `1` | Number of training epochs |
+| `--max-steps` | none | Stop after this many optimizer steps, whatever `--epochs` says |
+| `--max-seq-len` | `0` | Maximum sequence length; `0` detects it from the model config |
+| `--max-grad-norm` | `1.0` | Gradient clipping norm; `0` disables |
+| `--no-sequence-packing` | `false` | Disable sequence packing |
+| `--pack-max-seq-len` | none | Override the maximum sequence length used for packing |
+| `--no-gradient-checkpointing` | `false` | Disable gradient checkpointing |
+| `--cut-cross-entropy` | `false` | Loss from fused Metal kernels that never hold the logits; gradient as precise as the full logits' |
+| `--label-smoothing` | `0.0` | Label smoothing of the training loss, in [0, 1); evaluation reports the plain loss |
+| `--z-loss` | `0.0` | Weight of the z-loss `weight * lse^2` added to each token's loss (PaLM; 1e-4 is the paper's value) |
+| `--neftune-alpha` | none | NEFTune noise alpha on the token embeddings of every training forward pass (5 for small models, 15 for larger) |
+| `--seed` | `42` | Random seed |
+| `--resume` | `false` | Resume from the latest checkpoint in the output directory |
+
+### Optimizer and schedule
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--learning-rate` | `2e-4` | Learning rate |
+| `--embedding-lr` | none | Separate learning rate for embeddings |
+| `--optimizer` | `adamw` | `adamw`, `sgd` (momentum 0.9), `lion`, `adafactor`, `muon`, `adamw_schedule_free` or `adamw_8bit`. Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW; schedule-free AdamW wants a constant rate |
+| `--weight-decay` | `0.01` | Weight decay |
+| `--lr-schedule` | `cosine` | `constant`, `linear`, `cosine`, `cosine_with_restarts`, `polynomial` or `wsd` |
+| `--warmup-steps` | `0` | Linear warmup steps |
+| `--warmup-ratio` | none | Share of the optimizer steps spent warming up (0 to 1); replaces `--warmup-steps` when set |
+| `--min-lr` | `0` | Floor the decaying schedules stop at |
+| `--wsd-stable-ratio` | `0.7` | Share of the steps the `wsd` schedule holds the peak rate for |
+| `--wsd-decay-style` | `linear` | Shape of the `wsd` decay: `linear`, `cosine` or `one_minus_sqrt` |
+| `--cosine-num-restarts` | `1` | Cycles of `cosine_with_restarts` |
+| `--polynomial-power` | `1` | Exponent of the `polynomial` schedule |
+| `--no-adaptive-lr` | `false` | Turn off the automatic adaptive learning rate (reductions on loss spikes, plateaus and divergence; it can only lower the scheduled rate) |
+
+### Logging and checkpoints
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--logging-steps` | `10` | Log the loss every this many optimizer steps |
+| `--eval-steps` | `100` | Evaluate every this many optimizer steps (needs `--eval-dataset`) |
+| `--save-steps` | `500` | Write a checkpoint every this many optimizer steps |
+| `--log-metrics` | none | Write per-step metrics as JSONL to this path; a bare file name goes inside the output directory |
+
+### Apple Neural Engine and distributed training
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--ane` | `false` | Train on the Apple Neural Engine (experimental) |
+| `--loss-scale` | `1.0` | Loss scaling factor for ANE training |
+| `--distributed-peers` | none | Distributed training: comma-separated peer addresses (`ip:port`) |
+| `--distributed-auto` | `false` | Distributed training: discover peers automatically over mDNS |
+| `--compression-strategy` | `none` | Gradient compression for distributed training: `none`, `topk`, `fp16` or `random` |
 
 ## Examples
 
@@ -31,64 +123,18 @@ pmetal train \
   --output ./output \
   --quantization nf4 --lora-r 16
 
-# DoRA with custom schedule
+# DoRA with a custom schedule
 pmetal train \
   --model Qwen/Qwen3-0.6B \
   --dataset train.jsonl \
-  --lr-schedule cosine_with_restarts
+  --dora --lr-schedule cosine_with_restarts
+
+# Resume an interrupted run
+pmetal train --model Qwen/Qwen3-0.6B --dataset train.jsonl --output ./output --resume
 
 # From a config file
 pmetal train --config training.yaml
 ```
-
-## Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--model` | *required* | HuggingFace model ID or local path |
-| `--dataset` | *required* | Path to training dataset (JSONL, Parquet, CSV) |
-| `--output` | `./output` | Output directory for weights and logs |
-| `--lora-r` | `16` | LoRA rank |
-| `--lora-alpha` | `32.0` | LoRA scaling factor (2× rank) |
-| `--batch-size` | `1` | Micro-batch size |
-| `--learning-rate` | `2e-4` | Learning rate |
-| `--max-seq-len` | `0` | Max sequence length (0 = auto-detect) |
-| `--epochs` | `1` | Number of training epochs |
-| `--max-steps` | None | Stop after this many optimizer steps, whatever `--epochs` says |
-| `--lora-targets` | all linear layers | Projections to adapt, comma-separated (`q_proj,v_proj`); MoE routers never are |
-| `--logging-steps` | `10` | Log the loss every this many optimizer steps |
-| `--eval-steps` | `100` | Evaluate every this many optimizer steps (needs `--eval-dataset`) |
-| `--save-steps` | `500` | Write a checkpoint every this many optimizer steps |
-| `--eval-dataset` | None | Evaluation dataset (same formats as `--dataset`) |
-| `--log-metrics` | None | Write per-step metrics as JSONL to this path |
-| `--max-grad-norm` | `1.0` | Gradient clipping |
-| `--quantization` | none | QLoRA base format: `nf4`, `fp4` (NVFP4), `int8` |
-| `--quant-block-size` | `64` | Weights per scale for `nf4` and `int8` (32, 64 or 128) |
-| `--double-quant` | `false` | Pack `nf4`'s absmax values to 8 bits as well |
-| `--gradient-accumulation-steps` | `4` | Gradient accumulation steps |
-| `--embedding-lr` | None | Separate LR for embeddings |
-| `--label-smoothing` | `0.0` | Label smoothing of the training loss, in [0, 1); evaluation reports the plain loss |
-| `--z-loss` | `0.0` | Weight of the z-loss `weight * lse^2` added to each token's loss (PaLM; 1e-4 is the paper's value) |
-| `--neftune-alpha` | None | NEFTune noise alpha on the token embeddings of every training forward pass (5 for small models, 15 for larger) |
-| `--lr-schedule` | `cosine` | `constant`, `linear`, `cosine`, `cosine_with_restarts`, `polynomial`, `wsd` |
-| `--warmup-ratio` | None | Share of the optimizer steps spent warming up (0 to 1); replaces `--warmup-steps` when set |
-| `--min-lr` | `0` | Floor the decaying schedules stop at |
-| `--wsd-stable-ratio` | `0.7` | Share of the steps the `wsd` schedule holds the peak rate for |
-| `--wsd-decay-style` | `linear` | Shape of the `wsd` decay: `linear`, `cosine`, `one_minus_sqrt` |
-| `--cosine-num-restarts` | `1` | Cycles of `cosine_with_restarts` |
-| `--polynomial-power` | `1` | Exponent of the `polynomial` schedule |
-| `--no-gradient-checkpointing` | `false` | Disable gradient checkpointing |
-| `--warmup-steps` | `0` | Learning rate warmup steps |
-| `--weight-decay` | `0.01` | Weight decay |
-| `--optimizer` | `adamw` | `adamw`, `sgd` (momentum 0.9), `lion`, `adafactor`, `muon`, `adamw_schedule_free`, `adamw_8bit`. Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW; schedule-free AdamW wants a constant rate |
-| `--no-sequence-packing` | `false` | Disable sequence packing |
-| `--cut-cross-entropy` | `false` | Loss from fused Metal kernels that never hold the logits; gradient as precise as the full logits' |
-| `--text-column` | — | Custom JSONL column name for training text |
-| `--text-columns` | — | Multi-column concat (comma-separated, e.g. `thinking,solution`) |
-| `--prompt-column` | — | Column for prompt (enables SFT loss masking) |
-| `--response-column` | — | Column for response (with prompt masking) |
-| `--column-separator` | `\n\n` | Separator for `--text-columns` |
-| `--config` | — | Path to YAML configuration file |
 
 ## Dataset Formats
 
@@ -123,14 +169,16 @@ pmetal train --model ... --dataset data.jsonl \
 
 ## Output
 
-Training produces:
+Training produces, in the output directory:
 
-- `adapter_model.safetensors` and `adapter_config.json` — the LoRA adapter, in the layout `peft` reads (`PeftModel.from_pretrained(base, "./output")` loads it; adapters from earlier releases, `lora_weights.safetensors`, still load here)
-- `training_metrics.jsonl` — Per-step metrics log
-- `checkpoint/` — Resumable checkpoints (if training is interrupted)
+- `adapter_model.safetensors` and `adapter_config.json`: the LoRA adapter, in the layout `peft` reads (`PeftModel.from_pretrained(base, "./output")` loads it; adapters from earlier releases, `lora_weights.safetensors`, still load here)
+- `checkpoints/`: resumable checkpoints, one every `--save-steps` steps (`--resume` continues from the latest)
+- the file named by `--log-metrics`, when given: per-step metrics
 
 ## See Also
 
-- [Configuration File](/configuration/config-file/) — YAML config format
-- [Training Overview](/training/overview/) — All training methods
-- [Supported Models](/models/supported/) — LoRA-compatible architectures
+- [Configuration File](/configuration/config-file/): YAML config format
+- [Training Overview](/training/overview/): All training methods
+- [Supported Models](/models/supported/): LoRA-compatible architectures
+- [pmetal fuse](/cli/fuse/): Fold the adapter into the base model
+- [pmetal infer](/cli/infer/): Run the adapter (`--lora`)

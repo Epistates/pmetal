@@ -101,5 +101,6 @@ pub enum OllamaTemplate {
     /// Phi-3 instruct format
     Phi3,
     /// DeepSeek chat format
+    #[value(name = "deepseek", alias = "deep-seek")]
     DeepSeek,
 }

@@ -2,7 +2,7 @@
 
 Start an OpenAI-compatible inference server.
 
-Start an HTTP inference server with an OpenAI-compatible API. Requires the `serve` feature flag.
+Start an HTTP inference server with OpenAI- and Anthropic-compatible APIs. The prebuilt release binary and the Homebrew formula include this command; a build from source needs the `serve` feature (see the note at the end of this page).
 
 ## Usage
 
@@ -10,16 +10,50 @@ Start an HTTP inference server with an OpenAI-compatible API. Requires the `serv
 pmetal serve --model <MODEL> [OPTIONS]
 ```
 
+## Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-m`, `--model` | required | Model ID or local path |
+| `-p`, `--port` | `8080` | Port to listen on |
+| `--host` | `127.0.0.1` | Address to bind. The default is this machine only; binding another address without `--api-key` logs a warning |
+| `--api-key` | none | API key clients must send (`Authorization: Bearer <key>` or `x-api-key: <key>`); repeatable. The `PMETAL_API_KEY` environment variable (comma-separated) sets the same without the key appearing in the process list. With none, the server is open: keep it on loopback |
+| `--cors-origin` | none | Browser origin whose pages may call the server (CORS), or `*` for any; repeatable. Without one, no CORS headers are sent |
+| `--request-timeout` | `1800` | Seconds one request may run before the server ends it (a 504, or an error frame in a stream); `0` for no limit |
+| `--max-seq-len` | the model's window, within memory | Context length held per sequence (prompt plus output); see [Context length](#context-length) |
+| `--experts-dir` | none | Packed expert directory for SSD-offloaded MoE inference (see [`pmetal pack-experts`](/cli/pack-experts/)) |
+| `--fp8` | `false` | Quantize weights to FP8 (E4M3) at load time, about 2x memory savings |
+| `--kv-quant` | engine default | KV cache quantization bits: `8` (q8_0), `4` (q4_0) or `0` (fp16) |
+| `--no-kv-quant` | `false` | Use an fp16 KV cache |
+| `--kv-group-size` | `64` | KV cache quantization group size |
+| `--kv-turboquant` | `false` | TurboQuant KV cache compression |
+| `--kv-turboquant-preset` | none | TurboQuant quality preset: `q2_5` or `q3_5` |
+| `--ane` | `false` | Generate on the Apple Neural Engine (experimental). A model the ANE cannot run is an error, not a quiet GPU run |
+| `--ane-max-seq-len` | `4096` | Largest context (prompt plus output) the ANE compiles a model for |
+| `--draft-model` | none | DFlash draft model drafting for the model on the ANE: it runs on the GPU and the ANE verifies its guesses. Needs `--ane` |
+| `--continuous-batch` | `false` | Serve requests together (see [Continuous batching](#continuous-batching)) |
+| `--cb-max-slots` | `8` | Requests running at once |
+| `--cb-max-queue-depth` | `256` | Requests that may wait for a slot |
+| `--cb-block-size` | `32` | Tokens per block that admission counts KV memory in |
+| `--cb-max-blocks` | `0` | KV blocks that may be reserved at once (`0` is what the device can hold beside the model) |
+| `--cb-exact` | `false` | One forward per request, bit for bit the single-request reply |
+
 ## Examples
 
 ```bash
 # Start server
 pmetal serve --model Qwen/Qwen3-0.6B --port 8080
 
+# Require an API key
+PMETAL_API_KEY=change-me pmetal serve --model Qwen/Qwen3-0.6B
+
+# Serve several requests at once
+pmetal serve --model Qwen/Qwen3-0.6B --continuous-batch --cb-max-slots 16
+
 # Serve a pre-fused adapter model
 pmetal fuse \
   --model Qwen/Qwen3-0.6B \
-  --lora ./output/adapter_model.safetensors \
+  --lora ./output \
   --output ./output/fused
 pmetal serve --model ./output/fused --port 8080
 ```
@@ -28,13 +62,14 @@ pmetal serve --model ./output/fused --port 8080
 
 The server speaks both the OpenAI and the Anthropic wire formats:
 
-- `POST /v1/chat/completions` — chat completions (streaming and non-streaming, tool calling, token logprobs, images and videos)
-- `POST /v1/completions` — text completions
-- `POST /v1/embeddings` — embeddings, 17 architectures via `forward_hidden`
-- `POST /v1/messages` — Anthropic-compatible messages, with SSE streaming and image blocks
-- `GET /v1/models` — list loaded models
-- `GET /v1/metrics` — serving metrics
-- `GET /health` — liveness check
+- `POST /v1/chat/completions`: chat completions (streaming and non-streaming, tool calling, token logprobs, images and videos)
+- `POST /v1/responses`: the OpenAI Responses API (text and image input, function tools, structured output, streaming events); server-side state such as `previous_response_id` is refused by name
+- `POST /v1/completions`: text completions
+- `POST /v1/embeddings`: embeddings, 17 architectures via `forward_hidden`
+- `POST /v1/messages`: Anthropic-compatible messages, with SSE streaming and image blocks
+- `GET /v1/models` and `GET /v1/models/{id}`: list loaded models, or describe one
+- `GET /v1/metrics`: serving metrics
+- `GET /health`: liveness check
 
 Request bodies are capped at 64 MiB, room for base64-encoded images and video frames.
 
@@ -133,10 +168,15 @@ slot is free and leaves the step it finishes; each step decodes one token for
 every running request and runs one chunk of the prompt that is prefilling, so a
 long prompt delays the others by a chunk and no more.
 
-A model with a batched forward (Llama, Mistral, Qwen 2 and 3, Qwen3-MoE, Gemma 1
-and 2, Phi, Cohere and Granite, with a plain dense KV cache) decodes all running
-requests in one forward, reading the weights once however many there are. Hybrid
-models, quantized, TurboQuant and sliding-window caches, and the other
+A model with a batched forward decodes all running requests in one forward,
+reading the weights once however many there are. Those are Llama, Mistral, Qwen 2
+and 3, Qwen3-MoE, Gemma 1 and 2, Phi and Phi-4, and Cohere (not Cohere 2 or
+Command R+), with a plain dense KV cache, and only when the model has no sliding
+window and a plain RoPE: a scaled RoPE (Llama 3 bands, YaRN, LongRoPE, dynamic
+NTK) takes the one-forward-per-request path, and so does every Granite release
+(a Granite's residual multiplier has no place in the batched forward). Gemma 3 and
+4, gpt-oss, the hybrid models (Qwen 3.5 and later, Nemotron-H, Granite 4.0-H),
+DeepSeek, Llama 4, quantized, TurboQuant and sliding-window caches, and the other
 architectures decode one forward per request. A request that decodes alone gets
 what the single-request path gives it, bit for bit; with company its logits can
 differ in the last bit of a bf16 value, so a greedy near-tie may fall the other
@@ -149,13 +189,8 @@ K/V. For a hybrid model the cached prefix holds the recurrent state beside the
 K/V, so it serves a request that repeats a whole earlier prompt (a chat's next
 turn) but not one that diverges inside it.
 
-| Flag | Meaning | Default |
-|------|---------|---------|
-| `--cb-max-slots` | Requests running at once | 8 |
-| `--cb-max-queue-depth` | Requests that may wait for a slot | 256 |
-| `--cb-block-size` | Tokens per block that admission counts KV memory in | 32 |
-| `--cb-max-blocks` | KV blocks that may be reserved at once (0 = what the device can hold beside the model) | 0 |
-| `--cb-exact` | One forward per request, bit for bit the single-request reply | off |
+The scheduler's options are listed in the table above (`--cb-max-slots`, `--cb-max-queue-depth`,
+`--cb-block-size`, `--cb-max-blocks` and `--cb-exact`).
 
 A request reserves its worst case (prompt plus `max_tokens`) while it runs, so
 none is ever preempted; one that does not fit waits, and a small request may pass
@@ -227,12 +262,14 @@ channel are recognised; the markers themselves appear in neither field.
 Logprobs cover the answer's tokens.
 
 :::note
-The prebuilt release binary and the Homebrew formula both ship this command. If you build PMetal
-yourself, `serve` is opt-in: `cargo install pmetal --features serve`.
+The prebuilt release binary and the Homebrew formula both ship this command (they are built with
+`--features serve,mcp`). If you build PMetal yourself, `serve` is opt-in:
+`cargo install pmetal --features serve,mcp`.
 :::
 
 ## See Also
 
-- [pmetal infer](/cli/infer/) — Interactive inference
-- [pmetal mcp](/cli/mcp/) — MCP server for Claude Desktop and Claude Code
-- [Feature Flags](/configuration/feature-flags/) — Enable the serve feature
+- [pmetal infer](/cli/infer/): Single-prompt inference
+- [pmetal decide](/cli/decide/): Decision-model requests, also served on `/v1/systemone`
+- [pmetal mcp](/cli/mcp/): MCP server for Claude Desktop and Claude Code
+- [Feature Flags](/configuration/feature-flags/): Enable the serve feature
