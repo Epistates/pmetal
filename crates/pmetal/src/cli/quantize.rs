@@ -14,9 +14,23 @@ pub struct QuantizeArgs {
     #[arg(short, long = "output")]
     pub output: String,
 
-    /// Path to Importance Matrix (imatrix.dat) for dynamic quantization
+    /// Importance matrix file (GGUF or legacy .dat), from `pmetal imatrix`:
+    /// weights the quantization error by how large the activations are
     #[arg(long = "imatrix")]
     pub imatrix: Option<String>,
+
+    /// Calibration data to measure the importance matrix on first (a text file,
+    /// or a JSONL / Parquet dataset), instead of reading one with --imatrix
+    #[arg(long = "calibration-dataset")]
+    pub calibration_dataset: Option<String>,
+
+    /// Tokens per calibration chunk
+    #[arg(long = "calibration-ctx-size", default_value_t = 512)]
+    pub calibration_ctx_size: usize,
+
+    /// Calibration chunks to run (0 = all the data makes)
+    #[arg(long = "calibration-chunks", default_value_t = 0)]
+    pub calibration_chunks: usize,
 
     /// Quantization method
     #[arg(long = "method", value_enum, default_value = "dynamic")]
@@ -98,6 +112,12 @@ pub enum QuantizeMethod {
     /// Legacy 4-bit affine GGML quantization
     #[value(name = "q4_1")]
     Q4_1,
+    /// 4-bit non-linear (~4.5 bpw): finer steps near zero, where weights are
+    #[value(name = "iq4_nl")]
+    Iq4Nl,
+    /// 4-bit non-linear with 256-weight super-blocks (~4.25 bpw)
+    #[value(name = "iq4_xs")]
+    Iq4Xs,
     /// 3-bit K-quant medium
     #[value(name = "q3_k_m")]
     Q3KM,
@@ -152,6 +172,8 @@ impl QuantizeMethod {
             Self::Q4KS => "q4_k_s",
             Self::Q4_0 => "q4_0",
             Self::Q4_1 => "q4_1",
+            Self::Iq4Nl => "iq4_nl",
+            Self::Iq4Xs => "iq4_xs",
             Self::Q3KM => "q3_k_m",
             Self::Q3KS => "q3_k_s",
             Self::Q3KL => "q3_k_l",
@@ -184,6 +206,8 @@ impl QuantizeMethod {
             Self::Q4KM | Self::Q4KS => Some(GgmlType::Q4K),
             Self::Q4_0 => Some(GgmlType::Q4_0),
             Self::Q4_1 => Some(GgmlType::Q4_1),
+            Self::Iq4Nl => Some(GgmlType::Iq4Nl),
+            Self::Iq4Xs => Some(GgmlType::Iq4Xs),
             // All Q3K size variants share the same K-quant block structure
             Self::Q3KM | Self::Q3KS | Self::Q3KL => Some(GgmlType::Q3K),
             Self::Q2K => Some(GgmlType::Q2K),
@@ -205,6 +229,9 @@ impl From<QuantizeArgs> for QuantizeSpec {
             model: a.model,
             output: a.output,
             imatrix: a.imatrix,
+            calibration_dataset: a.calibration_dataset,
+            calibration_ctx_size: a.calibration_ctx_size,
+            calibration_chunks: a.calibration_chunks,
             method: a.method.as_str().to_string(),
             lora: a.lora,
             kl_calibrate: a.kl_calibrate,

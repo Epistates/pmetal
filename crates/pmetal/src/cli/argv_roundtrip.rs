@@ -7,8 +7,8 @@ use pmetal_core::JobFields;
 use pmetal_core::jobs::ServeSpec;
 use pmetal_core::jobs::{
     BenchSpec, DecideSpec, DflashSpec, DistillSpec, EmbedTrainSpec, EvalSpec, FuseSpec, GrpoSpec,
-    InferSpec, MergeSpec, PackExpertsSpec, PretrainSpec, QuantizeSpec, RlkdSpec, TokenizeSpec,
-    TrainSpec,
+    ImatrixSpec, InferSpec, MergeSpec, PackExpertsSpec, PretrainSpec, QuantizeSpec, RlkdSpec,
+    TokenizeSpec, TrainSpec,
 };
 
 /// Parse an argv slice built from a spec's `to_argv()` output.  Returns
@@ -80,6 +80,9 @@ fn busy_train_spec() -> TrainSpec {
         cut_cross_entropy: true,
         no_adaptive_lr: true,
         ane: true,
+        full_finetune: true,
+        freeze_embeddings: true,
+        no_memory_check: true,
         pack_max_seq_len: Some(1024),
         distributed_peers: Some("10.0.0.2:7000,10.0.0.3:7000".into()),
         distributed_auto: true,
@@ -335,6 +338,9 @@ fn preference_spec_round_trip() {
         beta: Some(0.3),
         max_steps: Some(12),
         undesirable_weight: 1.5,
+        full_finetune: true,
+        freeze_embeddings: true,
+        no_memory_check: true,
         log_metrics: Some("m.jsonl".into()),
         ..defaults.clone()
     };
@@ -578,8 +584,8 @@ fn quantize_refuses_a_format_it_does_not_have() {
 fn quantize_methods_parse_canonical_names() {
     let methods = [
         "dynamic", "q1_0", "q2_k", "q3_k_s", "q3_k_m", "q3_k_l", "q4_0", "q4_1", "q4_k_s",
-        "q4_k_m", "q5_0", "q5_1", "q5_k_s", "q5_k_m", "q6_k", "q8_0", "q8_1", "tq1_0", "tq2_0",
-        "mxfp4", "nvfp4", "bf16", "f16", "f32",
+        "q4_k_m", "q5_0", "q5_1", "q5_k_s", "q5_k_m", "q6_k", "q8_0", "q8_1", "iq4_nl", "iq4_xs",
+        "tq1_0", "tq2_0", "mxfp4", "nvfp4", "bf16", "f16", "f32",
     ];
 
     for method in methods {
@@ -787,6 +793,14 @@ fn grpo_and_rlkd_specs_round_trip_every_field() {
         reward_model_max_length: 1024,
         reward_model_weight: 0.5,
         reward_model_template: Some("chatml".into()),
+        reward_cmd: vec!["python3 judge.py --strict".into(), "./tests.sh".into()],
+        reward_weight: vec!["0.5".into(), "-1".into()],
+        reward_timeout: 30,
+        reward_regex: Some(r"^\d+$".into()),
+        reward_regex_weight: 0.25,
+        reward_json: true,
+        reward_json_schema: Some("schema.json".into()),
+        reward_json_weight: 2.0,
         async_rewards: true,
         prompt_column: Some("q".into()),
         response_column: Some("a".into()),
@@ -1013,7 +1027,10 @@ fn model_commands_round_trip_every_field() {
                 model: "m".into(),
                 output: "o".into(),
                 imatrix: Some("im.dat".into()),
-                method: "q5_k_m".into(),
+                calibration_dataset: None,
+                calibration_ctx_size: 512,
+                calibration_chunks: 0,
+                method: "iq4_xs".into(),
                 lora: Some("adapter".into()),
                 kl_calibrate: true,
                 target_bpw: Some(4.5),
@@ -1025,6 +1042,53 @@ fn model_commands_round_trip_every_field() {
         ],
         |c| match c {
             Commands::Quantize(a) => Some(a),
+            _ => None,
+        },
+    );
+    // Measured on the fly rather than read: the fields the first spec leaves
+    // at their defaults are the ones the file form does not use.
+    round_trips(
+        "quantize",
+        [
+            QuantizeSpec {
+                model: "m".into(),
+                output: "o.gguf".into(),
+                calibration_dataset: Some("calib.jsonl".into()),
+                calibration_ctx_size: 1024,
+                calibration_chunks: 64,
+                method: "iq4_nl".into(),
+                ..Default::default()
+            },
+            QuantizeSpec {
+                model: "m".into(),
+                output: "o.gguf".into(),
+                ..Default::default()
+            },
+        ],
+        |c| match c {
+            Commands::Quantize(a) => Some(a),
+            _ => None,
+        },
+    );
+    round_trips(
+        "imatrix",
+        [
+            ImatrixSpec {
+                model: "m".into(),
+                dataset: "calib.txt".into(),
+                ..Default::default()
+            },
+            ImatrixSpec {
+                model: "m".into(),
+                dataset: "calib.jsonl".into(),
+                output: "im.dat".into(),
+                ctx_size: 2048,
+                chunks: 100,
+                batch_size: 2,
+            },
+        ],
+        |c| match c {
+            Commands::Imatrix(a) => Some(a),
             _ => None,
         },
     );
@@ -1194,10 +1258,17 @@ fn eval_spec_round_trips_every_field() {
             },
             EvalSpec {
                 model: "m".into(),
-                dataset: "d".into(),
+                dataset: "q.jsonl".into(),
+                task: Some("mmlu".into()),
+                fewshot: Some(3),
                 lora: Some("adapter".into()),
-                max_seq_len: 512,
-                num_samples: 20,
+                max_seq_len: 4096,
+                num_samples: 100,
+                seed: 7,
+                batch_size: 8,
+                max_gen_tokens: 128,
+                output: Some("results.json".into()),
+                log_samples: true,
                 json: true,
             },
         ],

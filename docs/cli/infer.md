@@ -194,7 +194,7 @@ same way. The family is read from `config.json` and the model's name.
 | Nemotron Nano 2 | 0.6 / 0.95 | greedy | none |
 
 Values are temperature / top-p / top-k. Families not listed (Llama 3.x and 4,
-Gemma 2/3, Phi-3/4, Mistral 7B, Mixtral, Cohere, Granite, SmolLM2, Qwen2.5)
+Gemma 2/3, Phi-3/4, Mistral 7B, Cohere, Granite, SmolLM2, Qwen2.5)
 publish no recommendation beyond their `generation_config.json`.
 
 ## Long Context (YaRN)

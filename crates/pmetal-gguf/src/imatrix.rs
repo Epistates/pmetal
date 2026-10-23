@@ -55,10 +55,17 @@ pub struct IMatrix {
     pub data: HashMap<String, Vec<f32>>,
     /// Number of calibration calls per tensor.
     pub ncalls: HashMap<String, i32>,
+    /// Tokens behind each tensor's values, one per expert for a stacked
+    /// mixture-of-experts matrix (the tokens routed to it). Kept for the
+    /// GGUF format, where a matrix's `values` are per-token means: the sums
+    /// the format stores are the means times these.
+    pub counts: HashMap<String, Vec<f32>>,
     /// Dataset filename (from footer, if available).
     pub dataset_name: Option<String>,
     /// Last chunk count (from footer, if available).
     pub last_chunk: Option<i32>,
+    /// Tokens per chunk of the calibration run, if known (GGUF format).
+    pub chunk_size: Option<u32>,
 }
 
 impl IMatrix {
@@ -153,7 +160,13 @@ impl IMatrix {
                 );
             }
             out.insert(name.to_string(), values, 1);
+            out.counts.insert(name.to_string(), counts);
         }
+        out.chunk_size = match model.get_metadata("imatrix.chunk_size") {
+            Some(MetadataValue::Uint32(v)) => Some(*v),
+            Some(MetadataValue::Int32(v)) => u32::try_from(*v).ok(),
+            _ => None,
+        };
         out.last_chunk = match model.get_metadata("imatrix.chunk_count") {
             Some(MetadataValue::Uint32(v)) => i32::try_from(*v).ok(),
             Some(MetadataValue::Int32(v)) => Some(*v),
@@ -268,6 +281,7 @@ impl IMatrix {
             ncalls,
             dataset_name,
             last_chunk,
+            ..Self::default()
         })
     }
 
@@ -348,6 +362,82 @@ impl IMatrix {
     pub fn insert(&mut self, name: String, values: Vec<f32>, ncall: i32) {
         self.ncalls.insert(name.clone(), ncall);
         self.data.insert(name, values);
+    }
+
+    /// Add the result of a calibration run for one matrix: its per-token mean
+    /// squared activations (`in_features` values, or that many per expert for a
+    /// stacked matrix) and the tokens behind them (one count, or one per
+    /// expert).
+    pub fn insert_measured(&mut self, name: String, mean_sq: Vec<f32>, counts: Vec<f32>) {
+        self.counts.insert(name.clone(), counts);
+        self.insert(name, mean_sq, 1);
+    }
+
+    /// Save as a GGUF imatrix file (`general.type = "imatrix"`), the format
+    /// described in the [module documentation](self), atomically.
+    ///
+    /// For each matrix the file holds the sums, not the means:
+    /// `in_sum2` is the stored per-token means times the matrix's token
+    /// counts (per expert), so tools that merge imatrix files weigh each by
+    /// the tokens behind it. A matrix that has no counts (read from the legacy
+    /// format) is written as one slice whose count is its `ncall` and whose
+    /// sums are its values, which [`importance`](Self::importance) divides
+    /// back out the same.
+    ///
+    /// # Errors
+    ///
+    /// A matrix whose values do not divide into its experts, or whose name is
+    /// too long for a tensor name once `.in_sum2` is appended, or the file
+    /// cannot be written.
+    pub fn save_gguf(&self, path: &std::path::Path) -> Result<()> {
+        use crate::{GgufBuilder, MetadataValue};
+
+        let mut builder = GgufBuilder::new();
+        builder.add_metadata("general.type", MetadataValue::String("imatrix".into()));
+        if let Some(dataset) = &self.dataset_name {
+            builder.add_string_array("imatrix.datasets", vec![dataset.clone()]);
+        }
+        if let Some(chunks) = self.last_chunk.and_then(|c| u32::try_from(c).ok()) {
+            builder.add_u32("imatrix.chunk_count", chunks);
+        }
+        if let Some(size) = self.chunk_size {
+            builder.add_u32("imatrix.chunk_size", size);
+        }
+
+        let mut names: Vec<&String> = self.data.keys().collect();
+        names.sort();
+        for name in names {
+            let values = &self.data[name];
+            let (counts, sums): (Vec<f32>, Vec<f32>) = match self.counts.get(name) {
+                Some(counts) if !counts.is_empty() => {
+                    if values.len() % counts.len() != 0 {
+                        return Err(PMetalError::InvalidArgument(format!(
+                            "imatrix entry {name} has {} values for {} experts",
+                            values.len(),
+                            counts.len()
+                        )));
+                    }
+                    let per = values.len() / counts.len();
+                    let sums = values
+                        .chunks(per.max(1))
+                        .zip(counts)
+                        .flat_map(|(slice, &count)| slice.iter().map(move |&v| v * count))
+                        .collect();
+                    (counts.clone(), sums)
+                }
+                _ => (
+                    vec![self.ncalls.get(name).copied().unwrap_or(1).max(1) as f32],
+                    values.clone(),
+                ),
+            };
+            let slices = counts.len() as u64;
+            let per = (sums.len() as u64) / slices.max(1);
+            builder.add_f32_tensor(format!("{name}.in_sum2"), vec![slices, per], sums);
+            builder.add_f32_tensor(format!("{name}.counts"), vec![slices, 1], counts);
+        }
+        builder
+            .write_file(path)
+            .map_err(|e| PMetalError::Serialization(format!("imatrix GGUF: {e}")))
     }
 
     /// Get the number of tensors in this imatrix.
@@ -594,6 +684,96 @@ mod tests {
         let loaded = IMatrix::load(&path).unwrap();
         assert_eq!(loaded.data, imatrix.data);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_measured_imatrix_round_trips_through_the_gguf_format() {
+        let mut m = IMatrix::new();
+        m.dataset_name = Some("calib.jsonl".into());
+        m.last_chunk = Some(12);
+        m.chunk_size = Some(512);
+        // A dense matrix (6144 tokens) and a stack of 3 experts that met 100, 0 and 40 tokens.
+        m.insert_measured(
+            "blk.0.attn_q.weight".into(),
+            vec![0.5, 2.0, 4.0],
+            vec![6144.0],
+        );
+        m.insert_measured(
+            "blk.0.ffn_up_exps.weight".into(),
+            vec![1.0, 2.0, 0.0, 0.0, 3.0, 5.0],
+            vec![100.0, 0.0, 40.0],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.gguf");
+        m.save_gguf(&path).unwrap();
+
+        // On disk the matrices are sums with their counts, as the format has them.
+        let model = crate::GgufModel::open(&path).unwrap();
+        let sums = model
+            .tensor_data("blk.0.ffn_up_exps.weight.in_sum2")
+            .unwrap();
+        let sums: Vec<f32> = sums
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect();
+        assert_eq!(sums, vec![100.0, 200.0, 0.0, 0.0, 120.0, 200.0]);
+        assert_eq!(
+            model
+                .tensor_info("blk.0.ffn_up_exps.weight.in_sum2")
+                .unwrap()
+                .dimensions,
+            vec![3, 2]
+        );
+        assert_eq!(
+            model
+                .tensor_info("blk.0.ffn_up_exps.weight.counts")
+                .unwrap()
+                .dimensions,
+            vec![3, 1]
+        );
+        assert_eq!(
+            model.get_metadata("general.type"),
+            Some(&crate::MetadataValue::String("imatrix".into()))
+        );
+
+        // And they load back as the same means, counts and run description.
+        let back = IMatrix::load(&path).unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!(
+            back.importance("blk.0.attn_q.weight"),
+            m.importance("blk.0.attn_q.weight")
+        );
+        assert_eq!(
+            back.importance("blk.0.ffn_up_exps.weight"),
+            Some(vec![1.0, 2.0, 0.0, 0.0, 3.0, 5.0])
+        );
+        assert_eq!(
+            back.counts["blk.0.ffn_up_exps.weight"],
+            vec![100.0, 0.0, 40.0]
+        );
+        assert_eq!(back.last_chunk, Some(12));
+        assert_eq!(back.chunk_size, Some(512));
+        assert_eq!(back.dataset_name.as_deref(), Some("calib.jsonl"));
+    }
+
+    #[test]
+    fn a_legacy_imatrix_saved_as_gguf_keeps_its_importance() {
+        let imatrix = create_test_imatrix(); // sums over 10 and 20 calls
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.gguf");
+        imatrix.save_gguf(&path).unwrap();
+        let back = IMatrix::load(&path).unwrap();
+        for name in ["layer.0.weight", "layer.1.weight"] {
+            let (a, b) = (
+                imatrix.importance(name).unwrap(),
+                back.importance(name).unwrap(),
+            );
+            for (x, y) in a.iter().zip(&b) {
+                assert!((x - y).abs() < 1e-6, "{name}: {a:?} against {b:?}");
+            }
+        }
     }
 
     #[test]

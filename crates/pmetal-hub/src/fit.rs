@@ -196,6 +196,12 @@ pub struct ModelSpec {
     pub active_params_b: Option<f64>,
     /// KV cache quantization bits (None = fp16, Some(8) = q8, Some(4) = q4).
     pub kv_cache_bits: Option<u8>,
+    /// Why pmetal cannot run this model, when its config names a family pmetal
+    /// declines ([`pmetal_core::model_type::declined_family`]). The memory
+    /// estimate is still made: whether it would fit and whether pmetal runs it
+    /// are separate answers.
+    #[serde(default)]
+    pub unsupported: Option<String>,
 }
 
 impl ModelSpec {
@@ -219,6 +225,7 @@ impl ModelSpec {
             active_experts: None,
             active_params_b: None,
             kv_cache_bits: None,
+            unsupported: None,
         }
     }
 
@@ -284,6 +291,9 @@ fn assumed_kv_bytes_per_token(params_b: f64) -> f64 {
 /// Estimate inference and training fit for a model on a device.
 pub fn estimate_fit(model: &ModelSpec, device: &DeviceSpec) -> FitEstimate {
     let mut notes = Vec::new();
+    if let Some(reason) = &model.unsupported {
+        notes.push(format!("pmetal cannot run this model: {reason}"));
+    }
     let bpp = bytes_per_param(&model.quantization);
 
     // --- Weights ---
@@ -714,6 +724,12 @@ pub fn model_spec_from_config(config: &Value, weight_bytes: Option<u64>) -> Mode
         active_experts,
         active_params_b: counted.filter(|_| is_moe).map(|(_, active)| active / 1e9),
         kv_cache_bits: None, // Set by caller based on inference config
+        unsupported: pmetal_core::model_type::declined_family(config).map(|family| {
+            format!(
+                "{} is not supported by pmetal yet: {}",
+                family.family, family.reason
+            )
+        }),
     }
 }
 
@@ -901,6 +917,49 @@ mod tests {
         let spec = model_spec_from_config(&config, None);
         close(spec.params_b, 1.5, 0.3, "params through text_config");
         assert!(spec.kv.is_some());
+    }
+
+    #[test]
+    fn a_family_pmetal_declines_is_said_so_beside_the_memory_estimate() {
+        let layout = json!({"hidden_size": 4096, "num_hidden_layers": 32,
+            "intermediate_size": 14336, "num_attention_heads": 32,
+            "num_key_value_heads": 8, "vocab_size": 128256});
+        for (model_type, family) in [
+            ("qwen3_vl", "Qwen3-VL"),
+            ("mixtral", "Mixtral"),
+            ("deepseek_v41", "DeepSeek V4 / V4.1"),
+            ("glm4_moe", "GLM-4.5"),
+        ] {
+            let mut config = layout.clone();
+            config["model_type"] = json!(model_type);
+            let spec = model_spec_from_config(&config, None);
+            let reason = spec.unsupported.as_deref().expect(model_type);
+            assert!(reason.contains(family), "{model_type}: {reason}");
+            let fit = estimate_fit(&spec, &device(64.0));
+            assert!(
+                fit.notes.iter().any(|n| n.contains("pmetal cannot run")),
+                "{:?}",
+                fit.notes
+            );
+            // The memory answer is still given.
+            assert!(fit.weights_gb > 0.0);
+        }
+        // DeepSeek-V3.2 reusing the V3 type is told by its indexer.
+        let mut v32 = layout.clone();
+        v32["model_type"] = json!("deepseek_v3");
+        v32["index_topk"] = json!(2048);
+        assert!(model_spec_from_config(&v32, None).unsupported.is_some());
+        // A family pmetal runs carries no note.
+        let mut llama = layout;
+        llama["model_type"] = json!("llama");
+        let spec = model_spec_from_config(&llama, None);
+        assert_eq!(spec.unsupported, None);
+        assert!(
+            !estimate_fit(&spec, &device(64.0))
+                .notes
+                .iter()
+                .any(|n| n.contains("pmetal cannot run"))
+        );
     }
 
     #[test]

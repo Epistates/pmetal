@@ -15,6 +15,7 @@
 //! low-rank adapter ([`pmetal_runtime::nn::moe::ExpertLora`]), and the gather
 //! kernels add it beside the weight.
 
+use pmetal_runtime::activation_stats::{observe_experts_per_slot, observe_experts_per_token};
 use pmetal_runtime::compat::{
     Array, Dtype, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue, nn,
 };
@@ -180,6 +181,10 @@ impl SwitchMlp {
             up: self.up_proj.adapter.as_ref(),
             down: self.down_proj.adapter.as_ref(),
         };
+        // Calibration: gate and up read the layer's input; down reads what
+        // each (token, expert) pair's activation made.
+        observe_experts_per_token(&self.gate_proj.weight, x_flat, inds);
+        observe_experts_per_token(&self.up_proj.weight, x_flat, inds);
         Ok(native_moe::switch_glu_adapted(
             x_flat,
             &gather_weight(&self.gate_proj)?,
@@ -188,7 +193,11 @@ impl SwitchMlp {
             adapters,
             inds,
             scores,
-            |gate, up, _| nn::silu(gate).multiply(up),
+            |gate, up, expert_ids| {
+                let activated = nn::silu(gate).multiply(up);
+                observe_experts_per_slot(&self.down_proj.weight, &activated, expert_ids);
+                activated
+            },
         ))
     }
 }
@@ -272,6 +281,7 @@ impl PlainSwitchMlp {
             up: None,
             down: self.fc2.adapter.as_ref(),
         };
+        observe_experts_per_token(&self.fc1.weight, x_flat, inds);
         Ok(native_moe::switch_mlp_adapted(
             x_flat,
             &gather_weight(&self.fc1)?,
@@ -279,7 +289,131 @@ impl PlainSwitchMlp {
             adapters,
             inds,
             scores,
-            activation,
+            |projected, expert_ids| {
+                let activated = activation(projected);
+                observe_experts_per_slot(&self.fc2.weight, &activated, expert_ids);
+                activated
+            },
         ))
+    }
+}
+
+#[cfg(test)]
+mod calibration_tests {
+    use super::*;
+    use pmetal_runtime::activation_stats::{ChannelStats, Collector};
+
+    const EXPERTS: usize = 4;
+    const HIDDEN: usize = 6;
+    const INTER: usize = 8;
+
+    fn host(a: &Array) -> Vec<f32> {
+        let n = a.size();
+        let mut a = a.as_dtype(Dtype::Float32.as_i32());
+        a.to_f32_vec(n).expect("read array")
+    }
+
+    fn silu(x: f32) -> f32 {
+        x / (1.0 + (-x).exp())
+    }
+
+    /// `y[o] = sum_i w[e][o][i] * x[i]` for the stacked weight `w [E, out, in]`.
+    fn project(w: &[f32], e: usize, out: usize, inp: usize, x: &[f32]) -> Vec<f32> {
+        (0..out)
+            .map(|o| {
+                (0..inp)
+                    .map(|i| w[(e * out + o) * inp + i] * x[i])
+                    .sum::<f32>()
+            })
+            .collect()
+    }
+
+    /// Runs the layer over `tokens` rows routed as `routes` says and checks that
+    /// the statistics are what the routed tokens give, worked out on the host
+    /// from the layer's own weights.
+    fn check(tokens: usize, routes: impl Fn(usize) -> [i32; 2]) {
+        let mlp = SwitchMlp::new(EXPERTS as i32, HIDDEN as i32, INTER as i32, 2);
+        let x: Vec<f32> = (0..tokens * HIDDEN)
+            .map(|i| ((i * 7 % 13) as f32 - 6.0) / 4.0)
+            .collect();
+        let ids: Vec<i32> = (0..tokens).flat_map(&routes).collect();
+        let x_arr = Array::from_f32_slice(&x, &[tokens as i32, HIDDEN as i32]);
+        let ids_arr = Array::from_slice(&ids, &[tokens as i32, 2]);
+        let scores = Array::from_f32_slice(&vec![0.5; tokens * 2], &[tokens as i32, 2]);
+
+        let collector = Collector::install([
+            ("gate".to_string(), &mlp.gate_proj.weight),
+            ("up".to_string(), &mlp.up_proj.weight),
+            ("down".to_string(), &mlp.down_proj.weight),
+        ])
+        .unwrap();
+        let y = mlp.forward(&x_arr, &ids_arr, &scores).expect("forward");
+        assert_eq!(y.shape(), &[tokens as i32, HIDDEN as i32]);
+        let stats: Vec<ChannelStats> = collector.finish();
+        let by = |n: &str| {
+            stats
+                .iter()
+                .find(|s| s.name == n)
+                .unwrap_or_else(|| panic!("{n}"))
+        };
+
+        let (wg, wu) = (host(&mlp.gate_proj.weight), host(&mlp.up_proj.weight));
+        let mut gate_sums = vec![0.0f32; EXPERTS * HIDDEN];
+        let mut down_sums = vec![0.0f32; EXPERTS * INTER];
+        let mut counts = vec![0.0f64; EXPERTS];
+        for t in 0..tokens {
+            let row = &x[t * HIDDEN..(t + 1) * HIDDEN];
+            for e in routes(t) {
+                let e = e as usize;
+                counts[e] += 1.0;
+                for j in 0..HIDDEN {
+                    gate_sums[e * HIDDEN + j] += row[j] * row[j];
+                }
+                let gate = project(&wg, e, INTER, HIDDEN, row);
+                let up = project(&wu, e, INTER, HIDDEN, row);
+                for i in 0..INTER {
+                    let h = silu(gate[i]) * up[i];
+                    down_sums[e * INTER + i] += h * h;
+                }
+            }
+        }
+
+        for name in ["gate", "up"] {
+            let s = by(name);
+            assert_eq!(
+                (s.experts, s.in_features),
+                (Some(EXPERTS), HIDDEN),
+                "{name}"
+            );
+            assert_eq!(s.counts, counts, "{name} counts");
+            for (j, (g, w)) in s.sum_sq.iter().zip(&gate_sums).enumerate() {
+                assert!(
+                    (g - w).abs() <= 1e-4 * w.abs().max(1e-2),
+                    "{name}[{j}]: {g} vs {w}"
+                );
+            }
+        }
+        let s = by("down");
+        assert_eq!((s.experts, s.in_features), (Some(EXPERTS), INTER));
+        assert_eq!(s.counts, counts, "down counts");
+        for (j, (g, w)) in s.sum_sq.iter().zip(&down_sums).enumerate() {
+            assert!(
+                (g - w).abs() <= 1e-3 * w.abs().max(1e-2),
+                "down[{j}]: {g} vs {w}"
+            );
+        }
+    }
+
+    /// In router order: a handful of tokens, one gather matmul per slot.
+    #[test]
+    fn routed_experts_are_measured_in_router_order() {
+        // Expert 3 is never picked, and the others are picked by two tokens each.
+        check(3, |t| [[0, 2], [2, 1], [0, 1]][t]);
+    }
+
+    /// Grouped by expert, as a prefill runs: from 64 (token, expert) pairs up.
+    #[test]
+    fn routed_experts_are_measured_when_the_pairs_are_grouped() {
+        check(40, |t| [(t % 3) as i32, (t % 3) as i32 + 1]);
     }
 }

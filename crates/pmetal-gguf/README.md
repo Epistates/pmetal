@@ -21,8 +21,12 @@ with it.
   float formats, with optional per-channel importance (an imatrix) steering the scale search.
 - **Writing**: `GgufBuilder` for small files, `GgufStreamWriter` / `GgufFileWriter` to stream a
   multi-gigabyte model tensor by tensor, atomically.
+- **Importance matrices**: `imatrix::IMatrix` reads and writes both formats (the GGUF imatrix
+  format of current tools, and the legacy `.dat`); the quantizers take its per-channel weights.
 - **Metadata**: tokenizer and `config.json` extraction from `tokenizer.ggml.*` and
-  `<arch>.*` keys.
+  `<arch>.*` keys; `config::GgufArchConfig` reads the architecture parameters, including RoPE
+  scaling (from `rope.scaling.*` and the `rope_freqs` / `rope_factors_*` tensors), and writes the
+  `config.json` for a GGUF-only download.
 
 ## Installation
 
@@ -137,6 +141,38 @@ fn write(path: &str, weights: &[f32], rows: usize, cols: usize) -> Result<(), Bo
 For small files `GgufBuilder::with_model(..)` collects everything in memory and writes it with
 `write_file` (atomic) or `build_to_bytes`.
 
+### Weighting the quantization by an importance matrix
+
+An importance matrix holds, per weight matrix, the mean squared activation of each input channel
+over calibration text. `quantize_tensor` takes it as `importance` (one weight per input channel,
+or one run of them per slice for a stack of experts) and minimises the importance-weighted error
+instead of the plain one. `IMatrix::save_gguf` writes the GGUF imatrix format (the sums and token
+counts, per expert), `IMatrix::load` reads it back or the legacy format.
+
+```rust
+use pmetal_gguf::{GgmlType, imatrix::IMatrix, quantize};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (rows, cols) = (4usize, 64usize);
+    let weights: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.37).sin()).collect();
+
+    // Measured elsewhere: 512 tokens, the last 16 channels twice as loud as the rest.
+    let mean_sq: Vec<f32> = (0..cols).map(|j| if j >= 48 { 2.0 } else { 1.0 }).collect();
+    let mut measured = IMatrix::new();
+    measured.insert_measured("blk.0.ffn_up.weight".into(), mean_sq, vec![512.0]);
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("imatrix.gguf");
+    measured.save_gguf(&path)?;
+    let loaded = IMatrix::load(&path)?;
+
+    let importance = loaded.importance("blk.0.ffn_up.weight").unwrap();
+    let packed = quantize::quantize_tensor(&weights, GgmlType::Iq4Nl, cols, Some(&importance))?;
+    assert_eq!(packed.len(), rows * cols / 32 * 18);
+    Ok(())
+}
+```
+
 ## Tensor types
 
 All types decode. "Encode" lists what `quantize::quantize_tensor` writes; the rest are read-only
@@ -164,9 +200,10 @@ decoded.
 | `dequant` | Tensor dequantization |
 | `quantize` | Quantization, importance weighting, row-length fallbacks |
 | `dynamic` | Per-tensor type selection and bit-budget allocation |
-| `imatrix` | Importance matrix (legacy `.dat` and GGUF) |
+| `imatrix` | Importance matrix: read and write, legacy `.dat` and GGUF |
 | `k_quants`, `iq_quants` | Block formats |
-| `tokenizer`, `config` | Metadata extraction |
+| `tokenizer` | Tokenizer metadata extraction |
+| `config` | `GgufArchConfig`: architecture parameters and RoPE scaling, as a typed value or a `config.json` |
 
 ## Feature flags
 

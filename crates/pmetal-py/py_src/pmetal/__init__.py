@@ -6,6 +6,8 @@ checks as the command's flags. A spec is data. Run it:
 
 * ``Trainer(TrainSpec(...)).train()`` fine-tunes in this process, with Python
   callbacks and Ctrl-C;
+* ``grpo(model, dataset, reward_funcs=[...])`` runs GRPO in this process with
+  Python reward functions;
 * ``run(spec)`` runs the ``pmetal`` command for any spec as a subprocess;
 * ``Model.load(...)``, ``infer(...)`` and ``DFlashGenerator`` generate.
 
@@ -48,8 +50,11 @@ from .pmetal import (
     FieldInfo as FieldInfo,
     FuseSpec as FuseSpec,
     GenerationConfig as GenerationConfig,
+    GrpoResult as GrpoResult,
     GrpoSpec as GrpoSpec,
+    GrpoTrainer as GrpoTrainer,
     HubError as HubError,
+    ImatrixSpec as ImatrixSpec,
     InferResult as InferResult,
     InferSpec as InferSpec,
     LoggingCallback as LoggingCallback,
@@ -67,6 +72,7 @@ from .pmetal import (
     ProgressCallback as ProgressCallback,
     QuantizationError as QuantizationError,
     QuantizeSpec as QuantizeSpec,
+    RewardError as RewardError,
     RlkdSpec as RlkdSpec,
     SerializationError as SerializationError,
     ServeSpec as ServeSpec,
@@ -112,9 +118,10 @@ if not UNWINDS_ON_PANIC:
     )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
     from typing import Unpack
 
-    from .pmetal import TrainCallOptions
+    from .pmetal import GrpoCallOptions, TrainCallOptions
 
 
 def finetune(model: str, dataset: str, **options: Unpack[TrainCallOptions]) -> TrainResult:
@@ -128,3 +135,35 @@ def finetune(model: str, dataset: str, **options: Unpack[TrainCallOptions]) -> T
     >>> pmetal.finetune("Qwen/Qwen3-0.6B", "train.jsonl", epochs=1, lora_r=8)  # doctest: +SKIP
     """
     return Trainer(TrainSpec(model=model, dataset=dataset, **options)).train()
+
+
+def grpo(
+    model: str,
+    dataset: str,
+    *,
+    reward_funcs: Sequence[Callable[..., Sequence[float]]] | None = None,
+    reward_weights: Sequence[float] | None = None,
+    callbacks: Sequence[object] | None = None,
+    **options: Unpack[GrpoCallOptions],
+) -> GrpoResult:
+    """Train ``model`` with GRPO on the prompts of ``dataset``, in this process.
+
+    ``reward_funcs`` are Python callables scoring completions,
+    ``fn(prompts, completions, **columns) -> list[float]``: ``prompts`` and
+    ``completions`` are lists of strings, one entry per completion, and every
+    other column of the dataset's row arrives as a keyword argument, a list with
+    one entry per completion. Return one number per completion; a completion a
+    function cannot score is an error, so ``None`` is refused. ``reward_weights``
+    gives each function's weight (1 each by default). They are summed with the
+    rewards ``options`` ask for (``reward_cmd``, ``reward_regex``,
+    ``reasoning_rewards``, ...). This is
+    ``GrpoTrainer(GrpoSpec(model=model, dataset=dataset, **options), reward_funcs,
+    reward_weights, callbacks).train()``.
+
+    >>> import pmetal
+    >>> def exact(prompts, completions, answer, **kwargs):
+    ...     return [float(c.strip() == a) for c, a in zip(completions, answer)]
+    >>> pmetal.grpo("Qwen/Qwen3-0.6B", "prompts.jsonl", reward_funcs=[exact])  # doctest: +SKIP
+    """
+    spec = GrpoSpec(model=model, dataset=dataset, **options)
+    return GrpoTrainer(spec, reward_funcs, reward_weights, callbacks).train()

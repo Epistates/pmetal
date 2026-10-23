@@ -7,7 +7,7 @@
 
 use chrono::{DateTime, Utc};
 use pmetal::hub::local::LocalModel;
-pub use pmetal::hub::local::{ModelSource, ScanPlan, dir_size, read_config};
+pub use pmetal::hub::local::{ModelSource, ScanPlan, read_config};
 use serde::Serialize;
 
 /// A model on disk.
@@ -78,7 +78,10 @@ pub fn infer_model_type(model_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use super::*;
+    use pmetal::hub::local::dir_size;
 
     fn write(path: &Path, text: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

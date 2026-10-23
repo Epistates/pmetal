@@ -296,7 +296,7 @@ impl std::str::FromStr for InferenceBackend {
 /// `model_type`: Qwen3.5, 3.6 and 3.8 are all `qwen3_5`.
 ///
 /// Families whose makers publish nothing (Llama, Gemma 2/3, Phi-3/4,
-/// Mistral 7B, Mixtral, Cohere, Granite, SmolLM2, Qwen2.5) are absent: their
+/// Mistral 7B, Cohere, Granite, SmolLM2, Qwen2.5) are absent: their
 /// `generation_config.json` and transformers' defaults apply
 /// ([`load_sampling_from_generation_config`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,14 +339,8 @@ impl ModelFamily {
         let config = read_json(&model_path.join("config.json"));
         let model_type = config
             .as_ref()
-            .and_then(|c| {
-                c.get("text_config")
-                    .and_then(|t| t.get("model_type"))
-                    .or_else(|| c.get("model_type"))
-            })
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
+            .and_then(pmetal_core::model_type::effective_model_type)
+            .unwrap_or_default();
         let name_or_path = config
             .as_ref()
             .and_then(|c| c.get("_name_or_path"))
@@ -360,7 +354,8 @@ impl ModelFamily {
     /// (both lower case).
     pub fn from_model_type_and_name(model_type: &str, name: &str) -> Option<Self> {
         let has = |needle: &str| name.contains(needle);
-        let model_type = model_type.strip_suffix("_mtp").unwrap_or(model_type);
+        let model_type = pmetal_core::model_type::canonical_model_type(model_type);
+        let model_type = model_type.as_str();
         if model_type.starts_with("qwen3_5")
             || model_type.starts_with("qwen3_6")
             || model_type.starts_with("qwen4_exp")

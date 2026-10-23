@@ -24,6 +24,7 @@ pub mod eval;
 pub mod fuse;
 pub mod grpo;
 pub mod hub;
+pub mod imatrix;
 pub mod infer;
 pub mod merge;
 pub mod ollama;
@@ -331,6 +332,11 @@ pub enum Commands {
 
     /// Quantize a model to GGUF format (supports Dynamic 2.0 and KL-calibrated)
     Quantize(crate::cli::quantize::QuantizeArgs),
+
+    /// Measure an importance matrix: run a model over calibration data and
+    /// record how large the activations at each weight matrix are, so that
+    /// `quantize --imatrix` can spend its few levels where they matter
+    Imatrix(crate::cli::imatrix::ImatrixArgs),
 
     /// Knowledge Distillation from teacher to student
     #[cfg(feature = "trainer")]

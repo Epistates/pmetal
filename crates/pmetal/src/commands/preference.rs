@@ -106,7 +106,11 @@ pub(crate) async fn run_preference(spec: PreferenceSpec, ctx: RunContext) -> any
             "Batch:     {} x {} accumulation, lr {:.1e}",
             spec.batch_size, spec.gradient_accumulation_steps, spec.learning_rate
         );
-        println!("LoRA:      r={} alpha={}", spec.lora_r, spec.lora_alpha);
+        if spec.full_finetune {
+            println!("Training:   every weight (full fine-tune)");
+        } else {
+            println!("LoRA:      r={} alpha={}", spec.lora_r, spec.lora_alpha);
+        }
         println!("========================================\n");
     }
 
@@ -119,10 +123,56 @@ pub(crate) async fn run_preference(spec: PreferenceSpec, ctx: RunContext) -> any
         dropout: 0.0,
         ..Default::default()
     };
-    tracing::info!("Loading {} with LoRA r={}", spec.model, spec.lora_r);
-    let mut model = DynamicLoraModel::from_pretrained(&model_path, lora_config.clone())?;
-
     let training = training_config(&spec)?;
+
+    // A full fine-tune trains every weight: the reference is the model as it
+    // starts, which the trainer scores once before the first update, as it
+    // does for LoRA's zero adapters. The run is refused before the model loads
+    // if it will not fit, and the result is saved as a whole model.
+    let full = spec
+        .full_finetune
+        .then_some(pmetal_trainer::full_finetune::FullFineTuneConfig {
+            freeze_embeddings: spec.freeze_embeddings,
+            skip_memory_check: spec.no_memory_check,
+        });
+    let mut model = match &full {
+        Some(full) => {
+            use pmetal_trainer::full_finetune::{RunShape, check_memory};
+            check_memory(
+                full,
+                &model_path,
+                &RunShape {
+                    optimizer: training.optimizer,
+                    // A pair is two sequences.
+                    batch_size: spec.batch_size * 2,
+                    seq_len: spec.max_length,
+                    gradient_checkpointing: false,
+                    cut_cross_entropy: false,
+                },
+            )?;
+            tracing::info!("Loading {} for a full fine-tune", spec.model);
+            DynamicLoraModel::from_pretrained_full(
+                &model_path,
+                pmetal_lora::FullFineTune {
+                    freeze_embeddings: full.freeze_embeddings,
+                },
+            )?
+        }
+        None => {
+            tracing::info!("Loading {} with LoRA r={}", spec.model, spec.lora_r);
+            DynamicLoraModel::from_pretrained(&model_path, lora_config.clone())?
+        }
+    };
+    let save_plan = match full {
+        Some(_) => {
+            use pmetal_runtime::compat::ModuleParametersExt;
+            Some(pmetal_trainer::full_finetune::plan_for_model(
+                &model_path,
+                &model.flatten_params(),
+            )?)
+        }
+        None => None,
+    };
 
     let mut callbacks = extra_callbacks;
     if let Some(metrics_path) = &spec.log_metrics {
@@ -175,12 +225,23 @@ pub(crate) async fn run_preference(spec: PreferenceSpec, ctx: RunContext) -> any
         }
     };
 
-    let weights = pmetal_trainer::orchestrator::save_adapter(
-        &model,
-        &output_dir,
-        &lora_config,
-        Some(&spec.model),
-    )?;
+    let weights = match &save_plan {
+        Some(plan) => {
+            use pmetal_runtime::compat::ModuleParametersExt;
+            pmetal_trainer::full_finetune::save_full_model(
+                &model.flatten_params(),
+                plan,
+                &model_path,
+                &output_dir,
+            )?
+        }
+        None => pmetal_trainer::orchestrator::save_adapter(
+            &model,
+            &output_dir,
+            &lora_config,
+            Some(&spec.model),
+        )?,
+    };
 
     if emit_console_output {
         if let (Some(first), Some(last)) = (history.first(), history.last()) {
@@ -193,7 +254,11 @@ pub(crate) async fn run_preference(spec: PreferenceSpec, ctx: RunContext) -> any
                 last.margin()
             );
         }
-        println!("LoRA adapter saved to {}", weights.display());
+        if spec.full_finetune {
+            println!("Fine-tuned model saved to {}", output_dir.display());
+        } else {
+            println!("LoRA adapter saved to {}", weights.display());
+        }
     }
     Ok(())
 }

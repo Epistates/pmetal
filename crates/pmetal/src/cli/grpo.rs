@@ -114,6 +114,56 @@ pub struct GrpoArgs {
     #[arg(long = "reward-model-template")]
     pub reward_model_template: Option<String>,
 
+    /// A command that scores completions, repeatable. Started once, it reads
+    /// one JSON request per line on stdin ({"prompts": [...], "completions":
+    /// [...], plus the dataset's other columns}, one entry per completion) and
+    /// answers one {"rewards": [...]} line on stdout. Each command's rewards
+    /// are weighted and summed with the others'.
+    #[arg(long = "reward-cmd", value_name = "COMMAND")]
+    pub reward_cmd: Vec<String>,
+
+    /// The weight of each --reward-cmd, in order (1 for a command without one).
+    #[arg(
+        long = "reward-weight",
+        value_name = "WEIGHT",
+        allow_hyphen_values = true
+    )]
+    pub reward_weight: Vec<String>,
+
+    /// Seconds a reward command has to answer one batch, its first included.
+    #[arg(long = "reward-timeout", default_value = "120")]
+    pub reward_timeout: u64,
+
+    /// A pattern the completion should match anywhere (reward 1, else 0).
+    #[arg(long = "reward-regex", value_name = "PATTERN")]
+    pub reward_regex: Option<String>,
+
+    /// Weight of --reward-regex.
+    #[arg(
+        long = "reward-regex-weight",
+        default_value = "1.0",
+        allow_hyphen_values = true
+    )]
+    pub reward_regex_weight: f64,
+
+    /// Reward a completion that is a JSON document (alone or in a fenced
+    /// code block).
+    #[arg(long = "reward-json")]
+    pub reward_json: bool,
+
+    /// A JSON Schema file: reward a completion that is a JSON document valid
+    /// against it (this includes --reward-json).
+    #[arg(long = "reward-json-schema", value_name = "PATH")]
+    pub reward_json_schema: Option<String>,
+
+    /// Weight of --reward-json and --reward-json-schema.
+    #[arg(
+        long = "reward-json-weight",
+        default_value = "1.0",
+        allow_hyphen_values = true
+    )]
+    pub reward_json_weight: f64,
+
     /// Enable pipelined (asynchronous) reward scoring.
     #[arg(long = "async-rewards")]
     pub async_rewards: bool,
@@ -162,6 +212,14 @@ impl From<GrpoArgs> for GrpoSpec {
             reward_model_max_length: a.reward_model_max_length,
             reward_model_weight: a.reward_model_weight,
             reward_model_template: a.reward_model_template,
+            reward_cmd: a.reward_cmd,
+            reward_weight: a.reward_weight,
+            reward_timeout: a.reward_timeout,
+            reward_regex: a.reward_regex,
+            reward_regex_weight: a.reward_regex_weight,
+            reward_json: a.reward_json,
+            reward_json_schema: a.reward_json_schema,
+            reward_json_weight: a.reward_json_weight,
             async_rewards: a.async_rewards,
             grpo_kv_bits: a.grpo_kv_bits,
             prompt_column: a.prompt_column,

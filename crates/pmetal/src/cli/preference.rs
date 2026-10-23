@@ -93,6 +93,22 @@ pub struct PreferenceArgs {
     #[arg(long = "lora-alpha", default_value = "32")]
     pub lora_alpha: f32,
 
+    /// Train every weight instead of a LoRA adapter, and save a whole model
+    /// that `infer` and `serve` load (the reference is the model as it
+    /// starts). Needs several times the model's size in memory: refused up
+    /// front when it will not fit.
+    #[arg(long = "full")]
+    pub full: bool,
+
+    /// With --full, keep the input token embedding as loaded.
+    #[arg(long = "freeze-embeddings", requires = "full")]
+    pub freeze_embeddings: bool,
+
+    /// With --full, run without checking the memory estimate against the
+    /// device's working set.
+    #[arg(long = "no-memory-check", requires = "full")]
+    pub no_memory_check: bool,
+
     /// Prompt tokens kept (the most recent ones).
     #[arg(long = "max-prompt-length", default_value = "512")]
     pub max_prompt_length: usize,
@@ -133,6 +149,9 @@ impl From<PreferenceArgs> for PreferenceSpec {
             optimizer: a.optimizer.to_string(),
             lora_r: a.lora_r,
             lora_alpha: a.lora_alpha,
+            full_finetune: a.full,
+            freeze_embeddings: a.freeze_embeddings,
+            no_memory_check: a.no_memory_check,
             max_prompt_length: a.max_prompt_length,
             max_length: a.max_length,
             seed: a.seed,

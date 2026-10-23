@@ -32,6 +32,7 @@ full = ["mlx-collectives", "tensor-parallel", "expert-parallel", "context-parall
 
 [dependencies]
 # Use workspace versions for consistency
+pmetal-core = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -74,7 +75,6 @@ parking_lot = { workspace = true }
 # Seals and opens a batch of frames on several cores.
 rayon = { workspace = true }
 half = { workspace = true }
-ordered-float = { workspace = true }
 
 # Local NIC enumeration for fabric detection (Thunderbolt / Ethernet / WiFi).
 if-addrs = { workspace = true }
@@ -90,3 +90,7 @@ tempfile = { workspace = true }
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+# Apple Silicon only: document the platform the crate runs on.
+targets = ["aarch64-apple-darwin"]

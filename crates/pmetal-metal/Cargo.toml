@@ -68,3 +68,7 @@ harness = false
 [[bench]]
 name = "vs_runtime"
 harness = false
+
+[package.metadata.docs.rs]
+# Apple Silicon only: document the platform the crate runs on.
+targets = ["aarch64-apple-darwin"]

@@ -21,7 +21,6 @@ pmetal-runtime = { workspace = true }
 pmetal-metal = { workspace = true }
 pmetal-hub = { workspace = true }
 pmetal-models = { workspace = true }
-pmetal-lora = { workspace = true }
 pmetal-data = { workspace = true }
 pmetal-trainer = { workspace = true }
 pmetal-supervisor = { workspace = true }
@@ -30,6 +29,7 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+tempfile = { workspace = true }
 
 [features]
 # Hooks that make the extension misbehave on purpose, for the tests that check

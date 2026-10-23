@@ -16,8 +16,9 @@ use std::sync::OnceLock;
 
 use pmetal::core::jobs::{
     BenchSpec, DecideSpec, DflashSpec, DistillSpec, EmbedTrainSpec, EvalSpec, FuseSpec, GrpoSpec,
-    MergeSpec, PackExpertsSpec, PreferenceSpec, PretrainSpec, QuantizeSpec, RlkdSpec, ServeSpec,
-    Spec, TokenizeSpec, TrainDiffusionSpec, TrainDraftSpec, TrainMtpSpec, TrainSpec, VocodeSpec,
+    ImatrixSpec, MergeSpec, PackExpertsSpec, PreferenceSpec, PretrainSpec, QuantizeSpec, RlkdSpec,
+    ServeSpec, Spec, TokenizeSpec, TrainDiffusionSpec, TrainDraftSpec, TrainMtpSpec, TrainSpec,
+    VocodeSpec,
 };
 use pmetal::core::{FieldKind, JobFields, default_text, spec_from_text};
 use pmetal_supervisor::{LaunchOptions, LaunchPlan};
@@ -435,6 +436,11 @@ pub fn all() -> &'static [Box<dyn Kind>] {
                 "Quantize",
                 "Convert a model to GGUF or MLX quantized weights",
             ),
+            spec_kind::<ImatrixSpec>(
+                "imatrix",
+                "Importance matrix",
+                "Measure which weights a model's activations lean on, to guide quantization",
+            ),
             spec_kind::<PackExpertsSpec>(
                 "pack_experts",
                 "Pack experts",
@@ -506,6 +512,7 @@ mod tests {
             JobKind::Bench,
             JobKind::Eval,
             JobKind::Quantize,
+            JobKind::Imatrix,
             JobKind::Merge,
             JobKind::Fuse,
             JobKind::Dflash,
@@ -545,6 +552,7 @@ mod tests {
             writes::<EvalSpec>(),
             writes::<MergeSpec>(),
             writes::<FuseSpec>(),
+            writes::<ImatrixSpec>(),
             writes::<QuantizeSpec>(),
             writes::<PackExpertsSpec>(),
             writes::<TokenizeSpec>(),

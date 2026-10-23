@@ -467,16 +467,10 @@ fn ensure_gguf_config(snapshot: &Path, plan: &ModelPlan) {
         return;
     };
     match pmetal_gguf::GgufModel::open(snapshot.join(&first.path)) {
-        Ok(model) => {
-            if let Some(path) =
-                pmetal_gguf::config::write_config_from_gguf(model.metadata_content(), snapshot)
-            {
-                tracing::info!(
-                    "Generated config.json from GGUF metadata: {}",
-                    path.display()
-                );
-            }
-        }
+        Ok(model) => match pmetal_gguf::config::write_config_from_gguf(&model, snapshot) {
+            Ok(path) => tracing::info!("Generated config.json from GGUF: {}", path.display()),
+            Err(e) => tracing::warn!("Could not generate config.json from the GGUF: {e}"),
+        },
         Err(e) => tracing::warn!("Could not read GGUF metadata for config generation: {e}"),
     }
 }

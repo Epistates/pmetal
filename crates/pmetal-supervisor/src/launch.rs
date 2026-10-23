@@ -190,7 +190,7 @@ mod tests {
     use super::*;
     use pmetal_core::jobs::{
         BenchSpec, DecideSpec, DflashSpec, DistillSpec, EmbedTrainSpec, EvalSpec, FuseSpec,
-        GrpoSpec, InferSpec, MergeSpec, PackExpertsSpec, PreferenceSpec, PretrainSpec,
+        GrpoSpec, ImatrixSpec, InferSpec, MergeSpec, PackExpertsSpec, PreferenceSpec, PretrainSpec,
         QuantizeSpec, RlkdSpec, ServeSpec, TokenizeSpec, TrainDiffusionSpec, TrainDraftSpec,
         TrainMtpSpec, TrainSpec, VocodeSpec,
     };
@@ -407,6 +407,7 @@ mod tests {
         check(EmbedTrainSpec::default(), false);
         check(EvalSpec::default(), false);
         check(FuseSpec::default(), false);
+        check(ImatrixSpec::default(), false);
         check(InferSpec::default(), false);
         check(MergeSpec::default(), false);
         check(PackExpertsSpec::default(), false);

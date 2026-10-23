@@ -63,6 +63,8 @@ pub enum JobKind {
     Eval,
     /// Weight quantization (GGUF / MLX).
     Quantize,
+    /// Importance-matrix measurement on calibration data.
+    Imatrix,
     /// LoRA / model merging.
     Merge,
     /// LoRA fusion into base weights.

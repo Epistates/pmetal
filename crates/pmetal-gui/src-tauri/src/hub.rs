@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use pmetal::core::SecretString;
@@ -398,6 +397,7 @@ impl Downloads {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     fn downloads(at_once: usize) -> (Downloads, Arc<Mutex<Vec<DownloadView>>>) {
         let seen = Arc::new(Mutex::new(Vec::new()));

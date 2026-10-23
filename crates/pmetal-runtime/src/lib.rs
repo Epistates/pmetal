@@ -46,6 +46,7 @@ pub mod dtype;
 pub mod compile;
 pub use compile::CompiledFn;
 
+pub mod activation_stats;
 pub mod scalar;
 pub mod try_ops;
 

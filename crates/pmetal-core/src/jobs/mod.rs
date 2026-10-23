@@ -24,6 +24,7 @@ pub mod embed_train;
 pub mod eval;
 pub mod fuse;
 pub mod grpo;
+pub mod imatrix;
 pub mod infer;
 pub mod merge;
 pub mod pack_experts;
@@ -47,6 +48,7 @@ pub use embed_train::EmbedTrainSpec;
 pub use eval::EvalSpec;
 pub use fuse::FuseSpec;
 pub use grpo::GrpoSpec;
+pub use imatrix::ImatrixSpec;
 pub use infer::{ChatMessage, InferSpec, MAX_MESSAGES_BYTES, parse_messages};
 pub use merge::MergeSpec;
 pub use pack_experts::PackExpertsSpec;
@@ -106,6 +108,10 @@ pub(crate) fn default_lora_alpha() -> f32 {
     crate::defaults::LORA_ALPHA
 }
 
+/// The highest learning rate `--full` accepts: above it a full fine-tune of a
+/// pretrained model diverges, and LoRA's default (2e-4) is above it.
+pub(crate) const FULL_FINETUNE_MAX_LEARNING_RATE: f64 = 1e-4;
+
 /// Default of every spec's `optimizer` field.
 pub(crate) fn default_optimizer() -> String {
     crate::OptimizerType::default().as_str().to_string()
@@ -155,6 +161,7 @@ impl_spec!(
     EvalSpec,
     FuseSpec,
     GrpoSpec,
+    ImatrixSpec,
     InferSpec,
     MergeSpec,
     PackExpertsSpec,

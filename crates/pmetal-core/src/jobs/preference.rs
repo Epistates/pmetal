@@ -230,6 +230,39 @@ pub struct PreferenceSpec {
     pub lora_alpha: f32,
 
     #[job(
+        label = "Full Fine-Tune",
+        group = "Full Fine-Tune",
+        argv = "--full",
+        flag,
+        default_bool = false,
+        help = "Train every weight instead of a LoRA adapter, and save a whole model that `infer` and `serve` load (the reference is the model as it starts). Needs several times the model's size in memory: refused up front when it will not fit"
+    )]
+    #[serde(default)]
+    pub full_finetune: bool,
+
+    #[job(
+        label = "Freeze Embeddings",
+        group = "Full Fine-Tune",
+        argv = "--freeze-embeddings",
+        flag,
+        default_bool = false,
+        help = "With --full, keep the input token embedding as loaded"
+    )]
+    #[serde(default)]
+    pub freeze_embeddings: bool,
+
+    #[job(
+        label = "No Memory Check",
+        group = "Full Fine-Tune",
+        argv = "--no-memory-check",
+        flag,
+        default_bool = false,
+        help = "With --full, run without checking the memory estimate against the device's working set"
+    )]
+    #[serde(default)]
+    pub no_memory_check: bool,
+
+    #[job(
         label = "Max Prompt Length",
         group = "Data",
         argv = "--max-prompt-length",
@@ -292,6 +325,9 @@ impl Default for PreferenceSpec {
             optimizer: super::default_optimizer(),
             lora_r: default_lora_r(),
             lora_alpha: default_lora_alpha(),
+            full_finetune: false,
+            freeze_embeddings: false,
+            no_memory_check: false,
             max_prompt_length: default_max_prompt_length(),
             max_length: default_max_length(),
             seed: default_seed(),
@@ -322,6 +358,28 @@ impl PreferenceSpec {
                     self.max_prompt_length, self.max_length
                 ),
             ));
+        }
+        if self.full_finetune {
+            if self.learning_rate > super::FULL_FINETUNE_MAX_LEARNING_RATE {
+                errs.push(FieldError::new(
+                    "learning_rate",
+                    format!(
+                        "{} would diverge a full fine-tune; preference tuning wants 1e-6 to 1e-5 \
+                         (the most --full accepts is {})",
+                        self.learning_rate,
+                        super::FULL_FINETUNE_MAX_LEARNING_RATE
+                    ),
+                ));
+            }
+        } else {
+            for (set, field) in [
+                (self.freeze_embeddings, "freeze_embeddings"),
+                (self.no_memory_check, "no_memory_check"),
+            ] {
+                if set {
+                    errs.push(FieldError::new(field, "needs --full"));
+                }
+            }
         }
         if errs.is_empty() { Ok(()) } else { Err(errs) }
     }
@@ -407,6 +465,39 @@ mod tests {
         let mut s = spec();
         s.max_prompt_length = 2048;
         assert!(s.normalize().is_err());
+    }
+
+    #[test]
+    fn full_is_a_flag_with_its_own_options_and_a_learning_rate_ceiling() {
+        let mut s = spec();
+        s.full_finetune = true;
+        s.freeze_embeddings = true;
+        let argv = s.to_argv();
+        assert!(argv.contains(&"--full".to_string()));
+        assert!(argv.contains(&"--freeze-embeddings".to_string()));
+        assert!(s.normalize().is_ok(), "the default 1e-5 is a full rate");
+
+        let mut fast = spec();
+        fast.full_finetune = true;
+        fast.learning_rate = 2e-4;
+        assert!(
+            fast.normalize()
+                .unwrap_err()
+                .iter()
+                .any(|e| e.field == "learning_rate")
+        );
+
+        // Its options mean nothing without it.
+        let mut stray = spec();
+        stray.freeze_embeddings = true;
+        stray.no_memory_check = true;
+        let fields: Vec<String> = stray
+            .normalize()
+            .unwrap_err()
+            .into_iter()
+            .map(|e| e.field)
+            .collect();
+        assert_eq!(fields, ["freeze_embeddings", "no_memory_check"]);
     }
 
     #[test]

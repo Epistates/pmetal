@@ -30,6 +30,7 @@ pub mod fields;
 pub mod format;
 pub mod jobs;
 pub mod logging;
+pub mod model_type;
 pub mod paths;
 pub mod scheduler;
 mod secrets;

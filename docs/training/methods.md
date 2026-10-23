@@ -36,6 +36,21 @@ Weight-Decomposed LoRA: decomposes weight updates into magnitude and direction f
 pmetal train --model Qwen/Qwen3-0.6B --dataset train.jsonl --dora
 ```
 
+### Full-parameter fine-tuning
+`--full` trains every weight of an existing checkpoint and saves a whole Hugging Face-layout model
+(sharded safetensors with the checkpoint's config, tokenizer and chat template) that `infer` and
+`serve` load, instead of an adapter. It runs through the same loop, optimizers, gradient
+checkpointing and sequence packing as LoRA, on the inference path's own model.
+```bash
+pmetal train --model Qwen/Qwen3-0.6B --dataset train.jsonl --output ./tuned \
+  --full --learning-rate 2e-5 --optimizer adamw_8bit --freeze-embeddings
+```
+It needs the weights, an f32 gradient per weight and the optimizer's state in memory, so it is
+refused before loading when the estimate exceeds the device's recommended working set; 8-bit AdamW,
+a frozen embedding and cut cross-entropy are what shrink it. The learning rate should be `1e-5` to
+`5e-5` (the command refuses LoRA's `2e-4`). Pretraining from scratch is `pmetal pretrain`. See
+[`pmetal train`](/cli/train/#full-parameter-fine-tuning).
+
 ## Preference Optimization
 
 `pmetal preference` (alias `pmetal dpo`) trains a LoRA adapter on preference data with one of six
@@ -98,6 +113,11 @@ pmetal grpo --model Qwen/Qwen3-0.6B --dataset reasoning.jsonl --reasoning-reward
 - **VLM mode** (`--vlm`): Vision-Language Model support with image inputs
 - **ML reward model** (`--reward-model`): Pretrained reward model scoring alongside heuristic rewards
 - **Async reward pipelining** (`--async-rewards`): Background reward scoring concurrent with GPU training
+- **Reward commands** (`--reward-cmd`, repeatable, with `--reward-weight`): a process you write, started once, that scores each batch over JSON lines; the batch carries the dataset's other columns, so it can score against the row
+- **Verifiers** (`--reward-regex`, `--reward-json`, `--reward-json-schema`): a pattern the completion must match, a JSON document, a JSON document valid against a schema
+- **Python reward functions** (`pmetal.grpo(..., reward_funcs=[fn], reward_weights=[...])`): callables `fn(prompts, completions, **columns) -> list[float]`
+
+Rewards are weighted and summed with the built-in ones. One that cannot score a completion fails the run; it is never a silent `0`. See [`pmetal grpo`](/cli/grpo/#rewards).
 
 `--num-iterations N` takes N optimizer updates on each batch of completions. The policy ratio is taken against the log-probs of the policy that generated them, so it is 1 on the first update and clipping (and GSPO) only act from the second.
 

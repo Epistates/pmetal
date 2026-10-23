@@ -138,6 +138,12 @@
     <button type="button" class="btn-ghost btn-sm shrink-0" onclick={reset}>Reset all</button>
   </div>
 
+  {#if fit?.unsupported}
+    <p class="text-sm text-red-600 dark:text-red-400" role="alert">
+      pmetal cannot run this model: {fit.unsupported}
+    </p>
+  {/if}
+
   {#if fit}
     <div class="flex flex-wrap items-center gap-2 text-sm" aria-live="polite">
       <span class={FIT_CLASS[fit.training_fit]}>Training: {FIT_TEXT[fit.training_fit]}</span>

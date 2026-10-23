@@ -22,10 +22,8 @@ serde_json = { workspace = true }
 serde-saphyr = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-rand = { workspace = true }
 pmetal-hub = { workspace = true }
 half = { workspace = true }
-zerocopy = { workspace = true }
 memmap2 = { workspace = true }
 ndarray = { workspace = true }
 regex = { workspace = true }
@@ -43,3 +41,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+# Apple Silicon only: document the platform the crate runs on.
+targets = ["aarch64-apple-darwin"]
