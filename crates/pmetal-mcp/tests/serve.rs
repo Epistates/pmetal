@@ -347,7 +347,7 @@ async fn commands_that_run_to_completion_take_turns() {
 mod blocking {
     use std::sync::{Arc, Mutex};
 
-    use pmetal_mcp::util::{pmetal_command, run_command};
+    use pmetal_mcp::jobs::{JobLimits, JobManager};
     use turbomcp::__macro_support::turbomcp_core::{McpSession, SessionFuture};
     use turbomcp::RequestContext;
 
@@ -373,8 +373,9 @@ mod blocking {
         }
     }
 
-    fn command(h: &Harness) -> tokio::process::Command {
-        pmetal_command(&h.dir.join("fake-pmetal"))
+    /// What the server runs its commands with: the harness's `pmetal`.
+    fn manager(h: &Harness) -> JobManager {
+        JobManager::with_binary(h.dir.join("fake-pmetal"), JobLimits::default())
     }
 
     #[tokio::test]
@@ -390,8 +391,8 @@ mod blocking {
             .with_progress_token(json!("tok-1"))
             .with_session(recorder.clone());
         let argv = ["infer".to_string()];
-        let run = run_command(
-            command(&h),
+        let jobs = manager(&h);
+        let run = jobs.run_within(
             &argv,
             &ctx,
             Duration::from_secs(120),
@@ -438,15 +439,15 @@ mod blocking {
         let h = Harness::new("sleep 0.6");
         let recorder = Arc::new(Recorder::default());
         let ctx = RequestContext::stdio().with_session(recorder.clone());
-        run_command(
-            command(&h),
-            &["infer".to_string()],
-            &ctx,
-            Duration::from_secs(30),
-            Duration::from_millis(100),
-        )
-        .await
-        .unwrap();
+        manager(&h)
+            .run_within(
+                &["infer".to_string()],
+                &ctx,
+                Duration::from_secs(30),
+                Duration::from_millis(100),
+            )
+            .await
+            .unwrap();
         assert!(recorder.0.lock().unwrap().is_empty());
     }
 
@@ -454,15 +455,15 @@ mod blocking {
     async fn a_command_past_its_time_limit_is_stopped() {
         let h = Harness::new("echo $$ > \"$(dirname \"$0\")/pid\"\nsleep 300");
         let started = Instant::now();
-        let error = run_command(
-            command(&h),
-            &["infer".to_string()],
-            &RequestContext::new(),
-            Duration::from_millis(600),
-            Duration::from_secs(5),
-        )
-        .await
-        .unwrap_err();
+        let error = manager(&h)
+            .run_within(
+                &["infer".to_string()],
+                &RequestContext::new(),
+                Duration::from_millis(600),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(
             error.to_string().contains("did not finish in 0s")
@@ -482,15 +483,15 @@ mod blocking {
     async fn output_is_bounded() {
         // 20 MiB of standard output; the result keeps the first 8.
         let h = Harness::new("head -c 20971520 /dev/zero | tr '\\0' y");
-        let out = run_command(
-            command(&h),
-            &["infer".to_string()],
-            &RequestContext::new(),
-            Duration::from_secs(60),
-            Duration::from_secs(5),
-        )
-        .await
-        .unwrap();
+        let out = manager(&h)
+            .run_within(
+                &["infer".to_string()],
+                &RequestContext::new(),
+                Duration::from_secs(60),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
         assert!(out.len() < 9 * 1024 * 1024, "{}", out.len());
         assert!(out.contains("more bytes of output dropped"));
     }

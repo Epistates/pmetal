@@ -64,7 +64,7 @@ impl Core {
                 }
             }
         };
-        util::run_pmetal(self.jobs.binary(), argv, ctx).await
+        self.jobs.run(argv, ctx).await
     }
 }
 
