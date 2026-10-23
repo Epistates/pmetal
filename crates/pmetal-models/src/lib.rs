@@ -47,6 +47,7 @@
 #[cfg(feature = "ane")]
 mod ane_worker;
 pub mod architectures;
+pub mod cache_policy;
 pub mod calibration;
 pub(crate) mod checkpointing;
 pub mod common;
@@ -77,6 +78,7 @@ pub mod rl_generation;
 pub mod sampling;
 pub mod shard;
 pub mod speculative;
+pub mod speculator;
 pub mod traits;
 pub mod weight_format;
 

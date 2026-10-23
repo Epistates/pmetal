@@ -95,12 +95,43 @@ pub trait MtpDrafter<T: MtpTarget> {
 
 /// Run an MTP speculative decode of `target` with `drafter`, drafting up to
 /// `num_draft_tokens` per round, and call `on_token` with every emitted token
-/// (`false` stops the decode).
+/// (`false` stops the decode). The tokens are drawn by `gen_config`'s own
+/// sampler.
 pub fn generate_mtp_streaming<T, D, F>(
     target: &mut T,
     drafter: &mut D,
     input_ids: &[u32],
     gen_config: &GenerationConfig,
+    num_draft_tokens: usize,
+    on_token: F,
+) -> Result<GenerationOutput, Exception>
+where
+    T: MtpTarget,
+    D: MtpDrafter<T>,
+    F: FnMut(u32) -> bool,
+{
+    generate_mtp_streaming_with(
+        target,
+        drafter,
+        input_ids,
+        gen_config,
+        gen_config.sampler(input_ids),
+        num_draft_tokens,
+        on_token,
+    )
+}
+
+/// [`generate_mtp_streaming`] drawing through `sampler`, which must continue
+/// `input_ids` (see [`GenerationConfig::sampler`]): a caller that wants more
+/// of the draw than the config says, such as a grammar the output must follow
+/// ([`DecodeSampler::with_processor`]), builds the sampler itself. `gen_config`
+/// still sets the length, the stop tokens and whether the draw is sampled.
+pub fn generate_mtp_streaming_with<T, D, F>(
+    target: &mut T,
+    drafter: &mut D,
+    input_ids: &[u32],
+    gen_config: &GenerationConfig,
+    sampler: DecodeSampler,
     num_draft_tokens: usize,
     mut on_token: F,
 ) -> Result<GenerationOutput, Exception>
@@ -116,7 +147,7 @@ where
     }
     let mut out = Emitter {
         token_ids: input_ids.to_vec(),
-        sampler: gen_config.sampler(input_ids),
+        sampler,
         num_generated: 0,
         stopped_by_token: false,
         stopped: false,

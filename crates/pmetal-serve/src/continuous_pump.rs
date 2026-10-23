@@ -727,6 +727,7 @@ impl ContinuousPump {
                         prompt_tokens: rec.prompt.len(),
                         cached_prompt_tokens: rec.prefix_hit_len,
                         completion_tokens: visible,
+                        speculative: None,
                     };
                     let _ = rec.tx.try_send(TokenEvent::Done {
                         finish_reason: finish_reason.to_string(),
@@ -949,6 +950,7 @@ mod tests {
                 match ev {
                     TokenEvent::Token { id, .. } => tokens.push(id),
                     TokenEvent::Done { finish_reason, .. } => finish = Some(finish_reason),
+                    TokenEvent::PromptLogprobs(_) => {}
                     TokenEvent::Error(e) => panic!("unexpected error: {e}"),
                 }
             }
@@ -1187,6 +1189,7 @@ mod tests {
                 match ev {
                     TokenEvent::Token { id, .. } => tokens.push(id),
                     TokenEvent::Done { finish_reason, .. } => finish = Some(finish_reason),
+                    TokenEvent::PromptLogprobs(_) => {}
                     TokenEvent::Error(e) => panic!("err: {e}"),
                 }
             }
@@ -1236,6 +1239,7 @@ mod tests {
                 match ev {
                     TokenEvent::Token { id, .. } => a_tokens.push(id),
                     TokenEvent::Done { .. } => a_done = true,
+                    TokenEvent::PromptLogprobs(_) => {}
                     TokenEvent::Error(e) => panic!("a err: {e}"),
                 }
             }
@@ -1243,6 +1247,7 @@ mod tests {
                 match ev {
                     TokenEvent::Token { id, .. } => b_tokens.push(id),
                     TokenEvent::Done { .. } => b_done = true,
+                    TokenEvent::PromptLogprobs(_) => {}
                     TokenEvent::Error(e) => panic!("b err: {e}"),
                 }
             }
@@ -1485,6 +1490,7 @@ mod tests {
                 match ev {
                     TokenEvent::Token { id, logprob } => entries.push((id, logprob)),
                     TokenEvent::Done { .. } => done = true,
+                    TokenEvent::PromptLogprobs(_) => {}
                     TokenEvent::Error(e) => panic!("err: {e}"),
                 }
             }
@@ -1558,6 +1564,7 @@ mod tests {
                 match ev {
                     TokenEvent::Token { id, .. } => tokens.push(id),
                     TokenEvent::Done { .. } => done = true,
+                    TokenEvent::PromptLogprobs(_) => {}
                     TokenEvent::Error(e) => panic!("err: {e}"),
                 }
             }

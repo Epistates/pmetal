@@ -79,6 +79,14 @@ pub struct LoadPolicy {
     /// Parameters the checkpoint does not have to fill: they keep the value
     /// the model was constructed with, which must be the right one.
     pub unloaded_params: Vec<Exemption>,
+    /// Keep an MLX-quantized checkpoint's projections packed on their
+    /// `Linear`s (MLX's quantized matmul reads them as they are), where the
+    /// default unpacks every quantized tensor to a dense copy: four times the
+    /// memory, and four times the bytes a decode step reads. Anything that is
+    /// not a `Linear` (an embedding, stacked experts) is unpacked either way.
+    /// Left off for training, which wants a dense base unless the caller asks
+    /// for QLoRA.
+    pub keep_quantized: bool,
 }
 
 /// Checkpoint tensors that are never a parameter of any architecture here.
@@ -105,7 +113,15 @@ impl LoadPolicy {
         Self {
             unused_tensors: NEVER_PARAMETERS.to_vec(),
             unloaded_params: Vec::new(),
+            keep_quantized: false,
         }
+    }
+
+    /// Keep quantized projections packed (see [`LoadPolicy::keep_quantized`]).
+    #[must_use]
+    pub fn keeping_quantized(mut self, keep: bool) -> Self {
+        self.keep_quantized = keep;
+        self
     }
 
     /// Also allow checkpoint tensors matching `exemptions` to go unused.

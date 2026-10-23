@@ -35,6 +35,10 @@ pub struct SamplingRequest<'a> {
     pub logit_bias: Option<&'a HashMap<String, f32>>,
     /// `Some(n)`: report log-probabilities with `n` alternatives per token.
     pub logprobs_top_n: Option<usize>,
+    /// `Some(n)`: also score the prompt, with `n` alternatives per token
+    /// (`echo` with `logprobs` on completions). Such a request may ask for no
+    /// output at all (`max_tokens: 0`) and only score.
+    pub prompt_logprobs_top_n: Option<usize>,
 }
 
 /// Stop sequences, resolved: the ones that are a single token end generation
@@ -88,7 +92,7 @@ pub fn validate_sampling(req: &SamplingRequest<'_>) -> ServeResult<()> {
             return Err(out_of_range(param, "between -2 and 2"));
         }
     }
-    if req.max_tokens == Some(0) {
+    if req.max_tokens == Some(0) && req.prompt_logprobs_top_n.is_none() {
         return Err(out_of_range("max_tokens", "at least 1"));
     }
     if req.logprobs_top_n.is_some_and(|n| n > MAX_TOP_LOGPROBS) {
@@ -236,6 +240,7 @@ pub fn sampling_params(
         extra_stop_token_ids: stops.token_ids.clone(),
         stop_sequences: stops.sequences.clone(),
         logprobs_top_n: req.logprobs_top_n,
+        prompt_logprobs_top_n: req.prompt_logprobs_top_n,
         logit_bias: parse_logit_bias(req.logit_bias)?,
         constraint: None,
     })
