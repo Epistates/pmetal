@@ -155,7 +155,7 @@ fn decoder_trunk(
     let b = hidden.dim(0);
     let s = hidden.dim(1);
     let dtype = weights.model_dtype;
-    let trace_qwen35 = std::env::var_os("PMETAL_TRACE_QWEN35").is_some();
+    let trace_qwen35 = crate::env_flag::env_flag!("PMETAL_TRACE_QWEN35");
 
     let mut gdn_slot = 0usize;
     let mut attn_slot = 0usize;

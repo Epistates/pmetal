@@ -339,7 +339,7 @@ pub fn load_model(
     crate::check_unobserved_error()
         .map_err(|e| format!("llama4: loading the weights failed: {e}"))?;
 
-    eprintln!(
+    tracing::info!(
         "[LLAMA4_NATIVE] load_model: {} layers, dtype={}, chunk_size={}",
         layers.len(),
         model_dtype,

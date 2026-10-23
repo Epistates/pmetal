@@ -28,6 +28,7 @@
 mod bridge_extern;
 
 mod callback;
+mod env_flag;
 mod strict_seed;
 
 pub mod inline_array;

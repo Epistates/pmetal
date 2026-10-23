@@ -410,7 +410,7 @@ pub fn load_model(
     crate::check_unobserved_error()
         .map_err(|e| format!("deepseek: loading the weights failed: {e}"))?;
 
-    eprintln!(
+    tracing::info!(
         "[DEEPSEEK] load_model: {} layers ({} routed experts), dtype={}",
         layers.len(),
         n_routed,

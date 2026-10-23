@@ -166,7 +166,7 @@ pub fn apply_kv_preconditioning(weights: &mut NativeWeights) {
     let r = r_f32.as_dtype(weights.model_dtype);
     let r_t = r.transpose_axes(&[1, 0]); // R^T [head_dim, head_dim]
 
-    eprintln!(
+    tracing::info!(
         "[PRECONDITION] Applying Hadamard preconditioning to attention weights (head_dim={})",
         head_dim
     );
@@ -230,7 +230,7 @@ pub fn apply_qjl_matrix(weights: &mut NativeWeights) {
     s.detach();
     weights.qjl_matrix = Some(s);
 
-    eprintln!(
+    tracing::info!(
         "[QJL] QJL projection matrix generated (head_dim={})",
         head_dim
     );
@@ -303,9 +303,10 @@ pub fn apply_outlier_permutation(weights: &mut NativeWeights, outlier_fraction: 
     let p = p.as_dtype(weights.model_dtype);
     let p_t = p.transpose_axes(&[1, 0]);
 
-    eprintln!(
+    tracing::info!(
         "[PRECONDITION] Applying outlier channel permutation (outlier_count={}, head_dim={})",
-        outlier_count, head_dim
+        outlier_count,
+        head_dim
     );
 
     // Apply P to all attention projection weights.

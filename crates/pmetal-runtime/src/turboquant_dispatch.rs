@@ -91,11 +91,11 @@ pub fn turboquant_attention_step(
     }
 }
 
-/// True when `PMETAL_TRACE_TURBOQUANT` is set in the environment. Cheap;
-/// the env probe runs only when this is consulted by `trace`.
+/// True when `PMETAL_TRACE_TURBOQUANT` was set when this was first consulted.
+/// The environment is read once.
 #[inline]
 fn trace_enabled() -> bool {
-    std::env::var_os("PMETAL_TRACE_TURBOQUANT").is_some()
+    crate::env_flag::env_flag!("PMETAL_TRACE_TURBOQUANT")
 }
 
 #[inline]

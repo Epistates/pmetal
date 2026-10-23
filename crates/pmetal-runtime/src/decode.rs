@@ -28,8 +28,7 @@ pub fn set_compiled_decode(enabled: bool) {
 }
 
 fn trace_decode_graph_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PMETAL_TRACE_DECODE_GRAPH").is_some())
+    crate::env_flag::env_flag!("PMETAL_TRACE_DECODE_GRAPH")
 }
 
 fn trace_decode_graph(tag: &str, step: usize, logits: &InlineArray, sampled: &InlineArray) {

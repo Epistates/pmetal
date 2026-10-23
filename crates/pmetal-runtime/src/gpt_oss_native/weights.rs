@@ -197,7 +197,7 @@ pub fn load_model(
         });
 
         if li == 0 {
-            eprintln!(
+            tracing::info!(
                 "[GPT-OSS] layer 0: type={:?} n_heads={n_heads} n_kv={n_kv_heads} \
                  head_dim={head_dim} experts={n_experts} top_k={top_k}",
                 layer_type,
@@ -258,7 +258,7 @@ pub fn load_model(
     crate::check_unobserved_error()
         .map_err(|e| format!("gpt_oss: loading the weights failed: {e}"))?;
 
-    eprintln!("[GPT-OSS] load_model: all weights force-copied into fresh Metal buffers");
+    tracing::info!("[GPT-OSS] load_model: all weights force-copied into fresh Metal buffers");
 
     Ok(NativeWeights {
         embed_w,

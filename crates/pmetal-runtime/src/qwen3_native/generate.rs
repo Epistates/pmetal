@@ -50,7 +50,7 @@ pub fn prefill_chunk(cache: &NativeCache) -> usize {
 // ============================================================================
 
 fn prepare_generation_cache(cache: &mut NativeCache, reserve_decode_inputs: i32, model_dtype: i32) {
-    let trace_qwen35 = std::env::var_os("PMETAL_TRACE_QWEN35").is_some();
+    let trace_qwen35 = crate::env_flag::env_flag!("PMETAL_TRACE_QWEN35");
     if trace_qwen35 {
         eprintln!("[QWEN35 TRACE] begin_generation_session before_eval_and_detach");
     }
@@ -64,7 +64,7 @@ fn prepare_generation_cache(cache: &mut NativeCache, reserve_decode_inputs: i32,
             "[QWEN35 TRACE] begin_generation_session after_reserve decode_inputs={reserve_decode_inputs}"
         );
     }
-    if std::env::var_os("PMETAL_SKIP_CLEAR_CACHE").is_none() {
+    if !crate::env_flag::env_flag!("PMETAL_SKIP_CLEAR_CACHE") {
         bridge::clear_cache();
         if trace_qwen35 {
             eprintln!("[QWEN35 TRACE] begin_generation_session after_clear_cache");

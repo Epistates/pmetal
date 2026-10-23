@@ -1742,7 +1742,7 @@ fn forward_hidden(
     cache: &mut NativeCache,
 ) -> InlineArray {
     let seq_len = input_ids.dim(1);
-    let profile = std::env::var_os("PMETAL_GEMMA4_TIMING").is_some();
+    let profile = crate::env_flag::env_flag!("PMETAL_GEMMA4_TIMING");
     let t_start = if profile {
         Some(std::time::Instant::now())
     } else {
