@@ -39,7 +39,9 @@ Every command is a job spec shared by the CLI, TUI, GUI, MCP server and Python b
 Packs multiple sequences into single rows so short samples do not waste compute on padding. On by default with block-diagonal attention masking, and for models with recurrent layers (Nemotron-H, Granite 4.0-H) the recurrent state is reset at sequence boundaries; `--no-sequence-packing` turns it off.
 
 ### Gradient Checkpointing
-Trade compute for memory: each decoder layer is recomputed in the backward pass instead of stored. On by default; `--no-gradient-checkpointing` turns it off.
+Trade compute for memory: each decoder layer is recomputed in the backward pass instead of stored, so the activations of a step no longer grow with depth. On by default; `--no-gradient-checkpointing` turns it off. Where a vocabulary is large (Qwen3's 152K) the logits of the loss become the largest activation that remains; `--cut-cross-entropy` never forms them.
+
+A training command also lowers MLX's per-command-buffer limit (`MLX_MAX_MB_PER_BUFFER`, to 4) before MLX starts, because the GPU command queue otherwise keeps the buffers a step has freed until its command buffer finishes, which hides what checkpointing saved. A value you set in the environment is used as it is. Programs that embed the library call `pmetal_runtime::memory::bound_command_buffer_memory()` before their first MLX operation.
 
 ### Adaptive Learning Rate
 EMA-based anomaly detection with automatic spike recovery, plateau reduction, and divergence detection.

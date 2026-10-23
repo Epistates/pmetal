@@ -39,7 +39,18 @@ impl Run {
         );
         let logs_events = matches!(
             args.first().copied(),
-            Some("train" | "distill" | "grpo" | "rlkd" | "preference")
+            Some(
+                "train"
+                    | "distill"
+                    | "grpo"
+                    | "rlkd"
+                    | "preference"
+                    | "pretrain"
+                    | "embed-train"
+                    | "train-mtp"
+                    | "train-draft"
+                    | "train-diffusion"
+            )
         );
         let mut command = Command::new(env!("CARGO_BIN_EXE_pmetal"));
         if logs_events {
@@ -147,6 +158,13 @@ fn stops_gracefully(mut run: Run, progress: impl Fn(&str) -> bool, artifact: &Pa
         "the run saved nothing before it exited ({}):\n{output}",
         artifact.display()
     );
+    // A command that writes an event log wrote its steps to it.
+    if let Ok(log) = std::fs::read_to_string(&run.events) {
+        assert!(
+            event_log_has_a_step(&log),
+            "the event log holds no step:\n{output}"
+        );
+    }
 }
 
 /// A tiny model and a text dataset in a fresh directory.

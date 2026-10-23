@@ -86,8 +86,23 @@ fn elements(set: &Set) -> usize {
         .sum()
 }
 
+/// How a step's parameters and optimizer state are waited for.
+#[derive(Clone, Copy)]
+enum Wait {
+    /// Queue every array, then wait on each.
+    Queued,
+    /// One `eval` per array, each its own wait (what `compat::eval` did).
+    PerArray,
+    /// One `compat::eval` of the whole set.
+    OneCall,
+}
+
 /// Median step time in milliseconds over `steps` steps after `warmup`.
 fn time_steps(set: &Set, fused: bool, warmup: usize, steps: usize) -> f64 {
+    time_steps_waiting(set, fused, warmup, steps, Wait::Queued)
+}
+
+fn time_steps_waiting(set: &Set, fused: bool, warmup: usize, steps: usize, wait: Wait) -> f64 {
     let dtype = set.dtype.as_i32();
     let mut params: Vec<InlineArray> = set
         .params
@@ -110,16 +125,28 @@ fn time_steps(set: &Set, fused: bool, warmup: usize, steps: usize) -> f64 {
         for (((name, _), grad), param) in set.params.iter().zip(&grads).zip(&mut params) {
             opt.step_single(name, grad, param);
         }
-        // Queue everything, then wait: one submission, not one sync per array.
         let all: Vec<&InlineArray> = params
             .iter()
             .chain(opt.states.values().flat_map(|s| s.arrays()))
             .collect();
-        for a in &all {
-            a.async_eval();
-        }
-        for a in &all {
-            a.eval();
+        match wait {
+            // Queue everything, then wait: one submission, not one sync per array.
+            Wait::Queued => {
+                for a in &all {
+                    a.async_eval();
+                }
+                for a in &all {
+                    a.eval();
+                }
+            }
+            Wait::PerArray => {
+                for a in &all {
+                    a.eval();
+                }
+            }
+            Wait::OneCall => {
+                pmetal_runtime::compat::eval(all.iter().copied()).expect("eval");
+            }
         }
         pmetal_runtime::check_unobserved_error().expect("no bridge error");
         if step >= warmup {
@@ -148,6 +175,35 @@ fn adamw_step_time() {
             set.label,
             elements(&set) as f64 / 1e6,
             ops / fused
+        );
+    }
+}
+
+/// The optimizer step with its parameters and state waited for one array at a
+/// time and in one call, alternated in this process so machine load cancels.
+///
+/// `cargo test --release -p pmetal-runtime --test adamw_bench eval_set_step_time -- --ignored --nocapture`
+#[test]
+#[ignore = "benchmark"]
+fn eval_set_step_time() {
+    println!("| set | arrays | per array (ms) | one call (ms) | speedup |");
+    println!("|---|---|---|---|---|");
+    for set in [lora(), dense_0_6b()] {
+        let (warmup, steps) = (3, 12);
+        let (mut per_array, mut one_call) = (Vec::new(), Vec::new());
+        for _ in 0..3 {
+            per_array.push(time_steps_waiting(&set, true, warmup, steps, Wait::PerArray));
+            one_call.push(time_steps_waiting(&set, true, warmup, steps, Wait::OneCall));
+        }
+        per_array.sort_by(|a, b| a.total_cmp(b));
+        one_call.sort_by(|a, b| a.total_cmp(b));
+        println!(
+            "| {} | {} | {:.1} | {:.1} | {:.2}x |",
+            set.label,
+            set.params.len() * 3,
+            per_array[1],
+            one_call[1],
+            per_array[1] / one_call[1]
         );
     }
 }
