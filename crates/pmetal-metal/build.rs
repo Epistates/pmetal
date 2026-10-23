@@ -29,6 +29,14 @@ fn main() {
     // Declare has_metal4 cfg for check-cfg lint
     println!("cargo::rustc-check-cfg=cfg(has_metal4)");
 
+    // docs.rs documents the crate on a Linux host with no Metal compiler. An
+    // empty library keeps `include_bytes!` compiling; rustdoc never runs it.
+    println!("cargo:rerun-if-env-changed=DOCS_RS");
+    if env::var_os("DOCS_RS").is_some() {
+        fs::write(out_dir.join("pmetal_kernels.metallib"), b"").unwrap();
+        return;
+    }
+
     // Check if we're on macOS
     if env::var("CARGO_CFG_TARGET_OS").unwrap() != "macos" {
         println!("cargo:warning=Metal shaders only compile on macOS");

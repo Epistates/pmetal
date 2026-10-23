@@ -69,3 +69,7 @@ unused_lifetimes = "warn"
 [lints.clippy]
 collapsible_if = "allow"
 manual_is_multiple_of = "allow"
+
+[package.metadata.docs.rs]
+# Apple Silicon only: document the platform the crate runs on.
+targets = ["aarch64-apple-darwin"]
