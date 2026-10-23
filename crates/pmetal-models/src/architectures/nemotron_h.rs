@@ -1104,6 +1104,20 @@ pub fn assign_nemotron_h_weights(
     )
 }
 
+/// [`assign_nemotron_h_weights`] for the checkpoint in `model_dir`, read the
+/// way `policy` says: with `policy.keep_quantized`, an MLX-quantized
+/// checkpoint's projections, embedding table and stacked experts stay packed.
+pub fn load_nemotron_h_weights(
+    model: &mut NemotronHForCausalLM,
+    model_dir: &std::path::Path,
+    policy: &crate::loader::LoadPolicy,
+) -> Result<(), crate::loader::LoadError> {
+    crate::loader::load_prepared(model, model_dir, policy, |weights, _| {
+        sanitize_nemotron_h_checkpoint(weights)
+            .map_err(|e| crate::loader::LoadError::SafeTensors(e.to_string()))
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

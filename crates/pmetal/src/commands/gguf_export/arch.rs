@@ -26,6 +26,10 @@ enum Family {
     /// Gemma 2 and Gemma 3: Gemma's norms, and four norms per block with their
     /// own names.
     GemmaPrePostNorm,
+    /// Gemma 4: the four norms, stored as they are (its norm multiplies by the
+    /// weight), the language model nested in a multimodal checkpoint, and no
+    /// value projection in the full-attention layers.
+    Gemma4,
 }
 
 /// The Hugging Face architectures that are exported, with the GGUF
@@ -44,6 +48,13 @@ const ARCHITECTURES: &[(&str, &str, Family)] = &[
     ("GemmaForCausalLM", "gemma", Family::Gemma),
     ("Gemma2ForCausalLM", "gemma2", Family::GemmaPrePostNorm),
     ("Gemma3ForCausalLM", "gemma3", Family::GemmaPrePostNorm),
+    ("Gemma4ForCausalLM", "gemma4", Family::Gemma4),
+    ("Gemma4ForConditionalGeneration", "gemma4", Family::Gemma4),
+    (
+        "Gemma4UnifiedForConditionalGeneration",
+        "gemma4",
+        Family::Gemma4,
+    ),
 ];
 
 /// The architecture a model is exported as, with what its tensors need.
@@ -90,10 +101,17 @@ impl ExportArch {
                 )
             })?;
 
-        let count = |key: &str| config.get(key).and_then(Value::as_u64).map(|v| v as usize);
+        let text = if family == Family::Gemma4 {
+            let text = text_config(config);
+            reject_unsupported_gemma4(&text)?;
+            text
+        } else {
+            config.clone()
+        };
+        let count = |key: &str| text.get(key).and_then(Value::as_u64).map(|v| v as usize);
         let num_heads = count("num_attention_heads").unwrap_or(1).max(1);
         let num_kv_heads = count("num_key_value_heads").unwrap_or(num_heads).max(1);
-        let tie_embeddings = config
+        let tie_embeddings = text
             .get("tie_word_embeddings")
             .and_then(Value::as_bool)
             .unwrap_or(false);
@@ -104,7 +122,29 @@ impl ExportArch {
             num_heads,
             num_kv_heads,
             tie_embeddings,
-            rope_frequency_factors: llama3_frequency_factors(config),
+            rope_frequency_factors: if family == Family::Gemma4 {
+                gemma4_frequency_factors(&text)
+            } else {
+                llama3_frequency_factors(config)
+            },
+        })
+    }
+
+    /// Whether this is a Gemma 4 file.
+    pub(crate) fn is_gemma4(&self) -> bool {
+        self.family == Family::Gemma4
+    }
+
+    /// The configuration of the model proper: the language model's, nested in
+    /// the multimodal wrapper a Gemma 4 checkpoint has, and the config itself
+    /// for every other family.
+    pub(crate) fn model_config(&self, config: Option<&Value>) -> Option<Value> {
+        config.map(|config| {
+            if self.family == Family::Gemma4 {
+                text_config(config)
+            } else {
+                config.clone()
+            }
         })
     }
 
@@ -125,6 +165,19 @@ impl ExportArch {
         }
         let name = match self.family {
             Family::GemmaPrePostNorm => WeightLoader::hf_to_gguf_name_gemma(hf_name),
+            Family::Gemma4 => {
+                // The language model only: a multimodal checkpoint's towers
+                // have no place in a text GGUF.
+                let Some(text_name) =
+                    pmetal_runtime::gemma4_native::normalize_checkpoint_key(hf_name)
+                else {
+                    return Ok(None);
+                };
+                if self.tie_embeddings && text_name == "lm_head.weight" {
+                    return Ok(None);
+                }
+                WeightLoader::hf_to_gguf_name_gemma(&text_name)
+            }
             Family::Llama | Family::Qwen | Family::Gemma => WeightLoader::hf_to_gguf_name(hf_name),
         };
         if !is_gguf_name(&name) {
@@ -199,6 +252,7 @@ const BLOCK_TENSORS: &[&str] = &[
     "post_attention_norm",
     "ffn_norm",
     "post_ffw_norm",
+    "layer_output_scale",
     "ffn_gate",
     "ffn_up",
     "ffn_down",
@@ -230,6 +284,82 @@ fn is_gguf_name(name: &str) -> bool {
             "token_embd.weight" | "output_norm.weight" | "output.weight"
         ),
     }
+}
+
+/// The language model's configuration, nested under `text_config` in a
+/// multimodal Gemma 4 checkpoint. The wrapper's `tie_word_embeddings` governs
+/// the text model's head when the text config says nothing, as the loader reads
+/// it.
+fn text_config(config: &Value) -> Value {
+    let Some(mut text) = config
+        .get("text_config")
+        .filter(|_| config.get("hidden_size").is_none())
+        .cloned()
+    else {
+        return config.clone();
+    };
+    if let (Some(object), Some(tie)) = (text.as_object_mut(), config.get("tie_word_embeddings")) {
+        object
+            .entry("tie_word_embeddings")
+            .or_insert_with(|| tie.clone());
+    }
+    text
+}
+
+/// Gemma 4 models the export does not write, refused by what they have.
+///
+/// The per-layer input embeddings of the E2B and E4B models, experts, per-layer
+/// feed-forward widths and layers that share another's keys and values each
+/// add tensors and metadata whose layout has not been checked against the
+/// reference converter's.
+fn reject_unsupported_gemma4(text: &Value) -> anyhow::Result<()> {
+    let positive = |key: &str| text.get(key).and_then(Value::as_u64).unwrap_or(0) > 0;
+    let enabled = |key: &str| text.get(key).and_then(Value::as_bool).unwrap_or(false);
+    for (unsupported, what) in [
+        (
+            positive("hidden_size_per_layer_input"),
+            "per-layer input embeddings",
+        ),
+        (enabled("enable_moe_block"), "mixture-of-experts layers"),
+        (
+            enabled("use_double_wide_mlp"),
+            "double-wide feed-forward layers",
+        ),
+        (
+            positive("num_kv_shared_layers"),
+            "layers that share another layer's keys and values",
+        ),
+    ] {
+        if unsupported {
+            anyhow::bail!(
+                "GGUF export of Gemma 4 does not cover {what}; it exports the dense Gemma 4 \
+                 text models"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The per-frequency divisors of Gemma 4's proportional RoPE: the leading pairs
+/// of a full-attention head rotate (a quarter of the head in the released
+/// models), and the rest are divided by `1e30`, which leaves them unrotated.
+/// `None` when the head rotates whole.
+fn gemma4_frequency_factors(text: &Value) -> Option<Vec<f32>> {
+    let full = text.pointer("/rope_parameters/full_attention")?;
+    let fraction = full.get("partial_rotary_factor").and_then(Value::as_f64)?;
+    if fraction >= 1.0 {
+        return None;
+    }
+    let head_dim = text
+        .get("global_head_dim")
+        .or_else(|| text.get("head_dim"))
+        .and_then(Value::as_u64)? as usize;
+    // The rotated width is the largest even number of channels in the share,
+    // as the model computes it.
+    let rotated_pairs = ((fraction * head_dim as f64) / 2.0) as usize;
+    let mut factors = vec![1e30f32; head_dim / 2];
+    factors[..rotated_pairs.min(head_dim / 2)].fill(1.0);
+    Some(factors)
 }
 
 /// Reorder the rows of a query or key projection (or its bias) from the
@@ -330,6 +460,122 @@ mod tests {
         let error = ExportArch::detect(Some(&config)).unwrap_err().to_string();
         assert!(error.contains("PhiForCausalLM"), "{error}");
         assert!(ExportArch::detect(None).is_err());
+    }
+
+    /// A multimodal Gemma 4 checkpoint: the language model's tensors under
+    /// `model.language_model.`, the towers beside them.
+    fn gemma4(extra: Value) -> ExportArch {
+        let mut text = json!({
+            "hidden_size": 64, "num_attention_heads": 4, "num_key_value_heads": 2,
+            "head_dim": 8, "global_head_dim": 16, "tie_word_embeddings": true,
+            "rope_parameters": {
+                "full_attention": {"partial_rotary_factor": 0.25, "rope_type": "proportional"},
+                "sliding_attention": {"rope_type": "default"},
+            },
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            text[key] = value.clone();
+        }
+        let config = json!({
+            "architectures": ["Gemma4UnifiedForConditionalGeneration"],
+            "text_config": text,
+            "tie_word_embeddings": true,
+        });
+        ExportArch::detect(Some(&config)).unwrap()
+    }
+
+    #[test]
+    fn gemma_4_names_its_language_model_and_leaves_the_towers_out() {
+        let gemma = gemma4(json!({}));
+        assert_eq!(gemma.name, "gemma4");
+        let name = |hf: &str| gemma.tensor_name(hf).unwrap();
+        let layer = "model.language_model.layers.7";
+        for (hf, gguf) in [
+            ("input_layernorm.weight", "attn_norm.weight"),
+            (
+                "post_attention_layernorm.weight",
+                "post_attention_norm.weight",
+            ),
+            ("pre_feedforward_layernorm.weight", "ffn_norm.weight"),
+            ("post_feedforward_layernorm.weight", "post_ffw_norm.weight"),
+            ("self_attn.q_proj.weight", "attn_q.weight"),
+            ("self_attn.k_norm.weight", "attn_k_norm.weight"),
+            ("mlp.down_proj.weight", "ffn_down.weight"),
+            ("layer_scalar", "layer_output_scale.weight"),
+        ] {
+            assert_eq!(
+                name(&format!("{layer}.{hf}")).as_deref(),
+                Some(format!("blk.7.{gguf}").as_str()),
+                "{hf}"
+            );
+        }
+        assert_eq!(
+            name("model.language_model.embed_tokens.weight").as_deref(),
+            Some("token_embd.weight")
+        );
+        assert_eq!(
+            name("model.language_model.norm.weight").as_deref(),
+            Some("output_norm.weight")
+        );
+        assert_eq!(name("model.vision_tower.encoder.layers.0.weight"), None);
+        assert_eq!(name("model.embed_audio.embedding_projection.weight"), None);
+        assert_eq!(name("lm_head.weight"), None);
+    }
+
+    /// Gemma 4's norm multiplies by its weight: unlike Gemma 1 to 3, no norm
+    /// gains 1.
+    #[test]
+    fn gemma_4_norms_are_stored_as_they_are() {
+        let gemma = gemma4(json!({}));
+        let mut norm = vec![0.5f32, -1.0];
+        gemma.lay_out("model.layers.0.input_layernorm.weight", &[2], &mut norm);
+        assert_eq!(norm, [0.5, -1.0]);
+    }
+
+    /// The unrotated pairs of a full-attention head are a `rope_freqs` tensor:
+    /// the rotated quarter of 16 channels is 2 pairs of 8.
+    #[test]
+    fn gemma_4_rotates_a_share_of_the_full_attention_head_by_a_tensor() {
+        let gemma = gemma4(json!({}));
+        assert!(gemma.scales_rope_by_tensor());
+        let extra = gemma.extra_tensors();
+        assert_eq!(extra.len(), 1);
+        assert_eq!(extra[0].0, "rope_freqs.weight");
+        assert_eq!(extra[0].1, [8]);
+        assert_eq!(extra[0].2[..2], [1.0, 1.0]);
+        assert!(extra[0].2[2..].iter().all(|f| *f == 1e30));
+        // A head rotated whole has none.
+        let whole = gemma4(json!({"rope_parameters": {
+            "full_attention": {"partial_rotary_factor": 1.0, "rope_type": "default"},
+            "sliding_attention": {"rope_type": "default"},
+        }}));
+        assert!(whole.extra_tensors().is_empty());
+        assert!(!whole.scales_rope_by_tensor());
+    }
+
+    /// The Gemma 4 models whose extra tensors have not been checked against
+    /// the reference converter are refused, not exported without them.
+    #[test]
+    fn gemma_4_models_with_extra_tensors_are_refused_by_name() {
+        for (extra, what) in [
+            (
+                json!({"hidden_size_per_layer_input": 256}),
+                "per-layer input",
+            ),
+            (json!({"enable_moe_block": true}), "mixture-of-experts"),
+            (json!({"use_double_wide_mlp": true}), "double-wide"),
+            (json!({"num_kv_shared_layers": 4}), "share"),
+        ] {
+            let mut text = json!({"hidden_size": 64});
+            for (k, v) in extra.as_object().unwrap() {
+                text[k] = v.clone();
+            }
+            let config = json!({
+                "architectures": ["Gemma4ForConditionalGeneration"], "text_config": text,
+            });
+            let error = ExportArch::detect(Some(&config)).unwrap_err().to_string();
+            assert!(error.contains(what), "{error}");
+        }
     }
 
     #[test]

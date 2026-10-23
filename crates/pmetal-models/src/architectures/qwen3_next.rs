@@ -2589,6 +2589,33 @@ pub fn sanitize_weights(
         }
     }
 
+    // An MLX conversion stores the experts already stacked, one tensor per
+    // projection: `mlp.switch_mlp.gate_proj.weight` and its two siblings.
+    let mlx_stacked: Vec<String> = weights
+        .keys()
+        .filter(|k| {
+            k.contains(".mlp.switch_mlp.")
+                && ["gate_proj", "up_proj", "down_proj"]
+                    .iter()
+                    .any(|p| k.ends_with(&format!(".switch_mlp.{p}.weight")))
+        })
+        .cloned()
+        .collect();
+    for key in mlx_stacked {
+        let Some(stacked) = weights.remove(&key) else {
+            continue;
+        };
+        if options.skip_routed_experts {
+            continue;
+        }
+        if let Some((layer, projection)) = key
+            .strip_suffix(".weight")
+            .and_then(|k| k.rsplit_once(".switch_mlp."))
+        {
+            weights.insert(format!("{layer}.switch_mlp_{projection}"), stacked);
+        }
+    }
+
     // Remove MTP (multi-token prediction) weights
     let mtp_keys: Vec<String> = weights
         .keys()

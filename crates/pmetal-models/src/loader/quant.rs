@@ -123,10 +123,14 @@ fn packed_candidates(base: &str) -> [String; 2] {
 /// block, a module the block calls dense, a mode that disagrees with whether
 /// biases are present, or scales with no packed tensor beside them. Any of
 /// those would otherwise load as a model that decodes noise.
+///
+/// Returns the modules it unpacked, which a loader that was asked to keep
+/// weights packed reports (see [`report_unpacked`]).
 pub(crate) fn unpack_mlx_quantized(
     weights: &mut HashMap<String, Array>,
     config: Option<&QuantConfig>,
-) -> Result<(), LoadError> {
+) -> Result<Vec<String>, LoadError> {
+    let mut unpacked = Vec::new();
     let scale_keys: Vec<String> = weights
         .keys()
         .filter(|key| key.ends_with(".scales"))
@@ -176,11 +180,41 @@ pub(crate) fn unpack_mlx_quantized(
             params.bits,
             params.mode,
         );
+        unpacked.push(weight_key.clone());
         weights.insert(weight_key, dense);
         weights.remove(&scales_key);
         weights.remove(&biases_key);
     }
-    Ok(())
+    unpacked.sort();
+    Ok(unpacked)
+}
+
+/// Say which MLX-quantized tensors a loader that was asked to keep them packed
+/// unpacked to dense instead, and why: a decode step reads four times the bytes
+/// of each, so the speed a packed checkpoint promises is short by that much.
+///
+/// A tensor of a vision or audio tower is left out: a text model drops it
+/// whatever its format, so unpacking it costs nothing.
+pub(crate) fn report_unpacked(unpacked: &[String]) {
+    let used: Vec<&String> = unpacked
+        .iter()
+        .filter(|name| {
+            !["vision", "visual", "audio"]
+                .iter()
+                .any(|t| name.contains(t))
+        })
+        .collect();
+    if used.is_empty() {
+        return;
+    }
+    let shown = used.len().min(4);
+    tracing::warn!(
+        count = used.len(),
+        "keep_quantized: unpacked {} quantized tensor(s) to dense (first: {:?}): the model has \
+         no packed layer for them, so they run as dense weights and read more memory per token",
+        used.len(),
+        &used[..shown]
+    );
 }
 
 /// Unpack every per-tensor-sidecar scheme to dense, as MLX's own format is
@@ -264,6 +298,50 @@ pub(crate) struct PackedLinear {
     params: QuantParams,
 }
 
+impl PackedLinear {
+    /// The tensors as MLX's quantized kernels read them, for a holder that
+    /// runs the gather matmuls itself (a layer's stacked experts): the words
+    /// as stored, `[experts, out, in * bits / 32]` when stacked, with their
+    /// scales.
+    pub(crate) fn into_layer_weight(self) -> pmetal_runtime::native_weight::LayerWeight {
+        pmetal_runtime::native_weight::LayerWeight::Quantized {
+            weight: self.weight,
+            scales: self.scales,
+            biases: self.biases,
+            tensor_scale: self.tensor_scale,
+            params: self.params,
+        }
+    }
+
+    /// The words, scales and biases of an affine tensor, with its width and
+    /// group size; `None` for a floating-point mode (no biases) or a tensor
+    /// with a per-tensor factor, which an affine-only holder cannot run.
+    pub(crate) fn into_affine(self) -> Option<AffineParts> {
+        match (self.biases, self.tensor_scale) {
+            (Some(biases), None) if self.params.mode == pmetal_runtime::QuantizedMode::Affine => {
+                Some(AffineParts {
+                    weight: self.weight,
+                    scales: self.scales,
+                    biases,
+                    bits: self.params.bits,
+                    group_size: self.params.group_size,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// An affine-quantized tensor's parts: [`PackedLinear::into_affine`].
+#[derive(Debug)]
+pub(crate) struct AffineParts {
+    pub(crate) weight: Array,
+    pub(crate) scales: Array,
+    pub(crate) biases: Array,
+    pub(crate) bits: i32,
+    pub(crate) group_size: i32,
+}
+
 /// The quantized `Linear`s of a checkpoint (ModelOpt's, or MLX's), by module
 /// path, and the
 /// dtype the model computes in.
@@ -291,6 +369,69 @@ impl PackedLinears {
     /// The module paths, for a loader to account for their `weight`s.
     pub(crate) fn modules(&self) -> impl Iterator<Item = &str> {
         self.modules.keys().map(String::as_str)
+    }
+
+    /// The dtype the model computes in.
+    pub(crate) fn dtype(&self) -> pmetal_runtime::compat::Dtype {
+        self.dtype
+            .unwrap_or(pmetal_runtime::compat::Dtype::Bfloat16)
+    }
+
+    /// Take the module that names the layer at model path `path` (the match
+    /// [`install`](Self::install) places by), for a holder of its own that
+    /// is not a `Linear` of the model.
+    pub(crate) fn take(&mut self, path: &str) -> Option<PackedLinear> {
+        let module = self.modules.keys().find(|m| names_linear(m, path))?.clone();
+        self.modules.remove(&module)
+    }
+
+    /// The packed words of each module under the name a dense loader looks
+    /// for, `{module}.weight`: a loader that checks every layer's weight is
+    /// present finds one here and assigns the words, and
+    /// [`install`](Self::install) then gives them their scales.
+    pub(crate) fn words(&self) -> impl Iterator<Item = (String, Array)> + '_ {
+        self.modules
+            .iter()
+            .map(|(module, packed)| (format!("{module}.weight"), packed.weight.clone()))
+    }
+
+    /// Split each module named `{prefix}{fused}` into the modules
+    /// `{prefix}{suffix}` for `(suffix, start, stop)` in `parts`, by output
+    /// rows.
+    ///
+    /// Every row of a packed weight is quantized on its own (its words, and
+    /// its scales and biases per group along the input axis), so a fused
+    /// projection's rows slice apart exactly: Phi-3's `qkv_proj` into the
+    /// `q_proj`, `k_proj` and `v_proj` the model holds.
+    pub(crate) fn split_rows(&mut self, fused: &str, parts: &[(&str, i32, i32)]) {
+        let names: Vec<String> = self
+            .modules
+            .keys()
+            .filter(|m| m.ends_with(fused))
+            .cloned()
+            .collect();
+        for module in names {
+            let Some(packed) = self.modules.remove(&module) else {
+                continue;
+            };
+            let prefix = module.strip_suffix(fused).unwrap_or(&module);
+            for &(name, start, stop) in parts {
+                let rows = |a: &Array| {
+                    let cols = a.dim(1);
+                    a.slice(&[start, 0], &[stop, cols])
+                };
+                self.modules.insert(
+                    format!("{prefix}{name}"),
+                    PackedLinear {
+                        weight: rows(&packed.weight),
+                        scales: rows(&packed.scales),
+                        biases: packed.biases.as_ref().map(rows),
+                        tensor_scale: packed.tensor_scale.clone(),
+                        params: packed.params,
+                    },
+                );
+            }
+        }
     }
 
     /// Rename the module paths (a loader that canonicalizes checkpoint keys
@@ -336,8 +477,13 @@ impl PackedLinears {
                 packed.weight.dim(1) * 32 / packed.params.bits,
             );
             // A layer built "for loading" is a 1x1 placeholder that takes the
-            // shape of whatever the checkpoint puts on it.
-            if linear.shape() != (out, input) && linear.shape() != (1, 1) {
+            // shape of whatever the checkpoint puts on it, and a loader that
+            // assigned the words as the dense weight (see
+            // [`words`](Self::words)) left them there.
+            if linear.shape() != (out, input)
+                && linear.shape() != (1, 1)
+                && linear.weight.value.shape() != packed.weight.shape()
+            {
                 failure = Some(LoadError::ShapeMismatch {
                     key: format!("{path}.weight"),
                     expected: vec![linear.shape().0, linear.shape().1],
@@ -379,7 +525,7 @@ impl PackedLinears {
                 packed.weight.dim(1) * 32 / packed.params.bits,
             );
             let shape = embedding.weight.value.shape().to_vec();
-            if shape != [rows, dims] && shape != [1, 1] {
+            if shape != [rows, dims] && shape != [1, 1] && shape != packed.weight.shape() {
                 failure = Some(LoadError::ShapeMismatch {
                     key: format!("{path}.weight"),
                     expected: shape.clone(),
@@ -389,6 +535,46 @@ impl PackedLinears {
             }
             embedding.weight.value = packed.weight;
             embedding.quant = Some(Box::new(pmetal_runtime::compat::LinearQuant {
+                scales: packed.scales,
+                biases: packed.biases,
+                params: packed.params,
+                dtype,
+                tensor_scale: packed.tensor_scale,
+                codebook: None,
+            }));
+        });
+        if let Some(e) = failure {
+            return Err(e);
+        }
+        // Stacked experts stay packed for MLX's quantized gather.
+        let mut failure: Option<LoadError> = None;
+        model.visit_experts_mut("", 0, &mut |path, _top_k, expert| {
+            let Some(module) = wanted.iter().find(|m| names_linear(m, path)) else {
+                return;
+            };
+            *installed.entry(module.clone()).or_default() += 1;
+            let Some(packed) = self.modules.remove(module) else {
+                return;
+            };
+            let (experts, rows, dims) = (
+                packed.weight.dim(0),
+                packed.weight.dim(1),
+                packed.weight.dim(2) * 32 / packed.params.bits,
+            );
+            // A layer built "for loading" holds a placeholder that takes the
+            // shape of whatever the checkpoint puts on it.
+            let shape = expert.weight.shape().to_vec();
+            if shape.len() == 3 && shape != [experts, rows, dims] && shape != packed.weight.shape()
+            {
+                failure = Some(LoadError::ShapeMismatch {
+                    key: format!("{path}.weight"),
+                    expected: shape.clone(),
+                    actual: vec![experts, rows, dims],
+                });
+                return;
+            }
+            expert.weight = packed.weight;
+            expert.quant = Some(Box::new(pmetal_runtime::compat::LinearQuant {
                 scales: packed.scales,
                 biases: packed.biases,
                 params: packed.params,
