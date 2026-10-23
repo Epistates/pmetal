@@ -30,16 +30,9 @@ pub enum Background {
 
 /// The owning thread has exited: its state failed to build, or every handle
 /// to it was dropped. Jobs queued after that are dropped unrun.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the model thread has exited")]
 pub struct ModelThreadExited;
-
-impl std::fmt::Display for ModelThreadExited {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the model thread has exited")
-    }
-}
-
-impl std::error::Error for ModelThreadExited {}
 
 /// How a [`ModelThread`] failed to start.
 #[derive(Debug)]

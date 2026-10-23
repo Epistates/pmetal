@@ -86,7 +86,7 @@ pub fn collect_imatrix(
         targets.push((gguf, array));
     }
     let mut collector = Collector::install(targets.iter().map(|(n, a)| (n.clone(), *a)))
-        .map_err(Exception::custom)?;
+        .map_err(Exception::from)?;
     drop(targets);
 
     let total = chunks.len();

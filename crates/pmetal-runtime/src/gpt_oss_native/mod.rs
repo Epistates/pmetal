@@ -27,6 +27,7 @@
 //!   * `moe` — biased top-k router + clamped GLU experts
 //!   * `forward` — full-model forward + prefill/prime/generate wrappers
 
+use crate::{RuntimeError, RuntimeResult};
 use serde::Deserialize;
 
 mod attention;
@@ -176,7 +177,7 @@ impl GptOssConfig {
     /// attention factor on q and k (transformers' [`default_rope_scaling`]
     /// when the config has no rope dict); an unknown `rope_type` is an error
     /// naming it.
-    pub fn rotary(&self) -> Result<crate::rope::RotaryEmbedding, String> {
+    pub fn rotary(&self) -> RuntimeResult<crate::rope::RotaryEmbedding> {
         let default = default_rope_scaling();
         crate::rope::RotaryEmbedding::from_config(
             self.head_dim,
@@ -190,7 +191,7 @@ impl GptOssConfig {
             1.0,
             false,
         )
-        .map_err(|e| format!("gpt_oss config: {e}"))
+        .map_err(|e| RuntimeError::Config(format!("gpt_oss config: {e}")))
     }
 
     /// Effective experts per token.
@@ -234,11 +235,11 @@ impl GptOssConfig {
 }
 
 /// Parse `config.json` from a model directory.
-pub fn load_config(model_dir: &std::path::Path) -> Result<GptOssConfig, String> {
+pub fn load_config(model_dir: &std::path::Path) -> RuntimeResult<GptOssConfig> {
     let text = crate::native_loader::read_config_json(model_dir)?;
     // Some checkpoints nest config under "text_config"
-    let json: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("failed to parse config.json: {e}"))?;
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| RuntimeError::Config(format!("failed to parse config.json: {e}")))?;
     GptOssConfig::from_json(&json)
 }
 
@@ -246,13 +247,14 @@ impl GptOssConfig {
     /// Read a `config.json` value, flat or with the text model nested under
     /// `text_config`. `tie_word_embeddings`, which a nested config keeps at
     /// the top, applies to the text model unless it states its own.
-    pub fn from_json(json: &serde_json::Value) -> Result<Self, String> {
+    pub fn from_json(json: &serde_json::Value) -> RuntimeResult<Self> {
         let mut text = json.get("text_config").unwrap_or(json).clone();
         if let (Some(obj), Some(tie)) = (text.as_object_mut(), json.get("tie_word_embeddings")) {
             obj.entry("tie_word_embeddings")
                 .or_insert_with(|| tie.clone());
         }
-        serde_json::from_value(text).map_err(|e| format!("failed to parse config: {e}"))
+        serde_json::from_value(text)
+            .map_err(|e| RuntimeError::Config(format!("failed to parse config: {e}")))
     }
 }
 
@@ -311,6 +313,6 @@ mod tests {
         assert_eq!(bare.rotary().unwrap().rotary(), &want);
 
         bare.rope_scaling = Some(serde_json::json!({"rope_type": "xpos"}));
-        assert!(bare.rotary().unwrap_err().contains("xpos"));
+        assert!(bare.rotary().unwrap_err().to_string().contains("xpos"));
     }
 }

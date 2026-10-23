@@ -7,6 +7,7 @@
 //! `[B, H, S, D]` append reshapes into place with no transposition.
 
 use crate::InlineArray;
+use crate::RuntimeResult;
 use crate::compat::Dtype;
 
 use super::quantizer::{Encoded, Quantizer};
@@ -235,8 +236,8 @@ impl ColdStore {
         &self,
         keys: &Quantizer,
         values: &Quantizer,
-    ) -> Result<(InlineArray, InlineArray), String> {
-        let decode = |store: &PackedStore, q: &Quantizer| -> Result<InlineArray, String> {
+    ) -> RuntimeResult<(InlineArray, InlineArray)> {
+        let decode = |store: &PackedStore, q: &Quantizer| -> RuntimeResult<InlineArray> {
             let rows = store.view(self.kv_rows, self.len, q.words());
             Ok(q.decode(&rows)?
                 .reshape(&[self.kv_rows as i32, self.len as i32, q.dim() as i32]))

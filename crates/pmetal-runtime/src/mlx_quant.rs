@@ -22,6 +22,7 @@
 //! (`A_log`, `dt_bias`, `conv1d`) are always kept at 8-bit or full precision
 //! because errors in these tensors have outsized downstream effects.
 
+use crate::{RuntimeError, RuntimeResult};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
@@ -418,19 +419,23 @@ pub fn quantize_and_save_mlx(
     assignments: &[TensorQuant],
     output_dir: &Path,
     _group_size: i32,
-) -> Result<(), String> {
-    std::fs::create_dir_all(output_dir)
-        .map_err(|e| format!("failed to create output dir '{}: {e}", output_dir.display()))?;
+) -> RuntimeResult<()> {
+    std::fs::create_dir_all(output_dir).map_err(|e| {
+        RuntimeError::Weights(format!(
+            "failed to create output dir '{}: {e}",
+            output_dir.display()
+        ))
+    })?;
 
     // --- Estimate per-assignment byte sizes for shard partitioning ---
     let mut records: Vec<ShardRecord<'_>> = Vec::with_capacity(assignments.len());
 
     for (idx, assignment) in assignments.iter().enumerate() {
         let array = weights.get(&assignment.name).ok_or_else(|| {
-            format!(
+            RuntimeError::Weights(format!(
                 "weight '{}' in assignment not found in weights map",
                 assignment.name
-            )
+            ))
         })?;
 
         let byte_estimate = if assignment.bits == BITS_PASSTHROUGH {
@@ -461,9 +466,9 @@ pub fn quantize_and_save_mlx(
     for (shard_num, shard_record_indices) in shards.iter().enumerate() {
         let shard_filename = format!("model-{:05}-of-{:05}.safetensors", shard_num + 1, n_shards);
         let shard_path = output_dir.join(&shard_filename);
-        let shard_path_str = shard_path
-            .to_str()
-            .ok_or_else(|| format!("non-UTF-8 path: {}", shard_path.display()))?;
+        let shard_path_str = shard_path.to_str().ok_or_else(|| {
+            RuntimeError::Weights(format!("non-UTF-8 path: {}", shard_path.display()))
+        })?;
 
         // Materialise quantized arrays for this shard.
         // We need owned storage for packed/scales/biases so the references
@@ -520,7 +525,8 @@ pub fn quantize_and_save_mlx(
             .map(|(k, idx)| (k.as_str(), &owned_arrays[*idx]))
             .collect();
 
-        InlineArray::save_safetensors(shard_path_str, &save_entries).map_err(|e| e.to_string())?;
+        InlineArray::save_safetensors(shard_path_str, &save_entries)
+            .map_err(|e| RuntimeError::Weights(e.to_string()))?;
     }
 
     // --- Write weight-map index ---
@@ -539,7 +545,7 @@ pub fn quantize_and_save_mlx(
 fn write_weight_map_index(
     output_dir: &Path,
     weight_map: &BTreeMap<String, String>,
-) -> Result<(), String> {
+) -> RuntimeResult<()> {
     use std::io::Write as _;
 
     let index = serde_json::json!({
@@ -551,8 +557,9 @@ fn write_weight_map_index(
 
     let index_path = output_dir.join("model.safetensors.index.json");
     let partial = output_dir.join("model.safetensors.index.json.partial");
-    let pretty = serde_json::to_string_pretty(&index)
-        .map_err(|e| format!("failed to serialise safetensors index: {e}"))?;
+    let pretty = serde_json::to_string_pretty(&index).map_err(|e| {
+        RuntimeError::Weights(format!("failed to serialise safetensors index: {e}"))
+    })?;
 
     let written = (|| -> std::io::Result<()> {
         let mut f = std::fs::File::create(&partial)?;
@@ -562,7 +569,9 @@ fn write_weight_map_index(
     })();
     if let Err(e) = written {
         let _ = std::fs::remove_file(&partial);
-        return Err(format!("failed to write index file: {e}"));
+        return Err(RuntimeError::Weights(format!(
+            "failed to write index file: {e}"
+        )));
     }
 
     Ok(())
@@ -637,12 +646,16 @@ pub fn write_quantization_config(
     default_bits: i32,
     group_size: i32,
     per_tensor_overrides: &HashMap<String, i32>,
-) -> Result<(), String> {
-    let raw = std::fs::read_to_string(source_config_path)
-        .map_err(|e| format!("failed to read '{}': {e}", source_config_path.display()))?;
+) -> RuntimeResult<()> {
+    let raw = std::fs::read_to_string(source_config_path).map_err(|e| {
+        RuntimeError::Weights(format!(
+            "failed to read '{}': {e}",
+            source_config_path.display()
+        ))
+    })?;
 
-    let mut json: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| format!("failed to parse config.json: {e}"))?;
+    let mut json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| RuntimeError::Weights(format!("failed to parse config.json: {e}")))?;
 
     // Build the quantization block.
     let mut quant = serde_json::json!({
@@ -666,16 +679,22 @@ pub fn write_quantization_config(
         serde_json::Value::Object(map) => {
             map.insert("quantization".to_owned(), quant);
         }
-        _ => return Err("config.json root is not a JSON object".to_owned()),
+        _ => {
+            return Err(RuntimeError::Config(
+                "config.json root is not a JSON object".to_owned(),
+            ));
+        }
     }
 
-    std::fs::create_dir_all(output_dir).map_err(|e| format!("failed to create output dir: {e}"))?;
+    std::fs::create_dir_all(output_dir)
+        .map_err(|e| RuntimeError::Weights(format!("failed to create output dir: {e}")))?;
 
     let out_path = output_dir.join("config.json");
     let serialised = serde_json::to_string_pretty(&json)
-        .map_err(|e| format!("failed to serialise config: {e}"))?;
-    std::fs::write(&out_path, &serialised)
-        .map_err(|e| format!("failed to write '{}': {e}", out_path.display()))?;
+        .map_err(|e| RuntimeError::Weights(format!("failed to serialise config: {e}")))?;
+    std::fs::write(&out_path, &serialised).map_err(|e| {
+        RuntimeError::Weights(format!("failed to write '{}': {e}", out_path.display()))
+    })?;
 
     Ok(())
 }
@@ -700,7 +719,7 @@ pub fn quantize_model(
     group_size: i32,
     bits_candidates: &[i32],
     extra_critical: &[&str],
-) -> Result<Vec<TensorQuant>, String> {
+) -> RuntimeResult<Vec<TensorQuant>> {
     // Sort deterministically so output is reproducible.
     let mut sorted_names: Vec<&String> = weights.keys().collect();
     sorted_names.sort();

@@ -43,20 +43,35 @@ unsafe extern "C" {
     fn pmetal_runtime_get_error_log_mode() -> i32;
 }
 
-/// Error type for faults reported by the bridge's C++ layer.
+/// Error type of the runtime: faults reported by the bridge's C++ layer, and
+/// the model, cache and checkpoint errors of the native engines.
 ///
 /// The [`CxxException`] variant carries the `what()` text from the caught
 /// `std::exception`; [`Unknown`] is reserved for `catch (...)` matches on
 /// non-std exception types (rare but possible for third-party code).
+/// [`Config`] and [`Weights`] carry the engines' own messages, which name
+/// the file, key or setting at fault and are shown to the user as written.
+///
+/// The type is written by hand, without `thiserror`: this crate keeps its
+/// dependencies to the few it cannot do without.
 ///
 /// [`CxxException`]: Self::CxxException
 /// [`Unknown`]: Self::Unknown
+/// [`Config`]: Self::Config
+/// [`Weights`]: Self::Weights
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RuntimeError {
     /// Caught a `std::exception` subclass.
     CxxException(String),
     /// Caught `...` — unknown C++ exception type.
     Unknown(String),
+    /// A model or cache configuration that cannot be read, is invalid, or
+    /// asks for something the engine does not support.
+    Config(String),
+    /// A checkpoint's tensors that are missing, mis-shaped, or stored in a
+    /// layout the engine cannot load.
+    Weights(String),
 }
 
 impl fmt::Display for RuntimeError {
@@ -64,6 +79,7 @@ impl fmt::Display for RuntimeError {
         match self {
             Self::CxxException(msg) => write!(f, "bridge C++ exception: {msg}"),
             Self::Unknown(msg) => write!(f, "bridge unknown C++ exception: {msg}"),
+            Self::Config(msg) | Self::Weights(msg) => f.write_str(msg),
         }
     }
 }
@@ -381,8 +397,8 @@ mod tests {
             RuntimeError::CxxException(msg) => {
                 assert!(msg.contains("item_f32"), "op tag missing: {msg}");
             }
-            RuntimeError::Unknown(msg) => {
-                panic!("expected CxxException, got Unknown: {msg}");
+            other => {
+                panic!("expected CxxException, got {other}");
             }
         }
 

@@ -531,7 +531,7 @@ fn attention_from_a_given_position_ignores_earlier_tokens() {
             .compute_attention(&w.queries_array(), w.scale(), first, None)
             .expect_err("nothing to attend to");
         assert!(
-            err.contains("no cached token"),
+            err.to_string().contains("no cached token"),
             "first token {first}: {err}"
         );
     }

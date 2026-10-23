@@ -28,6 +28,7 @@
 //! Weights are pre-transposed to `[in, out]` at load time (`w.t()`) so the
 //! per-decode matmuls are contiguous.
 
+use crate::{RuntimeError, RuntimeResult};
 use serde::Deserialize;
 
 use crate::InlineArray;
@@ -187,7 +188,7 @@ impl Gemma4Config {
     }
 
     /// Layer `layer_idx`'s rotation; see [`gemma4_layer_rope`].
-    pub fn layer_rope(&self, layer_idx: usize) -> Result<Gemma4LayerRope, String> {
+    pub fn layer_rope(&self, layer_idx: usize) -> RuntimeResult<Gemma4LayerRope> {
         let is_full = self.is_full_attention(layer_idx);
         let head_dim = self.layer_head_dim(layer_idx);
         let (default_base, default_frac) = if is_full {
@@ -253,66 +254,66 @@ impl Gemma4Config {
             .find(|&src| self.is_full_attention(src) == is_full)
     }
 
-    fn validate_supported(&self) -> Result<(), String> {
+    fn validate_supported(&self) -> RuntimeResult<()> {
         // Both the MLP's activation and the per-layer-input gate's.
         if let Some(ref act) = self.hidden_activation
             && !matches!(act.as_str(), "gelu" | "gelu_pytorch_tanh" | "gelu_tanh")
         {
-            return Err(format!(
+            return Err(RuntimeError::Config(format!(
                 "Gemma 4 native: unsupported hidden_activation {act:?}; the MLP and the \
-                 per-layer-input gate are tanh-approximate GELU"
-            ));
+             per-layer-input gate are tanh-approximate GELU"
+            )));
         }
         match self.use_bidirectional_attention.as_deref() {
             None | Some("vision") => {}
             Some(other) => {
-                return Err(format!(
+                return Err(RuntimeError::Config(format!(
                     "Gemma 4 native: use_bidirectional_attention {other:?} is not supported; \
-                     the engine's attention is causal"
-                ));
+                 the engine's attention is causal"
+                )));
             }
         }
         if self.attention_bias {
-            return Err(
+            return Err(RuntimeError::Config(
                 "Gemma 4 native: attention_bias is not supported; the projections load no biases"
                     .to_string(),
-            );
+            ));
         }
         if self.uses_moe()
             && (self.num_experts.is_none()
                 || self.top_k_experts.is_none()
                 || self.moe_intermediate_size.is_none())
         {
-            return Err(
-                "Gemma 4 native: MoE block needs num_experts, top_k_experts and moe_intermediate_size"
-                    .to_string(),
-            );
+            return Err(RuntimeError::Config("Gemma 4 native: MoE block needs num_experts, top_k_experts and moe_intermediate_size".to_string()));
         }
         if self.use_double_wide_mlp.unwrap_or(false) {
-            return Err("Gemma 4 native: double-wide MLP is not ported yet".to_string());
+            return Err(RuntimeError::Config(
+                "Gemma 4 native: double-wide MLP is not ported yet".to_string(),
+            ));
         }
         Ok(())
     }
 }
 
-pub fn load_config(model_dir: &std::path::Path) -> Result<Gemma4Config, String> {
+pub fn load_config(model_dir: &std::path::Path) -> RuntimeResult<Gemma4Config> {
     let text = crate::native_loader::read_config_json(model_dir)?;
     parse_config_text(&text)
 }
 
-fn parse_config_text(text: &str) -> Result<Gemma4Config, String> {
-    let json: serde_json::Value =
-        serde_json::from_str(text).map_err(|e| format!("failed to parse config.json: {e}"))?;
+fn parse_config_text(text: &str) -> RuntimeResult<Gemma4Config> {
+    let json: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| RuntimeError::Config(format!("failed to parse config.json: {e}")))?;
 
     // Multimodal Gemma 4 nests text params under `text_config`.
     let config_str = if json.get("text_config").is_some() {
-        serde_json::to_string(&json["text_config"]).map_err(|e| e.to_string())?
+        serde_json::to_string(&json["text_config"])
+            .map_err(|e| RuntimeError::Config(e.to_string()))?
     } else {
         text.to_owned()
     };
 
     let mut cfg: Gemma4Config = serde_json::from_str(&config_str)
-        .map_err(|e| format!("failed to parse gemma4 config: {e}"))?;
+        .map_err(|e| RuntimeError::Config(format!("failed to parse gemma4 config: {e}")))?;
     cfg.validate_supported()?;
     // `Gemma4TextConfig.__post_init__`: every sixth layer is full attention
     // unless the config says otherwise, and the last one always is.
@@ -668,7 +669,7 @@ pub fn gemma4_layer_rope(
     partial_rotary_factor: f32,
     factor: Option<f32>,
     is_full: bool,
-) -> Result<Gemma4LayerRope, String> {
+) -> RuntimeResult<Gemma4LayerRope> {
     let rope_type = rope_type.unwrap_or(if is_full { "proportional" } else { "default" });
     let mut params = serde_json::json!({
         "rope_type": rope_type,
@@ -687,19 +688,19 @@ pub fn gemma4_layer_rope(
         theta as f64,
         1.0,
     )
-    .map_err(|e| format!("Gemma 4 rope_parameters: {e}"))?;
+    .map_err(|e| RuntimeError::Config(format!("Gemma 4 rope_parameters: {e}")))?;
     let rotated_dims =
         (2 * ((partial_rotary_factor * head_dim as f32) / 2.0) as i32).clamp(0, head_dim);
     match rotary.scaling {
         crate::rope::RopeScaling::Default if rotated_dims == head_dim => {}
         crate::rope::RopeScaling::Proportional { factor: 1.0 } => {}
         ref other => {
-            return Err(format!(
+            return Err(RuntimeError::Config(format!(
                 "Gemma 4 rope_parameters: rope_type {:?} with partial_rotary_factor \
-                 {partial_rotary_factor} and factor {factor:?} is not supported; Gemma 4 runs \
-                 \"default\" over the whole head and \"proportional\" without a factor",
+             {partial_rotary_factor} and factor {factor:?} is not supported; Gemma 4 runs \
+             \"default\" over the whole head and \"proportional\" without a factor",
                 other.rope_type()
-            ));
+            )));
         }
     }
     let periods = (rotated_dims < head_dim).then(|| rotary.periods(0));
@@ -1186,7 +1187,7 @@ pub fn normalize_checkpoint_key(key: &str) -> Option<String> {
 pub fn load_model(
     model_dir: &std::path::Path,
     config: &Gemma4Config,
-) -> Result<NativeWeights, String> {
+) -> RuntimeResult<NativeWeights> {
     // Shards come from the index rather than a directory glob. A glob picks up
     // whatever else ends in `.safetensors`, and on a non-APFS volume that
     // includes the `._model-0000N-of-…` AppleDouble sidecars macOS writes
@@ -1199,11 +1200,13 @@ pub fn load_model(
     // checkpoints all load through the same key set.
     let mut raw: std::collections::HashMap<String, InlineArray> = std::collections::HashMap::new();
     for shard in &shard_files {
-        let shard_str = shard
-            .to_str()
-            .ok_or_else(|| format!("shard path is not valid UTF-8: {shard:?}"))?;
+        let shard_str = shard.to_str().ok_or_else(|| {
+            RuntimeError::Config(format!("shard path is not valid UTF-8: {shard:?}"))
+        })?;
         let Some(pairs) = bridge::load_safetensors_shard(shard_str) else {
-            return Err(format!("failed to load safetensors shard {shard_str}"));
+            return Err(RuntimeError::Config(format!(
+                "failed to load safetensors shard {shard_str}"
+            )));
         };
         for (key, arr) in pairs {
             let Some(stripped) = normalize_checkpoint_key(&key) else {
@@ -1212,9 +1215,9 @@ pub fn load_model(
             // Two layouts normalising onto one key would resolve silently in
             // whatever order the shards happened to be read.
             if raw.insert(stripped.clone(), arr).is_some() {
-                return Err(format!(
+                return Err(RuntimeError::Config(format!(
                     "Gemma 4 native: two checkpoint keys both normalise to {stripped}"
-                ));
+                )));
             }
         }
     }
@@ -1241,12 +1244,12 @@ pub fn load_model(
     let params_for_tensors = |module: &str,
                               scales: &Option<InlineArray>,
                               biases: &Option<InlineArray>|
-     -> Result<QuantParams, String> {
+     -> RuntimeResult<QuantParams> {
         let params = params_for(module);
         if scales.is_some() {
             params
                 .for_tensors(module, biases.is_some())
-                .map_err(|e| format!("Gemma 4 native: {e}"))
+                .map_err(|e| RuntimeError::Config(format!("Gemma 4 native: {e}")))
         } else {
             Ok(params)
         }
@@ -1254,9 +1257,9 @@ pub fn load_model(
 
     let take = |map: &mut std::collections::HashMap<String, InlineArray>,
                 key: &str|
-     -> Result<InlineArray, String> {
+     -> RuntimeResult<InlineArray> {
         map.remove(key)
-            .ok_or_else(|| format!("Gemma 4 native: missing weight {key}"))
+            .ok_or_else(|| RuntimeError::Config(format!("Gemma 4 native: missing weight {key}")))
     };
 
     // ⚠️ Not from `embed_tokens.weight`: on a quantized checkpoint that is the
@@ -1273,7 +1276,7 @@ pub fn load_model(
     for (module, weight) in crate::native_loader::take_modelopt_weights(&mut raw)? {
         let native = weight
             .into_native(model_dtype)
-            .map_err(|e| format!("Gemma 4 native: {module}.weight: {e}"))?;
+            .map_err(|e| RuntimeError::Config(format!("Gemma 4 native: {module}.weight: {e}")))?;
         modelopt.insert(module, native.into_layer_weight());
     }
 
@@ -1282,13 +1285,13 @@ pub fn load_model(
     // `{path}.scales` is in the weights.
     let mut take_proj = |map: &mut std::collections::HashMap<String, InlineArray>,
                          module: &str|
-     -> Result<LayerWeight, String> {
+     -> RuntimeResult<LayerWeight> {
         if let Some(weight) = modelopt.remove(module) {
             return Ok(weight);
         }
-        let weight = map
-            .remove(&format!("{module}.weight"))
-            .ok_or_else(|| format!("Gemma 4 native: missing weight {module}.weight"))?;
+        let weight = map.remove(&format!("{module}.weight")).ok_or_else(|| {
+            RuntimeError::Config(format!("Gemma 4 native: missing weight {module}.weight"))
+        })?;
         let scales = map.remove(&format!("{module}.scales"));
         let biases = map.remove(&format!("{module}.biases"));
         let params = params_for_tensors(module, &scales, &biases)?;
@@ -1369,14 +1372,14 @@ pub fn load_model(
             .map(|p| InlineArray::from_f32_slice(&p, &[p.len() as i32]));
         let shared_source = if idx >= first_kv_shared_layer_idx && first_kv_shared_layer_idx > 0 {
             Some(config.kv_shared_source_layer(idx).ok_or_else(|| {
-                format!(
+                RuntimeError::Config(format!(
                     "Gemma 4 native: no KV-sharing source layer found for layer {idx} ({})",
                     if is_full {
                         "full_attention"
                     } else {
                         "sliding_attention"
                     }
-                )
+                ))
             })?)
         } else {
             None
@@ -1422,7 +1425,7 @@ pub fn load_model(
                     )
                 } else if raw.contains_key(&format!("{experts}.switch_glu.gate_proj.weight")) {
                     // MLX-format checkpoints stack experts as `switch_glu.*`, `[E, out, in]`.
-                    let mut stacked = |name: &str| -> Result<LayerWeight, String> {
+                    let mut stacked = |name: &str| -> RuntimeResult<LayerWeight> {
                         let module = format!("{experts}.switch_glu.{name}");
                         if raw.contains_key(&format!("{module}.scales")) {
                             return take_proj(&mut raw, &module);
@@ -1440,12 +1443,13 @@ pub fn load_model(
                 } else {
                     // One module per expert, as NVIDIA ModelOpt ships them.
                     let num_experts = config.num_experts.unwrap_or_default();
-                    let mut per_expert = |name: &str| -> Result<LayerWeight, String> {
+                    let mut per_expert = |name: &str| -> RuntimeResult<LayerWeight> {
                         let mut parts = Vec::with_capacity(num_experts as usize);
                         for e in 0..num_experts {
                             parts.push(take_proj(&mut raw, &format!("{experts}.{e}.{name}"))?);
                         }
-                        LayerWeight::stack(parts).map_err(|e| format!("{experts}.*.{name}: {e}"))
+                        LayerWeight::stack(parts)
+                            .map_err(|e| RuntimeError::Config(format!("{experts}.*.{name}: {e}")))
                     };
                     (
                         per_expert("gate_proj")?,
@@ -1541,9 +1545,9 @@ pub fn load_model(
     if !modelopt.is_empty() {
         let mut unused: Vec<&String> = modelopt.keys().collect();
         unused.sort();
-        return Err(format!(
+        return Err(RuntimeError::Config(format!(
             "Gemma 4 native: quantized modules with no place in the model: {unused:?}"
-        ));
+        )));
     }
 
     // Pre-cast scalars once so the forward step never constructs an
@@ -2062,7 +2066,7 @@ mod tests {
             (Some("proportional"), 0.25, Some(8.0), "proportional"),
         ] {
             let err = gemma4_layer_rope(256, rope_type, 1e6, partial, factor, true).unwrap_err();
-            assert!(err.contains(needle), "{err}");
+            assert!(err.to_string().contains(needle), "{err}");
         }
     }
 
@@ -2263,7 +2267,7 @@ mod tests {
             (r#", "hidden_activation": "silu""#, "hidden_activation"),
         ] {
             let err = parse_config_text(&minimal_config(extra)).expect_err(extra);
-            assert!(err.contains(needle), "{extra}: {err}");
+            assert!(err.to_string().contains(needle), "{extra}: {err}");
         }
         // Vision-only bidirectionality leaves a text prompt causal.
         parse_config_text(&minimal_config(

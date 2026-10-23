@@ -392,7 +392,7 @@ impl Qwen4ExpConfig {
     /// `hidden_act`), resolved as for the rest of the Qwen3.5 family.
     pub fn gate_activation(&self) -> Result<GateActivation, Exception> {
         GateActivation::resolve(self.output_gate_type.as_deref(), Some(&self.hidden_act))
-            .map_err(Exception::custom)
+            .map_err(Exception::from)
     }
 
     /// RoPE as the reference resolves it: `rope_scaling` replaces

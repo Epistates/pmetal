@@ -373,7 +373,7 @@ mod tests {
             RuntimeError::CxxException(msg) => {
                 assert!(msg.contains("[matmul]"), "expected op tag, got: {msg}");
             }
-            RuntimeError::Unknown(msg) => panic!("expected CxxException, got Unknown: {msg}"),
+            other => panic!("expected CxxException, got: {other}"),
         }
 
         // The error slot must have been cleared on read.

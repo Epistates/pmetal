@@ -326,8 +326,8 @@ mod tests {
             crate::RuntimeError::CxxException(msg) => {
                 assert!(msg.contains("[matmul]"), "expected op tag, got {msg}");
             }
-            crate::RuntimeError::Unknown(msg) => {
-                panic!("expected CxxException, got Unknown: {msg}");
+            other => {
+                panic!("expected CxxException, got {other}");
             }
         }
     }

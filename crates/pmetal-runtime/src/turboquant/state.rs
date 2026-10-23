@@ -4,6 +4,7 @@
 //! distinct `(head dim, bits)`, so a model builds it once and shares it, in
 //! an `Arc`, between all its layers.
 
+use crate::RuntimeResult;
 use std::sync::Arc;
 
 use super::config::{TurboQuantConfig, TurboQuantTensorConfig};
@@ -20,7 +21,7 @@ impl TurboQuantState {
     /// Build the state for `key_dim`-wide keys and `value_dim`-wide values.
     /// Fails when the configuration asks for something the cache does not
     /// support.
-    pub fn new(key_dim: usize, value_dim: usize, config: TurboQuantConfig) -> Result<Self, String> {
+    pub fn new(key_dim: usize, value_dim: usize, config: TurboQuantConfig) -> RuntimeResult<Self> {
         config.validate()?;
         let (
             TurboQuantTensorConfig::Uniform { bits: key_bits },

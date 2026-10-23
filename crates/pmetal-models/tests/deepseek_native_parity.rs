@@ -354,7 +354,7 @@ fn native_deepseek_refuses_trunk_tensors_it_does_not_read() {
     .expect("save the weights");
     let config = load_config(dir.path()).expect("config parses");
     let err = load_model(dir.path(), &config).expect_err("an unread trunk tensor is refused");
-    assert!(err.contains(extra), "{err}");
+    assert!(err.to_string().contains(extra), "{err}");
     // The same checkpoint without it loads, MTP layer and all.
     entries.pop();
     Array::save_safetensors(

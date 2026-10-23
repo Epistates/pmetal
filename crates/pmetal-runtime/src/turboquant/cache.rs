@@ -19,6 +19,7 @@
 //! A decode step attends to all three parts in one pass (see
 //! `cpp/bridge_turboquant_attention.cpp`), reading the cold part packed.
 
+use crate::{RuntimeError, RuntimeResult};
 use std::sync::Arc;
 
 use crate::InlineArray;
@@ -185,27 +186,23 @@ impl QuantizedKvCache {
         }
     }
 
-    fn ensure_layout(
-        &mut self,
-        keys: &InlineArray,
-        values: &InlineArray,
-    ) -> Result<Layout, String> {
+    fn ensure_layout(&mut self, keys: &InlineArray, values: &InlineArray) -> RuntimeResult<Layout> {
         if keys.ndim() != 4 || values.ndim() != 4 {
-            return Err(format!(
+            return Err(RuntimeError::Config(format!(
                 "TurboQuant: expected [B, H, S, D] keys and values, got {} and {} dimensions",
                 keys.ndim(),
                 values.ndim()
-            ));
+            )));
         }
         if keys.dim(0) != values.dim(0)
             || keys.dim(1) != values.dim(1)
             || keys.dim(2) != values.dim(2)
         {
-            return Err(format!(
+            return Err(RuntimeError::Config(format!(
                 "TurboQuant: keys {:?} and values {:?} disagree on batch, heads or length",
                 keys.shape(),
                 values.shape()
-            ));
+            )));
         }
         let seen = (
             keys.dim(0) as usize,
@@ -214,16 +211,16 @@ impl QuantizedKvCache {
             values.dim(3) as usize,
         );
         if seen.2 % 4 != 0 {
-            return Err(format!(
+            return Err(RuntimeError::Config(format!(
                 "TurboQuant: the key head dimension must be a multiple of 4, got {}",
                 seen.2
-            ));
+            )));
         }
         if let Some(layout) = self.layout {
             if (layout.batch, layout.heads, layout.dim, layout.value_dim) != seen {
-                return Err(format!(
+                return Err(RuntimeError::Config(format!(
                     "TurboQuant: the cache holds [{}, {}, *, {}] keys and [.., {}] values, \
-                     cannot append [{}, {}, *, {}] keys and [.., {}] values",
+                 cannot append [{}, {}, *, {}] keys and [.., {}] values",
                     layout.batch,
                     layout.heads,
                     layout.dim,
@@ -232,7 +229,7 @@ impl QuantizedKvCache {
                     seen.1,
                     seen.2,
                     seen.3
-                ));
+                )));
             }
             return Ok(layout);
         }
@@ -256,14 +253,14 @@ impl QuantizedKvCache {
             }
         };
         if state.keys.dim() != layout.dim || state.values.dim() != layout.value_dim {
-            return Err(format!(
+            return Err(RuntimeError::Config(format!(
                 "TurboQuant: the shared state quantizes {}-wide keys and {}-wide values, \
-                 the cache is being given {} and {}",
+             the cache is being given {} and {}",
                 state.keys.dim(),
                 state.values.dim(),
                 layout.dim,
                 layout.value_dim
-            ));
+            )));
         }
         let ring_capacity = self
             .config
@@ -292,7 +289,7 @@ impl QuantizedKvCache {
     }
 
     /// Append `[B, H, S, D]` keys and `[B, H, S, Dv]` values.
-    pub fn append(&mut self, keys: &InlineArray, values: &InlineArray) -> Result<(), String> {
+    pub fn append(&mut self, keys: &InlineArray, values: &InlineArray) -> RuntimeResult<()> {
         let layout = self.ensure_layout(keys, values)?;
         let seq = keys.dim(2) as usize;
         if seq == 0 {
@@ -376,7 +373,7 @@ impl QuantizedKvCache {
     }
 
     /// Move the `n` oldest recent tokens into the cold store.
-    fn evict_ring(&mut self, n: usize) -> Result<(), String> {
+    fn evict_ring(&mut self, n: usize) -> RuntimeResult<()> {
         if n == 0 {
             return Ok(());
         }
@@ -390,7 +387,7 @@ impl QuantizedKvCache {
         keys: &InlineArray,
         values: &InlineArray,
         n: usize,
-    ) -> Result<(), String> {
+    ) -> RuntimeResult<()> {
         let layout = self.layout.expect("layout");
         let state = Arc::clone(self.state.as_ref().expect("state"));
         let cold = self.cold.as_mut().expect("cold store");
@@ -467,12 +464,12 @@ impl QuantizedKvCache {
         keys: &InlineArray,
         values: &InlineArray,
         scale: f32,
-    ) -> Result<InlineArray, String> {
+    ) -> RuntimeResult<InlineArray> {
         if keys.ndim() != 4 || keys.dim(2) != 1 || values.dim(2) != 1 || queries.dim(2) != 1 {
-            return Err(
+            return Err(RuntimeError::Config(
                 "TurboQuant direct attention requires [B, H, 1, D] single-token decode inputs"
                     .to_string(),
-            );
+            ));
         }
         self.append(keys, values)?;
         self.compute_attention(queries, scale, 0, None)
@@ -488,32 +485,35 @@ impl QuantizedKvCache {
         scale: f32,
         first_token: usize,
         sink_logits: Option<&InlineArray>,
-    ) -> Result<InlineArray, String> {
-        let layout = self
-            .layout
-            .ok_or("TurboQuant: attention over an empty cache")?;
-        let state = self.state.as_ref().ok_or("TurboQuant: no state")?;
+    ) -> RuntimeResult<InlineArray> {
+        let layout = self.layout.ok_or_else(|| {
+            RuntimeError::Config("TurboQuant: attention over an empty cache".to_string())
+        })?;
+        let state = self
+            .state
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Config("TurboQuant: no state".to_string()))?;
         if queries.ndim() != 4 || queries.dim(2) != 1 {
-            return Err(format!(
+            return Err(RuntimeError::Config(format!(
                 "TurboQuant decode attention takes [B, Hq, 1, D] queries, got {:?}",
                 queries.shape()
-            ));
+            )));
         }
         if queries.dim(0) as usize != layout.batch || queries.dim(3) as usize != layout.dim {
-            return Err(format!(
+            return Err(RuntimeError::Config(format!(
                 "TurboQuant: queries {:?} do not fit a cache of [{}, {}, *, {}]",
                 queries.shape(),
                 layout.batch,
                 layout.heads,
                 layout.dim
-            ));
+            )));
         }
         if queries.dim(1) as usize % layout.heads != 0 {
-            return Err(format!(
+            return Err(RuntimeError::Config(format!(
                 "TurboQuant: {} query heads is not a multiple of {} KV heads",
                 queries.dim(1),
                 layout.heads
-            ));
+            )));
         }
         let dense = self.dense.as_ref().expect("dense store");
         // Nothing quantized yet, nothing masked: the tokens are dense and
@@ -553,7 +553,7 @@ impl QuantizedKvCache {
         sink_logits: Option<&InlineArray>,
         layout: Layout,
         dense: &DenseStore,
-    ) -> Result<InlineArray, String> {
+    ) -> RuntimeResult<InlineArray> {
         let tokens = dense.tokens() as i32;
         let view = |store: &InlineArray, width: usize| -> InlineArray {
             let used = store
@@ -583,7 +583,7 @@ impl QuantizedKvCache {
                 &sinks.as_dtype(Dtype::Float32.as_i32()),
             ),
         };
-        crate::error::check_last_error().map_err(|err| err.to_string())?;
+        crate::error::check_last_error()?;
         Ok(out)
     }
 

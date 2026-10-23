@@ -367,7 +367,7 @@ impl Gemma4Config {
             cfg.and_then(|c| c.factor),
             is_full,
         )
-        .map_err(Exception::custom)
+        .map_err(Exception::from)
     }
 
     pub fn uses_per_layer_inputs(&self) -> bool {

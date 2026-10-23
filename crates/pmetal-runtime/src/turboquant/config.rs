@@ -1,5 +1,7 @@
 //! TurboQuant configuration: pure data, no runtime state.
 
+use crate::{RuntimeError, RuntimeResult};
+
 /// How one tensor (the keys, or the values) is quantized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurboQuantTensorConfig {
@@ -157,19 +159,19 @@ impl TurboQuantConfig {
 
     /// Whether a [`QuantizedKvCache`](super::QuantizedKvCache) can be built
     /// from this configuration.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> RuntimeResult<()> {
         for (label, tensor) in [("keys", self.keys), ("values", self.values)] {
             match tensor {
                 TurboQuantTensorConfig::Uniform { bits } if (1..=8).contains(&bits) => {}
                 TurboQuantTensorConfig::Uniform { bits } => {
-                    return Err(format!(
+                    return Err(RuntimeError::Config(format!(
                         "TurboQuant {label} bits must be in 1..=8, got {bits}"
-                    ));
+                    )));
                 }
                 TurboQuantTensorConfig::Mixed { .. } => {
-                    return Err(format!(
+                    return Err(RuntimeError::Config(format!(
                         "TurboQuant {label}: a mixed-precision tensor needs a MixedQuantizedKvCache"
-                    ));
+                    )));
                 }
             }
         }

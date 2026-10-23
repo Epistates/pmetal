@@ -75,8 +75,8 @@ pub(super) struct TurboLayer {
     cache: Cache,
 }
 
-fn failure(err: String) -> Exception {
-    Exception::custom(err)
+fn failure(err: pmetal_runtime::RuntimeError) -> Exception {
+    Exception::custom(err.to_string())
 }
 
 impl TurboLayer {

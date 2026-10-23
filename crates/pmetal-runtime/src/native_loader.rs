@@ -19,6 +19,7 @@ use crate::compat::Dtype;
 use crate::error::{check_last_error, check_unobserved_error};
 use crate::inline_array as bridge;
 use crate::native_weight::MlxQuantization;
+use crate::{RuntimeError, RuntimeResult};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -26,9 +27,10 @@ use std::path::{Path, PathBuf};
 ///
 /// Error format matches what the native loaders produced before
 /// extraction: `"failed to read {path}: {io-error}"`.
-pub fn read_config_json(model_dir: &Path) -> Result<String, String> {
+pub fn read_config_json(model_dir: &Path) -> RuntimeResult<String> {
     let path = model_dir.join("config.json");
-    std::fs::read_to_string(&path).map_err(|e| format!("failed to read {}: {e}", path.display()))
+    std::fs::read_to_string(&path)
+        .map_err(|e| RuntimeError::Weights(format!("failed to read {}: {e}", path.display())))
 }
 
 /// The quantization block of a parsed `config.json`, or `None` when the
@@ -57,10 +59,10 @@ pub fn quantization_block(config: &serde_json::Value) -> Option<&serde_json::Val
 pub fn load_mlx_quantization(
     model_dir: &Path,
     normalize: impl Fn(&str) -> Option<String>,
-) -> Result<Option<MlxQuantization>, String> {
+) -> RuntimeResult<Option<MlxQuantization>> {
     let text = read_config_json(model_dir)?;
-    let json: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("failed to parse config.json: {e}"))?;
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| RuntimeError::Weights(format!("failed to parse config.json: {e}")))?;
 
     let Some(block) = quantization_block(&json) else {
         return Ok(None);
@@ -68,10 +70,10 @@ pub fn load_mlx_quantization(
     MlxQuantization::from_json(block, normalize)
         .map(Some)
         .ok_or_else(|| {
-            format!(
+            RuntimeError::Weights(format!(
                 "unsupported quantization block in {}: {block}",
                 model_dir.join("config.json").display()
-            )
+            ))
         })
 }
 
@@ -84,7 +86,7 @@ pub fn load_mlx_quantization(
 ///    leading `/` to prevent path traversal.
 /// 3. Otherwise, returns an error that matches the legacy wording so
 ///    callers' user-facing messages do not regress.
-pub fn discover_safetensors_shards(model_dir: &Path) -> Result<Vec<PathBuf>, String> {
+pub fn discover_safetensors_shards(model_dir: &Path) -> RuntimeResult<Vec<PathBuf>> {
     let single_path = model_dir.join("model.safetensors");
     let index_path = model_dir.join("model.safetensors.index.json");
 
@@ -92,30 +94,32 @@ pub fn discover_safetensors_shards(model_dir: &Path) -> Result<Vec<PathBuf>, Str
         return Ok(vec![single_path]);
     }
     if !index_path.exists() {
-        return Err(format!(
+        return Err(RuntimeError::Weights(format!(
             "no model.safetensors or model.safetensors.index.json in {}",
             model_dir.display()
-        ));
+        )));
     }
 
     let content = std::fs::read_to_string(&index_path)
-        .map_err(|e| format!("failed to read index JSON: {e}"))?;
-    let index: serde_json::Value =
-        serde_json::from_str(&content).map_err(|e| format!("failed to parse index JSON: {e}"))?;
+        .map_err(|e| RuntimeError::Weights(format!("failed to read index JSON: {e}")))?;
+    let index: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| RuntimeError::Weights(format!("failed to parse index JSON: {e}")))?;
     let weight_map = index
         .get("weight_map")
         .and_then(|v| v.as_object())
-        .ok_or_else(|| "index JSON missing weight_map".to_string())?;
+        .ok_or_else(|| RuntimeError::Weights("index JSON missing weight_map".to_string()))?;
 
     let mut seen = std::collections::HashSet::new();
     let mut paths = Vec::new();
     for shard_file in weight_map.values() {
         let name = shard_file
             .as_str()
-            .ok_or_else(|| "shard filename is not a string".to_string())?;
+            .ok_or_else(|| RuntimeError::Weights("shard filename is not a string".to_string()))?;
         if seen.insert(name.to_string()) {
             if !is_safe_relative_path(name) {
-                return Err(format!("shard filename contains path traversal: {name}"));
+                return Err(RuntimeError::Weights(format!(
+                    "shard filename contains path traversal: {name}"
+                )));
             }
             paths.push(model_dir.join(name));
         }
@@ -145,20 +149,23 @@ fn is_safe_relative_path(path: &str) -> bool {
 pub fn load_shards_into_map(
     shard_paths: &[PathBuf],
     model_dir: &Path,
-) -> Result<HashMap<String, InlineArray>, String> {
+) -> RuntimeResult<HashMap<String, InlineArray>> {
     let mut raw: HashMap<String, InlineArray> = HashMap::new();
     for shard_path in shard_paths {
-        let path_str = shard_path
-            .to_str()
-            .ok_or_else(|| format!("non-UTF-8 shard path: {:?}", shard_path))?;
+        let path_str = shard_path.to_str().ok_or_else(|| {
+            RuntimeError::Weights(format!("non-UTF-8 shard path: {:?}", shard_path))
+        })?;
         let entries = bridge::load_safetensors_shard(path_str)
-            .ok_or_else(|| format!("failed to load shard: {path_str}"))?;
+            .ok_or_else(|| RuntimeError::Weights(format!("failed to load shard: {path_str}")))?;
         for (key, arr) in entries {
             raw.insert(key, arr);
         }
     }
     if raw.is_empty() {
-        return Err(format!("no weights loaded from {}", model_dir.display()));
+        return Err(RuntimeError::Weights(format!(
+            "no weights loaded from {}",
+            model_dir.display()
+        )));
     }
     Ok(raw)
 }
@@ -174,12 +181,12 @@ pub fn dequantize_fp8_e4m3_scaled_weight(
     weight: &InlineArray,
     scale_inv: &InlineArray,
     target_dtype: i32,
-) -> Result<InlineArray, String> {
+) -> RuntimeResult<InlineArray> {
     if weight.ndim() != 2 {
-        return Err(format!(
+        return Err(RuntimeError::Weights(format!(
             "FP8 dequant expected a 2D weight, got shape {:?}",
             weight.shape()
-        ));
+        )));
     }
 
     let w_f = fp8_e4m3_to_dtype(weight, target_dtype)?;
@@ -204,11 +211,11 @@ pub fn dequantize_fp8_e4m3_scaled_weight(
         }
         1 if scale_inv.dim(0) == 1 => multiply_by_scale_inv(&w_f, scale_inv, None, target_dtype),
         0 => multiply_by_scale_inv(&w_f, scale_inv, None, target_dtype),
-        _ => Err(format!(
+        _ => Err(RuntimeError::Weights(format!(
             "unsupported FP8 scale_inv shape {:?} for weight shape {:?}",
             scale_inv.shape(),
             weight.shape()
-        )),
+        ))),
     }
 }
 
@@ -247,7 +254,7 @@ impl ModelOptWeight {
     /// Rounds once. An fp4 value carries at most two significant bits and an
     /// e4m3 scale four, so their product is exact in bfloat16, and the only
     /// rounding is the fp32 multiply by the tensor scale.
-    pub fn to_dense(&self, dtype: i32) -> Result<InlineArray, String> {
+    pub fn to_dense(&self, dtype: i32) -> RuntimeResult<InlineArray> {
         let f32_dtype = Dtype::Float32.as_i32();
         let dense = match self {
             Self::Nvfp4 {
@@ -264,7 +271,8 @@ impl ModelOptWeight {
             } => fp8_e4m3_to_dtype(weight, f32_dtype)?.multiply(tensor_scale),
         };
         let dense = dense.as_dtype(dtype);
-        check_unobserved_error().map_err(|e| format!("ModelOpt dequantize: {e}"))?;
+        check_unobserved_error()
+            .map_err(|e| RuntimeError::Weights(format!("ModelOpt dequantize: {e}")))?;
         Ok(dense)
     }
 }
@@ -314,7 +322,7 @@ impl ModelOptWeight {
     /// scale at 2^0, so the product is exact where re-quantizing to mxfp8
     /// would round each element a second time. A width the mxfp8 kernel cannot
     /// tile goes dense.
-    pub fn into_native(self, dtype: i32) -> Result<NativeModelOpt, String> {
+    pub fn into_native(self, dtype: i32) -> RuntimeResult<NativeModelOpt> {
         const MXFP8_GROUP: i32 = 32;
         /// The e8m0 byte for 2^0: an mxfp8 block scale that leaves a value alone.
         const E8M0_ONE: f32 = 127.0;
@@ -353,7 +361,7 @@ impl ModelOptWeight {
 /// Shapes are checked here, once, for every loader.
 pub fn take_modelopt_weights(
     raw: &mut HashMap<String, InlineArray>,
-) -> Result<Vec<(String, ModelOptWeight)>, String> {
+) -> RuntimeResult<Vec<(String, ModelOptWeight)>> {
     const U8: i32 = 1;
     const U32: i32 = 3;
     let f32_dtype = Dtype::Float32.as_i32();
@@ -367,31 +375,31 @@ pub fn take_modelopt_weights(
     let mut taken = Vec::with_capacity(bases.len());
     for base in bases {
         let weight_key = format!("{base}.weight");
-        let scale = raw
-            .remove(&format!("{base}.weight_scale"))
-            .ok_or_else(|| format!("ModelOpt sidecar disappeared during load: {base}"))?;
-        let weight = raw
-            .remove(&weight_key)
-            .ok_or_else(|| format!("ModelOpt scale {base}.weight_scale has no weight"))?;
+        let scale = raw.remove(&format!("{base}.weight_scale")).ok_or_else(|| {
+            RuntimeError::Weights(format!("ModelOpt sidecar disappeared during load: {base}"))
+        })?;
+        let weight = raw.remove(&weight_key).ok_or_else(|| {
+            RuntimeError::Weights(format!("ModelOpt scale {base}.weight_scale has no weight"))
+        })?;
         raw.remove(&format!("{base}.input_scale"));
 
         if weight.dtype_raw() != U8 || weight.ndim() != 2 {
-            return Err(format!(
+            return Err(RuntimeError::Weights(format!(
                 "{weight_key}: expected a 2D uint8 ModelOpt weight, got dtype {} shape {:?}",
                 weight.dtype_raw(),
                 weight.shape()
-            ));
+            )));
         }
 
         let entry = if let Some(scale_2) = raw.remove(&format!("{base}.weight_scale_2")) {
             // Two fp4 values per byte, one e4m3 scale per 16 values.
             let in_dim = weight.dim(1) * 2;
             if scale.dtype_raw() != U8 || scale.dim(1) * 16 != in_dim || in_dim % 8 != 0 {
-                return Err(format!(
+                return Err(RuntimeError::Weights(format!(
                     "{weight_key}: nvfp4 scales {:?} do not match weight {:?}",
                     scale.shape(),
                     weight.shape()
-                ));
+                )));
             }
             ModelOptWeight::Nvfp4 {
                 packed: weight.view(U32),
@@ -400,10 +408,10 @@ pub fn take_modelopt_weights(
             }
         } else {
             if scale.size() != 1 {
-                return Err(format!(
+                return Err(RuntimeError::Weights(format!(
                     "{weight_key}: only per-tensor ModelOpt fp8 is supported, got weight_scale {:?}",
                     scale.shape()
-                ));
+                )));
             }
             ModelOptWeight::Fp8 {
                 weight,
@@ -433,15 +441,16 @@ pub fn quant_sidecar_base(key: &str) -> Option<&str> {
     .find_map(|suffix| key.strip_suffix(suffix))
 }
 
-fn fp8_e4m3_to_dtype(weight: &InlineArray, target_dtype: i32) -> Result<InlineArray, String> {
+fn fp8_e4m3_to_dtype(weight: &InlineArray, target_dtype: i32) -> RuntimeResult<InlineArray> {
     if weight.dtype_raw() == Dtype::Uint8.as_i32() {
-        return weight
-            .try_from_fp8(target_dtype)
-            .map_err(|e| format!("failed to dequantize uint8 E4M3 payload: {e}"));
+        return weight.try_from_fp8(target_dtype).map_err(|e| {
+            RuntimeError::Weights(format!("failed to dequantize uint8 E4M3 payload: {e}"))
+        });
     }
 
     let out = weight.as_dtype(target_dtype);
-    check_last_error().map_err(|e| format!("failed to cast FP8 E4M3 weight: {e}"))?;
+    check_last_error()
+        .map_err(|e| RuntimeError::Weights(format!("failed to cast FP8 E4M3 weight: {e}")))?;
     Ok(out)
 }
 
@@ -451,7 +460,7 @@ fn dequantize_fp8_e4m3_block_scaled(
     target_dtype: i32,
     block_m: i32,
     block_n: i32,
-) -> Result<InlineArray, String> {
+) -> RuntimeResult<InlineArray> {
     let m = weight.dim(0);
     let n = weight.dim(1);
     let bs = 128i32;
@@ -461,7 +470,8 @@ fn dequantize_fp8_e4m3_block_scaled(
     let w_padded = if m != m_pad || n != n_pad {
         let padded = InlineArray::zeros(&[m_pad, n_pad], target_dtype);
         let out = padded.slice_set(weight, &[0, 0], &[m, n]);
-        check_last_error().map_err(|e| format!("failed to pad FP8 weight: {e}"))?;
+        check_last_error()
+            .map_err(|e| RuntimeError::Weights(format!("failed to pad FP8 weight: {e}")))?;
         out
     } else {
         weight.clone()
@@ -469,20 +479,26 @@ fn dequantize_fp8_e4m3_block_scaled(
 
     let reshaped = w_padded
         .try_reshape(&[block_m, bs, block_n, bs])
-        .map_err(|e| format!("failed to reshape FP8 weight blocks: {e}"))?;
+        .map_err(|e| RuntimeError::Weights(format!("failed to reshape FP8 weight blocks: {e}")))?;
     let scale = scale_inv
         .try_reshape(&[block_m, 1, block_n, 1])
-        .map_err(|e| format!("failed to reshape FP8 scale_inv blocks: {e}"))?;
+        .map_err(|e| {
+            RuntimeError::Weights(format!("failed to reshape FP8 scale_inv blocks: {e}"))
+        })?;
     let scale = cast_scale_inv(&scale, target_dtype)?;
     let scaled = reshaped.multiply(&scale);
-    check_last_error().map_err(|e| format!("failed to apply FP8 scale_inv: {e}"))?;
+    check_last_error()
+        .map_err(|e| RuntimeError::Weights(format!("failed to apply FP8 scale_inv: {e}")))?;
 
-    let back = scaled
-        .try_reshape(&[m_pad, n_pad])
-        .map_err(|e| format!("failed to restore FP8 dequantized weight shape: {e}"))?;
+    let back = scaled.try_reshape(&[m_pad, n_pad]).map_err(|e| {
+        RuntimeError::Weights(format!(
+            "failed to restore FP8 dequantized weight shape: {e}"
+        ))
+    })?;
     if m != m_pad || n != n_pad {
         let out = back.slice(&[0, 0], &[m, n]);
-        check_last_error().map_err(|e| format!("failed to unpad FP8 weight: {e}"))?;
+        check_last_error()
+            .map_err(|e| RuntimeError::Weights(format!("failed to unpad FP8 weight: {e}")))?;
         Ok(out)
     } else {
         Ok(back)
@@ -494,23 +510,25 @@ fn multiply_by_scale_inv(
     scale_inv: &InlineArray,
     reshape: Option<&[i32]>,
     target_dtype: i32,
-) -> Result<InlineArray, String> {
+) -> RuntimeResult<InlineArray> {
     let scale = if let Some(shape) = reshape {
         scale_inv
             .try_reshape(shape)
-            .map_err(|e| format!("failed to reshape FP8 scale_inv: {e}"))?
+            .map_err(|e| RuntimeError::Weights(format!("failed to reshape FP8 scale_inv: {e}")))?
     } else {
         scale_inv.clone()
     };
     let scale = cast_scale_inv(&scale, target_dtype)?;
     let out = weight.multiply(&scale);
-    check_last_error().map_err(|e| format!("failed to apply FP8 scale_inv: {e}"))?;
+    check_last_error()
+        .map_err(|e| RuntimeError::Weights(format!("failed to apply FP8 scale_inv: {e}")))?;
     Ok(out)
 }
 
-fn cast_scale_inv(scale_inv: &InlineArray, target_dtype: i32) -> Result<InlineArray, String> {
+fn cast_scale_inv(scale_inv: &InlineArray, target_dtype: i32) -> RuntimeResult<InlineArray> {
     let out = scale_inv.as_dtype(target_dtype);
-    check_last_error().map_err(|e| format!("failed to cast FP8 scale_inv: {e}"))?;
+    check_last_error()
+        .map_err(|e| RuntimeError::Weights(format!("failed to cast FP8 scale_inv: {e}")))?;
     Ok(out)
 }
 
