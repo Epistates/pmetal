@@ -416,12 +416,15 @@ pub struct CompletionRequest {
 pub struct CompletionLogprobs {
     /// Decoded token strings, in generation order.
     pub tokens: Vec<String>,
-    /// Per-token log-probabilities, aligned 1:1 with `tokens`.
-    pub token_logprobs: Vec<f32>,
-    /// Per-token alternative maps: `{token_string: logprob}` for the top-N
-    /// alternatives at each position. Empty map when the caller requested
-    /// `logprobs: 0` (chosen-token logprob only).
-    pub top_logprobs: Vec<std::collections::HashMap<String, f32>>,
+    /// Per-token log-probabilities, aligned 1:1 with `tokens`. `null` for the
+    /// first token of an echoed prompt, which has nothing before it to be
+    /// predicted from.
+    pub token_logprobs: Vec<Option<f32>>,
+    /// Per-token maps `{token_string: logprob}` of the `logprobs` most likely
+    /// tokens at each position, the chosen one among them when it is one of
+    /// them. Empty when the caller requested `logprobs: 0`. `null` where
+    /// `token_logprobs` is.
+    pub top_logprobs: Vec<Option<std::collections::HashMap<String, f32>>>,
     /// Byte offset into the returned `text` where each token starts.
     pub text_offset: Vec<usize>,
 }

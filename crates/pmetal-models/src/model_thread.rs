@@ -14,7 +14,8 @@
 //! Callers on any thread queue closures and get results back over channels
 //! they pass in. The state itself never moves, so it need not be `Send`.
 
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 
 type Job<S> = Box<dyn FnOnce(&mut S) + Send>;
 type BackgroundFn<S> = Box<dyn FnMut(&mut S) -> Background + Send>;
@@ -70,12 +71,15 @@ impl<E: std::fmt::Debug + std::fmt::Display> std::error::Error for ModelThreadSt
 /// finishes the jobs already queued, drops the state and exits.
 pub struct ModelThread<S> {
     jobs: mpsc::Sender<Job<S>>,
+    /// Jobs queued and not yet started.
+    pending: Arc<AtomicUsize>,
 }
 
 impl<S> Clone for ModelThread<S> {
     fn clone(&self) -> Self {
         Self {
             jobs: self.jobs.clone(),
+            pending: Arc::clone(&self.pending),
         }
     }
 }
@@ -111,6 +115,8 @@ impl<S: 'static> ModelThread<S> {
         background: Option<BackgroundFn<S>>,
     ) -> Result<Self, ModelThreadStartError<E>> {
         let (jobs, queue) = mpsc::channel::<Job<S>>();
+        let pending = Arc::new(AtomicUsize::new(0));
+        let waiting = Arc::clone(&pending);
         let (ready, built) = mpsc::sync_channel::<Result<(), E>>(1);
         std::thread::Builder::new()
             .name(name.to_string())
@@ -124,14 +130,14 @@ impl<S: 'static> ModelThread<S> {
                 };
                 let _ = ready.send(Ok(()));
                 drop(ready);
-                run(&mut state, &queue, background);
+                run(&mut state, &queue, &waiting, background);
                 // The state's arrays go first, then the streams they ran on.
                 drop(state);
                 pmetal_runtime::inline_array::release_thread_streams();
             })
             .map_err(ModelThreadStartError::Spawn)?;
         match built.recv() {
-            Ok(Ok(())) => Ok(Self { jobs }),
+            Ok(Ok(())) => Ok(Self { jobs, pending }),
             Ok(Err(e)) => Err(ModelThreadStartError::Init(e)),
             // The sender went away without a word: `init` panicked.
             Err(_) => Err(ModelThreadStartError::InitPanicked),
@@ -145,7 +151,17 @@ impl<S: 'static> ModelThread<S> {
         &self,
         job: impl FnOnce(&mut S) + Send + 'static,
     ) -> Result<(), ModelThreadExited> {
-        self.jobs.send(Box::new(job)).map_err(|_| ModelThreadExited)
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        self.jobs.send(Box::new(job)).map_err(|_| {
+            self.pending.fetch_sub(1, Ordering::Relaxed);
+            ModelThreadExited
+        })
+    }
+
+    /// How many jobs are queued behind the one running: submitted, and not
+    /// yet started.
+    pub fn pending(&self) -> usize {
+        self.pending.load(Ordering::Relaxed)
     }
 
     /// Run `job` on the thread and block this one until it returns. Not for
@@ -162,7 +178,12 @@ impl<S: 'static> ModelThread<S> {
     }
 }
 
-fn run<S>(state: &mut S, queue: &mpsc::Receiver<Job<S>>, mut background: Option<BackgroundFn<S>>) {
+fn run<S>(
+    state: &mut S,
+    queue: &mpsc::Receiver<Job<S>>,
+    pending: &AtomicUsize,
+    mut background: Option<BackgroundFn<S>>,
+) {
     // A panic in one request must not take the others down with it. The
     // panicking job drops its reply channel, which tells its caller.
     fn guarded<T>(what: &str, f: impl FnOnce() -> T) -> Option<T> {
@@ -193,6 +214,7 @@ fn run<S>(state: &mut S, queue: &mpsc::Receiver<Job<S>>, mut background: Option<
                 Err(_) => return,
             },
         };
+        pending.fetch_sub(1, Ordering::Relaxed);
         guarded("a model job", || job(state));
         // The job may have given the background work something to do.
         idle = false;
@@ -255,6 +277,31 @@ mod tests {
         let err =
             pmetal_runtime::check_unobserved_error().expect_err("cross-thread eval must fail");
         assert!(err.to_string().contains("Stream"), "{err}");
+    }
+
+    /// `pending` counts the jobs waiting behind the running one, and falls
+    /// back to zero as they start.
+    #[test]
+    fn pending_counts_the_jobs_waiting() {
+        let thread = ModelThread::spawn("test-model", || Ok::<_, ()>(())).unwrap();
+        assert_eq!(thread.pending(), 0);
+        let (started, running) = mpsc::sync_channel::<()>(0);
+        let (release, held) = mpsc::sync_channel::<()>(0);
+        thread
+            .submit(move |_: &mut ()| {
+                started.send(()).unwrap();
+                held.recv().unwrap();
+            })
+            .unwrap();
+        running.recv().unwrap();
+        assert_eq!(thread.pending(), 0, "the running job is not waiting");
+        for _ in 0..3 {
+            thread.submit(|_: &mut ()| {}).unwrap();
+        }
+        assert_eq!(thread.pending(), 3);
+        release.send(()).unwrap();
+        thread.call(|_: &mut ()| ()).unwrap();
+        assert_eq!(thread.pending(), 0);
     }
 
     #[test]

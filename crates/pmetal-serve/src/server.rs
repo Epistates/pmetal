@@ -84,10 +84,13 @@ pub fn build_router(engine: InferenceEngine, max_concurrent: usize) -> Router {
 
 /// Build the axum router with all routes, under `config`.
 pub fn build_router_with(engine: InferenceEngine, config: &ServeConfig) -> Router {
+    let permits = config.max_concurrent.max(1);
     let state = Arc::new(AppState {
+        telemetry: crate::telemetry::Telemetry::new(engine.model_id()),
         engine,
         metrics: ServingMetrics::default(),
-        request_permits: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent.max(1))),
+        request_permits: Arc::new(tokio::sync::Semaphore::new(permits)),
+        configured_permits: permits,
         request_timeout: config.request_timeout,
         max_choices: config.max_choices.max(1),
     });
@@ -97,6 +100,7 @@ pub fn build_router_with(engine: InferenceEngine, config: &ServeConfig) -> Route
         .route("/v1/models", axum::routing::get(routes::list_models))
         .route("/v1/models/{*id}", axum::routing::get(routes::get_model))
         .route("/v1/metrics", axum::routing::get(routes::serving_metrics))
+        .route("/metrics", axum::routing::get(crate::telemetry::metrics))
         .route(
             "/v1/chat/completions",
             axum::routing::post(routes::chat_completions),
@@ -105,6 +109,10 @@ pub fn build_router_with(engine: InferenceEngine, config: &ServeConfig) -> Route
         .route("/v1/embeddings", axum::routing::post(routes::embeddings))
         .route("/v1/messages", axum::routing::post(anthropic::messages))
         .route(
+            "/v1/messages/count_tokens",
+            axum::routing::post(anthropic::count_tokens),
+        )
+        .route(
             "/v1/responses",
             axum::routing::post(crate::responses::responses),
         )
@@ -112,7 +120,13 @@ pub fn build_router_with(engine: InferenceEngine, config: &ServeConfig) -> Route
             "/v1/systemone",
             axum::routing::post(crate::decision::not_a_decision_model),
         );
-    harden(router, config).with_state(state)
+    // Outermost, so a request the API key refuses is counted too.
+    harden(router, config)
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            crate::telemetry::track_http,
+        ))
+        .with_state(state)
 }
 
 /// The layers every router of this server carries, outermost last: request

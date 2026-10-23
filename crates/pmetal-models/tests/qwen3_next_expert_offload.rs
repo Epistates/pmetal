@@ -229,6 +229,7 @@ fn models() -> Models {
         checkpoint.path(),
         DynamicModelLoadOptions {
             prefer_expert_offload: true,
+            ..Default::default()
         },
     )
     .expect("offloaded loads");

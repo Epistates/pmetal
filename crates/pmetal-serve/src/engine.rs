@@ -3,7 +3,7 @@
 use crate::continuous_pump::ContinuousPump;
 use crate::error::{ServeError, ServeResult};
 use crate::types::ChatMessage;
-use pmetal_cache::kv_cache::{CacheMode, KVCache, KVCacheConfig, MambaCache};
+use pmetal_cache::kv_cache::{KVCache, KVCacheConfig, MambaCache};
 use pmetal_data::chat_templates::{ChatTemplate, ChatTemplateType, detect_chat_template};
 use pmetal_data::image_processing::{
     MllamaImageProcessor, MllamaImageProcessorConfig, mllama_cross_attention_mask,
@@ -12,14 +12,17 @@ use pmetal_data::inference_config::collect_all_stop_tokens;
 use pmetal_data::qwen_vl_processing::{ProcessedMedia, QwenVlProcessor, RgbImage};
 use pmetal_models::architectures::mllama::{CrossAttentionInputs, MllamaVisionInputs};
 use pmetal_models::architectures::qwen3_5_vision::{Qwen3_5MultimodalConfig, Qwen3_5Vision};
+use pmetal_models::cache_policy::{
+    CacheModeRequest, log_cache_selection, select_cache_mode_for_model,
+};
 use pmetal_models::dispatcher::DynamicModel;
 use pmetal_models::generation::GenerationConfig;
 use pmetal_models::model_thread::{Background, ModelThread, ModelThreadStartError};
+use pmetal_models::speculator::Speculator;
+pub use pmetal_models::speculator::SpeculatorSpec;
 use pmetal_models::{GenerationOutput, generate_cached_ane_streaming, is_ane_inference_compatible};
 use pmetal_runtime::compat::{Array, Dtype, ModuleParameters as _};
 use pmetal_runtime::decode::DecodeSampler;
-use std::collections::HashSet;
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -50,6 +53,13 @@ pub struct SamplingParams {
     /// includes the top-`n` alternative logprobs. `None` (default) skips
     /// logprob computation entirely to keep the hot path unchanged.
     pub logprobs_top_n: Option<usize>,
+    /// When `Some(n)`, also score the prompt: the log-probability of each
+    /// prompt token after the first, given the tokens before it, with the top
+    /// `n` alternatives (OpenAI's `echo` with `logprobs`). It arrives as one
+    /// [`TokenEvent::PromptLogprobs`] ahead of the first token. The prompt is
+    /// prefilled in full, bypassing the prefix cache, and a request that asks
+    /// for this may set `max_tokens` to 0 to only score.
+    pub prompt_logprobs_top_n: Option<usize>,
     /// A grammar the output must conform to (see [`crate::structured`]),
     /// enforced by masking the logits at every step through the request's own
     /// sampler, in a batch as well as alone.
@@ -89,6 +99,27 @@ pub struct RequestMetrics {
     pub cached_prompt_tokens: usize,
     /// Number of completion tokens.
     pub completion_tokens: usize,
+    /// What speculative decoding did for this request, when it ran.
+    pub speculative: Option<SpeculativeUsage>,
+}
+
+/// How a speculative decode fared: tokens proposed by the draft model or MTP
+/// head and how many of them the target model kept.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpeculativeUsage {
+    pub drafted_tokens: usize,
+    pub accepted_tokens: usize,
+}
+
+impl SpeculativeUsage {
+    /// Fraction of drafted tokens accepted; 0 when none were drafted.
+    pub fn acceptance_rate(&self) -> f64 {
+        if self.drafted_tokens == 0 {
+            0.0
+        } else {
+            self.accepted_tokens as f64 / self.drafted_tokens as f64
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -104,6 +135,10 @@ pub enum TokenEvent {
         id: u32,
         logprob: Option<TokenLogprobEntry>,
     },
+    /// The prompt's own log-probabilities, once, before any token: one entry
+    /// per prompt token after the first (`token` is that prompt token), for a
+    /// request that set `SamplingParams::prompt_logprobs_top_n`.
+    PromptLogprobs(Vec<TokenLogprobEntry>),
     /// Generation is complete — carries finish reason and final metrics.
     Done {
         finish_reason: String,
@@ -130,6 +165,8 @@ enum StepOutcome {
 
 /// Aggregated result of a single async decode run.
 struct DecodeRun {
+    /// What speculative decoding did, when the request ran on it.
+    speculative: Option<SpeculativeUsage>,
     /// Prompt tokens restored from the prefix cache.
     cached_prompt_tokens: usize,
     /// Finish reason: `"length"`, `"stop"`, or `"cancelled"`.
@@ -144,32 +181,6 @@ struct DecodeRun {
 enum PreferredGenerationBackend {
     Gpu,
     Ane,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ServeCacheModeSource {
-    AutoFp16,
-    AutoQ8,
-    Explicit,
-}
-
-impl ServeCacheModeSource {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::AutoFp16 => "auto-fp16",
-            Self::AutoQ8 => "auto-q8",
-            Self::Explicit => "explicit",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ServeCacheModeSelection {
-    mode: CacheMode,
-    source: ServeCacheModeSource,
-    estimated_weight_bytes: u64,
-    estimated_fp16_kv_bytes: u64,
-    working_set_bytes: Option<u64>,
 }
 
 fn build_generation_config_from_parts(
@@ -313,165 +324,6 @@ fn select_accelerated_backend(
     Ok(PreferredGenerationBackend::Ane)
 }
 
-fn select_serve_cache_mode(
-    model_path: &Path,
-    param_count: usize,
-    base_cache_config: &KVCacheConfig,
-) -> ServeCacheModeSelection {
-    let working_set_bytes = pmetal_metal::context::MetalContext::global()
-        .ok()
-        .map(|ctx| ctx.properties().recommended_working_set_size);
-    let estimated_weight_bytes = estimate_serve_weight_bytes(
-        model_path,
-        estimate_weight_bytes_from_param_count(param_count),
-    );
-
-    select_serve_cache_mode_with_working_set(
-        base_cache_config,
-        estimated_weight_bytes,
-        working_set_bytes,
-    )
-}
-
-fn select_serve_cache_mode_with_working_set(
-    base_cache_config: &KVCacheConfig,
-    estimated_weight_bytes: u64,
-    working_set_bytes: Option<u64>,
-) -> ServeCacheModeSelection {
-    let estimated_fp16_kv_bytes = estimate_fp16_kv_cache_bytes(base_cache_config);
-    let estimated_total_fp16 = estimated_weight_bytes.saturating_add(estimated_fp16_kv_bytes);
-    let prefer_q8 = working_set_bytes.is_some_and(|working_set| {
-        working_set > 0 && estimated_total_fp16 > ((working_set as f64) * 0.70) as u64
-    });
-
-    ServeCacheModeSelection {
-        mode: if prefer_q8 {
-            CacheMode::Quantized {
-                bits: 8,
-                group_size: 64,
-            }
-        } else {
-            CacheMode::Standard
-        },
-        source: if prefer_q8 {
-            ServeCacheModeSource::AutoQ8
-        } else {
-            ServeCacheModeSource::AutoFp16
-        },
-        estimated_weight_bytes,
-        estimated_fp16_kv_bytes,
-        working_set_bytes,
-    }
-}
-
-fn log_serve_cache_selection(selection: &ServeCacheModeSelection, max_seq_len: usize) {
-    let estimated_weight_gb = selection.estimated_weight_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-    let estimated_fp16_kv_gb =
-        selection.estimated_fp16_kv_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-    let working_set_gb = selection
-        .working_set_bytes
-        .map(|bytes| bytes as f64 / (1024.0 * 1024.0 * 1024.0));
-
-    tracing::info!(
-        mode = %selection.mode.describe(),
-        source = selection.source.as_str(),
-        tokens = max_seq_len,
-        estimated_weight_gb = format!("{estimated_weight_gb:.2}"),
-        estimated_fp16_kv_gb = format!("{estimated_fp16_kv_gb:.2}"),
-        working_set_gb = working_set_gb.map(|value| format!("{value:.2}")),
-        "serve KV cache"
-    );
-}
-
-fn estimate_serve_weight_bytes(model_path: &Path, param_estimate: u64) -> u64 {
-    estimate_local_model_weight_bytes(model_path)
-        .map(|bytes| bytes.max(param_estimate))
-        .unwrap_or(param_estimate)
-}
-
-fn estimate_weight_bytes_from_param_count(param_count: usize) -> u64 {
-    (param_count as f64 * 2.0) as u64
-}
-
-fn estimate_local_model_weight_bytes(model_path: &Path) -> Option<u64> {
-    let mut total = 0u64;
-    let mut visited_dirs = HashSet::new();
-    let mut counted_files = HashSet::new();
-    accumulate_model_weight_file_bytes(
-        model_path,
-        &mut visited_dirs,
-        &mut counted_files,
-        &mut total,
-    );
-    (total > 0).then_some(total)
-}
-
-fn accumulate_model_weight_file_bytes(
-    path: &Path,
-    visited_dirs: &mut HashSet<PathBuf>,
-    counted_files: &mut HashSet<PathBuf>,
-    total: &mut u64,
-) {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return;
-    };
-
-    if metadata.is_dir() {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        if !visited_dirs.insert(canonical) {
-            return;
-        }
-
-        let Ok(entries) = std::fs::read_dir(path) else {
-            return;
-        };
-
-        for entry in entries.flatten() {
-            accumulate_model_weight_file_bytes(&entry.path(), visited_dirs, counted_files, total);
-        }
-        return;
-    }
-
-    if !metadata.is_file() || !is_supported_model_weight_file(path) {
-        return;
-    }
-
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if counted_files.insert(canonical) {
-        *total = total.saturating_add(metadata.len());
-    }
-}
-
-fn is_supported_model_weight_file(path: &Path) -> bool {
-    let extension = path
-        .extension()
-        .and_then(OsStr::to_str)
-        .map(|ext| ext.to_ascii_lowercase());
-    let file_name = path
-        .file_name()
-        .and_then(OsStr::to_str)
-        .map(|name| name.to_ascii_lowercase())
-        .unwrap_or_default();
-
-    match extension.as_deref() {
-        Some("safetensors") | Some("gguf") => true,
-        Some("bin") | Some("pt") | Some("pth") => {
-            file_name.contains("model")
-                || file_name.contains("pytorch")
-                || file_name.contains("consolidated")
-        }
-        _ => false,
-    }
-}
-
-fn estimate_fp16_kv_cache_bytes(base_cache_config: &KVCacheConfig) -> u64 {
-    base_cache_config
-        .clone()
-        .with_dtype(Dtype::Float16)
-        .with_mode(CacheMode::Standard)
-        .memory_footprint() as u64
-}
-
 // ────────────────────────────────────────────────────────────────────────────
 // Inference engine
 // ────────────────────────────────────────────────────────────────────────────
@@ -522,8 +374,9 @@ pub struct InferenceEngine {
     stop_token_ids: Vec<u32>,
     /// Model creation timestamp.
     created_at: i64,
-    /// Explicit cache mode override (bypasses auto-selection when set).
-    cache_mode_override: Option<CacheMode>,
+    /// What the operator asked of the KV cache (see
+    /// [`pmetal_models::cache_policy`]); nothing leaves it to the memory budget.
+    cache_request: CacheModeRequest,
     /// Cross-request KV prefix cache. Consulted at the start of every
     /// request to skip the prefill of any prompt prefix we've already
     /// processed. Empty for hybrid/recurrent models (they can't be
@@ -535,6 +388,8 @@ pub struct InferenceEngine {
     /// default). The model thread drives it; this handle is for
     /// [`continuous_batching_depth`](Self::continuous_batching_depth).
     continuous: Mutex<Option<Arc<Mutex<ContinuousPump>>>>,
+    /// How the engine drafts, when it does.
+    speculation: Mutex<Option<SpeculationInfo>>,
 }
 
 /// What lives on the model thread.
@@ -546,6 +401,18 @@ struct EngineState {
     /// A Qwen 3.5-family vision tower, loaded by the first request with
     /// media and kept.
     qwen_vision: Option<Qwen3_5Vision>,
+    /// The drafter that speeds single-request decoding up, once enabled (see
+    /// [`InferenceEngine::enable_speculation`]).
+    speculator: Option<Speculator>,
+}
+
+/// How the engine drafts, once speculative decoding is enabled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeculationInfo {
+    /// What drafts: `qwen-mtp`, `gemma4-assistant` or `dflash`.
+    pub kind: &'static str,
+    /// Tokens a round drafts.
+    pub draft_tokens: usize,
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -865,7 +732,7 @@ const DEFAULT_PREFIX_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
 struct GpuRequestContext {
     model_path: PathBuf,
     max_seq_len: usize,
-    cache_mode_override: Option<CacheMode>,
+    cache_request: CacheModeRequest,
     tokenizer: Arc<pmetal_data::Tokenizer>,
     prefix_cache: Arc<Mutex<pmetal_cache::prefix_cache::PrefixCache>>,
 }
@@ -876,6 +743,8 @@ struct GpuRequest {
     gen_config: GenerationConfig,
     stop_sequences: Vec<String>,
     logprobs_top_n: Option<usize>,
+    /// Score the prompt, with this many alternatives per token.
+    prompt_logprobs_top_n: Option<usize>,
     /// The grammar the output must conform to.
     constraint: Option<crate::structured::Constraint>,
     /// The images and videos the prompt's media tokens stand for.
@@ -887,25 +756,16 @@ impl InferenceEngine {
         model: &DynamicModel,
         model_path: &Path,
         max_seq_len: usize,
-        cache_mode_override: Option<CacheMode>,
+        request: CacheModeRequest,
     ) -> (KVCache, Option<MambaCache>) {
         let base_cache = model.create_cache(max_seq_len);
-        let selection = if let Some(mode) = cache_mode_override {
-            let estimated_weight_bytes = estimate_serve_weight_bytes(
-                model_path,
-                estimate_weight_bytes_from_param_count(model.num_parameters()),
-            );
-            ServeCacheModeSelection {
-                mode,
-                source: ServeCacheModeSource::Explicit,
-                estimated_weight_bytes,
-                estimated_fp16_kv_bytes: estimate_fp16_kv_cache_bytes(base_cache.config()),
-                working_set_bytes: None,
-            }
-        } else {
-            select_serve_cache_mode(model_path, model.num_parameters(), base_cache.config())
-        };
-        log_serve_cache_selection(&selection, max_seq_len);
+        let selection = select_cache_mode_for_model(
+            base_cache.config(),
+            model_path,
+            model.num_parameters(),
+            request,
+        );
+        log_cache_selection(&selection, max_seq_len);
         let cache = model.create_cache_with_mode(max_seq_len, selection.mode);
         let mamba_cache = model.create_mamba_cache();
         (cache, mamba_cache)
@@ -977,6 +837,7 @@ impl InferenceEngine {
                     model,
                     continuous: None,
                     qwen_vision: None,
+                    speculator: None,
                 })
             },
             continuous_step,
@@ -1018,12 +879,13 @@ impl InferenceEngine {
             backend: preferred_backend,
             stop_token_ids,
             created_at: chrono::Utc::now().timestamp(),
-            cache_mode_override: None,
+            cache_request: CacheModeRequest::default(),
             prefix_cache: Arc::new(Mutex::new(pmetal_cache::prefix_cache::PrefixCache::new(
                 DEFAULT_PREFIX_CACHE_ENTRIES,
                 DEFAULT_PREFIX_CACHE_BYTES,
             ))),
             continuous: Mutex::new(None),
+            speculation: Mutex::new(None),
         })
     }
 
@@ -1034,10 +896,12 @@ impl InferenceEngine {
         self
     }
 
-    /// Use `mode` for every request's KV cache instead of choosing one from
-    /// the model's size and the device's memory.
-    pub fn with_cache_mode_override(mut self, mode: CacheMode) -> Self {
-        self.cache_mode_override = Some(mode);
+    /// Choose every request's KV cache as `request` asks, by the one policy
+    /// `pmetal infer` uses (see [`pmetal_models::cache_policy`]): an explicit
+    /// mode is honoured, anything else is fp16 unless the weights and the
+    /// cache would crowd the device, then 8-bit.
+    pub fn with_cache_request(mut self, request: CacheModeRequest) -> Self {
+        self.cache_request = request;
         self
     }
 
@@ -1050,12 +914,90 @@ impl InferenceEngine {
         }
     }
 
+    /// Requests waiting for the model: queued behind the one it is running,
+    /// and, under continuous batching, waiting for a slot.
+    pub fn queue_depth(&self) -> usize {
+        self.model.pending() + self.continuous_batching_depth().1
+    }
+
     /// Snapshot of prefix-cache stats: `(entries, bytes, hits, misses, hit_rate)`.
     pub fn prefix_cache_stats(&self) -> (usize, usize, u64, u64, f64) {
         match self.prefix_cache.lock() {
             Ok(pc) => (pc.len(), pc.bytes(), pc.hits(), pc.misses(), pc.hit_rate()),
             Err(_) => (0, 0, 0, 0, 0.0),
         }
+    }
+
+    /// Speed single-request decoding up with a drafter: a Qwen 3.5-family
+    /// model's MTP head, a Gemma 4 assistant or a DFlash draft model (see
+    /// [`SpeculatorSpec`]). The model thread loads it and checks it fits the
+    /// model; from then on every request that can run on it does, and gets the
+    /// tokens plain decoding would give (greedy), or draws from the same
+    /// distribution (sampled), only sooner. A request that wants log-probabilities
+    /// or carries an image decodes plainly.
+    ///
+    /// Continuous batching serves many requests at once, which a drafter
+    /// does not: asking for both is an error, whichever came first. So is the
+    /// ANE backend, which has its own drafter.
+    ///
+    /// # Errors
+    ///
+    /// The drafter cannot be loaded, does not fit the model, or the engine is
+    /// already drafting, batching or on the ANE.
+    pub fn enable_speculation(&self, spec: SpeculatorSpec) -> ServeResult<SpeculationInfo> {
+        self.enable_speculation_with(move |model, max_seq_len| {
+            Speculator::load(model, &spec, max_seq_len)
+        })
+    }
+
+    /// [`enable_speculation`](Self::enable_speculation) with a drafter the
+    /// caller builds: `load` runs on the model thread, given the model and
+    /// the longest sequence a request holds.
+    pub fn enable_speculation_with(
+        &self,
+        load: impl FnOnce(&DynamicModel, usize) -> Result<Speculator, pmetal_runtime::compat::Exception>
+        + Send
+        + 'static,
+    ) -> ServeResult<SpeculationInfo> {
+        let refuse = |why: &str| ServeError::Internal(why.to_string());
+        if self.backend == PreferredGenerationBackend::Ane {
+            return Err(refuse(
+                "speculative decoding on the GPU is not for --ane, which drafts with its own DFlash draft model",
+            ));
+        }
+        let batching = self.continuous.lock().map_err(|_| ServeError::Busy)?;
+        if batching.is_some() {
+            return Err(refuse(
+                "speculative decoding runs one request at a time, and continuous batching serves many: choose one",
+            ));
+        }
+        let mut current = self.speculation.lock().map_err(|_| ServeError::Busy)?;
+        if current.is_some() {
+            return Err(refuse("speculative decoding is already enabled"));
+        }
+        let max_seq_len = self.max_seq_len;
+        let info = self
+            .model
+            .call(
+                move |state| -> Result<SpeculationInfo, pmetal_runtime::compat::Exception> {
+                    let speculator = load(&state.model, max_seq_len)?;
+                    let info = SpeculationInfo {
+                        kind: speculator.kind(),
+                        draft_tokens: speculator.draft_tokens(),
+                    };
+                    state.speculator = Some(speculator);
+                    Ok(info)
+                },
+            )
+            .map_err(|_| ServeError::ModelNotLoaded)?
+            .map_err(ServeError::Model)?;
+        *current = Some(info.clone());
+        Ok(info)
+    }
+
+    /// How the engine drafts, when speculative decoding is enabled.
+    pub fn speculation(&self) -> Option<SpeculationInfo> {
+        self.speculation.lock().ok().and_then(|info| info.clone())
     }
 
     /// Enable continuous batching with the given capacity. The model thread
@@ -1085,6 +1027,12 @@ impl InferenceEngine {
         let mut guard = self.continuous.lock().map_err(|_| ServeError::Busy)?;
         if guard.is_some() {
             return Ok(());
+        }
+        if self.speculation().is_some() {
+            return Err(ServeError::Internal(
+                "continuous batching serves many requests at once, and speculative decoding runs one at a time: choose one"
+                    .into(),
+            ));
         }
         let tokenizer = Arc::clone(&self.tokenizer);
         let prefix_cache = Arc::clone(&self.prefix_cache);
@@ -1149,6 +1097,12 @@ impl InferenceEngine {
         if input_ids.is_empty() {
             return Err(ServeError::BadRequest("the prompt is empty".into()));
         }
+        if params.prompt_logprobs_top_n.is_some() {
+            return Err(ServeError::BadRequest(
+                "prompt log-probabilities are scored in a request of their own, not in a batch"
+                    .into(),
+            ));
+        }
         if !self.continuous_batching_enabled() {
             return Err(ServeError::Internal(
                 "continuous batching not enabled; call enable_continuous_batching first".into(),
@@ -1168,6 +1122,7 @@ impl InferenceEngine {
             gen_config,
             stop_sequences: params.stop_sequences,
             logprobs_top_n: params.logprobs_top_n,
+            prompt_logprobs_top_n: None,
             constraint: params.constraint,
             media: None,
         };
@@ -1221,14 +1176,14 @@ impl InferenceEngine {
     fn create_continuous_cache_config(&self) -> ServeResult<KVCacheConfig> {
         let model_path = self.model_path.clone();
         let max_seq_len = self.max_seq_len;
-        let cache_mode_override = self.cache_mode_override;
+        let cache_request = self.cache_request;
         self.model
             .call(move |state| {
                 let (cache, _) = Self::create_request_caches(
                     &state.model,
                     &model_path,
                     max_seq_len,
-                    cache_mode_override,
+                    cache_request,
                 );
                 cache.config().clone()
             })
@@ -1679,7 +1634,7 @@ impl InferenceEngine {
     /// Deliberately does not error on `max_tokens > max_seq_len` — the engine
     /// clamps silently, matching OpenAI behaviour.
     fn validate_params(params: &SamplingParams, _max_seq_len: usize) -> ServeResult<()> {
-        if params.max_tokens == 0 {
+        if params.max_tokens == 0 && params.prompt_logprobs_top_n.is_none() {
             return Err(ServeError::BadRequest("max_tokens must be >= 1".into()));
         }
         if params.temperature < 0.0 || !params.temperature.is_finite() {
@@ -1737,7 +1692,7 @@ impl InferenceEngine {
     pub fn validate_sampling_params(&self, params: &SamplingParams) -> ServeResult<()> {
         Self::validate_params(params, self.max_seq_len)?;
         if self.backend == PreferredGenerationBackend::Ane {
-            if params.logprobs_top_n.is_some() {
+            if params.logprobs_top_n.is_some() || params.prompt_logprobs_top_n.is_some() {
                 return Err(ServeError::unsupported(
                     "logprobs",
                     "the ANE engine (--ane) does not report log-probabilities",
@@ -1790,6 +1745,7 @@ impl InferenceEngine {
             prompt_tokens,
             cached_prompt_tokens: 0,
             completion_tokens,
+            speculative: None,
         }
     }
 
@@ -1977,6 +1933,69 @@ impl InferenceEngine {
         }
     }
 
+    /// Prefill `input_ids` and score them: for every prompt token after the
+    /// first, its log-probability given the tokens before it and the top
+    /// `top_n` alternatives, appended to `scored`. Returns the last chunk's
+    /// logits, as a prefill does.
+    ///
+    /// The prompt goes through in chunks small enough that a chunk's logits
+    /// (`chunk * vocab` floats) stay modest, each chunk's rows reduced to
+    /// their log-probabilities on the device before the next runs.
+    fn prefill_scoring(
+        model: &mut DynamicModel,
+        cache: &mut KVCache,
+        mut mamba_cache: Option<&mut MambaCache>,
+        input_ids: &[u32],
+        prefill_step_size: usize,
+        top_n: usize,
+        scored: &mut Vec<TokenLogprobEntry>,
+    ) -> Result<Array, pmetal_runtime::compat::Exception> {
+        use pmetal_models::generation::{row_logprobs, run_cached_prefill_chunks_at};
+        use pmetal_runtime::compat::ops::slice_axis;
+
+        /// Positions scored per forward: 512 rows of a 152k vocabulary are
+        /// 150 MB of bf16 logits.
+        const SCORING_CHUNK: usize = 512;
+        let step = match prefill_step_size {
+            0 => SCORING_CHUNK,
+            size => size.min(SCORING_CHUNK),
+        };
+        let mut position = 0usize;
+        run_cached_prefill_chunks_at(input_ids, 0, step, |chunk| {
+            let logits = model.forward_with_hybrid_cache(
+                chunk,
+                None,
+                Some(cache),
+                mamba_cache.as_deref_mut(),
+            )?;
+            let rows = chunk.dim(1) as usize;
+            // Row `i` predicts prompt token `position + i + 1`; the last
+            // prompt position predicts the first token to generate.
+            let scorable = rows.min(input_ids.len() - 1 - position);
+            if scorable > 0 {
+                let targets = &input_ids[position + 1..position + 1 + scorable];
+                let logits = slice_axis(&logits, 1, 0, scorable as i32);
+                // One more than asked, so the chosen token can be left out
+                // of its own alternatives as chat logprobs do.
+                for (target, (logprob, mut top)) in
+                    targets
+                        .iter()
+                        .zip(row_logprobs(&logits, targets, top_n + 1)?)
+                {
+                    top.retain(|(token, _)| token != target);
+                    top.truncate(top_n);
+                    scored.push(TokenLogprobEntry {
+                        token: *target,
+                        logprob,
+                        top_logprobs: top,
+                    });
+                }
+            }
+            position += rows;
+            Ok(logits)
+        })
+    }
+
     /// Run a single GPU decode request with 1-step look-ahead async
     /// pipelining, chunked prefill, and wired-memory management.
     ///
@@ -2015,10 +2034,12 @@ impl InferenceEngine {
         stop_tokens: &[u32],
         stop_sequences: &[String],
         logprobs_top_n: Option<usize>,
+        prompt_logprobs_top_n: Option<usize>,
         prefill_step_size: usize,
         prefix_cache: Option<&Arc<Mutex<pmetal_cache::prefix_cache::PrefixCache>>>,
         media: Option<&MediaForward>,
         start: Instant,
+        on_prompt_logprobs: impl FnOnce(Vec<TokenLogprobEntry>),
         mut on_token: E,
     ) -> ServeResult<DecodeRun>
     where
@@ -2045,7 +2066,17 @@ impl InferenceEngine {
         // so we skip the cache entirely when `mamba_cache` is populated.
         // A prompt with media skips it too: the cache is keyed by token ids,
         // and an image's tokens are the same placeholder id whatever it shows.
-        let prefix_cache = prefix_cache.filter(|_| media.is_none());
+        //
+        // Scoring the prompt needs the logits of every prompt position, so it
+        // is prefilled in full and takes no hit.
+        if prompt_logprobs_top_n.is_some() && media.is_some() {
+            return Err(ServeError::BadRequest(
+                "prompt log-probabilities are not available for a prompt with images or videos"
+                    .into(),
+            ));
+        }
+        let prefix_cache =
+            prefix_cache.filter(|_| media.is_none() && prompt_logprobs_top_n.is_none());
         let prefix_hit_len: usize =
             if let (Some(pc), true) = (prefix_cache.as_ref(), mamba_cache.is_none()) {
                 let mut guard = match pc.lock() {
@@ -2087,8 +2118,8 @@ impl InferenceEngine {
         //
         // A prompt with media prefills in one forward from its merged
         // embeddings, as `pmetal infer --image` does.
-        let prefill_logits = match media {
-            None => run_cached_prefill_chunks_at(
+        let prefill_logits = match (media, prompt_logprobs_top_n) {
+            (None, None) => run_cached_prefill_chunks_at(
                 prefill_slice,
                 prefix_hit_len,
                 prefill_step_size,
@@ -2102,7 +2133,23 @@ impl InferenceEngine {
                     )
                 },
             ),
-            Some(media) => Self::prefill_media(model, media, cache, mamba_cache.as_mut()),
+            (None, Some(top_n)) => {
+                let mut scored = Vec::with_capacity(input_ids.len().saturating_sub(1));
+                let logits = Self::prefill_scoring(
+                    model,
+                    cache,
+                    mamba_cache.as_mut(),
+                    input_ids,
+                    prefill_step_size,
+                    top_n,
+                    &mut scored,
+                );
+                if logits.is_ok() {
+                    on_prompt_logprobs(scored);
+                }
+                logits
+            }
+            (Some(media), _) => Self::prefill_media(model, media, cache, mamba_cache.as_mut()),
         }
         .map_err(ServeError::Model)?;
 
@@ -2211,6 +2258,7 @@ impl InferenceEngine {
 
         let completion_tokens = generated.len();
         Ok(DecodeRun {
+            speculative: None,
             cached_prompt_tokens: prefix_hit_len,
             finish_reason,
             first_token_time_ms,
@@ -2222,7 +2270,7 @@ impl InferenceEngine {
         GpuRequestContext {
             model_path: self.model_path.clone(),
             max_seq_len: self.max_seq_len,
-            cache_mode_override: self.cache_mode_override,
+            cache_request: self.cache_request,
             tokenizer: Arc::clone(&self.tokenizer),
             prefix_cache: Arc::clone(&self.prefix_cache),
         }
@@ -2234,6 +2282,7 @@ impl InferenceEngine {
         state: &mut EngineState,
         ctx: &GpuRequestContext,
         request: GpuRequest,
+        on_prompt_logprobs: impl FnOnce(Vec<TokenLogprobEntry>),
         on_token: E,
     ) -> ServeResult<(DecodeRun, Instant)>
     where
@@ -2252,13 +2301,20 @@ impl InferenceEngine {
             )?),
             None => None,
         };
+        // A request the drafter can serve runs on it: the target's own tokens,
+        // sooner. What it cannot (the target's per-token log-probabilities,
+        // the prompt's, an image) takes the plain path below: the reply is the
+        // same either way.
+        if state.speculator.is_some()
+            && request.media.is_none()
+            && request.logprobs_top_n.is_none()
+            && request.prompt_logprobs_top_n.is_none()
+        {
+            return Self::generate_speculatively(state, ctx, request, start, on_token);
+        }
         let model = &mut state.model;
-        let (mut cache, mut mamba_cache) = Self::create_request_caches(
-            model,
-            &ctx.model_path,
-            ctx.max_seq_len,
-            ctx.cache_mode_override,
-        );
+        let (mut cache, mut mamba_cache) =
+            Self::create_request_caches(model, &ctx.model_path, ctx.max_seq_len, ctx.cache_request);
         let max_tokens = request.gen_config.max_new_tokens;
         let stop_tokens = request.gen_config.stop_tokens.clone();
         let prefill_step_size = request.gen_config.prefill_step_size;
@@ -2277,13 +2333,109 @@ impl InferenceEngine {
             &stop_tokens,
             &request.stop_sequences,
             request.logprobs_top_n,
+            request.prompt_logprobs_top_n,
             prefill_step_size,
             Some(&ctx.prefix_cache),
             media.as_ref(),
             start,
+            on_prompt_logprobs,
             on_token,
         )?;
         Ok((run, start))
+    }
+
+    /// Decode `request` with the engine's drafter: the same sampler, stop
+    /// tokens, stop sequences and cancellation as [`run_async_decode`]
+    /// (the tokens come a round at a time, not one at a time), and the same
+    /// tokens.
+    ///
+    /// [`run_async_decode`]: Self::run_async_decode
+    fn generate_speculatively<E>(
+        state: &mut EngineState,
+        ctx: &GpuRequestContext,
+        request: GpuRequest,
+        start: Instant,
+        mut on_token: E,
+    ) -> ServeResult<(DecodeRun, Instant)>
+    where
+        E: FnMut(u32, Option<TokenLogprobEntry>) -> StepOutcome,
+    {
+        use pmetal_runtime::inline_array::{GenerationStream, WiredLimit};
+
+        let EngineState {
+            model, speculator, ..
+        } = state;
+        let speculator = speculator
+            .as_mut()
+            .ok_or_else(|| ServeError::Internal("no drafter is loaded".into()))?;
+        let _wired = WiredLimit::max();
+        let _stream = GenerationStream::enter();
+
+        let mut sampler = request.gen_config.sampler(&request.input_ids);
+        if let Some(constraint) = &request.constraint {
+            sampler = sampler.with_processor(constraint.processor());
+        }
+        let mut generated: Vec<u32> = Vec::with_capacity(request.gen_config.max_new_tokens);
+        let mut first_token_time_ms: Option<f64> = None;
+        let mut finish_reason: &'static str = "length";
+        let mut cancelled = false;
+        let tokenizer = ctx.tokenizer.as_ref();
+
+        let run = speculator
+            .generate(
+                model,
+                &request.input_ids,
+                &request.gen_config,
+                sampler,
+                |token| {
+                    if first_token_time_ms.is_none() {
+                        first_token_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    // A stop token never arrives here: the drafter ends the
+                    // generation at it, and says so in the run.
+                    generated.push(token);
+                    if let StepOutcome::Cancel = on_token(token, None) {
+                        cancelled = true;
+                        return false;
+                    }
+                    // As in the plain path, the tokens that complete a stop
+                    // sequence are kept: where the text is cut is the
+                    // reply's business (see `crate::stop`).
+                    if detect_stop_sequence_suffix(tokenizer, &generated, &request.stop_sequences)
+                        .is_some()
+                    {
+                        finish_reason = "stop";
+                        return false;
+                    }
+                    if generated.len() % 256 == 0 {
+                        pmetal_runtime::inline_array::clear_cache();
+                    }
+                    true
+                },
+            )
+            .map_err(ServeError::Model)?;
+        pmetal_runtime::check_unobserved_error()
+            .map_err(|e| ServeError::Internal(format!("speculative decoding: {e}")))?;
+
+        if run.stopped_by_token {
+            finish_reason = "stop";
+        }
+        if cancelled {
+            finish_reason = "cancelled";
+        }
+        Ok((
+            DecodeRun {
+                speculative: Some(SpeculativeUsage {
+                    drafted_tokens: run.drafted_tokens,
+                    accepted_tokens: run.accepted_tokens,
+                }),
+                cached_prompt_tokens: 0,
+                finish_reason,
+                first_token_time_ms,
+                completion_tokens: generated.len(),
+            },
+            start,
+        ))
     }
 
     /// Run one request on the GPU, on the model thread, streaming its tokens
@@ -2296,16 +2448,25 @@ impl InferenceEngine {
         tx: &tokio::sync::mpsc::Sender<TokenEvent>,
     ) {
         let prompt_tokens = request.input_ids.len();
-        let run = Self::generate_on_model(state, ctx, request, |token, logprob| {
-            if tx
-                .blocking_send(TokenEvent::Token { id: token, logprob })
-                .is_err()
-            {
-                StepOutcome::Cancel
-            } else {
-                StepOutcome::Continue
-            }
-        });
+        let run = Self::generate_on_model(
+            state,
+            ctx,
+            request,
+            |scored| {
+                // A client that has gone shows at the first token.
+                let _ = tx.blocking_send(TokenEvent::PromptLogprobs(scored));
+            },
+            |token, logprob| {
+                if tx
+                    .blocking_send(TokenEvent::Token { id: token, logprob })
+                    .is_err()
+                {
+                    StepOutcome::Cancel
+                } else {
+                    StepOutcome::Continue
+                }
+            },
+        );
         let (run, start) = match run {
             Ok(r) => r,
             Err(e) => {
@@ -2319,6 +2480,7 @@ impl InferenceEngine {
         }
         let metrics = RequestMetrics {
             cached_prompt_tokens: run.cached_prompt_tokens,
+            speculative: run.speculative,
             ..Self::build_metrics(
                 start,
                 prompt_tokens,
@@ -2392,6 +2554,8 @@ impl InferenceEngine {
                     ..
                 } => return Ok((tokens, logprobs, finish_reason, metrics)),
                 TokenEvent::Error(message) => return Err(ServeError::Internal(message)),
+                // Not reported here; a caller that wants them reads the stream.
+                TokenEvent::PromptLogprobs(_) => {}
             }
         }
         Err(ServeError::Internal(
@@ -2558,6 +2722,7 @@ impl InferenceEngine {
             gen_config: self.build_generation_config(&params),
             stop_sequences: params.stop_sequences,
             logprobs_top_n: params.logprobs_top_n,
+            prompt_logprobs_top_n: params.prompt_logprobs_top_n,
             constraint: params.constraint.clone(),
             media: prompt.media.clone(),
         };
@@ -2613,10 +2778,6 @@ mod tests {
             "num_experts": 0,
             "num_local_experts": 0
         })
-    }
-
-    fn qwen3_cache_config(max_seq_len: usize) -> KVCacheConfig {
-        KVCacheConfig::new(28, max_seq_len, 8, 128)
     }
 
     fn tiny_nemotron_h_config() -> NemotronHConfig {
@@ -2843,6 +3004,7 @@ mod tests {
             extra_stop_token_ids: vec![99],
             stop_sequences: vec![],
             logprobs_top_n: None,
+            prompt_logprobs_top_n: None,
             logit_bias: Vec::new(),
             constraint: None,
         };
@@ -2856,36 +3018,6 @@ mod tests {
     }
 
     #[test]
-    fn serve_auto_cache_prefers_fp16_when_model_fits_comfortably() {
-        let selection = select_serve_cache_mode_with_working_set(
-            &qwen3_cache_config(256),
-            1_240_000_000,
-            Some(48 * 1024 * 1024 * 1024),
-        );
-
-        assert_eq!(selection.mode, CacheMode::Standard);
-        assert_eq!(selection.source, ServeCacheModeSource::AutoFp16);
-    }
-
-    #[test]
-    fn serve_auto_cache_prefers_q8_when_budget_is_tight() {
-        let selection = select_serve_cache_mode_with_working_set(
-            &qwen3_cache_config(8192),
-            14_000_000_000,
-            Some(18 * 1024 * 1024 * 1024),
-        );
-
-        assert_eq!(
-            selection.mode,
-            CacheMode::Quantized {
-                bits: 8,
-                group_size: 64,
-            }
-        );
-        assert_eq!(selection.source, ServeCacheModeSource::AutoQ8);
-    }
-
-    #[test]
     fn create_request_caches_allocates_mamba_cache_for_hybrid_models() {
         let model =
             DynamicModel::NemotronH(NemotronHForCausalLM::new(tiny_nemotron_h_config()).unwrap());
@@ -2893,7 +3025,7 @@ mod tests {
             &model,
             std::env::temp_dir().as_path(),
             64,
-            None,
+            CacheModeRequest::default(),
         );
 
         assert_eq!(cache.config().max_seq_len, 64);
@@ -2901,8 +3033,8 @@ mod tests {
     }
 
     #[test]
-    fn continuous_cache_config_honors_cache_mode_override() {
-        let override_mode = CacheMode::TurboQuant {
+    fn continuous_cache_config_honors_the_cache_request() {
+        let override_mode = pmetal_cache::kv_cache::CacheMode::TurboQuant {
             config: pmetal_cache::kv_cache::TurboQuantConfig::uniform(4, 4),
         };
         let engine = InferenceEngine::new_with_backend(
@@ -2919,7 +3051,11 @@ mod tests {
             1024,
         )
         .unwrap()
-        .with_cache_mode_override(override_mode);
+        .with_cache_request(CacheModeRequest {
+            kv_quant: Some(4),
+            kv_turboquant: true,
+            ..CacheModeRequest::default()
+        });
 
         let cfg = engine.create_continuous_cache_config().unwrap();
         assert_eq!(cfg.mode, override_mode);
@@ -3045,6 +3181,7 @@ mod tests {
                     logprobs.push(logprob.expect("requested logprobs").logprob);
                 }
                 TokenEvent::Done { .. } => return (tokens, logprobs),
+                TokenEvent::PromptLogprobs(_) => {}
                 TokenEvent::Error(e) => panic!("stream failed: {e}"),
             }
         }
@@ -3090,6 +3227,7 @@ mod tests {
             extra_stop_token_ids: vec![],
             stop_sequences: vec![],
             logprobs_top_n: None,
+            prompt_logprobs_top_n: None,
             logit_bias: Vec::new(),
             constraint: None,
         }
@@ -3101,6 +3239,7 @@ mod tests {
             match event {
                 TokenEvent::Token { id, .. } => tokens.push(id),
                 TokenEvent::Done { .. } => return tokens,
+                TokenEvent::PromptLogprobs(_) => {}
                 TokenEvent::Error(e) => panic!("stream failed: {e}"),
             }
         }

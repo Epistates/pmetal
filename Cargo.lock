@@ -5793,6 +5793,7 @@ dependencies = [
  "pmetal-metal",
  "pmetal-models",
  "pmetal-runtime",
+ "prometheus-client",
  "serde",
  "serde_json",
  "serde_path_to_error",

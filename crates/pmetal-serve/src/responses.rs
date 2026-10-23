@@ -755,6 +755,7 @@ pub async fn responses(
         let convert = move |_: usize, event: ChoiceEvent, _: &mut StreamTotals| -> Vec<Event> {
             let events = match event {
                 ChoiceEvent::Piece(piece) => builder.piece(piece),
+                ChoiceEvent::PromptLogprobs(_) => Vec::new(),
                 ChoiceEvent::Done(done) => builder.finish(&done, prompt_tokens),
                 ChoiceEvent::Failed(failure) => builder.fail(&failure),
             };
@@ -773,6 +774,7 @@ pub async fn responses(
         while let Some(event) = choice.next().await {
             match event {
                 ChoiceEvent::Piece(piece) => pieces.push(piece),
+                ChoiceEvent::PromptLogprobs(_) => {}
                 ChoiceEvent::Done(d) => done = Some(d),
                 ChoiceEvent::Failed(failure) => return Err(failure.into()),
             }

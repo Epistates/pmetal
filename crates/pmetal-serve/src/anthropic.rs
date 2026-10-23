@@ -146,23 +146,43 @@ pub struct MessagesRequest {
     pub other: Map<String, Value>,
 }
 
-impl MessagesRequest {
-    /// The chat template kwargs this request asks for.
-    fn template_kwargs(&self) -> Result<ChatTemplateKwargs, ServeError> {
-        let mut kwargs = ChatTemplateKwargs::new();
-        match self.thinking.as_ref().map(|t| t.kind.as_str()) {
-            None => {}
-            Some("enabled") => kwargs.set(ChatTemplateKwargs::ENABLE_THINKING, true),
-            Some("disabled") => kwargs.set(ChatTemplateKwargs::ENABLE_THINKING, false),
-            Some(other) => {
-                return Err(ServeError::invalid(
-                    "thinking.type",
-                    format!("thinking.type must be \"enabled\" or \"disabled\", not {other:?}"),
-                ));
-            }
+/// The chat template kwargs a `thinking` field asks for.
+fn thinking_kwargs(thinking: Option<&ThinkingConfig>) -> Result<ChatTemplateKwargs, ServeError> {
+    let mut kwargs = ChatTemplateKwargs::new();
+    match thinking.map(|t| t.kind.as_str()) {
+        None => {}
+        Some("enabled") => kwargs.set(ChatTemplateKwargs::ENABLE_THINKING, true),
+        Some("disabled") => kwargs.set(ChatTemplateKwargs::ENABLE_THINKING, false),
+        Some(other) => {
+            return Err(ServeError::invalid(
+                "thinking.type",
+                format!("thinking.type must be \"enabled\" or \"disabled\", not {other:?}"),
+            ));
         }
-        Ok(kwargs)
     }
+    Ok(kwargs)
+}
+
+/// Anthropic `/v1/messages/count_tokens` request body: the fields of a
+/// messages request that shape the prompt.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CountTokensRequest {
+    pub model: String,
+    pub messages: Vec<AnthropicMessage>,
+    #[serde(default)]
+    pub system: Option<SystemPrompt>,
+    #[serde(default)]
+    pub tools: Option<Vec<AnthropicTool>>,
+    #[serde(default)]
+    pub tool_choice: Option<AnthropicToolChoice>,
+    #[serde(default)]
+    pub thinking: Option<ThinkingConfig>,
+}
+
+/// Anthropic `/v1/messages/count_tokens` response body.
+#[derive(Debug, Clone, Serialize)]
+pub struct CountTokensResponse {
+    pub input_tokens: usize,
 }
 
 /// Fields of the Messages API that change what is generated and that this
@@ -303,6 +323,38 @@ impl AnthropicMessage {
         }
         Ok(out)
     }
+}
+
+/// The conversation a request holds as chat messages: the system prompt
+/// first, when there is one, then each message. What `/v1/messages` runs and
+/// `/v1/messages/count_tokens` counts.
+fn conversation(
+    system: Option<&SystemPrompt>,
+    messages: &[AnthropicMessage],
+) -> Result<Vec<ChatMessage>, ServeError> {
+    let mut chat: Vec<ChatMessage> = Vec::with_capacity(messages.len() + 1);
+    if let Some(system) = system {
+        let system = system.text()?;
+        if !system.is_empty() {
+            chat.push(ChatMessage::text("system", system));
+        }
+    }
+    for (i, m) in messages.iter().enumerate() {
+        if m.role != "user" && m.role != "assistant" {
+            return Err(ServeError::invalid(
+                format!("messages.{i}.role"),
+                "a message's role is `user` or `assistant`",
+            ));
+        }
+        chat.extend(m.to_chat_messages(i)?);
+    }
+    if messages.is_empty() {
+        return Err(ServeError::invalid(
+            "messages",
+            "`messages` must hold at least one message",
+        ));
+    }
+    Ok(chat)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -449,10 +501,13 @@ struct MessageDeltaUsage {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// The tools and choice of a request as the plan the chat endpoint uses.
-fn plan_tools(req: &MessagesRequest, engine: &InferenceEngine) -> Result<ToolPlan, ServeError> {
-    let defs: Vec<ToolDefinition> = req
-        .tools
-        .iter()
+fn plan_tools(
+    tools: Option<&[AnthropicTool]>,
+    tool_choice: Option<&AnthropicToolChoice>,
+    engine: &InferenceEngine,
+) -> Result<ToolPlan, ServeError> {
+    let defs: Vec<ToolDefinition> = tools
+        .into_iter()
         .flatten()
         .enumerate()
         .map(|(i, tool)| {
@@ -475,7 +530,7 @@ fn plan_tools(req: &MessagesRequest, engine: &InferenceEngine) -> Result<ToolPla
             })
         })
         .collect::<Result<_, _>>()?;
-    let choice = match req.tool_choice.as_ref() {
+    let choice = match tool_choice {
         None => ToolChoice::Auto,
         Some(choice) => match choice.kind.as_str() {
             "auto" => ToolChoice::Auto,
@@ -495,14 +550,41 @@ fn plan_tools(req: &MessagesRequest, engine: &InferenceEngine) -> Result<ToolPla
             }
         },
     };
-    let single = req
-        .tool_choice
-        .as_ref()
+    let single = tool_choice
         .and_then(|c| c.disable_parallel_tool_use)
         .unwrap_or(false);
     let plan = ToolPlan::new(defs, choice, single, engine.tool_format())
         .map_err(|why| ServeError::invalid("tool_choice", why))?;
     Ok(plan)
+}
+
+/// `POST /v1/messages/count_tokens` — how many input tokens a messages
+/// request would use.
+///
+/// The count is of the prompt [`messages`] would run: the same conversation,
+/// rendered by the same chat template with the same tools and thinking
+/// setting, images expanded to the tokens the model reads them as, and
+/// tokenized by the same tokenizer. Nothing is generated, so it takes no
+/// request slot and runs no model.
+pub async fn count_tokens(
+    State(state): State<Arc<AppState>>,
+    ApiJson(req): ApiJson<CountTokensRequest>,
+) -> Result<Json<CountTokensResponse>, ServeError> {
+    state.engine.check_model(&req.model)?;
+    let plan = plan_tools(
+        req.tools.as_deref(),
+        req.tool_choice.as_ref(),
+        &state.engine,
+    )?;
+    let messages = conversation(req.system.as_ref(), &req.messages)?;
+    let kwargs = thinking_kwargs(req.thinking.as_ref())?;
+    let prompt = state
+        .engine
+        .prepare_chat(&messages, plan.prompt.as_deref(), &kwargs)
+        .await?;
+    Ok(Json(CountTokensResponse {
+        input_tokens: prompt.input_ids.len(),
+    }))
 }
 
 /// `POST /v1/messages` — Anthropic-compatible message generation.
@@ -521,35 +603,16 @@ pub async fn messages(
             "`temperature` must be between 0 and 1",
         ));
     }
-    let tool_plan = plan_tools(&req, &state.engine)?;
+    let tool_plan = plan_tools(
+        req.tools.as_deref(),
+        req.tool_choice.as_ref(),
+        &state.engine,
+    )?;
     let permit = state.try_acquire_request_permit()?;
 
-    // Assemble the internal chat-message list: optional system prompt first,
-    // then each Anthropic message.
-    let mut messages: Vec<ChatMessage> = Vec::with_capacity(req.messages.len() + 1);
-    if let Some(system) = req.system.as_ref() {
-        let system = system.text()?;
-        if !system.is_empty() {
-            messages.push(ChatMessage::text("system", system));
-        }
-    }
-    for (i, m) in req.messages.iter().enumerate() {
-        if m.role != "user" && m.role != "assistant" {
-            return Err(ServeError::invalid(
-                format!("messages.{i}.role"),
-                "a message's role is `user` or `assistant`",
-            ));
-        }
-        messages.extend(m.to_chat_messages(i)?);
-    }
-    if req.messages.is_empty() {
-        return Err(ServeError::invalid(
-            "messages",
-            "`messages` must hold at least one message",
-        ));
-    }
+    let messages = conversation(req.system.as_ref(), &req.messages)?;
 
-    let template_kwargs = req.template_kwargs()?;
+    let template_kwargs = thinking_kwargs(req.thinking.as_ref())?;
     let stops = resolve_stop_sequences(req.stop_sequences.as_deref(), None, &state.engine)?;
     let generate::Prepared { prompt, params } = generate::prepare(
         &state,
@@ -602,6 +665,7 @@ pub async fn messages(
                 ChoiceEvent::Piece(piece) => {
                     blocks.events(piece).iter().map(encode_event).collect()
                 }
+                ChoiceEvent::PromptLogprobs(_) => Vec::new(),
                 ChoiceEvent::Done(done) => {
                     let mut events = blocks.closing();
                     events.push(MessageEvent::MessageDelta {
@@ -930,11 +994,10 @@ mod tests {
     #[test]
     fn thinking_maps_to_enable_thinking() {
         let kwargs = |thinking: &str| {
-            parse(&format!(
+            let req = parse(&format!(
                 r#"{{"model":"m","max_tokens":10,"messages":[]{thinking}}}"#
-            ))
-            .template_kwargs()
-            .map(|k| k.enable_thinking())
+            ));
+            thinking_kwargs(req.thinking.as_ref()).map(|k| k.enable_thinking())
         };
         assert_eq!(kwargs("").unwrap(), None);
         assert_eq!(

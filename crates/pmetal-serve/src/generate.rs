@@ -90,7 +90,7 @@ pub(crate) fn start_choices(
                     metrics: Some(m), ..
                 }) = event
                 {
-                    metrics.metrics.record(m);
+                    metrics.record_request(m);
                 }
             })
         })
@@ -104,6 +104,8 @@ pub(crate) struct Collected {
     pub content: String,
     pub tool_calls: Vec<ParsedCall>,
     pub logprobs: Vec<TokenLogprobEntry>,
+    /// The prompt's own log-probabilities, when the request scored it.
+    pub prompt_logprobs: Option<Vec<TokenLogprobEntry>>,
     pub done: Option<ChoiceDone>,
 }
 
@@ -152,6 +154,7 @@ pub(crate) async fn collect(
                 reply.logprobs.extend(logprobs);
             }
             ChoiceEvent::Piece(Piece::ToolCall(call)) => reply.tool_calls.push(call),
+            ChoiceEvent::PromptLogprobs(entries) => reply.prompt_logprobs = Some(entries),
             ChoiceEvent::Done(done) => reply.done = Some(done),
             ChoiceEvent::Failed(failure) => return Err(failure.into()),
         }

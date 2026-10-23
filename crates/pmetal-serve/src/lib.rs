@@ -12,8 +12,10 @@
 //! - `POST /v1/responses` — the OpenAI Responses API
 //! - `POST /v1/embeddings` — embeddings
 //! - `POST /v1/messages` — Anthropic-compatible message generation
+//! - `POST /v1/messages/count_tokens` — the input tokens a messages request would use
 //! - `GET /v1/models` — list loaded models
 //! - `GET /v1/metrics` — rolling serving metrics (tok/s, latencies, request counts)
+//! - `GET /metrics` — the same and more as Prometheus / OpenMetrics text (see [`telemetry`])
 //! - `GET /health` — liveness check
 //!
 //! A decision model (a Clef release) is served by its own router instead, with
@@ -37,6 +39,7 @@ pub mod server;
 pub(crate) mod sse;
 pub mod stop;
 pub mod structured;
+pub mod telemetry;
 pub mod tools;
 pub mod types;
 pub mod vocab;
@@ -51,7 +54,10 @@ pub use continuous_driver::{
 };
 pub use continuous_pump::{ContinuousPump, Tick};
 pub use decision::DecisionEngine;
-pub use engine::{InferenceEngine, PreparedPrompt, RequestMetrics};
+pub use engine::{
+    InferenceEngine, PreparedPrompt, RequestMetrics, SpeculationInfo, SpeculativeUsage,
+    SpeculatorSpec,
+};
 pub use routes::ServingMetrics;
 pub use server::ServeConfig;
 

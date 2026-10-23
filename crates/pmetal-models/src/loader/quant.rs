@@ -255,11 +255,15 @@ pub(crate) fn dequantize_sidecar_weights(
 pub(crate) struct PackedLinear {
     weight: Array,
     scales: Array,
-    tensor_scale: Array,
+    /// Affine quantization's per-group offsets.
+    biases: Option<Array>,
+    /// ModelOpt's per-tensor factor.
+    tensor_scale: Option<Array>,
     params: QuantParams,
 }
 
-/// The ModelOpt-quantized `Linear`s of a checkpoint, by module path, and the
+/// The quantized `Linear`s of a checkpoint (ModelOpt's, or MLX's), by module
+/// path, and the
 /// dtype the model computes in.
 #[derive(Debug, Default)]
 pub(crate) struct PackedLinears {
@@ -271,6 +275,15 @@ impl PackedLinears {
     /// Whether nothing was lifted out.
     pub(crate) fn is_empty(&self) -> bool {
         self.modules.is_empty()
+    }
+
+    /// Take `other`'s modules too (they are of one checkpoint, so their paths
+    /// differ); the dtype is `other`'s when this has none.
+    pub(crate) fn absorb(&mut self, other: &mut PackedLinears) {
+        self.modules.extend(std::mem::take(&mut other.modules));
+        if self.dtype.is_none() {
+            self.dtype = other.dtype;
+        }
     }
 
     /// The module paths, for a loader to account for their `weight`s.
@@ -320,7 +333,9 @@ impl PackedLinears {
                 packed.weight.dim(0),
                 packed.weight.dim(1) * 32 / packed.params.bits,
             );
-            if linear.shape() != (out, input) {
+            // A layer built "for loading" is a 1x1 placeholder that takes the
+            // shape of whatever the checkpoint puts on it.
+            if linear.shape() != (out, input) && linear.shape() != (1, 1) {
                 failure = Some(LoadError::ShapeMismatch {
                     key: format!("{path}.weight"),
                     expected: vec![linear.shape().0, linear.shape().1],
@@ -333,12 +348,52 @@ impl PackedLinears {
             // computing in the dtype its model does.
             linear.quant = Some(pmetal_runtime::compat::LinearQuant {
                 scales: packed.scales,
-                biases: None,
+                biases: packed.biases,
                 params: packed.params,
                 dtype,
-                tensor_scale: Some(packed.tensor_scale),
+                tensor_scale: packed.tensor_scale,
                 codebook: None,
             });
+        });
+        if let Some(e) = failure {
+            return Err(e);
+        }
+        // A quantized embedding table stays packed too: its lookups unpack the
+        // rows they gather, and a tied head multiplies over the packed words.
+        let dtype = self
+            .dtype
+            .unwrap_or(pmetal_runtime::compat::Dtype::Bfloat16);
+        let mut failure: Option<LoadError> = None;
+        model.visit_embeddings_mut("", &mut |path, embedding| {
+            let Some(module) = wanted.iter().find(|m| names_linear(m, path)) else {
+                return;
+            };
+            *installed.entry(module.clone()).or_default() += 1;
+            let Some(packed) = self.modules.remove(module) else {
+                return;
+            };
+            let (rows, dims) = (
+                packed.weight.dim(0),
+                packed.weight.dim(1) * 32 / packed.params.bits,
+            );
+            let shape = embedding.weight.value.shape().to_vec();
+            if shape != [rows, dims] && shape != [1, 1] {
+                failure = Some(LoadError::ShapeMismatch {
+                    key: format!("{path}.weight"),
+                    expected: shape.clone(),
+                    actual: vec![rows, dims],
+                });
+                return;
+            }
+            embedding.weight.value = packed.weight;
+            embedding.quant = Some(Box::new(pmetal_runtime::compat::LinearQuant {
+                scales: packed.scales,
+                biases: packed.biases,
+                params: packed.params,
+                dtype,
+                tensor_scale: packed.tensor_scale,
+                codebook: None,
+            }));
         });
         if let Some(e) = failure {
             return Err(e);
@@ -421,7 +476,8 @@ pub(crate) fn take_packed_linears(
                     PackedLinear {
                         weight,
                         scales,
-                        tensor_scale,
+                        biases: None,
+                        tensor_scale: Some(tensor_scale),
                         params,
                     },
                 );
@@ -430,6 +486,88 @@ pub(crate) fn take_packed_linears(
                 weights.insert(format!("{base}.weight"), dense);
             }
         }
+    }
+    Ok(out)
+}
+
+/// Whether the checkpoint module `module` is the `Linear` at model path `path`:
+/// the same rule [`PackedLinears::install`] places it by, since the module a
+/// checkpoint names may sit under a namespace the model's tree adds or drops.
+fn names_linear(module: &str, path: &str) -> bool {
+    path == module || path.ends_with(&format!(".{module}")) || module.ends_with(&format!(".{path}"))
+}
+
+/// Lift the MLX-quantized projections that land on one of the model's
+/// `Linear`s (`linear_paths`) out of `weights`, still packed, where
+/// [`unpack_mlx_quantized`] would unpack them to a dense copy.
+///
+/// A decode step reads every weight once, so a 4-bit model unpacked to bf16
+/// reads four times the bytes, and decodes at a quarter of the speed. The
+/// words, scales and (affine) biases go on the `Linear` as they are
+/// ([`PackedLinears::install`]); MLX's quantized matmul reads them. What is
+/// not a `Linear` of the model (an embedding, stacked experts, a module the
+/// config calls dense) is left for [`unpack_mlx_quantized`] as before.
+pub(crate) fn take_packed_mlx_linears(
+    weights: &mut HashMap<String, Array>,
+    config: Option<&QuantConfig>,
+    linear_paths: &[String],
+) -> Result<PackedLinears, LoadError> {
+    let mut out = PackedLinears::default();
+    let Some(config) = config else {
+        return Ok(out);
+    };
+    let scale_keys: Vec<String> = weights
+        .keys()
+        .filter(|key| key.ends_with(".scales"))
+        .cloned()
+        .collect();
+    let mut dtype_hint = None;
+    for scales_key in scale_keys {
+        let Some(module) = scales_key.strip_suffix(".scales") else {
+            continue;
+        };
+        // MLX's layout only: `X.weight` beside `X.scales`.
+        let weight_key = format!("{module}.weight");
+        if !weights.contains_key(&weight_key)
+            || !linear_paths.iter().any(|path| names_linear(module, path))
+        {
+            continue;
+        }
+        let biases_key = format!("{module}.biases");
+        let has_biases = weights.contains_key(&biases_key);
+        let Some(params) = config.params_for(&weight_key) else {
+            continue; // the config says it was left dense: the unpacker errors
+        };
+        let params = params
+            .for_tensors(&weight_key, has_biases)
+            .map_err(LoadError::SafeTensors)?;
+        let (Some(weight), Some(scales)) =
+            (weights.remove(&weight_key), weights.remove(&scales_key))
+        else {
+            continue;
+        };
+        // Affine scales are in the dtype the model computes in.
+        if params.mode == pmetal_runtime::QuantizedMode::Affine {
+            dtype_hint.get_or_insert(scales.dtype_raw());
+        }
+        out.modules.insert(
+            module.to_string(),
+            PackedLinear {
+                weight,
+                scales,
+                biases: weights.remove(&biases_key),
+                tensor_scale: None,
+                params,
+            },
+        );
+    }
+    if !out.is_empty() {
+        let code = dtype_hint.unwrap_or_else(|| {
+            pmetal_runtime::native_weight::detect_model_dtype(|key| {
+                weights.get(key).map(|w| w.dtype_raw())
+            })
+        });
+        out.dtype = Some(pmetal_runtime::compat::Dtype::from_raw(code));
     }
     Ok(out)
 }
