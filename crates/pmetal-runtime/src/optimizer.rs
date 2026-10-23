@@ -324,6 +324,12 @@ pub struct AdamW {
     pub states: HashMap<String, AdamState>,
     /// Maps a parameter name to its [`ParamClass`].
     classifier: Box<dyn Fn(&str) -> ParamClass + Send>,
+    /// Whether an update is one fused Metal dispatch ([`Self::with_fused`]).
+    fused: bool,
+    /// The step's scalars as the fused kernel reads them, one array per
+    /// distinct set (a step has at most one per parameter class). Emptied
+    /// when the step advances.
+    scalar_arrays: Vec<(AdamWStepScalars, InlineArray)>,
 }
 
 impl std::fmt::Debug for AdamW {
@@ -357,7 +363,25 @@ impl AdamW {
             step_count_inner: 0,
             states: HashMap::new(),
             classifier: Box::new(default_classifier),
+            fused: true,
+            scalar_arrays: Vec::new(),
         }
+    }
+
+    /// Choose how an update is computed.
+    ///
+    /// `true` (the default) updates each parameter in one fused Metal
+    /// dispatch. `false` builds the update from elementwise ops, the
+    /// reference the fused kernel is tested against; it gives the same
+    /// result bit for bit and reads and writes each tensor about ten times
+    /// as often.
+    ///
+    /// An update the kernel cannot take (a tensor of more than `i32::MAX`
+    /// elements, a gradient of another size, a device without Metal) falls
+    /// back to the ops.
+    pub fn with_fused(mut self, fused: bool) -> Self {
+        self.fused = fused;
+        self
     }
 
     /// Override Adam beta coefficients (default: 0.9, 0.999).
@@ -465,6 +489,7 @@ impl AdamW {
     /// `advance_step` once before the loop.
     pub fn advance_step(&mut self) {
         self.step_count_inner += 1;
+        self.scalar_arrays.clear();
     }
 
     /// Update a single parameter in-place given its gradient.
@@ -512,7 +537,50 @@ impl AdamW {
         }
 
         let weight = state.master.weight(parameter);
-        let gradient = gradient.as_dtype(f32_);
+        if self.fused
+            && crate::adamw_kernel::fits(parameter.size())
+            && gradient.size() == parameter.size()
+        {
+            let hp = match self.scalar_arrays.iter().find(|(known, _)| *known == s) {
+                Some((_, hp)) => hp.clone(),
+                None => {
+                    let hp = crate::adamw_kernel::scalars_array(&s);
+                    self.scalar_arrays.push((s, hp.clone()));
+                    hp
+                }
+            };
+            let gradient = match Dtype::from_raw(gradient.dtype_raw()) {
+                Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16 => gradient.clone(),
+                _ => gradient.as_dtype(f32_),
+            };
+            match crate::adamw_kernel::update(&weight, &gradient, &state.m, &state.v, &hp) {
+                Ok((weight, m, v)) => {
+                    state.m = m;
+                    state.v = v;
+                    state.master.commit(parameter, weight);
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "the fused AdamW kernel is unavailable ({e}); updating with ops instead"
+                    );
+                    self.fused = false;
+                }
+            }
+        }
+        Self::step_single_ops(state, &s, gradient, parameter, weight);
+    }
+
+    /// The update from elementwise ops: the reference [`Self::step_single`]'s
+    /// fused kernel is tested against.
+    fn step_single_ops(
+        state: &mut AdamState,
+        s: &AdamWStepScalars,
+        gradient: &InlineArray,
+        parameter: &mut InlineArray,
+        weight: InlineArray,
+    ) {
+        let gradient = gradient.as_dtype(Dtype::Float32.as_i32());
 
         let weight = if s.decay != 1.0 {
             weight.mul_scalar(s.decay)
@@ -897,6 +965,104 @@ mod tests {
         opt.advance_step();
         opt.step_single("w", &InlineArray::from_f32_slice(&[1.0], &[1]), &mut param);
         assert!(opt.states["w"].master.value().is_none());
+    }
+
+    /// Parameters of every shape, dtype and class, stepped 100 times by the
+    /// fused kernel and by the op-based reference with the same gradients.
+    ///
+    /// The kernel contracts nothing and uses the precise square root and
+    /// divide, so it rounds as the separate ops do: the two agree exactly, in
+    /// the parameters, in both moments and in the f32 master copies.
+    #[test]
+    fn the_fused_kernel_matches_the_op_reference_over_100_steps() {
+        use crate::compat::Dtype;
+        let (f32_, bf16, f16) = (
+            Dtype::Float32.as_i32(),
+            Dtype::Bfloat16.as_i32(),
+            Dtype::Float16.as_i32(),
+        );
+        // (name, shape, parameter dtype, gradient dtype). The names pick the
+        // classes: decayed weights, a norm weight that is not, an embedding
+        // and a LoRA B matrix (the last two train at their own rates).
+        let cases: [(&str, &[i32], i32, i32); 7] = [
+            ("layers.0.q_proj.weight", &[33, 17], f32_, f32_),
+            ("layers.0.input_layernorm.weight", &[64], f32_, f32_),
+            ("embed_tokens.weight", &[5, 70], bf16, bf16),
+            ("layers.0.q_proj.lora_b", &[8, 31], bf16, f32_),
+            ("layers.0.q_proj.lora_a", &[7, 9], f16, f16),
+            ("layers.1.v_proj.weight", &[1], f32_, bf16),
+            ("layers.2.up_proj.weight", &[1000], bf16, f32_),
+        ];
+        let build = |fused: bool| {
+            AdamW::new(3e-3, 0.05)
+                .with_embedding_lr(1e-3)
+                .with_loraplus_ratio(4.0)
+                .with_betas(0.9, 0.99)
+                .with_eps(1e-7)
+                .with_fused(fused)
+        };
+        let (mut fused, mut reference) = (build(true), build(false));
+        let mut params: Vec<(InlineArray, InlineArray)> = cases
+            .iter()
+            .map(|(_, shape, dtype, _)| {
+                let n: i32 = shape.iter().product();
+                let values: Vec<f32> = (0..n).map(|i| ((i * 7 % 23) as f32 - 11.0) / 8.0).collect();
+                let p = InlineArray::from_f32_slice(&values, shape).as_dtype(*dtype);
+                (p.clone(), p)
+            })
+            .collect();
+        for step in 0..100 {
+            fused.advance_step();
+            reference.advance_step();
+            for (i, (name, shape, _, grad_dtype)) in cases.iter().enumerate() {
+                let n: i32 = shape.iter().product();
+                // A gradient that changes sign and scale from step to step.
+                let values: Vec<f32> = (0..n)
+                    .map(|j| {
+                        let x = ((j * 13 + step * 29 + i as i32 * 5) % 41) as f32 - 20.0;
+                        x * 0.01 * (1.0 + (step % 7) as f32)
+                    })
+                    .collect();
+                let grad = InlineArray::from_f32_slice(&values, shape).as_dtype(*grad_dtype);
+                fused.step_single(name, &grad, &mut params[i].0);
+                reference.step_single(name, &grad, &mut params[i].1);
+            }
+            let all: Vec<&InlineArray> = params.iter().flat_map(|(a, b)| [a, b]).collect();
+            for a in all {
+                a.eval();
+            }
+        }
+        assert!(fused.fused, "the fused kernel fell back to the ops");
+        for (i, (name, ..)) in cases.iter().enumerate() {
+            let (f, r) = (&params[i].0, &params[i].1);
+            assert_eq!(f.dtype(), r.dtype(), "{name}");
+            assert_eq!(read(f), read(r), "{name}: the parameter");
+            let (fs, rs) = (&fused.states[*name], &reference.states[*name]);
+            assert_eq!(read(&fs.m), read(&rs.m), "{name}: the first moment");
+            assert_eq!(read(&fs.v), read(&rs.v), "{name}: the second moment");
+            match (fs.master.value(), rs.master.value()) {
+                (Some(a), Some(b)) => assert_eq!(read(a), read(b), "{name}: the master copy"),
+                (None, None) => {}
+                _ => panic!("{name}: only one of the two kept a master copy"),
+            }
+        }
+        crate::check_unobserved_error().expect("no bridge error");
+    }
+
+    /// A gradient of a different size than its parameter is left to the ops
+    /// (which broadcast it), not read out of bounds by the kernel.
+    #[test]
+    fn a_gradient_of_another_size_falls_back_to_the_ops() {
+        let mut fused = AdamW::new(1e-2, 0.0);
+        let mut reference = AdamW::new(1e-2, 0.0).with_fused(false);
+        let grad = InlineArray::from_f32_slice(&[0.5], &[1]);
+        let mut a = InlineArray::from_f32_slice(&[1.0, 2.0, 3.0], &[3]);
+        let mut b = a.clone();
+        fused.advance_step();
+        reference.advance_step();
+        fused.step_single("w", &grad, &mut a);
+        reference.step_single("w", &grad, &mut b);
+        assert_eq!(read(&a), read(&b));
     }
 
     #[test]

@@ -55,6 +55,7 @@ pub mod decode;
 pub mod distributed;
 pub mod logits_processor;
 
+mod adamw_kernel;
 pub mod optimizer;
 pub use optimizer::{AdamW, ParamClass, ParamSet};
 
