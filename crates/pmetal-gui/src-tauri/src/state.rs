@@ -300,7 +300,7 @@ impl AppState {
                 let folder = self
                     .paths
                     .hub_cache
-                    .join(format!("models--{}", model.id.replace('/', "--")));
+                    .join(pmetal::core::paths::hub_repo_folder("models", &model.id));
                 if folder.parent() != Some(self.paths.hub_cache.as_path()) || !folder.is_dir() {
                     return Err(AppError::new(format!(
                         "Could not find {} in the Hugging Face cache. Refresh the model list.",

@@ -810,6 +810,20 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn dataset_results_are_read_leniently() {
+        let body =
+            br#"[{"id":"acme/data","downloads":1500,"likes":3,"tags":["a","b"],"description":"d"},
+            {"downloads":1}, {"id":"../escape"}, {"id":"plain"}]"#;
+        let results = parse_dataset_results(body).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].dataset_id, "acme/data");
+        assert_eq!(results[0].author.as_deref(), Some("acme"));
+        assert_eq!(results[0].tags, ["a", "b"]);
+        assert_eq!(results[1].author, None);
+        assert!(parse_dataset_results(b"{}").is_err());
+    }
+
+    #[test]
     fn a_result_is_read_with_its_real_weight_size() {
         // Shapes taken from live Hub responses: `total` is a parameter count
         // (not bytes), `parameters` is keyed by element type.
