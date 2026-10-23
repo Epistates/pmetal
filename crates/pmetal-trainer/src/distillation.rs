@@ -557,8 +557,8 @@ impl DistillationTrainer {
             with_training_mode(|| loss_and_grad_fn(student, &batch.input_ids))?
         };
 
+        self.loop_state.accumulate_gradients(grads, &[&loss])?;
         let loss_val = crate::step_check::check_step(self.loop_state.step + 1, loss.item_f32())?;
-        self.loop_state.accumulate_gradients(grads)?;
         let applied = self.loop_state.should_apply_gradients();
         let mut grad_norm = None;
         if applied {

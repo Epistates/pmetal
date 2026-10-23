@@ -424,16 +424,20 @@ impl TrainingLoop {
     /// Fold in the gradients of a micro-batch whose mean loss the caller
     /// computed itself (distillation), at equal weight with the others of its
     /// optimizer step; the loop's own steps weight by tokens instead.
+    ///
+    /// Evaluates what is held together with `also` (the micro-batch's loss,
+    /// which the caller reads next), in one evaluation.
     pub(crate) fn accumulate_gradients(
         &mut self,
         grads: pmetal_runtime::compat::FlattenedModuleParam,
+        also: &[&Array],
     ) -> Result<()> {
         self.accumulator.add(super::step::MicroOutput {
             loss_sum: Array::from_f32(0.0),
             count: Array::from_f32(1.0),
             grads,
         });
-        self.accumulator.eval_held(&[])
+        self.accumulator.eval_held(also)
     }
 
     /// Whether `gradient_accumulation_steps` micro-batches are held.

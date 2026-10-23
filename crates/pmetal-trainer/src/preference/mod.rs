@@ -494,9 +494,8 @@ where
             let lr = scheduler.get_lr(step) as f32;
             set_lr(optimizer, lr);
             optimizer.update(model, grads)?;
-            grad_norm.eval();
             let params = model.lora_parameters();
-            transforms::eval(params.values())?;
+            transforms::eval(params.values().chain([&grad_norm]))?;
             pmetal_runtime::check_unobserved_error()
                 .map_err(|e| Exception::custom(e.to_string()))?;
             step += 1;
