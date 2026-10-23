@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 
 /// The sections of a training config file, loaded and checked by `pmetal-core`.
 pub use pmetal_core::FullTrainingConfig;
-use pmetal_core::{ConfigValidator, LoraConfig, TrainingCallback, TrainingConfig};
+use pmetal_core::jobs::{Explicit, FileSection, file_key_flag};
+use pmetal_core::{ConfigValidator, LoraConfig, TrainingCallback, TrainingConfig, TrainingInfo};
 use pmetal_data::{
     DataLoaderConfig, DatasetColumnConfig, DatasetFormat, DatasetSource, Tokenizer,
     TrainingDataset, resolve_dataset_source,
@@ -152,6 +153,12 @@ pub struct TrainingJobConfig {
     pub dispatch: DispatchConfig,
     /// Optional YAML config file to load defaults from.
     pub config_path: Option<String>,
+    /// Which flags were given, as opposed to left at their defaults. With a
+    /// config file: a setting comes from the flag if it was given, else from
+    /// the file, else from the default. The command line says which flags it
+    /// was given (`Explicit::Only`); a job built from a spec on purpose has
+    /// said every one of them.
+    pub explicit: Explicit,
     /// Path for JSONL metrics output.
     pub log_metrics: Option<String>,
     /// Resume from latest checkpoint.
@@ -176,6 +183,7 @@ impl Default for TrainingJobConfig {
             columns: None,
             dispatch: DispatchConfig::default(),
             config_path: None,
+            explicit: Explicit::All,
             log_metrics: None,
             resume: false,
             seed: 42,
@@ -261,6 +269,7 @@ impl TrainingJobConfig {
                 ..DispatchConfig::default()
             },
             config_path: spec.config_path.clone(),
+            explicit: Explicit::All,
             log_metrics: spec.log_metrics.clone(),
             resume: spec.resume,
             seed: spec.seed,
@@ -269,24 +278,17 @@ impl TrainingJobConfig {
     }
 }
 
-fn cli_training_defaults() -> TrainingConfig {
-    TrainingConfig {
-        num_epochs: 1,
-        max_seq_len: 0,
-        warmup_steps: 0,
-        ..TrainingConfig::default()
-    }
-}
-
-/// Copy into `target` every field of `overrides` that differs from `defaults`.
+/// Copy into `target` every field of `overrides` that a flag given on the
+/// command line sets (`Explicit`).
 ///
-/// A field `overrides` leaves at its default is the caller saying nothing
-/// about it, so the file's value stands; a field it sets, even to the value
-/// the file has, wins. The fields are found by serializing, so a field added
-/// to the config is merged without anyone remembering to add a line here (the
-/// hand-copied version of this silently dropped every field added after it
-/// was written).
-fn merge_overrides<T>(target: &mut T, overrides: &T, defaults: &T)
+/// A field no flag was given for is the caller saying nothing about it, so the
+/// file's value stands; a field a flag was given for wins, even when the value
+/// is the one the file has or the default. The fields are found by
+/// serializing, so a field added to the config is merged without anyone
+/// remembering to add a line here (the hand-copied version of this silently
+/// dropped every field added after it was written); which flag sets which key
+/// is `pmetal_core::jobs::FILE_KEYS`.
+fn merge_overrides<T>(target: &mut T, overrides: &T, section: FileSection, explicit: &Explicit)
 where
     T: serde::Serialize + serde::de::DeserializeOwned,
 {
@@ -294,10 +296,9 @@ where
         Ok(serde_json::Value::Object(map)) => map,
         other => panic!("a config section serializes to an object, got {other:?}"),
     };
-    let (mut merged, overrides, defaults) =
-        (to_object(target), to_object(overrides), to_object(defaults));
+    let (mut merged, overrides) = (to_object(target), to_object(overrides));
     for (key, value) in overrides {
-        if defaults.get(&key) != Some(&value) {
+        if file_key_flag(section, &key).is_some_and(|flag| explicit.is_set(flag)) {
             merged.insert(key, value);
         }
     }
@@ -305,12 +306,16 @@ where
         .expect("a merge of two valid config sections is a valid config section");
 }
 
-fn merge_lora_overrides(target: &mut LoraConfig, overrides: &LoraConfig) {
-    merge_overrides(target, overrides, &LoraConfig::default());
+fn merge_lora_overrides(target: &mut LoraConfig, overrides: &LoraConfig, explicit: &Explicit) {
+    merge_overrides(target, overrides, FileSection::Lora, explicit);
 }
 
-fn merge_training_overrides(target: &mut TrainingConfig, overrides: &TrainingConfig) {
-    merge_overrides(target, overrides, &cli_training_defaults());
+fn merge_training_overrides(
+    target: &mut TrainingConfig,
+    overrides: &TrainingConfig,
+    explicit: &Explicit,
+) {
+    merge_overrides(target, overrides, FileSection::Training, explicit);
 }
 
 /// The training loop's settings for a run: the config's training and LoRA
@@ -353,8 +358,8 @@ fn merge_job_overrides_into_full_config(full: &mut FullTrainingConfig, job: &Tra
     if !job.dataset.is_empty() {
         full.dataset.dataset_id = job.dataset.clone();
     }
-    merge_lora_overrides(&mut full.lora, &job.lora);
-    merge_training_overrides(&mut full.training, &job.training);
+    merge_lora_overrides(&mut full.lora, &job.lora, &job.explicit);
+    merge_training_overrides(&mut full.training, &job.training, &job.explicit);
 }
 
 // ---------------------------------------------------------------------------
@@ -485,17 +490,16 @@ pub async fn run_training(
         anyhow::bail!("A dataset is required. Specify --dataset <path> or set dataset in config.");
     }
 
-    let output_candidate =
-        if has_config_file && config.output_dir == TrainingJobConfig::default().output_dir {
-            full_config.training.output_dir.clone()
-        } else {
-            config.output_dir.clone()
-        };
+    let output_candidate = if has_config_file && !config.explicit.is_set("--output") {
+        full_config.training.output_dir.clone()
+    } else {
+        config.output_dir.clone()
+    };
     let validated_output = pmetal_core::paths::output_path(&output_candidate, "output directory")?;
     let output_dir = validated_output.to_string_lossy().to_string();
     full_config.training.output_dir = output_dir.clone();
 
-    if !has_config_file || config.seed != TrainingJobConfig::default().seed {
+    if !has_config_file || config.explicit.is_set("--seed") {
         full_config.training.seed = config.seed;
     }
 
@@ -511,11 +515,8 @@ pub async fn run_training(
     // the model, or runs with the same seed start from different weights.
     pmetal_runtime::compat::random::seed(config.seed);
 
-    if has_config_file {
-        let dispatch_defaults = DispatchConfig::default();
-        if config.dispatch.sequence_packing == dispatch_defaults.sequence_packing {
-            config.dispatch.sequence_packing = full_config.training.use_packing;
-        }
+    if has_config_file && !config.explicit.is_set("--no-sequence-packing") {
+        config.dispatch.sequence_packing = full_config.training.use_packing;
     }
 
     // -----------------------------------------------------------------------
@@ -525,6 +526,26 @@ pub async fn run_training(
     tokio::task::yield_now().await;
     tracing::info!("Loading model: {}", full_config.model.model_id);
     let model_path = resolve_model_path(&full_config.model.model_id).await?;
+
+    // What this run starts from, beside its results: the terminal UI and the
+    // desktop app list an adapter with its base model from it. A resumed run
+    // keeps the record of the run it continues.
+    let record_dir = Path::new(&output_dir);
+    if !(config.resume && TrainingInfo::read(record_dir).is_some()) {
+        let method = match (config.qlora.is_some(), config.lora.use_dora) {
+            (false, false) => "lora",
+            (true, false) => "qlora",
+            (false, true) => "dora",
+            (true, true) => "qdora",
+        };
+        TrainingInfo {
+            base_model_path: Some(model_path.display().to_string()),
+            dataset: Some(full_config.dataset.dataset_id.clone()),
+            method: Some(method.to_string()),
+            ..TrainingInfo::starting(full_config.model.model_id.clone())
+        }
+        .write_or_warn(record_dir);
+    }
 
     // -----------------------------------------------------------------------
     // Phase 3: Load model config
@@ -755,19 +776,10 @@ pub async fn run_training(
     // Actual MetricsJsonCallback creation is deferred to AFTER ANE attempt
     // to avoid truncating the metrics file if ANE writes to it first.
     // -----------------------------------------------------------------------
-    let metrics_path_resolved = config.log_metrics.as_ref().map(|metrics_path| {
-        // If the path is just a filename (e.g. "metrics.jsonl"), join it to the
-        // canonicalized output_dir so all consumers agree on the absolute path.
-        let p = PathBuf::from(metrics_path);
-        if p.is_absolute() {
-            p
-        } else if metrics_path.contains('/') || metrics_path.contains('\\') {
-            // Relative path with directories — resolve against output_dir
-            PathBuf::from(&output_dir).join(p)
-        } else {
-            PathBuf::from(&output_dir).join(metrics_path)
-        }
-    });
+    let metrics_path_resolved = config
+        .log_metrics
+        .as_ref()
+        .map(|metrics_path| pmetal_core::paths::resolve_in(Path::new(&output_dir), metrics_path));
     let has_metrics_cb = metrics_path_resolved.is_some();
     let mut metrics_callback: Option<Box<dyn TrainingCallback>> = if let Some(ref path) =
         metrics_path_resolved
@@ -1499,16 +1511,8 @@ async fn attempt_ane_training(
     // on all callbacks internally.
     // -----------------------------------------------------------------------
     if let Some(ref metrics_str) = config.log_metrics {
-        // Resolve to absolute path using canonicalized output_dir
-        let p = PathBuf::from(metrics_str);
-        let metrics_path = if p.is_absolute() {
-            p
-        } else {
-            PathBuf::from(output_dir).join(
-                p.file_name()
-                    .unwrap_or(std::ffi::OsStr::new("metrics.jsonl")),
-            )
-        };
+        // Relative to the output directory, as everywhere else.
+        let metrics_path = pmetal_core::paths::resolve_in(Path::new(output_dir), metrics_str);
         if let Ok(cb) = crate::MetricsJsonCallback::new(&metrics_path) {
             let cb = cb
                 .with_run_name(format!("ane-{}", config.model_id.replace('/', "-")))
@@ -1853,6 +1857,10 @@ mod tests {
         );
     }
 
+    fn only(flags: &[&str]) -> Explicit {
+        Explicit::Only(flags.iter().map(|f| f.to_string()).collect())
+    }
+
     #[test]
     fn config_file_merge_preserves_yaml_training_defaults() {
         let mut full = FullTrainingConfig::default();
@@ -1865,10 +1873,11 @@ mod tests {
         full.training.min_lr = Some(1e-6);
         full.training.use_packing = false;
 
+        // No flag given: the job's values are the defaults, which say nothing.
         let job = TrainingJobConfig {
             model_id: String::new(),
             dataset: String::new(),
-            training: cli_training_defaults(),
+            explicit: only(&[]),
             ..TrainingJobConfig::default()
         };
 
@@ -1891,9 +1900,11 @@ mod tests {
         full.dataset.dataset_id = "yaml.jsonl".to_string();
         full.training.num_epochs = 7;
 
-        let mut overrides = cli_training_defaults();
-        overrides.num_epochs = 2;
-        overrides.max_steps = Some(5);
+        let overrides = TrainingConfig {
+            num_epochs: 2,
+            max_steps: Some(5),
+            ..TrainingConfig::default()
+        };
         let job = TrainingJobConfig {
             model_id: "cli/model".to_string(),
             dataset: "cli.jsonl".to_string(),
@@ -1902,6 +1913,7 @@ mod tests {
                 ..LoraConfig::default()
             },
             training: overrides,
+            explicit: only(&["--epochs", "--max-steps", "--lora-r"]),
             ..TrainingJobConfig::default()
         };
 
@@ -1912,6 +1924,27 @@ mod tests {
         assert_eq!(full.lora.r, 8);
         assert_eq!(full.training.num_epochs, 2);
         assert_eq!(full.training.max_steps, Some(5));
+    }
+
+    /// A flag given the value that is also the default is still a flag given:
+    /// `--epochs 1` beats a file that says 7, which comparing with the default
+    /// could not tell from leaving the flag out.
+    #[test]
+    fn a_flag_given_its_default_value_still_beats_the_file() {
+        let mut full = FullTrainingConfig::default();
+        full.training.num_epochs = 7;
+        full.training.weight_decay = 0.3;
+        let job = TrainingJobConfig {
+            explicit: only(&["--epochs"]),
+            ..TrainingJobConfig::default()
+        };
+        assert_eq!(job.training.num_epochs, pmetal_core::defaults::EPOCHS);
+        merge_job_overrides_into_full_config(&mut full, &job);
+        assert_eq!(full.training.num_epochs, pmetal_core::defaults::EPOCHS);
+        assert_eq!(
+            full.training.weight_decay, 0.3,
+            "a flag that was not given leaves the file's value"
+        );
     }
 
     /// Every field a job sets reaches the merged config, the ones added since
@@ -1926,10 +1959,16 @@ mod tests {
             z_loss: 1e-4,
             neftune_noise_alpha: Some(5.0),
             optimizer: pmetal_core::OptimizerType::Muon,
-            ..cli_training_defaults()
+            ..TrainingConfig::default()
         };
         let job = TrainingJobConfig {
             training: overrides,
+            explicit: only(&[
+                "--label-smoothing",
+                "--z-loss",
+                "--neftune-alpha",
+                "--optimizer",
+            ]),
             ..TrainingJobConfig::default()
         };
         merge_job_overrides_into_full_config(&mut full, &job);
@@ -1941,5 +1980,22 @@ mod tests {
             full.training.weight_decay, 0.3,
             "untouched fields keep the file's value"
         );
+    }
+
+    /// A job built from a spec on purpose has said every value, so with no
+    /// word from a command line the spec's values are the ones used.
+    #[test]
+    fn a_job_built_from_a_spec_overrides_the_file_throughout() {
+        let mut full = FullTrainingConfig::default();
+        full.training.num_epochs = 7;
+        full.lora.r = 64;
+        let spec = pmetal_core::jobs::TrainSpec {
+            epochs: 2,
+            lora_r: 8,
+            ..Default::default()
+        };
+        let job = TrainingJobConfig::from_spec(&spec).unwrap();
+        merge_job_overrides_into_full_config(&mut full, &job);
+        assert_eq!((full.training.num_epochs, full.lora.r), (2, 8));
     }
 }

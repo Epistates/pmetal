@@ -1,5 +1,6 @@
 //! `pmetal train` — supervised fine-tuning / LoRA / QLoRA / ANE.
 
+use super::{default_lora_alpha, default_lora_r, default_seed};
 use crate::{
     DistributedCompression, DistributedTrainingConfig, FieldError, JobFields, LoraConfig,
     TrainingConfig, defaults,
@@ -12,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Holds the user-facing input fields. Conversion to the trainer's internal
 /// `TrainingJobConfig` happens at the consumer boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, JobSpec)]
-#[spec(kind = "Train", subcommand = "train")]
+#[spec(kind = "Train", subcommand = "train", events)]
 #[serde(rename_all = "snake_case")]
 pub struct TrainSpec {
     // -- Model & data ---------------------------------------------------------
@@ -804,6 +805,99 @@ impl TrainSpec {
     }
 }
 
+/// A section of the training config file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileSection {
+    /// `training:`.
+    Training,
+    /// `lora:`.
+    Lora,
+}
+
+/// The flag of `pmetal train` that sets each key of the config file's
+/// `training:` and `lora:` sections: what a flag given on the command line
+/// overrides. A key with no flag (`lora.loraplus_lr_ratio`, ...) is the file's
+/// alone.
+pub const FILE_KEYS: &[(&str, FileSection, &str)] = &[
+    ("--learning-rate", FileSection::Training, "learning_rate"),
+    (
+        "--embedding-lr",
+        FileSection::Training,
+        "embedding_learning_rate",
+    ),
+    (
+        "--label-smoothing",
+        FileSection::Training,
+        "label_smoothing",
+    ),
+    ("--z-loss", FileSection::Training, "z_loss"),
+    (
+        "--neftune-alpha",
+        FileSection::Training,
+        "neftune_noise_alpha",
+    ),
+    ("--batch-size", FileSection::Training, "batch_size"),
+    (
+        "--gradient-accumulation-steps",
+        FileSection::Training,
+        "gradient_accumulation_steps",
+    ),
+    ("--epochs", FileSection::Training, "num_epochs"),
+    ("--max-steps", FileSection::Training, "max_steps"),
+    ("--warmup-steps", FileSection::Training, "warmup_steps"),
+    ("--warmup-ratio", FileSection::Training, "warmup_ratio"),
+    ("--weight-decay", FileSection::Training, "weight_decay"),
+    ("--max-grad-norm", FileSection::Training, "max_grad_norm"),
+    ("--lr-schedule", FileSection::Training, "lr_scheduler"),
+    ("--min-lr", FileSection::Training, "min_lr"),
+    (
+        "--wsd-stable-ratio",
+        FileSection::Training,
+        "wsd_stable_ratio",
+    ),
+    (
+        "--wsd-decay-style",
+        FileSection::Training,
+        "wsd_decay_style",
+    ),
+    (
+        "--cosine-num-restarts",
+        FileSection::Training,
+        "cosine_num_restarts",
+    ),
+    (
+        "--polynomial-power",
+        FileSection::Training,
+        "polynomial_power",
+    ),
+    ("--logging-steps", FileSection::Training, "logging_steps"),
+    ("--eval-steps", FileSection::Training, "eval_steps"),
+    ("--save-steps", FileSection::Training, "save_steps"),
+    ("--optimizer", FileSection::Training, "optimizer"),
+    ("--seed", FileSection::Training, "seed"),
+    ("--output", FileSection::Training, "output_dir"),
+    ("--max-seq-len", FileSection::Training, "max_seq_len"),
+    (
+        "--no-sequence-packing",
+        FileSection::Training,
+        "use_packing",
+    ),
+    ("--lora-r", FileSection::Lora, "r"),
+    ("--lora-alpha", FileSection::Lora, "alpha"),
+    ("--lora-dropout", FileSection::Lora, "dropout"),
+    ("--rslora", FileSection::Lora, "use_rslora"),
+    ("--dora", FileSection::Lora, "use_dora"),
+    ("--lora-targets", FileSection::Lora, "target_modules"),
+];
+
+/// The flag that overrides `key` of `section` of the config file, if one does.
+pub fn file_key_flag(section: FileSection, key: &str) -> Option<&'static str> {
+    FILE_KEYS
+        .iter()
+        .find(|(_, s, k)| *s == section && *k == key)
+        .map(|(flag, _, _)| *flag)
+}
+
 // -- defaults shims (for `#[serde(default = "...")]`) -----------------------
 
 fn default_train_output_dir() -> String {
@@ -816,7 +910,7 @@ fn default_batch_size() -> usize {
     defaults::CLI_BATCH_SIZE
 }
 fn default_epochs() -> usize {
-    defaults::CLI_EPOCHS
+    defaults::EPOCHS
 }
 fn default_grad_accum() -> usize {
     defaults::GRADIENT_ACCUMULATION_STEPS
@@ -830,17 +924,8 @@ fn default_weight_decay() -> f64 {
 fn default_lr_schedule() -> String {
     "cosine".to_string()
 }
-fn default_seed() -> u64 {
-    defaults::SEED
-}
 fn default_loss_scale() -> f32 {
     defaults::LOSS_SCALE as f32
-}
-fn default_lora_r() -> usize {
-    defaults::LORA_R
-}
-fn default_lora_alpha() -> f32 {
-    defaults::LORA_ALPHA
 }
 fn default_logging_steps() -> usize {
     defaults::LOGGING_STEPS
@@ -956,6 +1041,8 @@ mod tests {
         let spec = TrainSpec {
             model: "Qwen/Qwen3-0.6B".into(),
             dataset: "data/train.jsonl".into(),
+            output_dir: "runs/a".into(),
+            learning_rate: 1e-4,
             ..Default::default()
         };
         let argv = spec.to_argv();
@@ -1164,5 +1251,82 @@ mod tests {
         assert_eq!(back.model, spec.model);
         assert_eq!(back.dataset, spec.dataset);
         assert_eq!(back.learning_rate, spec.learning_rate);
+    }
+
+    /// A value for `descriptor`'s field that is not the spec's default, to see
+    /// what the field changes.
+    fn other_than(
+        descriptor: &crate::FieldDescriptor,
+        default: &serde_json::Value,
+    ) -> serde_json::Value {
+        use crate::FieldKind;
+        use serde_json::{Value, json};
+        match descriptor.kind {
+            FieldKind::Toggle => json!(!default.as_bool().unwrap_or(false)),
+            FieldKind::Enum { options } => json!(
+                options
+                    .iter()
+                    .find(|o| Some(**o) != default.as_str())
+                    .expect("an enum has two options")
+            ),
+            FieldKind::Number { .. } => json!(default.as_f64().unwrap_or(0.0) + 0.25),
+            FieldKind::Integer { .. } => json!(default.as_i64().unwrap_or(0) + 1),
+            _ if descriptor.shape == crate::FieldShape::List => json!(["x"]),
+            _ => Value::String("x".into()),
+        }
+    }
+
+    /// `FILE_KEYS` is what the orchestrator merges the config file by, so it
+    /// must say, for each flag, the key the spec really builds from it, and
+    /// leave out no key a flag sets.
+    #[test]
+    fn the_file_keys_are_the_keys_each_flag_builds() {
+        use serde_json::Value;
+
+        fn keys<T: Serialize>(value: &T) -> serde_json::Map<String, Value> {
+            match serde_json::to_value(value).unwrap() {
+                Value::Object(map) => map,
+                other => panic!("{other}"),
+            }
+        }
+        let default = TrainSpec::default();
+        let default_fields = keys(&default);
+        let default_training = keys(&default.training_config().unwrap());
+        let default_lora = keys(&default.lora_config());
+
+        for (flag, section, key) in FILE_KEYS {
+            let descriptor = TrainSpec::field_descriptors()
+                .iter()
+                .find(|d| d.argv == Some(*flag))
+                .unwrap_or_else(|| panic!("no field takes {flag}"));
+            let mut fields = default_fields.clone();
+            let value = other_than(descriptor, &default_fields[descriptor.name]);
+            fields.insert(descriptor.name.to_string(), value);
+            let spec: TrainSpec = serde_json::from_value(Value::Object(fields)).unwrap();
+            let (before, after) = match section {
+                FileSection::Training => {
+                    (&default_training, keys(&spec.training_config().unwrap()))
+                }
+                FileSection::Lora => (&default_lora, keys(&spec.lora_config())),
+            };
+            let changed: Vec<&String> = after.keys().filter(|k| after[*k] != before[*k]).collect();
+            assert_eq!(changed, [&key.to_string()], "{flag}");
+        }
+
+        // Every key of the two sections is a flag's or is known to have none.
+        const FILE_ONLY_LORA: &[&str] = &["bias", "init_lora_weights", "loraplus_lr_ratio"];
+        for key in default_training.keys() {
+            assert!(
+                file_key_flag(FileSection::Training, key).is_some(),
+                "training.{key} has no flag in FILE_KEYS"
+            );
+        }
+        for key in default_lora.keys() {
+            assert!(
+                file_key_flag(FileSection::Lora, key).is_some()
+                    || FILE_ONLY_LORA.contains(&key.as_str()),
+                "lora.{key} has no flag in FILE_KEYS"
+            );
+        }
     }
 }

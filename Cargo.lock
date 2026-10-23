@@ -5481,6 +5481,8 @@ dependencies = [
 name = "pmetal-core"
 version = "0.7.0"
 dependencies = [
+ "chrono",
+ "dirs 7.0.0",
  "pmetal-core-derive",
  "secrecy",
  "serde",
@@ -5489,6 +5491,8 @@ dependencies = [
  "serde_path_to_error",
  "tempfile",
  "thiserror 2.0.21",
+ "tracing",
+ "tracing-subscriber",
  "trybuild",
 ]
 
@@ -5645,7 +5649,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-subscriber",
  "turbomcp",
  "turbomcp-types",
  "uuid",
@@ -5755,6 +5758,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5813,6 +5817,7 @@ version = "0.7.0"
 dependencies = [
  "anstream",
  "chrono",
+ "dirs 7.0.0",
  "pmetal-core",
  "rustix",
  "schemars",

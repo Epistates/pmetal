@@ -404,8 +404,13 @@ fn handle(
         .collect();
     let seg: Vec<&str> = segments.iter().map(String::as_str).collect();
 
-    // /api/models?search=…&limit=…&filter=…&pipeline_tag=…
-    if seg == ["api", "models"] {
+    // /api/{models|datasets}?search=…&limit=…&filter=…&pipeline_tag=…
+    if seg == ["api", "models"] || seg == ["api", "datasets"] {
+        let listed = if seg[1] == "models" {
+            Kind::Model
+        } else {
+            Kind::Dataset
+        };
         let params: Vec<(String, String)> = query
             .split('&')
             .filter(|p| !p.is_empty())
@@ -422,11 +427,8 @@ fn handle(
             .collect();
         let search = get("search").unwrap_or("").to_lowercase();
         let limit: usize = get("limit").and_then(|l| l.parse().ok()).unwrap_or(1000);
-        let mut ids: Vec<&(Kind, String)> = inner
-            .repos
-            .keys()
-            .filter(|(k, _)| *k == Kind::Model)
-            .collect();
+        let mut ids: Vec<&(Kind, String)> =
+            inner.repos.keys().filter(|(k, _)| *k == listed).collect();
         ids.sort();
         let mut out = Vec::new();
         for key in ids {

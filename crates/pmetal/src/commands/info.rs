@@ -76,7 +76,7 @@ fn environment() -> Environment {
     Environment {
         hub_cache: pmetal_hub::cache_dir(),
         hub_offline: pmetal_hub::HubOptions::default().is_offline(),
-        log_dir: crate::pmetal_log_dir(),
+        log_dir: pmetal_core::logging::log_dir(),
         features,
     }
 }

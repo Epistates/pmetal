@@ -41,7 +41,7 @@ impl PathPolicy {
                     .split(':')
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .map(|s| expand_home(s).unwrap_or_else(|| PathBuf::from(s))),
+                    .map(pmetal_core::paths::expand_home),
             );
         }
         Self::new(cwd, roots)
@@ -79,8 +79,7 @@ impl PathPolicy {
         if raw.contains('\0') {
             return Err(format!("{field}: the path contains a NUL byte"));
         }
-        let home = expand_home(raw);
-        let resolved = resolve(home.as_deref().unwrap_or(Path::new(raw)), &self.cwd);
+        let resolved = resolve(&pmetal_core::paths::expand_home(raw), &self.cwd);
         if self.roots.iter().any(|root| resolved.starts_with(root)) {
             Ok(resolved)
         } else {
@@ -187,15 +186,6 @@ pub fn root_uri_to_path(uri: &str) -> Option<PathBuf> {
     }
     let decoded = String::from_utf8(out).ok()?;
     (!decoded.contains('\0')).then(|| PathBuf::from(decoded))
-}
-
-fn expand_home(raw: &str) -> Option<PathBuf> {
-    let rest = raw.strip_prefix('~')?;
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    match rest {
-        "" => Some(home),
-        _ => rest.strip_prefix('/').map(|r| home.join(r)),
-    }
 }
 
 /// `path` made absolute against `cwd`, with `.` and `..` removed and symlinks

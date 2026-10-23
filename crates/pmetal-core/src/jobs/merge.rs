@@ -1,4 +1,10 @@
-//! `pmetal merge` — multi-model merging (SLERP / TIES / DARE / etc.).
+//! `pmetal merge`: merge two models (SLERP, TIES, DARE, task arithmetic, ...).
+//!
+//! The `method` field's options are the one list of merge methods every
+//! surface offers (the command line's `--method`, the forms, the MCP tool, the
+//! Python class). Fisher-weighted and RegMean merging are in the library but
+//! need a statistics file per model that nothing in PMetal produces, so they
+//! are not offered here.
 
 use crate::{FieldError, JobFields};
 use pmetal_core_derive::JobSpec;
@@ -39,9 +45,11 @@ pub struct MergeSpec {
     pub output: String,
 
     #[job(label = "Method", group = "Method", argv = "--method", kind = "enum",
+          help = "Every method but linear, slerp, multislerp and passthrough merges what each model changed from a base model, which it then needs",
           enum_options = ["linear", "slerp", "ties", "dare_ties", "dare_linear",
-                          "task_arithmetic", "della", "breadcrumbs", "model_stock",
-                          "nearswap", "passthrough"],
+                          "task_arithmetic", "della", "della_linear", "breadcrumbs",
+                          "model_stock", "consensus", "multislerp", "nearswap", "ram",
+                          "ram_plus", "passthrough"],
           default = "slerp")]
     #[serde(default = "default_method")]
     pub method: String,
@@ -122,9 +130,23 @@ impl Default for MergeSpec {
     }
 }
 
+/// The methods that merge the two models as they are; every other method
+/// merges what each changed from a common base model.
+pub const METHODS_WITHOUT_BASE: &[&str] = &["linear", "slerp", "multislerp", "passthrough"];
+
 impl MergeSpec {
     pub fn normalize(&mut self) -> Result<(), Vec<FieldError>> {
-        let errs = self.validate_descriptors();
+        let mut errs = self.validate_descriptors();
+        let has_base = self.base.as_deref().is_some_and(|b| !b.trim().is_empty());
+        if errs.is_empty() && !has_base && !METHODS_WITHOUT_BASE.contains(&self.method.as_str()) {
+            errs.push(FieldError::new(
+                "base",
+                format!(
+                    "{} merges what each model changed from a base model: give the model both were trained from",
+                    self.method
+                ),
+            ));
+        }
         if errs.is_empty() { Ok(()) } else { Err(errs) }
     }
 }
@@ -148,6 +170,40 @@ fn default_dtype() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_method_is_offered_and_the_base_rule_covers_them_all() {
+        let options = match MergeSpec::field_descriptors()
+            .iter()
+            .find(|d| d.name == "method")
+            .map(|d| d.kind)
+        {
+            Some(crate::FieldKind::Enum { options }) => options,
+            other => panic!("method is not an enum: {other:?}"),
+        };
+        assert_eq!(options.len(), 16);
+        for method in METHODS_WITHOUT_BASE {
+            assert!(options.contains(method), "{method}");
+        }
+        for method in options {
+            let mut spec = MergeSpec {
+                model_a: "a".into(),
+                model_b: "b".into(),
+                output: "o".into(),
+                method: (*method).into(),
+                ..Default::default()
+            };
+            let needs_base = !METHODS_WITHOUT_BASE.contains(method);
+            let errors = spec.normalize().err().unwrap_or_default();
+            assert_eq!(
+                errors.iter().any(|e| e.field == "base"),
+                needs_base,
+                "{method}: {errors:?}"
+            );
+            spec.base = Some("ancestor".into());
+            assert!(spec.normalize().is_ok(), "{method}");
+        }
+    }
 
     #[test]
     fn argv_round_trip() {

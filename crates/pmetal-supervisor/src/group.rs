@@ -5,8 +5,6 @@
 //! only the process the supervisor holds. `rustix` makes the call without
 //! `unsafe` and without a `kill(1)` child.
 
-use std::path::PathBuf;
-
 use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 
 /// Ask the group led by `pid` to finish.
@@ -29,25 +27,4 @@ fn signal_group(pid: u32, signal: Signal) -> bool {
         return false;
     };
     kill_process_group(pid, signal).is_ok() || kill_process(pid, signal).is_ok()
-}
-
-/// The `pmetal` binary jobs run.
-///
-/// Search order:
-/// 1. `PMETAL_BIN` (explicit override)
-/// 2. a `pmetal` beside the running executable
-/// 3. `pmetal` on `PATH`
-pub fn resolve_pmetal_binary() -> PathBuf {
-    if let Some(bin) = std::env::var_os("PMETAL_BIN") {
-        return PathBuf::from(bin);
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join("pmetal");
-            if candidate.exists() {
-                return candidate;
-            }
-        }
-    }
-    PathBuf::from("pmetal")
 }

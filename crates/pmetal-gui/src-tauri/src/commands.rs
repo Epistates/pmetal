@@ -520,10 +520,14 @@ pub async fn list_trained_adapters(state: State<'_, AppState>) -> Result<Vec<Tra
 struct ChatEvents(AppHandle);
 
 impl inference::Sink for ChatEvents {
-    fn token(&self, session_id: &str, text: &str) {
+    fn token(&self, session_id: &str, piece: inference::Piece<'_>) {
         let _ = self.0.emit(
             "chat-token",
-            serde_json::json!({ "session_id": session_id, "text": text }),
+            serde_json::json!({
+                "session_id": session_id,
+                "text": piece.text,
+                "thinking": piece.thinking,
+            }),
         );
     }
 
@@ -549,20 +553,21 @@ pub async fn start_chat(
     session_id: String,
 ) -> Result<()> {
     let token = state.token_for_hub().await;
-    inference::start(
-        state.sessions.clone(),
-        spec,
-        messages,
-        token,
-        Arc::new(ChatEvents(app)),
-        session_id,
-    )
-    .await
+    state
+        .chat
+        .start(
+            spec,
+            messages.unwrap_or_default(),
+            token,
+            Arc::new(ChatEvents(app)),
+            session_id,
+        )
+        .await
 }
 
 #[tauri::command]
 pub async fn stop_chat(state: State<'_, AppState>, session_id: Option<String>) -> Result<()> {
-    state.sessions.cancel(session_id.as_deref());
+    state.chat.cancel(session_id.as_deref());
     Ok(())
 }
 

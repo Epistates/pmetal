@@ -22,9 +22,17 @@ pub struct InferArgs {
     #[arg(long = "lora")]
     pub lora: Option<String>,
 
-    /// Input prompt
-    #[arg(short, long = "prompt")]
-    pub prompt: String,
+    /// Input prompt. Give this or --messages-file
+    #[arg(short, long = "prompt", required_unless_present_any = ["messages_file", "benchmark"], conflicts_with = "messages_file")]
+    pub prompt: Option<String>,
+
+    /// A conversation to continue instead of a prompt: a JSON array of chat
+    /// messages, `[{"role": "user", "content": "..."}, ...]` (roles system,
+    /// user, assistant, tool; the last must be a user's or a tool's result).
+    /// The chat template, --tools and --image apply, as for --prompt. A prompt
+    /// is a one-message conversation, so the two give the same text.
+    #[arg(long = "messages-file", value_name = "FILE")]
+    pub messages_file: Option<String>,
 
     /// Image file to show the model, before the prompt text (repeatable, in
     /// order). Qwen3.5-family vision models (Qwen3.5 / 3.6 / 3.8).
@@ -257,7 +265,8 @@ impl From<InferArgs> for InferSpec {
         InferSpec {
             model: a.model,
             lora: a.lora,
-            prompt: a.prompt,
+            prompt: a.prompt.unwrap_or_default(),
+            messages_file: a.messages_file,
             image: a.image,
             video: a.video,
             video_fps: a.video_fps,

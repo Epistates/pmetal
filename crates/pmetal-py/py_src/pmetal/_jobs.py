@@ -23,6 +23,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import warnings
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -50,9 +51,6 @@ __all__ = [
     "run",
     "start",
 ]
-
-#: The subcommands that write a ``--log-events`` stream.
-EVENT_LOG_SUBCOMMANDS = frozenset({"train", "distill", "grpo", "rlkd", "preference"})
 
 #: Exit status of a ``pmetal`` run that was interrupted (128 + SIGINT).
 _INTERRUPTED = 130
@@ -109,10 +107,13 @@ class JobSpec(Protocol):
     """What ``run`` and ``start`` need of a spec: every ``pmetal.*Spec`` is one."""
 
     subcommand: ClassVar[str]
+    reports_events: ClassVar[bool]
 
     def normalize(self) -> None: ...
 
     def to_argv(self) -> list[str]: ...
+
+    def _launch(self, events_dir: str | os.PathLike[str] | None = None) -> tuple[str, list[str], str | None]: ...
 
 
 @dataclass(frozen=True)
@@ -385,14 +386,16 @@ def start(
     spec = copy.copy(spec)
     spec.normalize()
     program = find_cli(cli)
-    native = _start_job(
-        str(program),
-        spec.subcommand,
-        spec.to_argv(),
-        spec.subcommand in EVENT_LOG_SUBCOMMANDS,
-        stop_grace,
-        on_event,
-    )
+    # A command that streams events is given a scratch directory for the file;
+    # the job removes it when it is gone.
+    events_dir = tempfile.mkdtemp(prefix="pmetal-events-") if spec.reports_events else None
+    try:
+        subcommand, argv, events_file = spec._launch(events_dir)
+        native = _start_job(str(program), subcommand, argv, events_file, events_dir, stop_grace, on_event)
+    except BaseException:
+        if events_dir is not None:
+            shutil.rmtree(events_dir, ignore_errors=True)
+        raise
     return Job(native)
 
 

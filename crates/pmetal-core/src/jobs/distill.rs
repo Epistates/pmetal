@@ -1,11 +1,12 @@
 //! `pmetal distill` — knowledge distillation (online / offline / progressive).
 
+use super::{default_lora_alpha, default_lora_r, default_seed};
 use crate::{FieldError, JobFields};
 use pmetal_core_derive::JobSpec;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JobSpec)]
-#[spec(kind = "Distill", subcommand = "distill")]
+#[spec(kind = "Distill", subcommand = "distill", events)]
 #[serde(rename_all = "snake_case")]
 pub struct DistillSpec {
     #[job(
@@ -464,20 +465,11 @@ fn default_lr() -> f32 {
 fn default_max_seq_len() -> usize {
     1024
 }
-fn default_lora_r() -> usize {
-    16
-}
-fn default_lora_alpha() -> f32 {
-    32.0
-}
 fn default_batch_size() -> usize {
     1
 }
 fn default_epochs() -> usize {
-    1
-}
-fn default_seed() -> u64 {
-    42
+    crate::defaults::EPOCHS
 }
 fn default_checkpoint_every() -> usize {
     100

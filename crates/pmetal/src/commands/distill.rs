@@ -230,7 +230,6 @@ pub(crate) async fn run_distillation(spec: DistillSpec, ctx: RunContext) -> anyh
     use pmetal_distill::{DistillConfig, Distiller, LogitCache, LossConfig};
     use pmetal_lora::DynamicLoraModel;
     use pmetal_trainer::{DistillationTrainer, TrainingLoopConfig, generate_teacher_logit_cache};
-    use std::path::PathBuf;
 
     // The data loader takes `seed` too; this one covers MLX's own key, which
     // initialises the student's LoRA weights.
@@ -281,6 +280,14 @@ pub(crate) async fn run_distillation(spec: DistillSpec, ctx: RunContext) -> anyh
 
     tracing::info!("Resolving student model: {}", student_id);
     let student_path = pmetal_hub::resolve_model_path(student_id, None, None).await?;
+
+    super::record_training(
+        &validated_distill_output,
+        student_id,
+        &student_path,
+        dataset_path,
+        "distill",
+    );
 
     tracing::info!("Loading tokenizer...");
     let tokenizer = Tokenizer::from_model_dir(&student_path)?;
@@ -433,11 +440,7 @@ pub(crate) async fn run_distillation(spec: DistillSpec, ctx: RunContext) -> anyh
 
     if let Some(metrics_path) = log_metrics {
         use pmetal_trainer::callbacks::MetricsJsonCallback;
-        let path = if metrics_path.contains('/') || metrics_path.contains('\\') {
-            PathBuf::from(metrics_path)
-        } else {
-            validated_distill_output.join(metrics_path)
-        };
+        let path = pmetal_core::paths::resolve_in(&validated_distill_output, metrics_path);
         let callback =
             MetricsJsonCallback::new(&path)?.with_run_name(format!("distill-{}", student_id));
         trainer.add_callback(Box::new(callback));

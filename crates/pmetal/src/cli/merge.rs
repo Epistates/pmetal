@@ -1,9 +1,41 @@
 //! Clap argument struct for `pmetal merge`.
 
 use clap::Args;
+use clap::builder::{PossibleValue, PossibleValuesParser};
 use pmetal_core::jobs::MergeSpec;
+use pmetal_core::{FieldKind, JobFields};
 
-/// Thin clap argument struct for `pmetal merge`.
+/// The merge methods the spec offers (its `method` field's options), each also
+/// spelled with hyphens, so what `--method` takes and what its help lists are
+/// the spec's.
+fn merge_methods() -> Vec<PossibleValue> {
+    let options = MergeSpec::field_descriptors()
+        .iter()
+        .find_map(|d| match d.kind {
+            FieldKind::Enum { options } if d.name == "method" => Some(options),
+            _ => None,
+        })
+        .unwrap_or_default();
+    options
+        .iter()
+        .map(|name| {
+            let mut value = PossibleValue::new(*name);
+            if name.contains('_') {
+                // Built once, for the life of the process.
+                value = value.alias(&*Box::leak(name.replace('_', "-").into_boxed_str()));
+            }
+            if *name == "multislerp" {
+                value = value.aliases(["multi_slerp", "multi-slerp"]);
+            }
+            value
+        })
+        .collect()
+}
+
+/// Merge two models into a new one.
+///
+/// Exactly two models are taken (`--model-a`, `--model-b`). The methods that
+/// merge changes from a common ancestor need that ancestor as `--base`.
 #[derive(Args, Debug)]
 pub struct MergeArgs {
     /// First model path or HuggingFace ID
@@ -18,11 +50,12 @@ pub struct MergeArgs {
     #[arg(short, long = "output")]
     pub output: String,
 
-    /// Merge method (linear, slerp, ties, dare_ties, dare_linear, task_arithmetic, della, della_linear, breadcrumbs, model_stock, nearswap, passthrough)
-    #[arg(long = "method", default_value = "slerp")]
+    /// Merge method
+    #[arg(long = "method", default_value = "slerp", value_parser = PossibleValuesParser::new(merge_methods()))]
     pub method: String,
 
-    /// Base model for task-vector methods (TIES, DARE, task_arithmetic)
+    /// Base model the other two descend from, for the task-vector methods (TIES, DARE,
+    /// DELLA, task_arithmetic, breadcrumbs, model_stock, consensus, ram)
     #[arg(long = "base")]
     pub base: Option<String>,
 

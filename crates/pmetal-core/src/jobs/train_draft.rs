@@ -1,6 +1,7 @@
 //! `pmetal train-draft` — train a DFlash block-diffusion draft model against a
 //! frozen Qwen3 target.
 
+use super::default_seed;
 use crate::{FieldError, JobFields};
 use pmetal_core_derive::JobSpec;
 use serde::{Deserialize, Serialize};
@@ -283,9 +284,6 @@ fn default_checkpoint_every() -> usize {
 }
 fn default_log_every() -> usize {
     10
-}
-fn default_seed() -> u64 {
-    crate::defaults::SEED
 }
 
 #[cfg(test)]

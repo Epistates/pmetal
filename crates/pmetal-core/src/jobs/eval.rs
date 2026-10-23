@@ -309,6 +309,7 @@ mod tests {
             fewshot: Some(0),
             output: Some("out.json".into()),
             log_samples: true,
+            seed: 7,
             ..Default::default()
         };
         let argv = spec.to_argv();

@@ -179,6 +179,14 @@ pub async fn run_grpo_job(
     // 1. Resolve and Download Model
     tracing::info!("Resolving model: {}", model_id);
     let model_path = crate::orchestrator::resolve_model_path(model_id).await?;
+    // What the run started from, left beside its results for the adapter list.
+    pmetal_core::TrainingInfo {
+        base_model_path: Some(model_path.display().to_string()),
+        dataset: Some(dataset_path.to_string()),
+        method: Some("grpo".to_string()),
+        ..pmetal_core::TrainingInfo::starting(model_id)
+    }
+    .write_or_warn(std::path::Path::new(output_dir));
 
     // 2. Load Tokenizer (with config-aware special token resolution)
     tracing::info!("Loading tokenizer...");
@@ -332,11 +340,7 @@ pub async fn run_grpo_job(
     // Wire metrics callback if --log-metrics was provided
     if let Some(metrics_path) = log_metrics {
         use crate::callbacks::MetricsJsonCallback;
-        let path = if metrics_path.contains('/') || metrics_path.contains('\\') {
-            PathBuf::from(metrics_path)
-        } else {
-            PathBuf::from(output_dir).join(metrics_path)
-        };
+        let path = pmetal_core::paths::resolve_in(std::path::Path::new(output_dir), metrics_path);
         let callback = MetricsJsonCallback::new(&path)?.with_run_name(format!(
             "grpo-{}",
             model_id.split('/').next_back().unwrap_or(model_id)

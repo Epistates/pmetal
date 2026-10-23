@@ -399,13 +399,11 @@ export interface ChatTurn {
 
 export interface ChatMetrics {
   session_id: string;
-  prompt_tokens: number;
+  /** 0 when the reply was stopped before the command reported its statistics. */
   generated_tokens: number;
   total_ms: number;
   ttft_ms: number | null;
   tok_per_sec: number | null;
-  avg_step_ms: number | null;
-  p50_step_ms: number | null;
   response_text: string;
   thinking: string | null;
   truncated_thinking: boolean;
@@ -436,7 +434,9 @@ export const onDownloadUpdate = (cb: (d: DownloadView) => void) =>
   on<DownloadView>('download-update', cb);
 export const onModelsUpdated = (cb: () => void) => on<null>('models-updated', () => cb());
 export const onAppQuitting = (cb: () => void) => on<null>('app-quitting', () => cb());
-export const onChatToken = (cb: (e: { session_id: string; text: string }) => void) =>
+export const onChatToken = (
+  cb: (e: { session_id: string; text: string; thinking: string }) => void,
+) =>
   on('chat-token', cb);
 export const onChatDone = (cb: (m: ChatMetrics) => void) => on<ChatMetrics>('chat-done', cb);
 export const onChatError = (cb: (e: { session_id: string; error: string }) => void) =>

@@ -41,7 +41,8 @@ pub(crate) mod rlkd;
 pub(crate) mod search;
 #[cfg(feature = "serve")]
 pub(crate) mod serve;
-#[cfg(feature = "trainer")]
+// `pmetal infer` stops on a request too; the trainers use the rest of it.
+#[cfg_attr(not(feature = "trainer"), allow(dead_code))]
 pub(crate) mod stop;
 pub(crate) mod tokenize;
 #[cfg(feature = "trainer")]
@@ -102,6 +103,27 @@ impl RunContext {
             callbacks: Vec::new(),
         }
     }
+}
+
+/// Leave beside a run's results what it started from (`training_info.json`),
+/// so the terminal UI and the desktop app can list the adapter with its base
+/// model. A record that cannot be written is a warning: the run does not
+/// depend on it.
+#[cfg(feature = "trainer")]
+pub(crate) fn record_training(
+    output_dir: &std::path::Path,
+    base_model: &str,
+    base_model_path: &std::path::Path,
+    dataset: &str,
+    method: &str,
+) {
+    pmetal_core::TrainingInfo {
+        base_model_path: Some(base_model_path.display().to_string()),
+        dataset: Some(dataset.to_string()),
+        method: Some(method.to_string()),
+        ..pmetal_core::TrainingInfo::starting(base_model)
+    }
+    .write_or_warn(output_dir);
 }
 
 /// Run a trainer command the way the command line does: `--log-events`

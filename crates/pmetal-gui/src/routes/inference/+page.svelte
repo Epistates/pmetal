@@ -122,14 +122,6 @@
     }
   }
 
-  function parseThinking(text: string): { thinking: string | null; reply: string } {
-    const match = text.match(/^<think>([\s\S]*?)<\/think>\s*/);
-    if (match) {
-      return { thinking: match[1].trim(), reply: text.slice(match[0].length) };
-    }
-    return { thinking: null, reply: text };
-  }
-
   function normalizeMaxTokensValue(value: number | null | undefined): number {
     const parsed = Number(value);
     if (!Number.isFinite(parsed)) return DEFAULT_MAX_TOKENS;
@@ -170,6 +162,7 @@
     const mine = crypto.randomUUID();
     session = mine;
     let content = '';
+    let thinking = '';
 
     try {
       // Listening before starting, and for this session only, so a reply that
@@ -180,8 +173,11 @@
       unlistenToken = await onChatToken((e) => {
         if (e.session_id !== mine) return;
         inferenceStatus = 'generating';
+        // The reasoning arrives apart from the answer, so it shows as it is
+        // written, in its own block.
+        thinking += e.thinking;
         content += e.text;
-        finishLast((m) => ({ ...m, content }));
+        finishLast((m) => ({ ...m, content, thinking: thinking || undefined }));
         scrollToBottom();
       });
       unlistenDone = await onChatDone((metrics) => {
@@ -572,7 +568,7 @@
                     {expandedThinking.has(idx) ? '▼' : '▶'}
                   </span>
                 </button>
-                {#if expandedThinking.has(idx)}
+                {#if expandedThinking.has(idx) || (message.isStreaming && !message.content)}
                   <div class="px-3 py-2 text-xs text-surface-600 dark:text-surface-400 font-mono whitespace-pre-wrap leading-relaxed border-t border-surface-200 dark:border-surface-700 max-h-96 overflow-y-auto bg-surface-50 dark:bg-surface-900/50">
                     {message.thinking}
                   </div>
@@ -598,8 +594,13 @@
                 {#if message.metrics.ttft_ms != null}
                   <span>TTFT {message.metrics.ttft_ms.toFixed(0)}ms</span>
                 {/if}
-                <span>{message.metrics.generated_tokens} tokens</span>
-                <span>{(message.metrics.total_ms / 1000).toFixed(1)}s</span>
+                {#if message.metrics.generated_tokens > 0}
+                  <span>{message.metrics.generated_tokens} tokens</span>
+                  <span>{(message.metrics.total_ms / 1000).toFixed(1)}s</span>
+                {/if}
+                {#if message.metrics.stopped}
+                  <span>stopped</span>
+                {/if}
               </div>
             {/if}
           </div>

@@ -1,6 +1,7 @@
 //! `pmetal train-diffusion` — block-diffusion LoRA fine-tuning of a
 //! DiffusionGemma model on `(prompt, response)` pairs.
 
+use super::{default_lora_alpha, default_lora_r, default_seed};
 use crate::{FieldError, JobFields};
 use pmetal_core_derive::JobSpec;
 use serde::{Deserialize, Serialize};
@@ -240,12 +241,6 @@ impl TrainDiffusionSpec {
 fn default_output() -> String {
     "./diffusion-lora-output".to_string()
 }
-fn default_lora_r() -> usize {
-    crate::defaults::LORA_R
-}
-fn default_lora_alpha() -> f32 {
-    crate::defaults::LORA_ALPHA
-}
 fn default_corrupted_only() -> bool {
     true
 }
@@ -269,9 +264,6 @@ fn default_max_context_len() -> usize {
 }
 fn default_log_every() -> usize {
     10
-}
-fn default_seed() -> u64 {
-    crate::defaults::SEED
 }
 
 #[cfg(test)]

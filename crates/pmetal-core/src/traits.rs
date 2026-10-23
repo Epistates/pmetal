@@ -80,10 +80,9 @@ pub mod defaults {
     pub const LEARNING_RATE: f64 = 2e-4;
     /// Default batch size. Matches `pmetal train --batch-size`.
     pub const CLI_BATCH_SIZE: usize = 1;
-    /// Default number of epochs for library consumers.
-    pub const EPOCHS: usize = 3;
-    /// Default number of epochs on the command line.
-    pub const CLI_EPOCHS: usize = 1;
+    /// Default number of epochs: for the command line, a config file that does
+    /// not say, and the library alike.
+    pub const EPOCHS: usize = 1;
     /// Default weight decay.
     pub const WEIGHT_DECAY: f64 = 0.01;
     /// Default gradient clipping norm.

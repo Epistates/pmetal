@@ -525,8 +525,8 @@ impl ModelFamily {
 fn model_name(model_path: &Path) -> String {
     for component in model_path.components().rev() {
         let part = component.as_os_str().to_string_lossy();
-        if let Some(repo) = part.strip_prefix("models--") {
-            return repo.replacen("--", "/", 1);
+        if let Some(repo) = pmetal_core::paths::hub_repo_id("models", &part) {
+            return repo;
         }
     }
     model_path

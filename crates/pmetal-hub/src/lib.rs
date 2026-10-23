@@ -20,6 +20,7 @@ mod client;
 mod dataset;
 mod download;
 pub mod fit;
+pub mod local;
 mod progress;
 mod repo;
 pub mod resolve;

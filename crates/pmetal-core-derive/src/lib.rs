@@ -8,6 +8,11 @@
 //!
 //! - `kind = "Train"` — required; the `pmetal_core::JobKind` variant.
 //! - `subcommand = "train"` — required; the CLI subcommand string.
+//! - `events` — optional; the command writes a `--log-events` file
+//!   (`JobEvent` lines a supervisor follows). It becomes
+//!   `JobFields::REPORTS_EVENTS`, the one place that fact is stated: the CLI
+//!   refuses the flag for other commands and every surface that launches jobs
+//!   asks for the file only where the command writes it.
 //!
 //! ## Field-level attributes (`#[job(...)]` on each field)
 //!
@@ -30,7 +35,11 @@
 //! - `invert` — pair with `flag`; emit `--flag` when `false`, omit when `true`
 //!   (for `--no-foo` semantics).
 //! - `valued` — `bool` field whose flag takes a value, `--flag true|false`;
-//!   always emitted. For a default of `true` that a switch could not turn off.
+//!   emitted unless it is the default. For a default of `true` that a switch
+//!   could not turn off.
+//! - `always` — emit the flag even at the default, for a setting that must be
+//!   stated and never left to the command (a bind address). Valid on plain
+//!   numeric, `String` and `valued` fields.
 //! - `csv` — `Vec<String>` field; emit `--flag a,b,c` joined with commas.
 //! - `repeat` — `Vec<String>` field; emit `--flag a --flag b`, one per item.
 //! - `required` — non-empty / non-default validation. Valid on `String`,
@@ -47,6 +56,11 @@
 //! Float fields additionally reject `NaN` and infinities in
 //! `validate_descriptors()`, bounded or not: `NaN` compares false against
 //! every bound, so a range check alone would wave it through.
+//!
+//! The generated impl also names the fields that `--output` and `--log-metrics`
+//! map to (`JobFields::OUTPUT_FIELD`, `JobFields::LOG_METRICS_FIELD`), so a
+//! launcher can find where a job writes without scanning descriptors (which a
+//! `skip_descriptor` field does not have).
 //!
 //! The generated impl carries the struct's generics and `where` clause, names
 //! everything through absolute paths (`::pmetal_core`, `::std`) and is marked
@@ -113,6 +127,8 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
     let mut argv_items = Vec::new();
     let mut argv_flags = Vec::new();
     let mut validate_items = Vec::new();
+    let mut output_field: Option<String> = None;
+    let mut log_metrics_field: Option<String> = None;
 
     for field in fields {
         let parsed = match parse_field(field) {
@@ -133,6 +149,11 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
             argv_items.push(emit_argv(&parsed));
             if let Some(flag) = &parsed.attrs.argv {
                 argv_flags.push(flag.clone());
+                match flag.as_str() {
+                    "--output" => output_field = Some(parsed.name_str.clone()),
+                    "--log-metrics" => log_metrics_field = Some(parsed.name_str.clone()),
+                    _ => {}
+                }
             }
         }
     }
@@ -144,11 +165,22 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
 
     let kind_ident = &spec_meta.kind;
     let subcommand = &spec_meta.subcommand;
+    let events = spec_meta.events;
+    let option_str = |name: &Option<String>| match name {
+        Some(name) => quote! { ::std::option::Option::Some(#name) },
+        None => quote! { ::std::option::Option::None },
+    };
+    let output_field = option_str(&output_field);
+    let log_metrics_field = option_str(&log_metrics_field);
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
     Ok(quote! {
         #[automatically_derived]
         impl #impl_generics ::pmetal_core::JobFields for #ident #ty_generics #where_clause {
+            const REPORTS_EVENTS: bool = #events;
+            const OUTPUT_FIELD: ::std::option::Option<&'static str> = #output_field;
+            const LOG_METRICS_FIELD: ::std::option::Option<&'static str> = #log_metrics_field;
+
             fn field_descriptors() -> &'static [::pmetal_core::FieldDescriptor] {
                 static DESCRIPTORS: &[::pmetal_core::FieldDescriptor] = &[
                     #(#descriptor_items),*
@@ -159,6 +191,11 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
             fn to_argv(&self) -> ::std::vec::Vec<::std::string::String> {
                 #[allow(unused_mut)]
                 let mut args: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
+                // A setting at its default is left to the command's own: a
+                // flag passed with the default's value would beat a config
+                // file that names another.
+                #[allow(unused_variables)]
+                let default = <Self as ::std::default::Default>::default();
                 #(#argv_items)*
                 args
             }
@@ -192,11 +229,13 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
 struct SpecMeta {
     kind: Ident,
     subcommand: LitStr,
+    events: bool,
 }
 
 fn parse_spec_meta(attrs: &[Attribute], span: Span) -> syn::Result<SpecMeta> {
     let mut kind: Option<Ident> = None;
     let mut subcommand: Option<LitStr> = None;
+    let mut events = false;
 
     for attr in attrs.iter().filter(|a| a.path().is_ident("spec")) {
         attr.parse_nested_meta(|meta| {
@@ -216,8 +255,13 @@ fn parse_spec_meta(attrs: &[Attribute], span: Span) -> syn::Result<SpecMeta> {
                 reject_duplicate(&meta, subcommand.is_some())?;
                 subcommand = Some(meta.value()?.parse()?);
                 Ok(())
+            } else if meta.path.is_ident("events") {
+                reject_duplicate(&meta, events)?;
+                events = true;
+                Ok(())
             } else {
-                Err(meta.error("unknown #[spec(...)] key — expected `kind` or `subcommand`"))
+                Err(meta
+                    .error("unknown #[spec(...)] key — expected `kind`, `subcommand` or `events`"))
             }
         })?;
     }
@@ -230,7 +274,11 @@ fn parse_spec_meta(attrs: &[Attribute], span: Span) -> syn::Result<SpecMeta> {
     })?;
     let subcommand = subcommand
         .ok_or_else(|| syn::Error::new(span, "JobSpec requires #[spec(subcommand = \"...\")]"))?;
-    Ok(SpecMeta { kind, subcommand })
+    Ok(SpecMeta {
+        kind,
+        subcommand,
+        events,
+    })
 }
 
 fn reject_duplicate(meta: &ParseNestedMeta<'_>, already_set: bool) -> syn::Result<()> {
@@ -300,6 +348,7 @@ struct FieldAttrs {
     csv: Option<Span>,
     repeat: Option<Span>,
     valued: Option<Span>,
+    always: Option<Span>,
 
     required: Option<Span>,
     skip_descriptor: bool,
@@ -557,6 +606,9 @@ fn parse_field_attrs(attrs: &[Attribute]) -> syn::Result<FieldAttrs> {
             } else if path.is_ident("valued") {
                 reject_duplicate(&meta, out.valued.is_some())?;
                 out.valued = Some(path.span());
+            } else if path.is_ident("always") {
+                reject_duplicate(&meta, out.always.is_some())?;
+                out.always = Some(path.span());
             } else if path.is_ident("csv") {
                 reject_duplicate(&meta, out.csv.is_some())?;
                 out.csv = Some(path.span());
@@ -715,6 +767,18 @@ fn check_attr_consistency(field: &ParsedField) -> syn::Result<()> {
             return Err(syn::Error::new(
                 span,
                 "`valued` cannot be combined with `flag`, `invert` or `csv`",
+            ));
+        }
+    }
+    if let Some(span) = a.always {
+        if a.argv.is_none() {
+            return Err(syn::Error::new(span, "`always` needs `argv = \"...\"`"));
+        }
+        if a.flag.is_some() || a.csv.is_some() || a.repeat.is_some() || ty.is_option() {
+            return Err(syn::Error::new(
+                span,
+                "`always` cannot be combined with `flag`, `csv` or `repeat`, or applied to an \
+                 `Option` field",
             ));
         }
     }
@@ -1025,11 +1089,21 @@ fn emit_argv(field: &ParsedField) -> TokenStream2 {
         };
     }
 
+    // A setting is passed when it differs from the default, or always if the
+    // field says it must be stated.
+    let differs = if attrs.always.is_some() {
+        quote! { true }
+    } else {
+        quote! { self.#name != default.#name }
+    };
+
     // Bool that takes `true` / `false`, so a default of true can be turned off.
     if attrs.valued.is_some() {
         return quote! {
-            args.push(::std::string::ToString::to_string(#argv));
-            args.push(::std::string::ToString::to_string(&self.#name));
+            if #differs {
+                args.push(::std::string::ToString::to_string(#argv));
+                args.push(::std::string::ToString::to_string(&self.#name));
+            }
         };
     }
 
@@ -1071,7 +1145,7 @@ fn emit_argv(field: &ParsedField) -> TokenStream2 {
     // Plain string
     if field.ty.is_string_like() {
         return quote! {
-            if !self.#name.is_empty() {
+            if !self.#name.is_empty() && #differs {
                 args.push(::std::string::ToString::to_string(#argv));
                 args.push(::std::clone::Clone::clone(&self.#name));
             }
@@ -1080,8 +1154,10 @@ fn emit_argv(field: &ParsedField) -> TokenStream2 {
 
     // Plain numeric (or any `Display` type with an explicit kind override).
     quote! {
-        args.push(::std::string::ToString::to_string(#argv));
-        args.push(::std::string::ToString::to_string(&self.#name));
+        if #differs {
+            args.push(::std::string::ToString::to_string(#argv));
+            args.push(::std::string::ToString::to_string(&self.#name));
+        }
     }
 }
 
@@ -1233,6 +1309,34 @@ mod tests {
 
     fn with_field(attrs: &str, ty: &str) -> String {
         format!("{SPEC} struct S {{ #[job({attrs})] f: {ty} }}")
+    }
+
+    #[test]
+    fn the_event_log_and_the_output_fields_are_part_of_the_impl() {
+        let plain = expand_src(&format!(
+            "{SPEC} struct S {{ #[job(skip_descriptor)] f: u8 }}"
+        ))
+        .expect("expands");
+        assert!(plain.contains("REPORTS_EVENTS : bool = false"), "{plain}");
+        assert!(
+            plain.contains("OUTPUT_FIELD : :: std :: option :: Option < & 'static str > = :: std :: option :: Option :: None"),
+            "{plain}"
+        );
+
+        let src = r#"#[spec(kind = "Train", subcommand = "t", events)]
+            struct S {
+                #[job(label = "O", group = "G", argv = "--output")] out: String,
+                #[job(skip_descriptor, argv = "--log-metrics")] m: Option<String>,
+            }"#;
+        let out = expand_src(src).expect("expands");
+        assert!(out.contains("REPORTS_EVENTS : bool = true"), "{out}");
+        assert!(out.contains("Option :: Some (\"out\")"), "{out}");
+        assert!(out.contains("Option :: Some (\"m\")"), "{out}");
+
+        expect_err(
+            r#"#[spec(kind = "Train", subcommand = "t", events, events)] struct S { #[job(skip_descriptor)] f: u8 }"#,
+            "more than once",
+        );
     }
 
     #[test]

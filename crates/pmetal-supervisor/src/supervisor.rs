@@ -4,12 +4,13 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use pmetal_core::StepMetrics;
 use pmetal_core::events::{CompletionSummary, JobEvent, MetricPayload};
+use pmetal_core::sync::locked;
 use serde::Serialize;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -61,7 +62,10 @@ pub enum Error {
     #[error("job not found: {0}")]
     NotFound(String),
     /// Starting the job would exceed [`Limits::max_running`].
-    #[error("{running} jobs are already running (the limit is {limit})")]
+    #[error(
+        "{running} jobs are already running (the limit is {limit}). Stop one, or wait for one \
+         to finish."
+    )]
     TooManyRunning {
         /// Jobs running now.
         running: usize,
@@ -77,6 +81,9 @@ pub enum Error {
     /// The process could not be started, or a file it needs could not be made.
     #[error("{0}")]
     Io(String),
+    /// A spec could not be turned into a command (a bug in the spec).
+    #[error("the job's settings could not be turned into a command: {0}")]
+    InvalidSpec(String),
 }
 
 /// How a job's process stands.
@@ -225,14 +232,6 @@ struct Job {
     logs: Mutex<LogBuffer>,
     stop_requested: AtomicBool,
     events: broadcast::Sender<Event>,
-}
-
-fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    // A panicking reader task leaves the data usable; a poisoned lock must not
-    // take the whole supervisor's job view down with it.
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Job {

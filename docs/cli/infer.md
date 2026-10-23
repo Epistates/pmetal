@@ -2,9 +2,9 @@
 
 Generate text from a model: one prompt in, one completion out, with the model's chat template, tool definitions, thinking controls, LoRA adapters, speculative decoding, and opt-in per-layer profiling for supported hybrid models.
 
-`--prompt` is required. For an interactive conversation use the Inference tab of [`pmetal tui`](/cli/tui/); to serve a model to other programs use [`pmetal serve`](/cli/serve/).
+Give `--prompt`, or `--messages-file` to continue a conversation (see [Continuing a Conversation](#continuing-a-conversation)). For an interactive conversation use the Inference tab of [`pmetal tui`](/cli/tui/) or the Chat page of the desktop app; to serve a model to other programs use [`pmetal serve`](/cli/serve/).
 
-Ctrl-C stops the generation after the token in flight; the text so far is kept (with `--json`, `stopped_by` is `interrupted`) and the command exits with status 130.
+Ctrl-C, or SIGTERM (how a supervisor such as the desktop app stops it), ends the generation after the token in flight; the text so far is kept and the statistics are printed (with `--json`, `stopped_by` is `interrupted`), and the command exits with status 130.
 
 ## Usage
 
@@ -20,7 +20,8 @@ pmetal infer \
 | Option | Default | Description |
 |--------|---------|-------------|
 | `-m`, `--model` | required | HuggingFace model ID or local path |
-| `-p`, `--prompt` | required | Input prompt |
+| `-p`, `--prompt` | required unless `--messages-file` | Input prompt |
+| `--messages-file` | none | A JSON array of chat messages to continue instead of a prompt (see [Continuing a Conversation](#continuing-a-conversation)); not with `--prompt` |
 | `--lora` | none | LoRA adapter: a directory written by `pmetal train` (or any PEFT adapter directory) or its weights file |
 | `--chat` | `false` | Apply the model's chat template (instruct models and `--tools` use it regardless) |
 | `--system` | none | System message |
@@ -143,6 +144,25 @@ pmetal infer \
   --profile-layers \
   --profile-output qwen35_layer_profile.json
 ```
+
+## Continuing a Conversation
+
+`--messages-file` takes the conversation so far as a JSON array of messages, and the model answers the last one:
+
+```json
+[
+  {"role": "system", "content": "Be brief."},
+  {"role": "user", "content": "Capital of France?"},
+  {"role": "assistant", "content": "Paris."},
+  {"role": "user", "content": "And of Italy?"}
+]
+```
+
+```bash
+pmetal infer --model Qwen/Qwen3-0.6B --messages-file chat.json
+```
+
+The roles are `system` (only first), `user`, `assistant` and `tool`; the last message must be a user's or a tool's result, and nothing but an assistant's tool call may be empty. An assistant message may carry `reasoning_content` and `tool_calls`, and a tool message a `tool_call_id`. The conversation goes through the model's chat template as it would for `--prompt` with `--chat`, and `--tools` and `--image` apply as they do there. `--system` is the same as a first system message, so give one or the other. A prompt is a conversation of one message, so the two forms give the same text. The file may be up to 32 MiB, and a problem in it is reported with the number of the message.
 
 ## Output Length
 

@@ -23,7 +23,8 @@ pub struct ServeSpec {
         label = "Host",
         group = "Server",
         argv = "--host",
-        default = "127.0.0.1"
+        default = "127.0.0.1",
+        always
     )]
     #[serde(default = "default_host")]
     pub host: String,
@@ -384,12 +385,13 @@ mod tests {
     fn argv_emits_required_fields() {
         let spec = ServeSpec {
             model: "model".into(),
+            port: 9090,
             ..Default::default()
         };
         let argv = spec.to_argv();
         assert!(argv.contains(&"--model".to_string()));
         assert!(argv.contains(&"--port".to_string()));
-        assert!(argv.contains(&"8080".to_string()));
+        assert!(argv.contains(&"9090".to_string()));
     }
 
     #[test]

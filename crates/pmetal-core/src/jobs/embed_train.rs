@@ -1,5 +1,6 @@
 //! `pmetal embed-train` — sentence embedding model training (contrastive losses).
 
+use super::{default_lora_alpha, default_lora_r, default_seed};
 use crate::{FieldError, JobFields};
 use pmetal_core_derive::JobSpec;
 use serde::{Deserialize, Serialize};
@@ -248,15 +249,6 @@ fn default_weight_decay() -> f64 {
 fn default_log_every() -> usize {
     10
 }
-fn default_lora_r() -> usize {
-    16
-}
-fn default_lora_alpha() -> f32 {
-    32.0
-}
-fn default_seed() -> u64 {
-    42
-}
 
 #[cfg(test)]
 mod tests {
@@ -267,6 +259,7 @@ mod tests {
         let spec = EmbedTrainSpec {
             model: "m".into(),
             dataset: "d".into(),
+            loss: "triplet".into(),
             ..Default::default()
         };
         let argv = spec.to_argv();

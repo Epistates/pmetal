@@ -567,7 +567,7 @@ fn collect_runs(dir: &Path, out: &mut Vec<JobEntry>, depth: usize) {
 fn looks_like_a_run(path: &Path) -> bool {
     path.join("adapter_config.json").exists()
         || path.join("training_args.json").exists()
-        || path.join("training_info.json").exists()
+        || pmetal_core::TrainingInfo::path_in(path).exists()
         || std::fs::read_dir(path).is_ok_and(|entries| {
             entries
                 .flatten()
@@ -580,8 +580,8 @@ fn read_run_meta(path: &Path) -> (Option<String>, Option<f64>) {
     let json = |file: &str| -> Option<serde_json::Value> {
         serde_json::from_str(&std::fs::read_to_string(path.join(file)).ok()?).ok()
     };
-    let model = json("training_info.json")
-        .and_then(|j| j["base_model"].as_str().map(String::from))
+    let model = pmetal_core::TrainingInfo::read(path)
+        .and_then(|info| info.base_model)
         .or_else(|| {
             let j = json("adapter_config.json")?;
             j["base_model_name_or_path"]
