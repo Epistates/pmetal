@@ -32,6 +32,7 @@ full = ["mlx-collectives", "tensor-parallel", "expert-parallel", "context-parall
 
 [dependencies]
 # Use workspace versions for consistency
+pmetal-core = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

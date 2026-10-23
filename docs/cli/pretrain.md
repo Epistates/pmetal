@@ -19,7 +19,7 @@ pmetal pretrain \
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `-a`, `--arch` | required | Architecture: `llama`, `qwen2`, `qwen3`, `qwen3.5` (also `qwen3.6`), `qwen3_moe`, `gemma`, `gemma4`, `mistral`, `phi` or `gpt-oss` |
+| `-a`, `--arch` | required | Architecture: `llama`, `qwen2`, `qwen3`, `qwen3.5` (also `qwen3.6`), `qwen3_moe`, `gemma`, `gemma4`, `mistral`, `phi3` (also `phi4`) or `gpt-oss` |
 | `--model-config` | the architecture's defaults | Model config JSON that overrides the defaults (required for `gemma4`) |
 | `-s`, `--shards` | required | Tokenized shard files (`.bin`), comma-separated or repeated; a shell glob such as `./tok/shard_*.bin` is expanded before the command runs |
 | `--eval-shards` | none | Held-out shard files for evaluation |

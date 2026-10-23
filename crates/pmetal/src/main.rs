@@ -827,7 +827,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 .parse::<pmetal_core::LrSchedulerType>()
                 .map_err(|e| anyhow::anyhow!("--lr-schedule: {e}"))?;
 
-            // Build model via factory (supports llama, qwen2, qwen3, gemma, gemma4, mistral, phi, gpt-oss)
+            // Build model via factory (supports llama, qwen2, qwen3, gemma, gemma4, mistral, phi3, gpt-oss)
             use pmetal_runtime::compat::module::ModuleParameters;
             let config_path = _model_config.as_deref().map(std::path::Path::new);
             let mut model = pretrain::create_model(&arch, config_path)?;
