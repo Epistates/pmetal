@@ -7,7 +7,7 @@
 //! - Llama (2, 3, 3.1, 3.2, 3.3), Llama 4, Llama 3.2 Vision (Mllama)
 //! - Qwen (2, 2.5, 3, 3-MoE, 3.5 / 3.6 / 3.8 hybrids, Qwen4-Exp)
 //! - DeepSeek (V2, V3)
-//! - Mistral / Mixtral
+//! - Mistral
 //! - Gemma (2, 3, 4), DiffusionGemma
 //! - Phi (3, 4)
 //! - Cohere (Command R)
@@ -71,6 +71,7 @@ pub mod ollama;
 pub mod pipelines;
 pub mod pooling;
 pub mod qwen3_next_mtp;
+pub mod resolve;
 pub mod rl_generation;
 pub mod sampling;
 pub mod shard;
@@ -84,6 +85,7 @@ pub use gemma4_mtp::*;
 pub use generation::*;
 pub use loader::*;
 pub use qwen3_next_mtp::*;
+pub use resolve::UnsupportedModel;
 pub use rl_generation::{
     BatchedGenerationOutput, BatchedRlConfig, BatchedRlGenerator, generate_rl_completions,
 };

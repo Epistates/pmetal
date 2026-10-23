@@ -7,11 +7,18 @@
 //! without ever forming the `[B, T, vocab]` logits: a 2048-token chunk of a
 //! 152k vocabulary is 600 MB of them.
 
+// Only the Gemma 4 synthetic config of the shared parity scaffolding.
+#[path = "common/gemma4.rs"]
+mod gemma4_config;
+
 use pmetal_models::DynamicModel;
 use pmetal_models::architectures::cohere::{CohereConfig, CohereForCausalLM};
 use pmetal_models::architectures::granite::{GraniteConfig, GraniteForCausalLM};
 use pmetal_models::architectures::llama::{LlamaConfig, LlamaForCausalLM};
 use pmetal_models::architectures::mistral::{MistralConfig, MistralForCausalLM};
+use pmetal_models::architectures::mllama::{
+    MllamaConfig, MllamaForConditionalGeneration, MllamaTextConfig, MllamaVisionConfig,
+};
 use pmetal_models::architectures::phi::{PhiConfig, PhiForCausalLM};
 use pmetal_models::architectures::qwen2::{Qwen2Config, Qwen2ForCausalLM};
 use pmetal_models::architectures::qwen3::{Qwen3Config, Qwen3ForCausalLM};
@@ -130,6 +137,13 @@ fn check(label: &str, mut model: DynamicModel) {
             .forward_with_hybrid_cache_last(&ids, None, Some(&mut cache), mamba.as_mut())
             .unwrap()
     });
+    println!(
+        "{label}: peak above baseline, full forward {:.1} MiB, last position {:.1} MiB \
+         ({:.1} MiB of prompt logits)",
+        full_peak as f64 / 1048576.0,
+        last_peak as f64 / 1048576.0,
+        logits_bytes as f64 / 1048576.0
+    );
     assert!(
         full_peak >= logits_bytes,
         "{label}: the full forward peaks at {full_peak} bytes, under its {logits_bytes} bytes of \
@@ -339,4 +353,160 @@ fn nemotron_h() {
     });
     let model = DynamicModel::from_config(&config.to_string()).unwrap();
     check("nemotron_h", model);
+}
+
+/// A tiny config, with its vocabulary widened to the one the logits are
+/// measured at.
+fn tiny(mut config: serde_json::Value) -> DynamicModel {
+    config["vocab_size"] = serde_json::json!(VOCAB);
+    DynamicModel::from_config(&config.to_string()).expect("tiny model builds")
+}
+
+/// Gemma 2: a tied head under a final-logit softcap, which has to be applied to
+/// the one row the head runs on, not skipped with the rows it dropped.
+#[test]
+#[serial]
+fn gemma() {
+    random::seed(10);
+    let model = tiny(serde_json::json!({
+        "model_type": "gemma2",
+        "hidden_size": 32,
+        "intermediate_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+        "query_pre_attn_scalar": 8,
+        "sliding_window": 16,
+        "final_logit_softcapping": 30.0,
+        "attn_logit_softcapping": 50.0,
+    }));
+    check("gemma2", model);
+}
+
+/// Gemma 3: QK norm, two RoPE bases, a local window, and no softcap.
+#[test]
+#[serial]
+fn gemma3() {
+    random::seed(11);
+    let model = tiny(serde_json::json!({
+        "model_type": "gemma3_text",
+        "hidden_size": 32,
+        "intermediate_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+        "query_pre_attn_scalar": 8,
+        "sliding_window": 16,
+        "sliding_window_pattern": 2,
+    }));
+    check("gemma3", model);
+}
+
+/// Gemma 4: per-layer-type attention, `k = v` on the full layers, a tied head
+/// and the final-logit softcap.
+#[test]
+#[serial]
+fn gemma4() {
+    random::seed(12);
+    let mut config: serde_json::Value =
+        serde_json::from_str(gemma4_config::synthetic_config_json()).unwrap();
+    config["max_position_embeddings"] = serde_json::json!(4096);
+    check("gemma4", tiny(config));
+}
+
+#[test]
+#[serial]
+fn llama4() {
+    random::seed(13);
+    let model = tiny(serde_json::json!({
+        "model_type": "llama4_text",
+        "hidden_size": 32,
+        "intermediate_size": 48,
+        "intermediate_size_mlp": 64,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+        "rms_norm_eps": 1e-5,
+        "rope_theta": 10000.0,
+        "max_position_embeddings": 4096,
+        "num_local_experts": 2,
+        "num_experts_per_tok": 1,
+        "interleave_moe_layer_step": 1,
+        "moe_layers": [1, 3],
+        "no_rope_layers": [1, 1, 1, 0],
+        "attention_chunk_size": 64,
+        "use_qk_norm": true,
+        "attn_temperature_tuning": true,
+        "floor_scale": 4,
+        "attn_scale": 0.1,
+        "tie_word_embeddings": false,
+    }));
+    check("llama4", model);
+}
+
+/// DeepSeek V3: latent attention and routed experts under a head that is
+/// untied.
+#[test]
+#[serial]
+fn deepseek() {
+    random::seed(14);
+    let config: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/deepseek_native_v3_config.json")).unwrap();
+    let mut config = config;
+    config["max_position_embeddings"] = serde_json::json!(4096);
+    check("deepseek", tiny(config));
+}
+
+#[test]
+#[serial]
+fn gpt_oss() {
+    random::seed(15);
+    let config: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/gpt_oss_native_config.json")).unwrap();
+    let mut config = config;
+    config["max_position_embeddings"] = serde_json::json!(4096);
+    check("gpt_oss", tiny(config));
+}
+
+/// Mllama's text path: the cross-attention layers are skipped without images,
+/// and the head runs on the last position of what is left.
+#[test]
+#[serial]
+fn mllama() {
+    random::seed(16);
+    let model = MllamaForConditionalGeneration::new(MllamaConfig {
+        vision_config: MllamaVisionConfig {
+            hidden_size: 32,
+            intermediate_size: 64,
+            num_hidden_layers: 2,
+            num_global_layers: 1,
+            attention_heads: 4,
+            image_size: 28,
+            patch_size: 14,
+            intermediate_layers_indices: vec![1],
+            vision_output_dim: 64,
+            ..Default::default()
+        },
+        text_config: MllamaTextConfig {
+            llama: LlamaConfig {
+                vocab_size: VOCAB,
+                hidden_size: 64,
+                intermediate_size: 128,
+                num_hidden_layers: 3,
+                num_attention_heads: 4,
+                num_key_value_heads: Some(2),
+                head_dim: None,
+                max_position_embeddings: 4096,
+                tie_word_embeddings: false,
+                ..Default::default()
+            },
+            cross_attention_layers: vec![1],
+        },
+        ..Default::default()
+    })
+    .unwrap();
+    check("mllama", DynamicModel::Mllama(model));
 }

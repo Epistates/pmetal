@@ -244,6 +244,11 @@
               {#if info?.context_length}<dt class="text-surface-500">Context</dt><dd>{info.context_length.toLocaleString()}</dd>{/if}
             </dl>
             <p class="break-all font-mono text-xs text-surface-500">{selected.path}</p>
+            {#if fit?.unsupported}
+              <p class="text-xs text-red-600 dark:text-red-400" role="alert">
+                pmetal cannot run this model: {fit.unsupported}
+              </p>
+            {/if}
             {#if fit}
               <div class="flex flex-wrap gap-2">
                 <span class={FIT[fit.training_fit][0]}>Training: {FIT[fit.training_fit][1]}</span>

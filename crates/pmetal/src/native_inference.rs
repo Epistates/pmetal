@@ -90,18 +90,12 @@ pub fn detect_arch(model_path: &Path) -> Option<NativeArch> {
     let data = std::fs::read_to_string(model_path.join("config.json")).ok()?;
     let v: serde_json::Value = serde_json::from_str(&data).ok()?;
 
-    let mt = v
-        .get("text_config")
-        .and_then(|tc| tc.get("model_type"))
-        .or_else(|| v.get("model_type"))
-        .and_then(|mv| mv.as_str())?;
+    // The checkpoint's own type, not the language tower a wrapper nests
+    // (Kimi-K2.5 wraps a `kimi_k2` tower and a vision model, and is neither),
+    // with a bundled `*_mtp` head read as its target.
+    let mt = pmetal_core::model_type::effective_model_type(&v)?;
 
-    // A `*_mtp` checkpoint is the base architecture plus bundled
-    // multi-token-prediction layers; `--mtp` loads those separately as a
-    // speculative draft, and the target runs as its own architecture.
-    let mt = mt.strip_suffix("_mtp").unwrap_or(mt);
-
-    match mt {
+    match mt.as_str() {
         "qwen3" | "qwen3dense" | "qwen3_moe" => Some(NativeArch::Qwen3),
         "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6"
         | "qwen3_6_text" | "qwen3_6_moe" | "qwen3_6_moe_text" => Some(NativeArch::Qwen3_5),

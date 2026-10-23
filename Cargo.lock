@@ -5400,6 +5400,7 @@ dependencies = [
  "libp2p",
  "parking_lot 0.13.0",
  "petgraph",
+ "pmetal-core",
  "pmetal-runtime",
  "rand 0.10.3",
  "rayon",

@@ -12,7 +12,7 @@ It sits between the runtime and the training and serving crates: it builds on `p
 
 ### Dispatched Models (via `DynamicModel`)
 
-These are the `ModelArchitecture` variants. Each is detected from `config.json` (its `model_type`, or failing that its `architectures`), and every one but `Flux` loads as a `DynamicModel`:
+These are the `ModelArchitecture` variants. Each is detected from `config.json` by an exact lookup of its `model_type`, or failing that of a whole `architectures` class name, and every one but `Flux` loads as a `DynamicModel`. A family not listed is refused with an `UnsupportedModel` error that names the `model_type` and lists these, never run as the nearest one:
 
 | Architecture | `model_type` | Models |
 |-------------|--------------|--------|
@@ -27,10 +27,10 @@ These are the `ModelArchitecture` variants. Each is detected from `config.json` 
 | `Gemma` | `gemma`, `gemma2`, `gemma3` | Gemma, Gemma 2, Gemma 3 |
 | `Gemma4` | `gemma4`, `gemma4_text`, `gemma4_unified` | Gemma 4, dense and MoE |
 | `DiffusionGemma` | `diffusion_gemma` | DiffusionGemma (block-autoregressive diffusion) |
-| `Mistral` | `mistral`, `mixtral` | Mistral 7B, Mixtral (MoE) |
+| `Mistral` | `mistral` | Mistral 7B and the other dense Mistral decoders |
 | `Phi` | `phi3` | Phi 3, 3.5 |
 | `Phi4` | `phi4` | Phi 4 |
-| `DeepSeek` | `deepseek`, `deepseek_v2`, `deepseek_v3` | DeepSeek V2, V3, R1 |
+| `DeepSeek` | `deepseek_v2`, `deepseek_v3` | DeepSeek V2, V3, R1 |
 | `Cohere` | `cohere`, `cohere2`, `command_r` | Command R |
 | `Granite` | `granite`, `granitemoe`, `granitemoeshared`, `granitemoehybrid` | Granite 3.x dense and MoE, 4.0 / 4.0-H (Mamba-2 hybrid), 4.1, 4.2 |
 | `NemotronH` | `nemotron_h` | Nemotron-H (hybrid Mamba and attention) |

@@ -170,7 +170,7 @@ pub fn create_model(arch: &str, config_path: Option<&Path>) -> Result<PretrainMo
                 architectures::Gemma4ForCausalLM::new(config)?,
             )))
         }
-        "mistral" | "mixtral" => {
+        "mistral" => {
             let config: architectures::MistralConfig = match &json {
                 Some(v) => serde_json::from_value(v.clone())
                     .map_err(|e| Exception::custom(format!("mistral config: {e}")))?,
@@ -200,7 +200,20 @@ pub fn create_model(arch: &str, config_path: Option<&Path>) -> Result<PretrainMo
                 architectures::Qwen3NextForCausalLM::new(config)?,
             )))
         }
-        "phi" | "phi3" | "phi4" => {
+        // `phi` is Phi-1 / Phi-1.5 / Phi-2, which share none of the Phi-3
+        // block built below (parallel block, LayerNorm with bias, a single GELU
+        // MLP); building it would train a different model under the name.
+        "phi" => Err(Exception::custom(
+            match pmetal_core::model_type::unsupported_family("phi", &[]) {
+                Some(d) => format!(
+                    "pretrain architecture \"phi\" is {}, which is not supported: {}; \
+                     use phi3 or phi4 for the Phi-3 architecture",
+                    d.family, d.reason
+                ),
+                None => "pretrain architecture \"phi\" is not supported; use phi3 or phi4".into(),
+            },
+        )),
+        "phi3" | "phi4" => {
             let config: architectures::PhiConfig = match &json {
                 Some(v) => serde_json::from_value(v.clone())
                     .map_err(|e| Exception::custom(format!("phi config: {e}")))?,
@@ -212,7 +225,7 @@ pub fn create_model(arch: &str, config_path: Option<&Path>) -> Result<PretrainMo
         }
         other => Err(Exception::custom(format!(
             "unsupported pretrain architecture: {other}\n\
-             supported: llama, qwen2, qwen3, qwen3.5/qwen3.6, qwen3_moe, gemma, gemma4, mistral, phi, gpt-oss"
+             supported: llama, qwen2, qwen3, qwen3.5/qwen3.6, qwen3_moe, gemma, gemma4, mistral, phi3/phi4, gpt-oss"
         ))),
     }
 }
