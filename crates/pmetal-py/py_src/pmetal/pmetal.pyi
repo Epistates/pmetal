@@ -553,6 +553,9 @@ class ServeOptions(TypedDict, total=False):
     ane: bool
     ane_max_seq_len: int
     draft_model: str | None
+    mtp: bool
+    mtp_model: str | None
+    draft_tokens: int | None
     continuous_batch: bool
     cb_max_slots: int
     cb_max_queue_depth: int
@@ -604,7 +607,13 @@ class ServeSpec(_Spec):
     ane_max_seq_len: int
     """ANE Max Context. Flag: ``--ane-max-seq-len``. From 0 to 9.22337e+18. Default: ``4096``."""
     draft_model: str | None
-    """Draft Model. Flag: ``--draft-model``. Default: ``None``."""
+    """Draft Model. A draft model that speeds decoding up without changing the output: a Gemma 4 assistant, or a DFlash draft model (with --ane, DFlash only). Flag: ``--draft-model``. Default: ``None``."""
+    mtp: bool
+    """Qwen MTP. Draft with a Qwen3.5/3.6/3.8 model's multi-token-prediction head (the mtp.* weights bundled in the model). Flag: ``--mtp``. Default: ``False``."""
+    mtp_model: str | None
+    """MTP Checkpoint. Qwen MTP checkpoint directory; defaults to the mtp.* weights bundled in the model. Flag: ``--mtp-model``. Default: ``None``."""
+    draft_tokens: int | None
+    """Draft Tokens. Tokens a draft round proposes (default: 3 for MTP, the assistant's own setting, the DFlash block size). Flag: ``--draft-tokens``. From 1 to 32. Default: ``None``."""
     continuous_batch: bool
     """Continuous Batch. Flag: ``--continuous-batch``. Default: ``False``."""
     cb_max_slots: int
