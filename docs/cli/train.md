@@ -169,7 +169,8 @@ run, with nothing attached, so what trains is what is served.
   weights, activations) is checked against the device's recommended working set, and the run is
   refused when it will not fit, with the breakdown and what would shrink it:
   `--optimizer adamw_8bit` (one byte per moment), `--freeze-embeddings`, `--cut-cross-entropy`,
-  a smaller `--batch-size` or `--max-seq-len`. `--no-memory-check` runs it anyway.
+  a smaller `--batch-size` or `--max-seq-len`. `--no-memory-check` runs it anyway. The estimate is
+  deliberately high: measured on Qwen3-0.6B it ran 25% to 80% above the peak the run reached.
 - **Learning rate.** LoRA's default `2e-4` diverges a full fine-tune, so `--full` refuses a
   `--learning-rate` above `1e-4`. Use `1e-5` to `5e-5`.
 - **Optimizers.** AdamW keeps f32 master weights for a bf16 model; `adamw_8bit` and `muon` work as in

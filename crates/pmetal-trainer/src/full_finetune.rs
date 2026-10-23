@@ -56,9 +56,18 @@ pub enum FullFineTuneError {
 // Memory
 // ---------------------------------------------------------------------------
 
-/// Bytes a trainable parameter costs in the gradient: an f32 accumulator, and
-/// the clipped copy the optimizer step reads while it is alive.
-const GRADIENT_BYTES: f64 = 8.0;
+// The constants below are calibrated on measured peaks (MLX's peak active
+// memory) of real full fine-tunes of Qwen3-0.6B, a 596M-parameter bf16 model
+// (hidden 1024, 28 layers, a tied 152K-token embedding): AdamW, 8-bit AdamW,
+// Muon and a frozen embedding; batches of 1 to 16 sequences of up to 1024
+// tokens; with and without gradient checkpointing and cut cross-entropy. The
+// estimate came out 25% to 80% above the measured peak, never below. Other
+// architectures (MoE, wider MLPs) are extrapolations.
+
+/// Bytes a trainable parameter costs in the gradient: an f32 accumulator. (The
+/// peak with AdamW measured 3 bytes a parameter beyond the moments and the f32
+/// master copy.)
+const GRADIENT_BYTES: f64 = 4.0;
 /// The runtime's own overhead (MLX, the Metal context, scratch buffers).
 const OVERHEAD_BYTES: f64 = 2.0 * 1e9;
 
@@ -128,23 +137,30 @@ fn optimizer_bytes(request: &MemoryRequest) -> f64 {
     moments + master * trainable
 }
 
-/// Activations of one micro-batch with the layer boundaries kept and one layer
-/// recomputed at a time (`gradient_checkpointing`), or every layer's kept; and
-/// the logits with their gradient in f32 unless the loss never forms them.
+/// Activations of one micro-batch with part of each layer recomputed in the
+/// backward pass (`gradient_checkpointing`), or every layer's kept; and the
+/// logits with their gradient unless the loss never forms them.
 fn activation_bytes(request: &MemoryRequest) -> f64 {
     let tokens = (request.batch_size * request.seq_len) as f64;
     let hidden = request.hidden as f64;
     let layers = request.layers as f64;
-    let per_layer = 34.0; // one layer's activations, in hidden-sized 2-byte rows
+    // Hidden-sized 2-byte rows kept per token and layer. Without checkpointing
+    // the measured peak grew 830 rows per token for 28 layers (30 a layer;
+    // 34 is the usual figure for a Llama-style block). With it, 635 rows (22 a
+    // layer): the saving as the runtime makes it today is about a third, not
+    // the layer boundaries alone.
+    let per_layer = 34.0;
     let kept = if request.gradient_checkpointing {
-        tokens * hidden * (2.0 * layers + per_layer) * 2.0
+        tokens * hidden * (22.0 * layers + per_layer) * 2.0
     } else {
         tokens * hidden * per_layer * layers * 2.0
     };
+    // The logits cost 0.4 to 0.6 MB a token at a 152K vocabulary: 3 to 4 bytes
+    // an entry.
     let logits = if request.cut_cross_entropy {
         0.0
     } else {
-        tokens * request.vocab as f64 * 8.0
+        tokens * request.vocab as f64 * 4.0
     };
     kept + logits
 }
@@ -213,6 +229,15 @@ fn config_number(config: &Value, key: &str) -> Option<u64> {
         .get(key)
         .or_else(|| config.get("text_config")?.get(key))?
         .as_u64()
+}
+
+/// A boolean in a `config.json` (or its `text_config`), false when absent.
+fn config_flag(config: &Value, key: &str) -> bool {
+    config
+        .get(key)
+        .or_else(|| config.get("text_config")?.get(key))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// The settings of a run that its memory depends on.
@@ -299,8 +324,15 @@ pub fn memory_request(
     let hidden = config_number(&config, "hidden_size").unwrap_or(0);
     let vocab = config_number(&config, "vocab_size").unwrap_or(0);
     let layers = config_number(&config, "num_hidden_layers").unwrap_or(0);
+    // A tied head is the embedding, and the model never loads the checkpoint's
+    // copy of it (Qwen3-0.6B ships both): counting it overstated this model by a
+    // quarter.
+    let tied = config_flag(&config, "tie_word_embeddings");
     let (mut params, mut weight_bytes, mut half) = (0u64, 0u64, false);
     for name in source.tensor_names() {
+        if tied && name == "lm_head.weight" {
+            continue;
+        }
         let (Ok(shape), Ok(dtype)) = (source.tensor_shape(&name), source.tensor_dtype(&name))
         else {
             continue;
@@ -652,6 +684,45 @@ mod tests {
             .collect()
     }
 
+    /// A checkpoint with an embedding and a copy of it as the head, as Qwen3's
+    /// small models ship.
+    fn checkpoint_with_head(tied: bool) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let tensor = |shape: Vec<usize>| {
+            let bytes = vec![0u8; shape.iter().product::<usize>() * 2];
+            safetensors::tensor::TensorView::new(safetensors::Dtype::BF16, shape, bytes.leak())
+                .unwrap()
+        };
+        let tensors = [
+            ("model.embed_tokens.weight", tensor(vec![8, 4])),
+            ("model.norm.weight", tensor(vec![4])),
+            ("lm_head.weight", tensor(vec![8, 4])),
+        ];
+        safetensors::serialize_to_file(tensors, None, &dir.path().join("model.safetensors"))
+            .unwrap();
+        let config = format!(
+            r#"{{"hidden_size": 4, "vocab_size": 8, "num_hidden_layers": 1, "tie_word_embeddings": {tied}}}"#
+        );
+        std::fs::write(dir.path().join("config.json"), config).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_tied_head_is_the_embedding_and_not_counted_twice() {
+        let run = RunShape {
+            optimizer: OptimizerType::AdamW,
+            batch_size: 1,
+            seq_len: 4,
+            gradient_checkpointing: true,
+            cut_cross_entropy: false,
+        };
+        let untied = memory_request(checkpoint_with_head(false).path(), false, &run).unwrap();
+        let tied = memory_request(checkpoint_with_head(true).path(), false, &run).unwrap();
+        assert_eq!(untied.params, 32 + 4 + 32);
+        assert_eq!(tied.params, 32 + 4);
+        assert_eq!(tied.weight_bytes, (32 + 4) * 2);
+    }
+
     fn request() -> MemoryRequest {
         MemoryRequest {
             weight_bytes: 1_200_000_000,
@@ -675,11 +746,11 @@ mod tests {
         let r = request();
         let e = estimate_memory(&r);
         assert_eq!(e.weights, 1_200_000_000);
-        assert_eq!(e.gradients, 4_800_000_000);
+        assert_eq!(e.gradients, 2_400_000_000);
         // Two f32 moments and an f32 master per parameter.
         assert_eq!(e.optimizer, 600_000_000 * 12);
-        // The logits dominate a small model's activations: 512 * 151936 * 8.
-        assert!(e.activations > 600_000_000, "{}", e.activations);
+        // The logits are a third of a small model's activations: 512 * 151936 * 4.
+        assert!(e.activations > 900_000_000, "{}", e.activations);
         assert_eq!(
             e.total(),
             e.weights + e.gradients + e.optimizer + e.activations + e.overhead
@@ -704,7 +775,7 @@ mod tests {
             cut_cross_entropy: true,
             ..request()
         });
-        assert!(cut.activations < base.activations / 4);
+        assert!(cut.activations < base.activations * 7 / 10);
         let uncheckpointed = estimate_memory(&MemoryRequest {
             gradient_checkpointing: false,
             ..request()
