@@ -77,18 +77,17 @@ pmetal-gui/
 │   │   ├── lib.rs          # Builder, start-up, orderly exit
 │   │   ├── commands.rs     # Tauri commands, thin wrappers
 │   │   ├── state.rs        # AppState: settings, token, models, jobs, downloads
-│   │   ├── jobs/           # kinds (spec to command), JobHub over the supervisor
+│   │   ├── jobs/           # kinds (spec to LaunchPlan), JobHub over the supervisor
 │   │   ├── models.rs       # Hub cache + trained + added folders
 │   │   ├── adapters.rs     # LoRA adapters trained on this Mac
 │   │   ├── datasets.rs     # a look inside a dataset file before a job uses it
 │   │   ├── hub.rs          # search, downloads
-│   │   ├── binary.rs       # finding the `pmetal` command line the jobs run
 │   │   ├── system.rs       # the chip, memory, and whether a model fits
 │   │   ├── secrets.rs      # the Hugging Face token, in the Keychain
 │   │   ├── settings.rs     # the settings file
 │   │   ├── paths.rs        # which locations a job may write to
 │   │   ├── logging.rs      # the app's log file, and what a crash leaves behind
-│   │   └── inference.rs    # chat, the one thing that generates inside the app
+│   │   └── inference.rs    # chat: `pmetal infer --messages-file`, run by a supervisor of its own
 │   ├── build.rs            # declares the commands, so capabilities can name them
 │   ├── capabilities/       # what the window may call
 │   └── tauri.conf.json     # CSP and window
@@ -100,21 +99,31 @@ pmetal-gui/
 Every job is a `pmetal` process run by `pmetal-supervisor` (process groups, bounded and redacted
 output, progress read from the job's own event stream, SIGTERM then SIGKILL on stop). `list_job_forms`
 sends the spec descriptors; `start_job` takes the text entered for fields, builds the spec with
-`spec_from_text`, runs its `normalize` and writes its argv. The app decides only where a job writes
+`spec_from_text`, runs its `normalize` and turns it into the supervisor's `LaunchPlan`, the same
+plan the terminal UI, the MCP server and the Python bindings start their jobs from (the command,
+the event log or metrics file it asks for, where it writes). A field left at its default is not
+passed, so a command's own default applies. The app decides only where a job writes
 (a new folder under `~/pmetal-output` unless you choose one), refuses locations that are system
 folders or that would overwrite a model the job reads, and tells the window what changed at most
 five times a second. Quitting asks first if jobs run, then stops them; a training run saves its
 adapter on the way.
 
-The `pmetal` binary is `PMETAL_BIN`, else the one beside the app (the release bundle carries it as
-a sidecar), else `~/.cargo/bin`, `/opt/homebrew/bin`, `/usr/local/bin` or `PATH`.
-`just build-gui-bundle` reproduces the release bundle locally.
+The `pmetal` binary is found by `pmetal_supervisor::locate_pmetal_binary`: `PMETAL_BIN`, else the
+one beside the app (the release bundle carries it as a sidecar), else `~/.cargo/bin`,
+`/opt/homebrew/bin`, `/usr/local/bin` or `PATH`. `just build-gui-bundle` reproduces the release
+bundle locally. The Models and Datasets pages read the Hub cache and search the Hub through
+`pmetal-hub` (`pmetal_hub::local`, `search_models`, `search_datasets`), as the other surfaces do.
 
 ### Chat
 
-A conversation needs its whole history to reach the chat template, which `pmetal infer` does not
-take, so chat is the one generation the app runs itself (on a blocking thread, stopping at the next
-token).
+A reply is `pmetal infer --messages-file`, run by the supervisor like every other job: the
+conversation (the system message first, then the turns) is written to a private file that goes when
+the reply ends, and the command answers it. What it prints is read as it arrives: the reasoning of a
+thinking model streams apart from the answer, and the statistics come from the command's own
+footer. Stop sends the command the signal that ends a generation after the token in flight, and the
+text so far is kept. Nothing in the app loads a model or samples a token, so a chat answers exactly
+as `pmetal infer` does with the same settings. Chats run under a supervisor of their own, so a reply
+is not listed as a job, takes none of the jobs' slots and is not stopped with them.
 
 ### Security
 

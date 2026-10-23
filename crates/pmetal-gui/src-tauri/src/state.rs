@@ -5,7 +5,7 @@
 //! token goes) can be tested without a window.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use pmetal::core::SecretString;
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,7 @@ use tokio::sync::RwLock;
 
 use crate::error::{AppError, Result};
 use crate::hub::Downloads;
-use crate::inference::Sessions;
+use crate::inference::Chat;
 use crate::jobs::JobHub;
 use crate::models::{CachedModel, ModelSource, ScanPlan};
 use crate::secrets::HfToken;
@@ -75,7 +75,7 @@ pub struct AppState {
     pub jobs: JobHub,
     models: RwLock<Vec<CachedModel>>,
     pub downloads: Downloads,
-    pub sessions: Arc<Sessions>,
+    pub chat: Chat,
     notes: Mutex<Vec<String>>,
     binary: std::result::Result<PathBuf, String>,
 }
@@ -109,7 +109,7 @@ impl AppState {
             token,
             models: RwLock::new(Vec::new()),
             downloads,
-            sessions: Arc::new(Sessions::default()),
+            chat: Chat::new(binary.clone()),
             notes: Mutex::new(notes),
             binary,
         }
@@ -121,7 +121,8 @@ impl AppState {
     /// training run time to write its adapter.
     pub async fn shutdown(&self) {
         self.downloads.cancel_all();
-        self.sessions.cancel(None);
+        self.chat.cancel(None);
+        self.chat.shutdown().await;
         self.jobs.shutdown().await;
     }
 
