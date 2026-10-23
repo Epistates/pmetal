@@ -263,6 +263,15 @@ Magistral's `[THINK]`, Gemma 4's thought channel and gpt-oss's `analysis`
 channel are recognised; the markers themselves appear in neither field.
 Logprobs cover the answer's tokens.
 
+### Quantized checkpoints
+
+An MLX-quantized checkpoint (an `mlx-community` 4-bit model, say) keeps its
+projections and its embedding table packed in memory: MLX's quantized matmul reads
+the packed words, so a decode step reads a quarter of the bytes a bf16 copy would
+and runs that much faster. This holds for the architectures that load through the
+generic loader (Llama, Qwen 2 and 3, Mistral, Cohere); the others unpack to bf16
+as they load. `--fp8` quantizes dense weights, so it unpacks them first.
+
 ### Speculative decoding
 
 A drafter speeds a single-request decode up without changing what it says: it
