@@ -192,7 +192,7 @@ impl Tokenizer {
             .map_err(|e| pmetal_core::PMetalError::Tokenizer(e.to_string()))?;
 
         let special = Self::load_special_tokens(&inner, dir);
-        Ok(Self { inner, special })
+        Ok(Self { inner, special }.with_the_models_bos(dir))
     }
 
     /// Load a tokenizer from a model path (file or directory), resolving GGUF
@@ -242,12 +242,86 @@ impl Tokenizer {
             .map_err(|e| pmetal_core::PMetalError::Tokenizer(e.to_string()))?;
 
         // If the file lives inside a model directory, try to load configs
-        let special = path
-            .parent()
+        let dir = path.parent();
+        let special = dir
             .map(|dir| Self::load_special_tokens(&inner, dir))
             .unwrap_or_default();
 
-        Ok(Self { inner, special })
+        let tokenizer = Self { inner, special };
+        Ok(match dir {
+            Some(dir) => tokenizer.with_the_models_bos(dir),
+            None => tokenizer,
+        })
+    }
+
+    /// Make this tokenizer start an encoding that asks for special tokens
+    /// with the BOS its model expects.
+    ///
+    /// Most tokenizers say so themselves: the post-processor of Llama 3 or
+    /// Gemma 3 puts the BOS in front. Gemma 4's does not; its chat template
+    /// writes the BOS, and `tokenizer(text)` of a plain text then starts
+    /// without one, which is a sequence the model never trained on (a
+    /// perplexity of 4596 against 819 with the BOS). So when the
+    /// post-processor adds none, the model's files decide whether it expects
+    /// one: `add_bos_token` in `tokenizer_config.json` if it says, else
+    /// whether the chat template opens a conversation with `bos_token`.
+    /// A model that expects none (Qwen3) keeps encoding to none.
+    ///
+    /// With the BOS in the post-processor, every path that asks for special
+    /// tokens ([`encode_with_special_tokens`](Self::encode_with_special_tokens)
+    /// and the batch and offset encoders) adds it, once: text that opens with
+    /// the BOS already is encoded without the post-processor.
+    fn with_the_models_bos(mut self, model_dir: &Path) -> Self {
+        let Some(bos_id) = self.bos_token_id() else {
+            return self;
+        };
+        let Some(bos) = self.inner.id_to_token(bos_id) else {
+            return self;
+        };
+        if self.post_processor_adds(bos_id) {
+            return self;
+        }
+        let expects = crate::chat_templates::read_tokenizer_config(model_dir)
+            .get("add_bos_token")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| {
+                let eos = self.eos_token_id().and_then(|id| self.inner.id_to_token(id));
+                crate::chat_templates::template_opens_with_bos(model_dir, &bos, eos.as_deref())
+            });
+        if !expects {
+            return self;
+        }
+        let processor = match crate::gguf_tokenizer::special_tokens_processor(
+            Some((bos, bos_id)),
+            None,
+        ) {
+            Ok(processor) => processor,
+            Err(e) => {
+                tracing::warn!("not adding the BOS the model expects: {e}");
+                return self;
+            }
+        };
+        // Whatever the post-processor does already (trimming offsets, an
+        // EOS) stays, and the BOS goes in front of its result.
+        let combined: tokenizers::processors::PostProcessorWrapper =
+            match self.inner.get_post_processor() {
+                Some(existing) => tokenizers::processors::sequence::Sequence::new(vec![
+                    existing.clone(),
+                    processor.into(),
+                ])
+                .into(),
+                None => processor.into(),
+            };
+        self.inner.with_post_processor(Some(combined));
+        self
+    }
+
+    /// Whether encoding with special tokens puts the BOS `bos_id` at the
+    /// front of a text.
+    fn post_processor_adds(&self, bos_id: u32) -> bool {
+        self.inner
+            .encode_fast("a", true)
+            .is_ok_and(|encoding| encoding.get_ids().first() == Some(&bos_id))
     }
 
     /// Load a tokenizer from bytes (no config-aware resolution).
@@ -779,6 +853,146 @@ mod tests {
             assert_eq!(batch[i], tk.encode(text).unwrap());
             assert_eq!(with_offsets[i], tk.encode_with_offsets(text, true).unwrap());
         }
+    }
+
+    /// A model directory: the tokenizer, `tokenizer_config.json`, and a chat
+    /// template, as the checkpoint ships them.
+    fn model_dir(
+        tk: &super::Tokenizer,
+        config: serde_json::Value,
+        chat_template: Option<&str>,
+    ) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        tk.inner()
+            .save(dir.path().join("tokenizer.json"), false)
+            .unwrap();
+        std::fs::write(dir.path().join("tokenizer_config.json"), config.to_string()).unwrap();
+        if let Some(template) = chat_template {
+            std::fs::write(dir.path().join("chat_template.jinja"), template).unwrap();
+        }
+        dir
+    }
+
+    /// Gemma 4's layout: a `<bos>` token, no BOS in the post-processor, and a
+    /// chat template that writes the BOS itself behind its macros.
+    const GEMMA4_TEMPLATE: &str = "{%- macro fmt(x) -%}{{ x }}{%- endmacro -%}\n\
+        {{- bos_token -}}\n\
+        {%- for m in messages -%}<|im_start|>{{ m['role'] }}\\n{{ fmt(m['content']) }}{%- endfor -%}\n\
+        {%- if add_generation_prompt -%}<|im_start|>model\\n{%- endif -%}";
+
+    fn count(ids: &[u32], id: u32) -> usize {
+        ids.iter().filter(|&&i| i == id).count()
+    }
+
+    #[test]
+    fn a_model_whose_template_writes_the_bos_gets_one_from_plain_text() {
+        // Gemma 4: no BOS in the post-processor; the chat template has it.
+        let none = byte_level_bpe(&["h i"], &["<bos>", "<|im_start|>"], None);
+        let dir = model_dir(
+            &none,
+            serde_json::json!({"bos_token": "<bos>"}),
+            Some(GEMMA4_TEMPLATE),
+        );
+        assert_eq!(
+            none.encode_with_special_tokens("hi").unwrap(),
+            none.encode("hi").unwrap(),
+            "the tokenizer alone adds nothing"
+        );
+        let tk = super::Tokenizer::from_model_dir(dir.path()).unwrap();
+        let bos = tk.inner().token_to_id("<bos>").unwrap();
+
+        let ids = tk.encode_with_special_tokens("hi").unwrap();
+        assert_eq!(ids[0], bos);
+        assert_eq!(count(&ids, bos), 1);
+        assert_eq!(ids[1..], none.encode("hi").unwrap()[..]);
+
+        // Every path that asks for special tokens gets the one BOS...
+        let enc = tk.encode_with_offsets("hi", true).unwrap();
+        assert_eq!((enc.ids[0], enc.offsets[0]), (bos, (0, 0)));
+        let batch = tk.encode_batch(&["hi", "hi hi"], true).unwrap();
+        assert!(batch.iter().all(|ids| ids[0] == bos && count(ids, bos) == 1));
+        let batch = tk.encode_batch_with_offsets(&["hi"], true).unwrap();
+        assert_eq!(batch[0].ids[0], bos);
+        // ...and text a chat template rendered, or that opens with the BOS,
+        // is never given a second.
+        let rendered = "<bos><|im_start|>hi";
+        assert_eq!(count(&tk.encode_with_special_tokens(rendered).unwrap(), bos), 1);
+        assert_eq!(count(&tk.encode(rendered).unwrap(), bos), 1);
+        assert_eq!(count(&tk.encode_batch(&[rendered], true).unwrap()[0], bos), 1);
+        // Text without special tokens asked for stays bare.
+        assert_eq!(tk.encode("hi").unwrap(), none.encode("hi").unwrap());
+    }
+
+    #[test]
+    fn a_tokenizer_that_adds_its_own_bos_is_not_given_another() {
+        // Llama 3: the post-processor adds `<s>`, and so does the template.
+        let llama = bpe();
+        let template = "{{- bos_token -}}{%- for m in messages -%}{{ m['content'] }}{%- endfor -%}";
+        let dir = model_dir(
+            &llama,
+            serde_json::json!({"bos_token": "<s>", "add_bos_token": true}),
+            Some(template),
+        );
+        let tk = super::Tokenizer::from_model_dir(dir.path()).unwrap();
+        let bos = tk.inner().token_to_id("<s>").unwrap();
+        let ids = tk.encode_with_special_tokens("hi").unwrap();
+        assert_eq!(ids[0], bos);
+        assert_eq!(count(&ids, bos), 1);
+        let enc = tk.encode_with_offsets("hi", true).unwrap();
+        assert_eq!(count(&enc.ids, bos), 1);
+        let batch = tk.encode_batch(&["hi"], true).unwrap();
+        assert_eq!(count(&batch[0], bos), 1);
+    }
+
+    #[test]
+    fn a_model_that_starts_without_a_bos_gets_none() {
+        // Qwen3: ChatML, a `<|endoftext|>` that is no BOS, no `bos_token`.
+        let none = byte_level_bpe(&["h i"], &["<|endoftext|>", "<|im_start|>"], None);
+        let template = "{%- for m in messages -%}<|im_start|>{{ m['role'] }}\\n{{ m['content'] }}{%- endfor -%}";
+        let dir = model_dir(
+            &none,
+            serde_json::json!({"eos_token": "<|endoftext|>", "pad_token": "<|endoftext|>"}),
+            Some(template),
+        );
+        let tk = super::Tokenizer::from_model_dir(dir.path()).unwrap();
+        assert_eq!(
+            tk.encode_with_special_tokens("hi").unwrap(),
+            none.encode("hi").unwrap()
+        );
+        assert_eq!(
+            tk.encode_batch(&["hi"], true).unwrap()[0],
+            none.encode("hi").unwrap()
+        );
+        // A token that is called `<s>` and is no BOS of the config is not one
+        // either: a template that does not write it does not expect it.
+        let with_s = byte_level_bpe(&["h i"], &["<s>", "<|im_start|>"], None);
+        let dir = model_dir(&with_s, serde_json::json!({}), Some(template));
+        let tk = super::Tokenizer::from_model_dir(dir.path()).unwrap();
+        assert_eq!(
+            tk.encode_with_special_tokens("hi").unwrap(),
+            with_s.encode("hi").unwrap()
+        );
+    }
+
+    #[test]
+    fn the_configs_add_bos_token_decides_when_there_is_no_template() {
+        let none = byte_level_bpe(&["h i"], &["<bos>"], None);
+        let yes = model_dir(
+            &none,
+            serde_json::json!({"bos_token": "<bos>", "add_bos_token": true}),
+            None,
+        );
+        let tk = super::Tokenizer::from_model_dir(yes.path()).unwrap();
+        let bos = tk.inner().token_to_id("<bos>").unwrap();
+        assert_eq!(tk.encode_with_special_tokens("hi").unwrap()[0], bos);
+        // ...and an explicit `false` beats a template that writes one.
+        let no = model_dir(
+            &none,
+            serde_json::json!({"bos_token": "<bos>", "add_bos_token": false}),
+            Some(GEMMA4_TEMPLATE),
+        );
+        let tk = super::Tokenizer::from_model_dir(no.path()).unwrap();
+        assert_eq!(count(&tk.encode_with_special_tokens("hi").unwrap(), bos), 0);
     }
 
     #[test]
