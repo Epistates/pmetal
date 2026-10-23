@@ -33,7 +33,7 @@ use crate::specs::PyGrpoSpec;
 use crate::trainer::build_callbacks;
 
 /// What a finished GRPO run produced.
-#[pyclass(name = "GrpoResult", module = "pmetal", frozen, skip_from_py_object)]
+#[pyclass(name = "GrpoResult", module = "pmetal", frozen)]
 pub struct PyGrpoResult {
     /// Optimizer steps taken.
     #[pyo3(get)]

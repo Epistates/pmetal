@@ -159,15 +159,29 @@ fn every_parameter_of_every_architecture_gets_a_nonzero_gradient() {
             problems.push(format!("{case}: loss is {loss}"));
             continue;
         }
-        // Every parameter the model holds is trainable, and so has a gradient.
-        let all: usize = model.model().flatten_params().len();
-        if grads.len() != all {
+        // Every parameter the model holds is trainable, and so has a gradient,
+        // but a router's load-balancing bias: a buffer, held and saved and
+        // never handed to the optimizer, where weight decay would erode it.
+        let all = model.model().flatten_params();
+        let untrained: Vec<_> = all
+            .keys()
+            .filter(|name| !grads.contains_key(&***name))
+            .filter(|name| !name.ends_with("e_score_correction_bias"))
+            .collect();
+        if !untrained.is_empty() {
             problems.push(format!(
-                "{case}: {} of the model's {all} parameters are trainable",
-                grads.len()
+                "{case}: {} of the model's {} parameters are not trained: {untrained:?}",
+                untrained.len(),
+                all.len()
             ));
         }
         for (name, grad) in &grads {
+            if name.ends_with("e_score_correction_bias") {
+                problems.push(format!(
+                    "{case}: the buffer {name} is handed to the optimizer"
+                ));
+                continue;
+            }
             let norm = norm_of(grad);
             if !(norm.is_finite() && norm > 0.0) {
                 problems.push(format!("{case}: {name} has gradient norm {norm}"));

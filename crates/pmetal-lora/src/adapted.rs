@@ -421,11 +421,15 @@ impl AdaptedModel {
                 .filter(|(path, _)| is_adapter_key(path))
                 .map(|(path, value)| (Rc::from(adapter_key(&path).as_str()), value))
                 .collect(),
-            Scope::Full { frozen } => self
-                .model
-                .flatten_params()
+            // The trainer's own tree, flat: a buffer is a parameter of the model
+            // that no gradient trains, and weight decay would erode it.
+            Scope::Full { .. } => self
+                .trainable_parameters()
                 .into_iter()
-                .filter(|(path, _)| !frozen.contains(&**path))
+                .filter_map(|(path, value)| match value {
+                    NestedValue::Value(array) => Some((path, array.clone())),
+                    NestedValue::Map(_) => None,
+                })
                 .collect(),
         }
     }
@@ -986,13 +990,15 @@ impl ModuleParameters for AdaptedModel {
             }
         }
 
-        let tree = self.model.parameters();
         let mut out = pmetal_runtime::compat::ModuleParamRef::new();
         match &self.scope {
-            Scope::Adapters => collect(&tree, "", &is_adapter_key, &mut out),
-            Scope::Full { frozen } => {
-                collect(&tree, "", &|path| !frozen.contains(path), &mut out);
-            }
+            Scope::Adapters => collect(&self.model.parameters(), "", &is_adapter_key, &mut out),
+            Scope::Full { frozen } => collect(
+                &self.model.trainable_parameters_with_routers(),
+                "",
+                &|path| !frozen.contains(path),
+                &mut out,
+            ),
         }
         out
     }

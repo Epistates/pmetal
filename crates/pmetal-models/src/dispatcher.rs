@@ -2796,6 +2796,20 @@ fn drop_routers(tree: &mut pmetal_runtime::compat::module::ModuleParamRef<'_>, p
     });
 }
 
+impl DynamicModel {
+    /// Every parameter a gradient can move, a MoE router's included: what a
+    /// full fine-tune trains. Buffers (a router's load-balancing bias) are
+    /// absent, as they are from [`trainable_parameters`], which also leaves
+    /// out the routers.
+    ///
+    /// [`trainable_parameters`]: ModuleParameters::trainable_parameters
+    pub fn trainable_parameters_with_routers(
+        &self,
+    ) -> pmetal_runtime::compat::module::ModuleParamRef<'_> {
+        dispatch_uniform!(self, trainable_parameters)
+    }
+}
+
 impl ModuleParameters for DynamicModel {
     fn parameters(&self) -> pmetal_runtime::compat::module::ModuleParamRef<'_> {
         dispatch_uniform!(self, parameters)
@@ -2806,7 +2820,7 @@ impl ModuleParameters for DynamicModel {
     /// (or weight decay) on it reroutes tokens the experts were never tuned
     /// for. Buffers and parameter-free layers are absent from the tree already.
     fn trainable_parameters(&self) -> pmetal_runtime::compat::module::ModuleParamRef<'_> {
-        let mut tree = dispatch_uniform!(self, trainable_parameters);
+        let mut tree = self.trainable_parameters_with_routers();
         drop_routers(&mut tree, "");
         tree
     }
