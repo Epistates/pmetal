@@ -160,6 +160,30 @@ fn gguf_shape_to_i32(dimensions: &[u64], tensor_name: &str) -> Result<Vec<i32>, 
         .collect()
 }
 
+/// Which Gemma layout a GGUF `general.architecture` writes.
+///
+/// Both store every norm weight with the 1 that Gemma's `x * (1 + w)` adds
+/// already applied, so the checkpoint's own `w` is the file's value less one.
+/// They differ in the block: Gemma 1 has the Llama layout (two norms), Gemma 2
+/// and 3 have four, named by what they wrap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GemmaGguf {
+    /// `gemma`: the Llama tensor names.
+    Gemma,
+    /// `gemma2` and `gemma3`: [`WeightLoader::gguf_to_hf_name_gemma`].
+    PrePostNorm,
+}
+
+impl GemmaGguf {
+    fn of(architecture: Option<&str>) -> Option<Self> {
+        match architecture? {
+            "gemma" => Some(Self::Gemma),
+            "gemma2" | "gemma3" => Some(Self::PrePostNorm),
+            _ => None,
+        }
+    }
+}
+
 /// Unified weight loader supporting multiple formats.
 pub struct WeightLoader;
 
@@ -167,6 +191,11 @@ impl WeightLoader {
     /// Load weights from GGUF format.
     ///
     /// Dequantizes all tensors to F32 and maps tensor names to HuggingFace format.
+    ///
+    /// The tensors come out as the Hugging Face checkpoint of the same model
+    /// holds them, so the conventions the GGUF architecture writes differently
+    /// are undone here: Gemma's tensor names for Gemma 2 and 3 and its norm
+    /// weights, which a GGUF stores with the 1 the model adds already applied.
     pub fn load_gguf(path: impl AsRef<Path>) -> Result<HashMap<String, Array>, WeightFormatError> {
         let path = path.as_ref();
 
@@ -176,6 +205,7 @@ impl WeightLoader {
         // bytes are borrowed from the mapping rather than read into buffers.
         let model = pmetal_gguf::GgufModel::open(&gguf_path)
             .map_err(|e| WeightFormatError::Gguf(e.to_string()))?;
+        let gemma = GemmaGguf::of(model.architecture());
 
         let mut weights = HashMap::new();
 
@@ -209,14 +239,22 @@ impl WeightLoader {
                 .map_err(|e| WeightFormatError::Gguf(e.to_string()))?;
 
             // Dequantize to f32
-            let floats = pmetal_gguf::dequant::dequantize(data, tensor_info.dtype, &shape)
+            let mut floats = pmetal_gguf::dequant::dequantize(data, tensor_info.dtype, &shape)
                 .map_err(|e| WeightFormatError::Dequant(e.to_string()))?;
+
+            // Map GGUF tensor name to HuggingFace format
+            let hf_name = match gemma {
+                Some(GemmaGguf::PrePostNorm) => Self::gguf_to_hf_name_gemma(&tensor_name),
+                _ => Self::gguf_to_hf_name(&tensor_name),
+            };
+            if gemma.is_some() && hf_name.ends_with("norm.weight") {
+                for value in &mut floats {
+                    *value -= 1.0;
+                }
+            }
 
             // Create MLX array
             let array = Array::from_slice(&floats, &shape);
-
-            // Map GGUF tensor name to HuggingFace format
-            let hf_name = Self::gguf_to_hf_name(&tensor_name);
             weights.insert(hf_name, array);
         }
 
@@ -291,7 +329,7 @@ impl WeightLoader {
         gguf_name.to_string()
     }
 
-    /// Map a Gemma 3 / Gemma 4 GGUF tensor name to HuggingFace format.
+    /// Map a Gemma 2 / Gemma 3 GGUF tensor name to HuggingFace format.
     ///
     /// Gemma's per-layer norm layout differs from the Llama family, so the
     /// generic [`Self::gguf_to_hf_name`] mis-maps it: in Gemma the GGUF
@@ -309,7 +347,7 @@ impl WeightLoader {
     /// | `ffn_norm`                  | `pre_feedforward_layernorm`       |
     /// | `post_ffw_norm`             | `post_feedforward_layernorm`      |
     /// | `ffn_gate/up/down`          | `mlp.{gate,up,down}_proj`         |
-    pub fn gguf_to_hf_name_gemma4(gguf_name: &str) -> String {
+    pub fn gguf_to_hf_name_gemma(gguf_name: &str) -> String {
         match gguf_name {
             "token_embd.weight" => return "model.embed_tokens.weight".to_string(),
             "output_norm.weight" => return "model.norm.weight".to_string(),
@@ -415,7 +453,7 @@ impl WeightLoader {
     }
 
     /// [`hf_to_gguf_name`](Self::hf_to_gguf_name) for Gemma 2 and Gemma 3, the
-    /// inverse of [`gguf_to_hf_name_gemma4`](Self::gguf_to_hf_name_gemma4).
+    /// inverse of [`gguf_to_hf_name_gemma`](Self::gguf_to_hf_name_gemma).
     ///
     /// Their four norms per block are named by what they wrap: the Hugging
     /// Face `post_attention_layernorm` is the norm *after* attention
@@ -479,6 +517,14 @@ pub struct GgufModelConfig {
     /// from the file's `rope.scaling.*` metadata, or the `rope_freqs` tensor
     /// ([`set_rope_frequency_factors`](Self::set_rope_frequency_factors)).
     pub rope_scaling: Option<serde_json::Value>,
+    /// Sliding-window width of the local-attention layers (Gemma 2 and 3).
+    pub sliding_window: Option<i32>,
+    /// RoPE base of the sliding-window layers (Gemma 3).
+    pub rope_local_base_freq: Option<f32>,
+    /// `tanh` cap on the attention scores (Gemma 2).
+    pub attn_logit_softcapping: Option<f32>,
+    /// `tanh` cap on the output logits (Gemma 2).
+    pub final_logit_softcapping: Option<f32>,
 }
 
 impl GgufModelConfig {
@@ -539,6 +585,10 @@ impl GgufModelConfig {
             rope_dimension_count: as_i32(arch.rope_dimension_count),
             original_context_length: as_i32(arch.original_context_length),
             rope_scaling: arch.rope_scaling,
+            sliding_window: as_i32(arch.sliding_window),
+            rope_local_base_freq: arch.rope_theta_swa.map(|v| v as f32),
+            attn_logit_softcapping: arch.attn_logit_softcapping.map(|v| v as f32),
+            final_logit_softcapping: arch.final_logit_softcapping.map(|v| v as f32),
             architecture: arch.architecture,
         })
     }
@@ -644,6 +694,53 @@ impl GgufModelConfig {
             original_max_position_embeddings: self.original_context_length,
             rope_scaling: self.rope_scaling.clone(),
             ..crate::architectures::phi::PhiConfig::phi3_mini()
+        }
+    }
+
+    /// Convert to a Gemma 1, 2 or 3 config.
+    ///
+    /// The generation is the file's `general.architecture`. The attention
+    /// scale is the one thing a GGUF leaves out: `query_pre_attn_scalar` is
+    /// the head width, except for the two 27B models, which use
+    /// `hidden / heads` (the engines that read GGUF infer it from the layer
+    /// count the same way, since the file does not say).
+    pub fn to_gemma_config(&self) -> crate::architectures::gemma::GemmaConfig {
+        let is_gemma2 = self.architecture == "gemma2";
+        let is_gemma3 = self.architecture == "gemma3";
+        let head_dim = self
+            .head_dim
+            .unwrap_or_else(|| self.hidden_size / self.num_attention_heads.max(1));
+        let wide_attention = (is_gemma2 && self.num_hidden_layers == 46)
+            || (is_gemma3 && self.num_hidden_layers == 62);
+        let query_pre_attn_scalar = (is_gemma2 || is_gemma3).then(|| {
+            if wide_attention {
+                self.hidden_size / self.num_attention_heads.max(1)
+            } else {
+                head_dim
+            }
+        });
+        crate::architectures::gemma::GemmaConfig {
+            model_type: self.architecture.clone(),
+            vocab_size: self.vocab_size,
+            hidden_size: self.hidden_size,
+            intermediate_size: self.intermediate_size,
+            num_hidden_layers: self.num_hidden_layers,
+            num_attention_heads: self.num_attention_heads,
+            num_key_value_heads: self.num_kv_heads,
+            head_dim: Some(head_dim),
+            max_position_embeddings: self.max_position_embeddings,
+            rms_norm_eps: self.rms_norm_eps,
+            rope_theta: self.rope_theta,
+            hidden_act: "gelu_pytorch_tanh".to_string(),
+            attn_logit_softcapping: self.attn_logit_softcapping,
+            final_logit_softcapping: self.final_logit_softcapping,
+            query_pre_attn_scalar,
+            sliding_window: self.sliding_window,
+            rope_local_base_freq: self.rope_local_base_freq,
+            is_gemma2,
+            is_gemma3,
+            rope_scaling: self.rope_scaling.clone(),
+            ..Default::default()
         }
     }
 
@@ -915,8 +1012,52 @@ mod tests {
             ("model.layers.4.mlp.up_proj.weight", "blk.4.ffn_up.weight"),
         ] {
             assert_eq!(WeightLoader::hf_to_gguf_name_gemma(hf), gguf);
-            assert_eq!(WeightLoader::gguf_to_hf_name_gemma4(gguf), hf);
+            assert_eq!(WeightLoader::gguf_to_hf_name_gemma(gguf), hf);
         }
+    }
+
+    fn gemma_config(architecture: &str, layers: i32, hidden: i32, heads: i32) -> GgufModelConfig {
+        GgufModelConfig {
+            architecture: architecture.to_string(),
+            hidden_size: hidden,
+            num_hidden_layers: layers,
+            num_attention_heads: heads,
+            num_kv_heads: Some(heads / 2),
+            intermediate_size: hidden * 4,
+            vocab_size: 262_144,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1_000_000.0,
+            max_position_embeddings: 32_768,
+            head_dim: Some(128),
+            rope_dimension_count: Some(128),
+            original_context_length: None,
+            rope_scaling: None,
+            sliding_window: Some(1024),
+            rope_local_base_freq: Some(10_000.0),
+            attn_logit_softcapping: None,
+            final_logit_softcapping: None,
+        }
+    }
+
+    /// A GGUF does not state `query_pre_attn_scalar`: it is the head width,
+    /// except for the two 27B models, where it is `hidden / heads`.
+    #[test]
+    fn the_gemma_attention_scale_is_inferred_the_way_the_converter_does() {
+        // Gemma 3 1B / 4B / 12B: the head width.
+        let small = gemma_config("gemma3", 34, 2560, 8).to_gemma_config();
+        assert_eq!(small.query_pre_attn_scalar, Some(128));
+        assert!(small.is_gemma3 && !small.is_gemma2);
+        // Gemma 3 27B: 5376 / 32.
+        let large = gemma_config("gemma3", 62, 5376, 32).to_gemma_config();
+        assert_eq!(large.query_pre_attn_scalar, Some(168));
+        // Gemma 2 27B: 4608 / 32.
+        let large = gemma_config("gemma2", 46, 4608, 32).to_gemma_config();
+        assert_eq!(large.query_pre_attn_scalar, Some(144));
+        assert!(large.is_gemma2 && !large.is_gemma3);
+        // Gemma 1 has no such scalar: the scale is the head width's.
+        let one = gemma_config("gemma", 28, 3072, 16).to_gemma_config();
+        assert_eq!(one.query_pre_attn_scalar, None);
+        assert!(!one.is_gemma2 && !one.is_gemma3);
     }
 
     #[test]
@@ -936,64 +1077,64 @@ mod tests {
     }
 
     #[test]
-    fn test_gguf_to_hf_name_gemma4_norm_layout() {
+    fn test_gguf_to_hf_name_gemma_norm_layout() {
         // The Gemma-specific norm layout is the whole reason this map exists:
         // ffn_norm is the PRE-feedforward norm, post_attention_norm and
         // post_ffw_norm are separate.
         assert_eq!(
-            WeightLoader::gguf_to_hf_name_gemma4("blk.0.attn_norm.weight"),
+            WeightLoader::gguf_to_hf_name_gemma("blk.0.attn_norm.weight"),
             "model.layers.0.input_layernorm.weight"
         );
         assert_eq!(
-            WeightLoader::gguf_to_hf_name_gemma4("blk.3.post_attention_norm.weight"),
+            WeightLoader::gguf_to_hf_name_gemma("blk.3.post_attention_norm.weight"),
             "model.layers.3.post_attention_layernorm.weight"
         );
         assert_eq!(
-            WeightLoader::gguf_to_hf_name_gemma4("blk.3.ffn_norm.weight"),
+            WeightLoader::gguf_to_hf_name_gemma("blk.3.ffn_norm.weight"),
             "model.layers.3.pre_feedforward_layernorm.weight"
         );
         assert_eq!(
-            WeightLoader::gguf_to_hf_name_gemma4("blk.3.post_ffw_norm.weight"),
+            WeightLoader::gguf_to_hf_name_gemma("blk.3.post_ffw_norm.weight"),
             "model.layers.3.post_feedforward_layernorm.weight"
         );
     }
 
     #[test]
-    fn test_gguf_to_hf_name_gemma4_attention_and_qk_norm() {
+    fn test_gguf_to_hf_name_gemma_attention_and_qk_norm() {
         assert_eq!(
-            WeightLoader::gguf_to_hf_name_gemma4("blk.1.attn_q.weight"),
+            WeightLoader::gguf_to_hf_name_gemma("blk.1.attn_q.weight"),
             "model.layers.1.self_attn.q_proj.weight"
         );
         assert_eq!(
-            WeightLoader::gguf_to_hf_name_gemma4("blk.1.attn_output.weight"),
+            WeightLoader::gguf_to_hf_name_gemma("blk.1.attn_output.weight"),
             "model.layers.1.self_attn.o_proj.weight"
         );
         assert_eq!(
-            WeightLoader::gguf_to_hf_name_gemma4("blk.2.attn_q_norm.weight"),
+            WeightLoader::gguf_to_hf_name_gemma("blk.2.attn_q_norm.weight"),
             "model.layers.2.self_attn.q_norm.weight"
         );
         assert_eq!(
-            WeightLoader::gguf_to_hf_name_gemma4("blk.2.attn_k_norm.weight"),
+            WeightLoader::gguf_to_hf_name_gemma("blk.2.attn_k_norm.weight"),
             "model.layers.2.self_attn.k_norm.weight"
         );
     }
 
     #[test]
-    fn test_gguf_to_hf_name_gemma4_embeddings_and_ffn() {
+    fn test_gguf_to_hf_name_gemma_embeddings_and_ffn() {
         assert_eq!(
-            WeightLoader::gguf_to_hf_name_gemma4("token_embd.weight"),
+            WeightLoader::gguf_to_hf_name_gemma("token_embd.weight"),
             "model.embed_tokens.weight"
         );
         assert_eq!(
-            WeightLoader::gguf_to_hf_name_gemma4("output_norm.weight"),
+            WeightLoader::gguf_to_hf_name_gemma("output_norm.weight"),
             "model.norm.weight"
         );
         assert_eq!(
-            WeightLoader::gguf_to_hf_name_gemma4("blk.0.ffn_gate.weight"),
+            WeightLoader::gguf_to_hf_name_gemma("blk.0.ffn_gate.weight"),
             "model.layers.0.mlp.gate_proj.weight"
         );
         assert_eq!(
-            WeightLoader::gguf_to_hf_name_gemma4("blk.0.ffn_down.weight"),
+            WeightLoader::gguf_to_hf_name_gemma("blk.0.ffn_down.weight"),
             "model.layers.0.mlp.down_proj.weight"
         );
     }
