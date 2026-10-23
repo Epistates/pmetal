@@ -1,3 +1,10 @@
+[install]
+# Resolve no package version younger than a week (seconds): most malicious
+# releases are caught and pulled within days. Versions already pinned in
+# bun.lock are installed as pinned, so a refresh is the moment this applies;
+# `just audit-deps` checks the pinned ones.
+minimumReleaseAge = 604800
+
 [test]
 # Compiles .svelte and .svelte.ts files, so a component can be rendered in a test.
 preload = ["./test/setup.ts"]
