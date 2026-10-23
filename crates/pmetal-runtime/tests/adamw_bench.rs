@@ -192,7 +192,13 @@ fn eval_set_step_time() {
         let (warmup, steps) = (3, 12);
         let (mut per_array, mut one_call) = (Vec::new(), Vec::new());
         for _ in 0..3 {
-            per_array.push(time_steps_waiting(&set, true, warmup, steps, Wait::PerArray));
+            per_array.push(time_steps_waiting(
+                &set,
+                true,
+                warmup,
+                steps,
+                Wait::PerArray,
+            ));
             one_call.push(time_steps_waiting(&set, true, warmup, steps, Wait::OneCall));
         }
         per_array.sort_by(|a, b| a.total_cmp(b));
