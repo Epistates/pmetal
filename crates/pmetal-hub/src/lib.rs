@@ -36,6 +36,9 @@ pub use client::HubOptions;
 pub use dataset::*;
 pub use download::*;
 pub use fit::*;
+/// The shard index reader and writer, from `pmetal-core`, for crates that reach
+/// the hub but not the core crate directly.
+pub use pmetal_core::safetensors_index;
 pub use progress::{ProgressCallback, TransferProgress};
 pub use resolve::*;
 pub use search::*;

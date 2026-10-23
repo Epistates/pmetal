@@ -215,41 +215,19 @@ pub fn index_files_to_read(files: &[RepoFile], format: WeightFormat) -> Vec<Stri
         .collect()
 }
 
-/// Whether `path` is a file path a repository (or an index file) may name:
-/// relative, `/`-separated, no empty, `.` or `..` component, no backslash or
-/// NUL. Anything else could point out of the directory it is joined onto.
-pub fn is_safe_relative_path(path: &str) -> bool {
-    !path.is_empty()
-        && !path.contains(['\\', '\0'])
-        && path
-            .split('/')
-            .all(|part| !part.is_empty() && part != "." && part != "..")
-}
+pub use pmetal_core::safetensors_index::is_safe_relative_path;
 
 /// The shard file names a safetensors/PyTorch `*.index.json` refers to, each
-/// once, in name order. `Err` if the JSON is not an index, or names a path
-/// that leaves the model directory.
+/// once, in name order. `Err` if the JSON is not an index, names no shard, or
+/// names a path that leaves the model directory.
 pub fn shards_in_index(json: &[u8]) -> Result<Vec<String>> {
-    let value: serde_json::Value = serde_json::from_slice(json)
-        .map_err(|e| PMetalError::Hub(format!("weight index is not valid JSON: {e}")))?;
-    let map = value
-        .get("weight_map")
-        .and_then(|m| m.as_object())
-        .ok_or_else(|| PMetalError::Hub("weight index has no `weight_map`".into()))?;
-    let shards: BTreeSet<String> = map
-        .values()
-        .filter_map(|v| v.as_str())
-        .map(str::to_owned)
-        .collect();
+    let index = pmetal_core::safetensors_index::ShardIndex::parse(json)
+        .map_err(|e| PMetalError::Hub(e.to_string()))?;
+    let shards: Vec<String> = index.shards().into_iter().map(str::to_owned).collect();
     if shards.is_empty() {
         return Err(PMetalError::Hub("weight index names no shards".into()));
     }
-    if let Some(bad) = shards.iter().find(|s| !is_safe_relative_path(s)) {
-        return Err(PMetalError::Hub(format!(
-            "weight index names a shard outside the model directory: {bad:?}"
-        )));
-    }
-    Ok(shards.into_iter().collect())
+    Ok(shards)
 }
 
 /// Choose the files of a model download.

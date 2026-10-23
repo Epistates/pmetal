@@ -22,7 +22,7 @@
 //! (`A_log`, `dt_bias`, `conv1d`) are always kept at 8-bit or full precision
 //! because errors in these tensors have outsized downstream effects.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use crate::InlineArray;
@@ -456,7 +456,7 @@ pub fn quantize_and_save_mlx(
     let n_shards = shards.len();
 
     // weight_map: tensor key → shard filename
-    let mut weight_map: HashMap<String, String> = HashMap::new();
+    let mut weight_map: BTreeMap<String, String> = BTreeMap::new();
 
     for (shard_num, shard_record_indices) in shards.iter().enumerate() {
         let shard_filename = format!("model-{:05}-of-{:05}.safetensors", shard_num + 1, n_shards);
@@ -529,10 +529,16 @@ pub fn quantize_and_save_mlx(
     Ok(())
 }
 
-/// Write `model.safetensors.index.json`.
+/// Write `model.safetensors.index.json`: in tensor-name order, so the file is
+/// the same on every run, and atomically (to a sibling file, then renamed), so
+/// a reader never sees half of it.
+///
+/// This crate depends on no other pmetal crate, so it writes the index here
+/// rather than through `pmetal_core::safetensors_index`; a test reads what it
+/// writes with that module.
 fn write_weight_map_index(
     output_dir: &Path,
-    weight_map: &HashMap<String, String>,
+    weight_map: &BTreeMap<String, String>,
 ) -> Result<(), String> {
     use std::io::Write as _;
 
@@ -544,13 +550,20 @@ fn write_weight_map_index(
     });
 
     let index_path = output_dir.join("model.safetensors.index.json");
+    let partial = output_dir.join("model.safetensors.index.json.partial");
     let pretty = serde_json::to_string_pretty(&index)
         .map_err(|e| format!("failed to serialise safetensors index: {e}"))?;
 
-    let mut f = std::fs::File::create(&index_path)
-        .map_err(|e| format!("failed to create index file: {e}"))?;
-    f.write_all(pretty.as_bytes())
-        .map_err(|e| format!("failed to write index file: {e}"))?;
+    let written = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&partial)?;
+        f.write_all(pretty.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&partial, &index_path)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&partial);
+        return Err(format!("failed to write index file: {e}"));
+    }
 
     Ok(())
 }
@@ -770,6 +783,39 @@ pub fn quantize_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The index this crate writes is read back by the shared index module,
+    /// whole, and is the same bytes on every write.
+    #[test]
+    fn the_written_index_is_read_by_the_shared_module() {
+        let dir = tempfile::tempdir().unwrap();
+        let map: BTreeMap<String, String> = [
+            ("b.weight", "model-00002-of-00002.safetensors"),
+            ("a.weight", "model-00001-of-00002.safetensors"),
+        ]
+        .into_iter()
+        .map(|(t, s)| (t.to_owned(), s.to_owned()))
+        .collect();
+        write_weight_map_index(dir.path(), &map).unwrap();
+        let path = dir.path().join("model.safetensors.index.json");
+        let first = std::fs::read(&path).unwrap();
+        let read = pmetal_core::safetensors_index::ShardIndex::parse(&first).unwrap();
+        assert_eq!(read.weight_map, map);
+        assert_eq!(
+            read.shards(),
+            [
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors"
+            ]
+        );
+        write_weight_map_index(dir.path(), &map).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+        assert!(
+            !dir.path()
+                .join("model.safetensors.index.json.partial")
+                .exists()
+        );
+    }
 
     // ── MLX checkpoint layout (#30) ───────────────────────────────────────────
 

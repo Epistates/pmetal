@@ -11,18 +11,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use pmetal_core::safetensors_index::ShardIndex;
 use pmetal_hub::torch::{TorchArchive, TorchDtype, TorchTensor};
 use pmetal_runtime::compat::Array;
 
 use super::LoadError;
-
-/// Weight index for sharded models.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct WeightIndex {
-    #[serde(default)]
-    pub metadata: HashMap<String, serde_json::Value>,
-    pub weight_map: HashMap<String, String>,
-}
 
 /// How a checkpoint's tensors are stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +30,7 @@ enum Layout {
     /// All of them in one file.
     Single(PathBuf),
     /// Spread over the shards `weight_map` names, relative to the directory.
-    Sharded(WeightIndex),
+    Sharded(ShardIndex),
 }
 
 /// The weight files of a checkpoint directory.
@@ -104,8 +97,7 @@ impl Checkpoint {
             }
             let index_path = model_dir.join(index);
             if index_path.exists() {
-                let text = std::fs::read_to_string(&index_path)?;
-                let index: WeightIndex = serde_json::from_str(&text)?;
+                let index = ShardIndex::read(&index_path)?;
                 return Ok(Self {
                     dir: model_dir.to_path_buf(),
                     format,

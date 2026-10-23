@@ -69,19 +69,11 @@ impl Checkpoint {
         let paths = if dir.is_file() {
             vec![dir.to_path_buf()]
         } else if dir.join("model.safetensors.index.json").exists() {
-            let text = std::fs::read_to_string(dir.join("model.safetensors.index.json"))
-                .map_err(|e| bad(format!("model.safetensors.index.json: {e}")))?;
-            let index: serde_json::Value = serde_json::from_str(&text)
-                .map_err(|e| bad(format!("model.safetensors.index.json: {e}")))?;
-            let mut shards: Vec<String> = index["weight_map"]
-                .as_object()
-                .ok_or_else(|| bad("model.safetensors.index.json has no weight_map".into()))?
-                .values()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-            shards.sort();
-            shards.dedup();
-            shards.into_iter().map(|f| dir.join(f)).collect()
+            let index = pmetal_core::safetensors_index::ShardIndex::read(
+                &dir.join(pmetal_core::safetensors_index::INDEX_FILE),
+            )
+            .map_err(|e| bad(format!("model.safetensors.index.json: {e}")))?;
+            index.shards().into_iter().map(|f| dir.join(f)).collect()
         } else {
             vec![dir.join("model.safetensors")]
         };
@@ -459,6 +451,17 @@ mod tests {
             .to_string(),
         )
         .unwrap();
+
+        // An index that names a path outside the directory is refused.
+        let honest = std::fs::read(dir.path().join("model.safetensors.index.json")).unwrap();
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            json!({"weight_map": {"w32": "../../victim.safetensors"}}).to_string(),
+        )
+        .unwrap();
+        let err = Checkpoint::open(dir.path()).err().expect("refused");
+        assert!(err.to_string().contains("outside"), "{err}");
+        std::fs::write(dir.path().join("model.safetensors.index.json"), honest).unwrap();
 
         let ckpt = Checkpoint::open(dir.path()).unwrap();
         assert_eq!(ckpt.f32("w32", 3).unwrap(), [1.5, -2.0, 0.25]);

@@ -3182,12 +3182,12 @@ mod tests {
         let bytes = std::fs::read(&whole).unwrap();
         let tensors = safetensors::SafeTensors::deserialize(&bytes).unwrap();
         let mut shards: [Vec<(String, TensorView<'_>)>; 2] = [Vec::new(), Vec::new()];
-        let mut weight_map = serde_json::Map::new();
+        let mut weight_map = std::collections::BTreeMap::new();
         for (name, view) in tensors.tensors() {
             let shard =
                 usize::from(name.starts_with("model.layers.1.") || name == "model.norm.weight");
             let file = format!("shard-{shard}.safetensors");
-            weight_map.insert(name.clone(), serde_json::json!(file));
+            weight_map.insert(name.clone(), file.clone());
             shards[shard].push((
                 name,
                 TensorView::new(Dtype::F32, view.shape().to_vec(), view.data()).unwrap(),
@@ -3203,11 +3203,9 @@ mod tests {
             )
             .unwrap();
         }
-        std::fs::write(
-            split.join("model.safetensors.index.json"),
-            serde_json::json!({"weight_map": weight_map}).to_string(),
-        )
-        .unwrap();
+        pmetal_core::safetensors_index::ShardIndex::new(weight_map, 0)
+            .write(&split.join(pmetal_core::safetensors_index::INDEX_FILE))
+            .unwrap();
 
         let mut reloaded = DynamicAneTrainer::new(config.clone());
         reloaded.load_weights_safetensors(&split).unwrap();

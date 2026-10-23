@@ -114,13 +114,26 @@ pub fn discover_safetensors_shards(model_dir: &Path) -> Result<Vec<PathBuf>, Str
             .as_str()
             .ok_or_else(|| "shard filename is not a string".to_string())?;
         if seen.insert(name.to_string()) {
-            if name.contains("..") || name.starts_with('/') {
+            if !is_safe_relative_path(name) {
                 return Err(format!("shard filename contains path traversal: {name}"));
             }
             paths.push(model_dir.join(name));
         }
     }
     Ok(paths)
+}
+
+/// Whether `path` is a relative, `/`-separated path with no empty, `.` or
+/// `..` component and no backslash or NUL: one that cannot leave the directory
+/// it is joined onto. The rule of `pmetal_core::safetensors_index`, which this
+/// crate (it depends on no other pmetal crate) cannot call; a test holds the
+/// two to the same verdicts.
+fn is_safe_relative_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains(['\\', '\0'])
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 /// Load every tensor from each shard in `shard_paths`, merging into one
@@ -632,6 +645,38 @@ mod tests {
                 (f64::from(*got) - want).abs() < 1e-4,
                 "row {r}: loader gives {got}, the format gives {want}"
             );
+        }
+    }
+
+    /// This crate's path rule and the shared index module's agree on every
+    /// name, and an index that names a path out of the directory is refused
+    /// by this loader as it is by `pmetal_core::safetensors_index`.
+    #[test]
+    fn the_loader_refuses_what_the_shared_index_module_refuses() {
+        use pmetal_core::safetensors_index::{ShardIndex, is_safe_relative_path as shared};
+        for name in [
+            "model.safetensors",
+            "text/model-00001.safetensors",
+            "",
+            "/etc/passwd",
+            "../x",
+            "a/../../x",
+            "a//b",
+            "./a",
+            "a/.",
+            "a\\b",
+            "a\0b",
+            "..model",
+            "a..b",
+        ] {
+            assert_eq!(super::is_safe_relative_path(name), shared(name), "{name:?}");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        for shard in ["../../victim", "/etc/passwd", "a/../b"] {
+            let index = format!(r#"{{"weight_map":{{"t":{shard:?}}}}}"#);
+            fs::write(tmp.path().join("model.safetensors.index.json"), &index).unwrap();
+            assert!(discover_safetensors_shards(tmp.path()).is_err(), "{shard}");
+            assert!(ShardIndex::parse(index.as_bytes()).is_err(), "{shard}");
         }
     }
 

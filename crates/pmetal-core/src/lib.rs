@@ -31,6 +31,7 @@ pub mod fields;
 pub mod jobs;
 pub mod model_type;
 pub mod paths;
+pub mod safetensors_index;
 pub mod scheduler;
 mod secrets;
 mod traits;

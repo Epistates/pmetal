@@ -1963,9 +1963,10 @@ impl CheckpointFiles {
     fn open(dir: &Path) -> Result<Self, LoadError> {
         let index_path = dir.join("model.safetensors.index.json");
         let key_to_file: HashMap<String, String> = if index_path.exists() {
-            let index: crate::loader::WeightIndex =
-                serde_json::from_str(&std::fs::read_to_string(&index_path)?)?;
-            index.weight_map
+            crate::loader::WeightIndex::read(&index_path)?
+                .weight_map
+                .into_iter()
+                .collect()
         } else {
             let (_, tensors) = read_header(&dir.join("model.safetensors"))?;
             tensors
