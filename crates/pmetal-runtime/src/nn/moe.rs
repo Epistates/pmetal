@@ -329,7 +329,7 @@ impl ModuleParameters for Linear {
     fn trainable_parameters(&self) -> ModuleParamRef<'_> {
         let Some(adapter) = &self.adapter else {
             if self.quant.is_some() {
-                return HashMap::new();
+                return BTreeMap::new();
             }
             return self.parameters();
         };
