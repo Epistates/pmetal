@@ -41,7 +41,8 @@ pub(crate) mod rlkd;
 pub(crate) mod search;
 #[cfg(feature = "serve")]
 pub(crate) mod serve;
-#[cfg(feature = "trainer")]
+// `pmetal infer` stops on a request too; the trainers use the rest of it.
+#[cfg_attr(not(feature = "trainer"), allow(dead_code))]
 pub(crate) mod stop;
 pub(crate) mod tokenize;
 #[cfg(feature = "trainer")]

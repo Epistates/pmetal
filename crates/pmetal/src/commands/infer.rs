@@ -647,17 +647,10 @@ pub(crate) async fn run_inference(spec: InferSpec) -> anyhow::Result<()> {
 
     // ── Generation dispatch ────────────────────────────────────────────────
     let start = std::time::Instant::now();
-    // Ctrl-C stops the generation after the token in flight, so the text so
-    // far is complete and the statistics are printed; the exit status is 130.
-    let interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    {
-        let interrupted = std::sync::Arc::clone(&interrupted);
-        tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                interrupted.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-        });
-    }
+    // Ctrl-C, or the SIGTERM a supervisor stops a job with (the desktop app's
+    // Stop button), ends the generation after the token in flight, so the text
+    // so far is complete and the statistics are printed; the exit status is 130.
+    let interrupted = super::stop::StopFlag::watch().handle();
     // The text: on stdout as it is generated, or kept for the JSON object.
     let collected = std::cell::RefCell::new(String::new());
     let emit = |delta: &str| {

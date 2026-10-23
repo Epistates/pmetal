@@ -5,8 +5,6 @@ mod custom_dirs;
 pub mod dashboard;
 mod datasets;
 mod device;
-
-mod infer_stream;
 mod inference;
 mod jobs;
 mod models;
