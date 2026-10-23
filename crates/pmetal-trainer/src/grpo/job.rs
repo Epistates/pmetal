@@ -23,9 +23,6 @@ use super::{
 /// What a surface adds to a GRPO run.
 #[derive(Default)]
 pub struct GrpoJobOptions {
-    /// Whether the run prints its banner and summary (the command line does;
-    /// the other surfaces draw their own).
-    pub emit_console_output: bool,
     /// Callbacks that carry the run's progress out and can stop it.
     pub callbacks: Vec<Box<dyn TrainingCallback>>,
     /// Rewards of the caller's own, with their weights, summed with the ones
@@ -138,7 +135,6 @@ pub async fn run_grpo_job(
     let optimizer: pmetal_core::OptimizerType =
         spec.optimizer.parse().map_err(anyhow::Error::msg)?;
     let GrpoJobOptions {
-        emit_console_output,
         callbacks: extra_callbacks,
         extra_rewards,
     } = options;
@@ -156,25 +152,21 @@ pub async fn run_grpo_job(
         reference: response_column.clone(),
     };
 
-    if emit_console_output {
-        println!("========================================");
-        println!("  PMetal GRPO Reasoning Training");
-        println!("========================================");
-        println!("Model:         {}", model_id);
-        println!("Dataset:       {}", dataset_path);
-        println!("Output:        {}", output_dir);
-        println!("Generations:   {}", num_generations);
-        println!("Beta:          {}", beta);
-        println!("LR:            {:.2e}", learning_rate);
-        println!("DAPO:          {}", dapo);
-        println!("Loss type:     {}", loss_type);
-        println!("Updates/batch: {}", num_iterations);
-        println!("Reasoning Rew: {}", reasoning_rewards);
-        if vlm_mode {
-            println!("VLM Mode:      enabled (max_image_size={})", max_image_size);
-        }
-        println!("========================================\n");
-    }
+    tracing::info!(
+        model = model_id,
+        dataset = dataset_path,
+        output = output_dir,
+        generations = num_generations,
+        beta,
+        learning_rate,
+        dapo,
+        loss_type,
+        updates_per_batch = num_iterations,
+        reasoning_rewards,
+        vlm = vlm_mode,
+        max_image_size,
+        "GRPO reasoning training"
+    );
 
     // 1. Resolve and Download Model
     tracing::info!("Resolving model: {}", model_id);
@@ -284,9 +276,6 @@ pub async fn run_grpo_job(
 
     // 6b. Load ML reward model if configured. Its path was resolved in step 4.
     if let Some((ref rm_path_str, ref rm_path)) = resolved_reward_model_path {
-        if emit_console_output {
-            println!("Loading ML reward model: {}", rm_path_str);
-        }
         tracing::info!("Loading ML reward model from: {}", rm_path_str);
 
         let rm_tokenizer = Tokenizer::from_model_dir(rm_path)
@@ -304,9 +293,7 @@ pub async fn run_grpo_job(
 
         rewards = rewards.add(Box::new(ml_reward), reward_model_weight);
 
-        if emit_console_output {
-            println!("ML reward model loaded (weight={:.2})", reward_model_weight);
-        }
+        tracing::info!(weight = reward_model_weight, "ML reward model loaded");
     }
 
     // A group of completions that all score alike has no advantage to learn
@@ -379,16 +366,12 @@ pub async fn run_grpo_job(
     let mut optimizer = crate::TrainOptimizer::from_config(&trainer.training_config);
 
     // 8. Run Training
-    if emit_console_output {
-        println!("Starting GRPO training loop...");
-    }
+    tracing::info!("Starting GRPO training loop");
 
     // The reference model (frozen) is only the KL penalty's, so it is loaded
     // only when the penalty is on.
     let mut ref_model = if beta > 0.0 {
-        if emit_console_output {
-            println!("Loading reference model...");
-        }
+        tracing::info!("Loading reference model");
         Some(
             DynamicModel::load(&model_path)
                 .map_err(|e| anyhow::anyhow!("Failed to load reference model: {}", e))?,
@@ -402,9 +385,7 @@ pub async fn run_grpo_job(
     let outcome = if async_rewards {
         // Pipelined path: reward scoring runs in a background thread so the GPU
         // training step can overlap with the next sample's reward computation.
-        if emit_console_output {
-            println!("Async rewards enabled — reward scoring will pipeline with GPU training.");
-        }
+        tracing::info!("Async rewards enabled: reward scoring will pipeline with GPU training");
         trainer.run_async(
             &mut model,
             ref_model.as_mut(),
@@ -438,12 +419,11 @@ pub async fn run_grpo_job(
         Some(model_id),
     )?;
 
-    if emit_console_output {
-        println!(
-            "\nGRPO training complete! Model weights saved to: {}",
-            output_dir
-        );
-    }
+    tracing::info!(
+        output = output_dir,
+        steps = trainer.step,
+        "GRPO training complete"
+    );
     Ok(GrpoJobResult {
         steps: trainer.step,
         stopped,

@@ -170,9 +170,7 @@ impl PyTrainer {
 
     /// Run the training. Raises `TrainingError` (or the error's own type) if it fails.
     fn train(&self, py: Python<'_>) -> PyResult<PyTrainResult> {
-        let mut job = TrainingJobConfig::from_spec(&self.spec).map_err(config_err)?;
-        // A library call prints nothing the caller did not ask for.
-        job.emit_console_output = false;
+        let job = TrainingJobConfig::from_spec(&self.spec).map_err(config_err)?;
         run_job(py, job, &self.callbacks)
     }
 
