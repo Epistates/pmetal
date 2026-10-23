@@ -105,6 +105,7 @@ fn array_of_strings(content: &GgufContent, key: &str) -> Vec<String> {
     }
 }
 
+const NORMAL: i32 = 1;
 const CONTROL: i32 = 3;
 const USER_DEFINED: i32 = 4;
 const BYTE: i32 = 6;
@@ -604,6 +605,85 @@ fn gemma4_tokenizer_adds_a_beginning_of_text_and_no_space_prefix() {
         Some(false)
     );
     assert_eq!(content.get_u64("tokenizer.ggml.bos_token_id"), Some(2));
+}
+
+/// A token is a control token of the file when the tokenizer flags it special
+/// (the 24 added tokens of Gemma 4's `tokenizer.json`: its pad, eos, bos, unk
+/// and mask, the turn, channel, tool and thinking markers, the media markers)
+/// and a normal one otherwise.
+///
+/// `</s>` (id 212 in the real vocabulary) is the second kind: an HTML tag among
+/// `</sub>` and `</sup>`, in the model's own vocabulary and no added token. An
+/// engine that treats the name `</s>` as an end-of-sequence marker warns that
+/// it is "control-looking" and not control-type, then drops it from its stop
+/// tokens as the normal token it is. Marking it control would stop that
+/// warning by hiding the text `</s>` from a generation, a change from the
+/// tokenizer that nothing asks for.
+#[test]
+fn gemma4_control_tokens_are_the_ones_the_tokenizer_flags_special() {
+    let vocab = ["a", "b", "</s>", "</sub>"];
+    let tokenizer = tokenizer_json(
+        &vocab,
+        &[],
+        &[
+            ("<pad>", true),
+            ("<eos>", true),
+            ("<bos>", true),
+            ("<unk>", true),
+            ("<mask>", true),
+            ("<|turn>", true),
+            ("<turn|>", true),
+            ("<|channel>", true),
+            ("<|image|>", true),
+            // Not special, and not spelled like a control token.
+            ("<br>", false),
+        ],
+        json!({"pre_tokenizer": byte_level(), "decoder": byte_level()}),
+        false,
+    );
+    let tokenizer_config = json!({
+        "bos_token": "<bos>", "eos_token": "<eos>", "pad_token": "<pad>", "unk_token": "<unk>",
+    });
+    let config = json!({
+        "architectures": ["Gemma4UnifiedForConditionalGeneration"], "model_type": "gemma4_unified",
+        "text_config": {"hidden_size": 8, "vocab_size": 13, "num_attention_heads": 2},
+    });
+    let (_, content) = export(
+        config,
+        &[
+            ("tokenizer.json", tokenizer.into_bytes()),
+            (
+                "tokenizer_config.json",
+                tokenizer_config.to_string().into_bytes(),
+            ),
+        ],
+    );
+    let tokens = array_of_strings(&content, "tokenizer.ggml.tokens");
+    let types = array_of_i32(&content, "tokenizer.ggml.token_type");
+    let type_of = |token: &str| {
+        let at = tokens.iter().position(|t| t == token).unwrap();
+        types[at]
+    };
+    // The added tokens flagged special are control tokens.
+    for token in [
+        "<pad>",
+        "<eos>",
+        "<bos>",
+        "<unk>",
+        "<mask>",
+        "<|turn>",
+        "<turn|>",
+        "<|channel>",
+        "<|image|>",
+    ] {
+        assert_eq!(type_of(token), CONTROL, "{token}");
+    }
+    // `</s>` and its neighbours are text; so is an added token that is neither
+    // flagged nor spelled like a control token.
+    for token in ["</s>", "</sub>", "a"] {
+        assert_eq!(type_of(token), NORMAL, "{token}");
+    }
+    assert_eq!(type_of("<br>"), USER_DEFINED);
 }
 
 // ── a Mistral-family model with no beginning-of-text in its config ─────────
