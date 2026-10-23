@@ -8,7 +8,7 @@
 #   MLX       the bridge's pin against the latest release and upstream main
 #   Rust      rust-toolchain.toml against the latest stable
 #   maturin   the pyproject floor against the latest release
-#   actions   each `uses:` in .github/workflows against the action's newest tag
+#   actions   each pinned `uses:` in .github/workflows against the newest release
 #   dups      crates that resolve to more than one version, per lockfile
 #
 # Needs network access, cargo-edit (`cargo upgrade`), bun, jq and curl.
@@ -86,20 +86,25 @@ floor=$(sed -nE 's/.*"maturin>=([0-9.]+),.*/\1/p' crates/pmetal-py/pyproject.tom
 latest=$(curl -fsSL https://pypi.org/pypi/maturin/json | jq -r .info.version)
 echo "pyproject floor: $floor, latest: $latest"
 
-section "GitHub Actions"
-grep -rhoE 'uses: *[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+' .github/workflows |
-    sed 's/uses: *//' | sort -u | while IFS=@ read -r action ref; do
-    newest=$(git ls-remote --tags "https://github.com/$action.git" 2>/dev/null |
-        awk '{ sub("refs/tags/", "", $2); sub(/\^\{\}$/, "", $2); print $2 }' |
-        grep -E '^v[0-9]+$' | sort -V | tail -1)
-    if [[ -z $newest ]]; then
-        newest=$(git ls-remote --tags "https://github.com/$action.git" 2>/dev/null |
-            awk '{ sub("refs/tags/", "", $2); sub(/\^\{\}$/, "", $2); print $2 }' |
-            grep -E '^v?[0-9]+(\.[0-9]+)*$' | sort -V | tail -1)
+section "GitHub Actions (pinned by commit; the comment names the release)"
+grep -rhoE 'uses: *[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40} # [A-Za-z0-9_.-]+' .github/workflows |
+    sed -E 's/uses: *//; s/ # / /' | sort -u | while read -r pinned version; do
+    action=${pinned%@*}
+    sha=${pinned#*@}
+    refs=$(git ls-remote "https://github.com/$action.git" 2>/dev/null)
+    if [[ $version =~ ^v[0-9] ]]; then
+        newest=$(awk '{ sub("refs/tags/", "", $2); sub(/\^\{\}$/, "", $2); print $2 }' <<<"$refs" |
+            grep -E '^v[0-9]+(\.[0-9]+)+$' | sort -V | tail -1)
+        flag=""
+        [[ -n $newest && $version != "$newest" ]] && flag="  <- behind"
+        printf '%-40s %-10s newest: %s%s\n' "$action" "$version" "${newest:-?}" "$flag"
+    else
+        # A branch (dtolnay/rust-toolchain's stable and nightly).
+        head=$(awk -v r="refs/heads/$version" '$2 == r { print $1 }' <<<"$refs")
+        flag=""
+        [[ -n $head && $head != "$sha" ]] && flag="  <- branch has moved"
+        printf '%-40s %-10s pinned %.12s, branch head %.12s%s\n' "$action" "$version" "$sha" "${head:-?}" "$flag"
     fi
-    flag=""
-    [[ -n $newest && $ref != "$newest" && $ref =~ ^v[0-9]+$ ]] && flag="  <- behind"
-    printf '%-40s %-10s newest major: %s%s\n' "$action" "$ref" "${newest:-?}" "$flag"
 done
 
 # Counted in what macOS actually builds (all features), not in Cargo.lock:

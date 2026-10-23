@@ -3,7 +3,8 @@ name: Dependencies
 # Watches the dependencies without changing them: a weekly report of
 # everything behind upstream (`just deps-check`) on the run's summary page,
 # and a daily check of the lockfiles against the RustSec advisory database
-# (deny.toml's reviewed ignores applied). Neither opens issues or pull
+# (deny.toml's reviewed ignores applied) and of every pinned crate and npm
+# package against OSV's malware records. Neither opens issues or pull
 # requests; a failed advisory run is the signal.
 on:
   schedule:
@@ -28,18 +29,20 @@ jobs:
     runs-on: macos-latest
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # rust-toolchain.toml's pinned toolchain, which `cargo` would otherwise
       # install on first use.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
 
       # `cargo upgrade` comes from cargo-edit.
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: just,cargo-edit
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version-file: crates/pmetal-gui/package.json
 
@@ -67,14 +70,19 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check advisories
 
       # The GUI is a separate workspace; same deny.toml, found by walking up.
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check advisories
           manifest-path: crates/pmetal-gui/src-tauri/Cargo.toml
+
+      # Malware records for every pinned crate and npm package (RustSec does
+      # not cover npm), and the versions pinned younger than a week.
+      - name: Malware and release age
+        run: python3 scripts/audit-lockfiles.py
