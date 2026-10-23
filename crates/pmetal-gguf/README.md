@@ -25,8 +25,9 @@ with it.
   format of current tools, and the legacy `.dat`); the quantizers take its per-channel weights.
 - **Metadata**: tokenizer and `config.json` extraction from `tokenizer.ggml.*` and
   `<arch>.*` keys; `config::GgufArchConfig` reads the architecture parameters, including RoPE
-  scaling (from `rope.scaling.*` and the `rope_freqs` / `rope_factors_*` tensors), and writes the
-  `config.json` for a GGUF-only download.
+  scaling (from `rope.scaling.*` and the `rope_freqs` / `rope_factors_*` tensors), the sliding
+  window, the local rope base and soft caps of Gemma, and the per-layer arrays of Gemma 4, and
+  writes the `config.json` for a GGUF-only download.
 
 ## Installation
 
@@ -203,7 +204,7 @@ decoded.
 | `imatrix` | Importance matrix: read and write, legacy `.dat` and GGUF |
 | `k_quants`, `iq_quants` | Block formats |
 | `tokenizer` | Tokenizer metadata extraction |
-| `config` | `GgufArchConfig`: architecture parameters and RoPE scaling, as a typed value or a `config.json` |
+| `config` | `GgufArchConfig`: architecture parameters, RoPE scaling and per-layer facts, as a typed value or a `config.json` |
 
 ## Feature flags
 

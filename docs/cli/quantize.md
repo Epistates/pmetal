@@ -58,7 +58,7 @@ These are the values `--method` accepts.
 | `mxfp4` / `nvfp4` | Block-floating 4-bit |
 | `bf16` / `f16` / `f32` | Dense export |
 
-The output head is written as `q6_k` for the K-quant, legacy 4- and 5-bit and 4-bit non-linear methods (a model that ties its head to the embedding has no `output.weight`, and its token embedding is then written as a head), and a token embedding beside a head of its own is stored in the type of the method, and a tensor whose rows are not a whole number of blocks falls back to a smaller block format (`iq4_nl`, `q5_0`, `q5_1` or `q8_0`) as the format requires. An importance matrix applies to GGUF output; `--imatrix` and `--calibration-dataset` are refused with `--format mlx`.
+The output head is written as `q6_k` for the K-quant, legacy 4- and 5-bit and 4-bit non-linear methods (a model that ties its head to the embedding has no `output.weight`, and its token embedding is then written as a head), and a token embedding beside a head of its own is stored in the type of the method, and a tensor whose rows are not a whole number of blocks falls back to a smaller block format (`q4_0` for `q2_k` and `q3_k`, `iq4_nl` for `iq4_xs`, `q5_0`, `q5_1` or `q8_0`) as the format requires. An importance matrix applies to GGUF output; `--imatrix` and `--calibration-dataset` are refused with `--format mlx`.
 
 ## Architectures
 
