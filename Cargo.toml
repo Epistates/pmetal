@@ -67,8 +67,7 @@ pmetal-lib = { package = "pmetal", path = "crates/pmetal", version = "0.7.0", de
 # repeat these strings verbatim.
 
 # Async runtime
-tokio = { version = "1.53", features = ["full"] }
-tokio-stream = "0.1"
+tokio = { version = "1.54", features = ["full"] }
 tokio-util = "0.7"
 futures = "0.3.34"
 async-trait = "0.1"
@@ -102,10 +101,10 @@ crossterm = "0.29"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde-saphyr = "1.3"
+serde-saphyr = "2.0"
 # Names the key a deserialization error came from.
 serde_path_to_error = "0.1"
-json5 = "1.3.1"
+json5 = "1.3.3"
 # TensorBoard event files
 prost = "0.14"
 crc = "3.4"
@@ -169,12 +168,11 @@ rayon = "1"
 # so a library consumer can't resolve below them.
 rand = "0.10.3"
 rand_distr = "0.6"
-ordered-float = "5"
 byteorder = "1.5"
 indicatif = "0.18"
 dirs = "7"
 walkdir = "2"
-memmap2 = "0.9.11"
+memmap2 = "0.9.12"
 chrono = "0.4.45"
 # Every decoder `image` has, without its default `avif` feature: that one is an
 # AVIF *encoder* (rav1e and its dependency tree), and nothing here writes AVIF.
@@ -182,14 +180,14 @@ image = { version = "0.25.10", default-features = false, features = [
     "rayon", "bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp",
 ] }
 flate2 = "1"
-libc = "0.2.190"
+libc = "0.2.191"
 # Signals a child's process group without `unsafe` (pmetal-supervisor)
 rustix = { version = "1.1", features = ["process"] }
 # Strips terminal escape sequences from a child's output (pmetal-supervisor)
 anstream = "1.0"
-parking_lot = "0.12.5"
+parking_lot = "0.13"
 regex = "1.13"
-uuid = "1.27"
+uuid = "1.28"
 # Splits a user's command line into arguments without a shell (pmetal-trainer rewards)
 shlex = "2.0"
 # JSON Schema validation (pmetal-trainer's schema reward); no HTTP: a schema never fetches
@@ -201,17 +199,17 @@ quote = "1.0"
 syn = "3.0"
 
 # Native build helpers
-cc = "1.6"
+cc = "1.9"
 cmake = "0.1"
 
 # Python bindings
-pyo3 = "0.29"
-pyo3-build-config = "0.29"
+pyo3 = "0.30"
+pyo3-build-config = "0.30"
 
 # Testing
 criterion = "0.8"
 tempfile = "3"
-proptest = "1.11"
+proptest = "1.12"
 serial_test = "4.0"
 trybuild = "1.0"
 

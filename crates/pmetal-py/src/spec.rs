@@ -237,7 +237,7 @@ pub fn equal<S: SpecType>(a: &S, b: &S) -> PyResult<bool> {
 // ---------------------------------------------------------------------------
 
 /// One field of a spec: what a form, a help page or a type stub needs.
-#[pyclass(frozen, name = "FieldInfo", module = "pmetal", skip_from_py_object)]
+#[pyclass(frozen, name = "FieldInfo", module = "pmetal")]
 pub struct PyFieldInfo {
     /// The attribute and keyword name.
     #[pyo3(get)]
@@ -420,7 +420,7 @@ pub fn reduce<'py, S: SpecType>(
 macro_rules! py_spec {
     ($py:ident, $name:literal, $spec:ty, $doc:literal $(, { $($extra:tt)* })?) => {
         #[doc = $doc]
-        #[pyclass(name = $name, module = "pmetal", skip_from_py_object)]
+        #[pyclass(name = $name, module = "pmetal")]
         #[derive(Clone)]
         pub struct $py {
             pub(crate) inner: $spec,

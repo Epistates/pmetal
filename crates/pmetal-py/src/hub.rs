@@ -266,7 +266,7 @@ pub fn download_file(
 }
 
 /// What a model download would fetch.
-#[pyclass(name = "DownloadPlan", module = "pmetal", frozen, skip_from_py_object)]
+#[pyclass(name = "DownloadPlan", module = "pmetal", frozen)]
 pub struct PyDownloadPlan {
     /// The repository.
     #[pyo3(get)]
@@ -349,7 +349,7 @@ pub fn plan_download(
 }
 
 /// What `verify_model` found in a model directory.
-#[pyclass(name = "ModelReport", module = "pmetal", frozen, skip_from_py_object)]
+#[pyclass(name = "ModelReport", module = "pmetal", frozen)]
 pub struct PyModelReport {
     /// The weight format present: `"safetensors"`, `"gguf"`, `"pytorch"`, or None without weights.
     #[pyo3(get)]
@@ -603,7 +603,7 @@ pub fn estimate_fit<'py>(
 }
 
 /// Where an upload landed.
-#[pyclass(name = "UploadReport", module = "pmetal", frozen, skip_from_py_object)]
+#[pyclass(name = "UploadReport", module = "pmetal", frozen)]
 pub struct PyUploadReport {
     /// The repository's URL.
     #[pyo3(get)]
