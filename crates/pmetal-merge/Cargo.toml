@@ -22,10 +22,8 @@ serde_json = { workspace = true }
 serde-saphyr = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-rand = { workspace = true }
 pmetal-hub = { workspace = true }
 half = { workspace = true }
-zerocopy = { workspace = true }
 memmap2 = { workspace = true }
 ndarray = { workspace = true }
 regex = { workspace = true }

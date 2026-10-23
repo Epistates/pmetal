@@ -51,9 +51,10 @@ pub mod vocode;
 pub struct Cli {
     /// Write every JobEvent of a training run as a JSONL line to this file.
     ///
-    /// Works with every training command (train, distill, grpo, rlkd,
-    /// preference). The TUI's subprocess runner and the MCP server read it. A
-    /// write that fails is reported when the run ends.
+    /// Works with train, distill, grpo, rlkd and preference; any other command
+    /// refuses it, rather than leave an empty file. The TUI, the desktop app
+    /// and the Python bindings follow a run through it. A write that fails is
+    /// reported when the run ends.
     #[cfg(feature = "trainer")]
     #[arg(long, global = true, value_name = "PATH")]
     pub log_events: Option<PathBuf>,
@@ -391,6 +392,22 @@ pub enum Commands {
 }
 
 impl Commands {
+    /// Whether this command writes the `--log-events` file: the trainers that
+    /// run under `commands::with_run_context`. The others (`pretrain`,
+    /// `embed-train`, `train-mtp`, `train-draft`, `train-diffusion`) take no
+    /// event log, and `main` refuses the flag for them.
+    #[cfg(feature = "trainer")]
+    pub fn writes_event_log(&self) -> bool {
+        matches!(
+            self,
+            Commands::Train(_)
+                | Commands::Distill(_)
+                | Commands::Grpo(_)
+                | Commands::Rlkd(_)
+                | Commands::Preference(_)
+        )
+    }
+
     /// Whether this command runs anything on MLX. The ones that don't skip the
     /// metallib search and the device check in `main`, so a missing or broken
     /// Metal library (or no network for the download fallback) can't stop
@@ -408,6 +425,71 @@ impl Commands {
             | Commands::Tokenize(_) => false,
             _ => true,
         }
+    }
+}
+
+#[cfg(test)]
+mod doc_examples;
+
+#[cfg(all(test, feature = "trainer"))]
+mod event_log_tests {
+    use super::Cli;
+    use clap::Parser;
+
+    fn writes_event_log(argv: &[&str]) -> bool {
+        let mut full = vec!["pmetal"];
+        full.extend_from_slice(argv);
+        full.extend(["--log-events", "events.jsonl"]);
+        Cli::try_parse_from(full)
+            .expect("the argv parses")
+            .command
+            .writes_event_log()
+    }
+
+    #[test]
+    fn only_the_commands_that_write_an_event_log_accept_the_flag() {
+        for argv in [
+            &["train", "-m", "m", "-d", "d"][..],
+            &["distill", "-t", "t", "-s", "s", "-d", "d"],
+            &["grpo", "-m", "m", "-d", "d"],
+            &["rlkd", "-m", "m", "--teacher-model", "t", "-d", "d"],
+            &["preference", "-m", "m", "-d", "d"],
+        ] {
+            assert!(writes_event_log(argv), "{argv:?}");
+        }
+        for argv in [
+            &["pretrain", "-a", "llama", "-s", "a.bin"][..],
+            &["embed-train", "-m", "m", "-d", "d"],
+            &["train-mtp", "-m", "m", "-s", "a.bin"],
+            &["train-draft", "--target", "t", "-s", "a.bin"],
+            &["train-diffusion", "--model", "m", "--dataset", "d"],
+            &["info"],
+        ] {
+            assert!(!writes_event_log(argv), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn pretrain_takes_several_shards_as_a_glob_expands() {
+        let cli = Cli::try_parse_from([
+            "pmetal",
+            "pretrain",
+            "--arch",
+            "llama",
+            "--shards",
+            "a.bin",
+            "b.bin",
+            "c.bin,d.bin",
+            "--eval-shards",
+            "e.bin",
+            "f.bin",
+        ])
+        .expect("several shards parse");
+        let super::Commands::Pretrain(args) = cli.command else {
+            panic!("not pretrain");
+        };
+        assert_eq!(args.shards, ["a.bin", "b.bin", "c.bin", "d.bin"]);
+        assert_eq!(args.eval_shards, ["e.bin", "f.bin"]);
     }
 }
 

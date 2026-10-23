@@ -84,7 +84,7 @@ pub(crate) const MAPPED: &[&str] = &[
 ];
 
 /// What a generation produced.
-#[pyclass(name = "InferResult", module = "pmetal", frozen, skip_from_py_object)]
+#[pyclass(name = "InferResult", module = "pmetal", frozen)]
 pub struct PyInferResult {
     /// The generated text (the prompt is not included).
     #[pyo3(get)]

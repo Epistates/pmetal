@@ -4,14 +4,14 @@
 
 [![Crates.io](https://img.shields.io/crates/v/pmetal.svg)](https://crates.io/crates/pmetal)
 [![docs.rs](https://docs.rs/pmetal/badge.svg)](https://docs.rs/pmetal)
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](../../LICENSE)
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](../../LICENSE-MIT)
 
 This is the umbrella crate that re-exports all PMetal sub-crates behind feature flags. Add a single dependency to access the full framework:
 
 ```toml
 [dependencies]
-pmetal = "0.6"                                      # default features
-pmetal = { version = "0.6", features = ["full"] }   # every sub-crate
+pmetal = "0.7"                                      # default features
+pmetal = { version = "0.7", features = ["full"] }   # every sub-crate
 ```
 
 ## Quick Start
@@ -79,7 +79,7 @@ fn main() {
 
 ## Feature Flags
 
-The default set is `cli`, `dashboard`, `trainer`, `lora`, `merge`, `ane` and `distributed`; the
+The default set is `cli`, `dashboard`, `trainer`, `lora`, `merge`, `vocoder`, `ane` and `distributed`; the
 rest come in transitively.
 
 | Feature | Crate | Default | Description |
@@ -93,22 +93,23 @@ rest come in transitively.
 | `cache` | `pmetal-cache` | yes* | KV caches, prefix reuse, speculative-decoding state |
 | `models` | `pmetal-models` | yes* | LLM architectures (Llama, Qwen, DeepSeek, ...) |
 | `lora` | `pmetal-lora` | yes | LoRA/QLoRA training |
-| `trainer` | `pmetal-trainer` | yes | Training loops (SFT, DPO, SimPO, ORPO, KTO, GRPO, DAPO, RLKD, Embedding, PPO, GSPO, Online DPO, Diffusion) — enables `data` + `distill` |
+| `trainer` | `pmetal-trainer` | yes | Training loops (SFT with LoRA/QLoRA/DoRA, DPO, IPO, hinge, SimPO, ORPO, KTO, GRPO, DAPO, GSPO, RLKD, embedding, pretraining, MTP and DFlash drafters, DiffusionGemma) — enables `data` + `distill` |
 | `data` | `pmetal-data` | yes* | Dataset loading and preprocessing (*via `cli` and `trainer`) |
 | `distill` | `pmetal-distill` | yes* | Knowledge distillation incl. TAID (*via `trainer`) |
-| `merge` | `pmetal-merge` | yes | Model merging (15 strategies: Linear, SLERP, TIES, DARE, DELLA, ModelStock, etc.) |
+| `merge` | `pmetal-merge` | yes | Model merging (18 strategies: Linear, SLERP, TIES, DARE, DELLA, ModelStock, etc.) |
 | `distributed` | `pmetal-distributed` | yes | Distributed training (mDNS, Ring All-Reduce) and the `cluster` subcommand |
 | `ane` | `pmetal-metal` | yes | Apple Neural Engine direct programming |
 | `dashboard` | — | yes | TUI control center |
 | `native-only` | `pmetal-runtime` | no | Bridge-only build, without `pmetal-cache` or `pmetal-models` |
-| `vocoder` | `pmetal-vocoder` | no | BigVGAN neural vocoder |
+| `vocoder` | `pmetal-vocoder` | yes | BigVGAN neural vocoder (`pmetal vocode`) |
 | `mhc` | `pmetal-mhc` | no | Manifold-Constrained Hyper-Connections |
 | `serve` | `pmetal-serve` | no | OpenAI-compatible inference server (`pmetal serve`) |
 | `mcp` | `pmetal-mcp` | no | MCP server for Claude Desktop (`pmetal mcp`) |
 | `full` | sub-crates | no | Every sub-crate feature (not `cli`, `serve` or `mcp`) |
 
 `serve` and `mcp` stay opt-in so library consumers don't inherit axum and rmcp. The prebuilt
-release binary and the Homebrew formula both enable them.
+release binary and the Homebrew formula both enable them; a build from source does with
+`cargo install pmetal --features serve,mcp`.
 
 ## Hardware Support
 
@@ -134,9 +135,9 @@ cargo run -p pmetal --example inference -- \
 cargo run -p pmetal --example finetune_manual -- \
     --model ./path/to/model --dataset data.jsonl
 
-# Fine-tuning on the Apple Neural Engine
-cargo run -p pmetal --example finetune_ane -- \
-    --model ./path/to/model --dataset data.jsonl
+# Benchmark fine-tuning on the Apple Neural Engine
+cargo run -p pmetal --example finetune_ane --features ane -- \
+    --dim 768 --seq 256 --steps 5
 ```
 
 ## Re-exports
