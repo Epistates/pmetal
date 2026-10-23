@@ -269,6 +269,16 @@ pub trait VisitLinears {
         f: &mut dyn FnMut(&str, &mut super::layers::Linear),
     );
 
+    /// Call `f` for each `Embedding` reachable from here, deepest path last.
+    /// A loader that keeps a quantized table packed puts it there.
+    fn visit_embeddings_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut super::layers::Embedding),
+    ) {
+        let _ = (prefix, f);
+    }
+
     /// Call `f` for each stacked expert projection reachable from here, with
     /// its path and the number of experts a token is routed to. The routed
     /// experts of a mixture-of-experts layer are stacked `[experts, out, in]`
@@ -335,6 +345,16 @@ impl<T: VisitLinears> VisitLinears for Option<T> {
         }
     }
 
+    fn visit_embeddings_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut super::layers::Embedding),
+    ) {
+        if let Some(inner) = self {
+            inner.visit_embeddings_mut(prefix, f);
+        }
+    }
+
     fn visit_experts_mut(
         &mut self,
         prefix: &str,
@@ -356,6 +376,14 @@ impl<T: VisitLinears> VisitLinears for Box<T> {
         (**self).visit_linears_mut(prefix, f);
     }
 
+    fn visit_embeddings_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut super::layers::Embedding),
+    ) {
+        (**self).visit_embeddings_mut(prefix, f);
+    }
+
     fn visit_experts_mut(
         &mut self,
         prefix: &str,
@@ -375,6 +403,16 @@ impl<T: VisitLinears> VisitLinears for Vec<T> {
     ) {
         for (i, item) in self.iter_mut().enumerate() {
             item.visit_linears_mut(&child_path(prefix, &i.to_string()), f);
+        }
+    }
+
+    fn visit_embeddings_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut super::layers::Embedding),
+    ) {
+        for (i, item) in self.iter_mut().enumerate() {
+            item.visit_embeddings_mut(&child_path(prefix, &i.to_string()), f);
         }
     }
 
@@ -450,6 +488,21 @@ macro_rules! impl_module_params {
                 )*
             }
 
+            fn visit_embeddings_mut(
+                &mut self,
+                prefix: &str,
+                f: &mut dyn ::std::ops::FnMut(&str, &mut $crate::compat::Embedding),
+            ) {
+                let _ = (&prefix, &f);
+                $(
+                    $crate::compat::VisitLinears::visit_embeddings_mut(
+                        &mut self.$field,
+                        &$crate::compat::child_path(prefix, stringify!($field)),
+                        f,
+                    );
+                )*
+            }
+
             fn visit_experts_mut(
                 &mut self,
                 prefix: &str,
@@ -508,6 +561,21 @@ macro_rules! impl_module_params {
                 let _ = (&prefix, &f);
                 $(
                     $crate::compat::VisitLinears::visit_linears_mut(
+                        &mut self.$field,
+                        &$crate::compat::child_path(prefix, stringify!($field)),
+                        f,
+                    );
+                )*
+            }
+
+            fn visit_embeddings_mut(
+                &mut self,
+                prefix: &str,
+                f: &mut dyn ::std::ops::FnMut(&str, &mut $crate::compat::Embedding),
+            ) {
+                let _ = (&prefix, &f);
+                $(
+                    $crate::compat::VisitLinears::visit_embeddings_mut(
                         &mut self.$field,
                         &$crate::compat::child_path(prefix, stringify!($field)),
                         f,

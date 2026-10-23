@@ -42,6 +42,7 @@ fn zero_embedding(embedding_count: i32, dimensions: i32) -> nn::Embedding {
     nn::Embedding {
         weight: Param::new(Array::zeros_f32(&[embedding_count, dimensions])),
         neftune_alpha: None,
+        quant: None,
     }
 }
 

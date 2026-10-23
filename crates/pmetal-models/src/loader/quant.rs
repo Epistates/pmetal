@@ -358,6 +358,46 @@ impl PackedLinears {
         if let Some(e) = failure {
             return Err(e);
         }
+        // A quantized embedding table stays packed too: its lookups unpack the
+        // rows they gather, and a tied head multiplies over the packed words.
+        let dtype = self
+            .dtype
+            .unwrap_or(pmetal_runtime::compat::Dtype::Bfloat16);
+        let mut failure: Option<LoadError> = None;
+        model.visit_embeddings_mut("", &mut |path, embedding| {
+            let Some(module) = wanted.iter().find(|m| names_linear(m, path)) else {
+                return;
+            };
+            *installed.entry(module.clone()).or_default() += 1;
+            let Some(packed) = self.modules.remove(module) else {
+                return;
+            };
+            let (rows, dims) = (
+                packed.weight.dim(0),
+                packed.weight.dim(1) * 32 / packed.params.bits,
+            );
+            let shape = embedding.weight.value.shape().to_vec();
+            if shape != [rows, dims] && shape != [1, 1] {
+                failure = Some(LoadError::ShapeMismatch {
+                    key: format!("{path}.weight"),
+                    expected: shape.clone(),
+                    actual: vec![rows, dims],
+                });
+                return;
+            }
+            embedding.weight.value = packed.weight;
+            embedding.quant = Some(pmetal_runtime::compat::LinearQuant {
+                scales: packed.scales,
+                biases: packed.biases,
+                params: packed.params,
+                dtype,
+                tensor_scale: packed.tensor_scale,
+                codebook: None,
+            });
+        });
+        if let Some(e) = failure {
+            return Err(e);
+        }
         let mut unplaced: Vec<&String> = wanted
             .iter()
             .filter(|m| installed.get(*m).copied().unwrap_or(0) != 1)

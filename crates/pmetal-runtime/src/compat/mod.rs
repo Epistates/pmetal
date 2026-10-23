@@ -29,7 +29,7 @@ pub mod optimizers;
 pub use crate::InlineArray as Array;
 
 pub use checkpoint::checkpointed;
-pub use layers::{Linear, LinearQuant};
+pub use layers::{Embedding, Linear, LinearQuant};
 pub use lora::LoraAdapter;
 
 // ── Dtype ────────────────────────────────────────────────────────────────────

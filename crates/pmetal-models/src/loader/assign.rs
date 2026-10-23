@@ -216,9 +216,12 @@ pub fn load_generic_weights_with<
 ) -> Result<(), LoadError> {
     let model_dir = model_dir.as_ref();
     let snapshot = ParamSnapshot::of(model);
+    // The layers a quantized tensor may stay packed on: projections and
+    // embedding tables.
     let linear_paths = policy.keep_quantized.then(|| {
         let mut paths = Vec::new();
         model.visit_linears_mut("", &mut |path, _| paths.push(path.to_string()));
+        model.visit_embeddings_mut("", &mut |path, _| paths.push(path.to_string()));
         paths
     });
     let (loaded, packed) = super::load_weights_keeping_packed(model_dir, linear_paths.as_deref())?;
@@ -761,7 +764,7 @@ mod tests {
         )
         .unwrap();
 
-        // The projection runs on its packed words; the embedding is dense.
+        // The projection runs on its packed words, and so does the embedding.
         let layer = &kept.model.layers[0].self_attn.q_proj;
         let quant = layer.quant.as_ref().expect("q_proj stays quantized");
         assert_eq!((quant.params.bits, quant.params.group_size), (4, 32));
@@ -770,11 +773,28 @@ mod tests {
             layer.weight.shape(),
             unpacked.model.layers[0].self_attn.q_proj.weight.shape()
         );
-        assert_eq!(
-            kept.model.embed_tokens.weight.shape(),
-            unpacked.model.embed_tokens.weight.shape(),
-            "an embedding is unpacked to dense"
+        let table = &kept.model.embed_tokens;
+        assert!(table.quant.is_some(), "the embedding stays quantized");
+        assert_ne!(
+            table.weight.shape(),
+            unpacked.model.embed_tokens.weight.shape()
         );
+        // A lookup and a tied head over the packed table are the dense ones.
+        let ids = Array::from_slice(&[3i32, 99, 7, 3], &[1, 4]);
+        let rows = |e: &pmetal_runtime::compat::Embedding| e.forward(&ids);
+        let diff = |a: &Array, b: &Array| {
+            a.subtract(&b.as_dtype(a.dtype().as_i32()))
+                .abs()
+                .max(None)
+                .item_f32()
+        };
+        assert!(diff(&rows(table), &rows(&unpacked.model.embed_tokens)) < 1e-6);
+        let hidden = pmetal_runtime::compat::random::normal(
+            &[1, 2, 32],
+            pmetal_runtime::compat::Dtype::Float32,
+        );
+        let head = table.as_linear(&hidden);
+        assert!(diff(&head, &unpacked.model.embed_tokens.as_linear(&hidden)) < 2e-2);
         // And it computes what the unpacked layer computes.
         let x = pmetal_runtime::compat::random::normal(
             &[1, 3, unpacked.model.layers[0].self_attn.q_proj.shape().1],
