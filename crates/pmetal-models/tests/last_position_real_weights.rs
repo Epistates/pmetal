@@ -82,8 +82,13 @@ fn greedy_decode_is_the_same_through_the_last_position_head() {
         .iter()
         .zip(&full_row)
         .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+    // The head runs on one row instead of the prompt's, and a bf16 matmul of
+    // another shape reduces in another order: logits of magnitude 16 to 32 sit
+    // 0.125 apart in bf16, so a rounding of one or two steps (about 1% of the
+    // largest logit) is the same number. The greedy tokens above are the
+    // behavioural check; this bounds the numbers to bf16 rounding.
     assert!(
-        worst <= 1e-3 * scale,
+        worst <= 1e-2 * scale,
         "prefill logits differ by {worst} over a scale of {scale}"
     );
 }
