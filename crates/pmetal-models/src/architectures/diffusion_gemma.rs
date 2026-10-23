@@ -7,7 +7,7 @@
 //! `canvas_length` block bidirectionally, reading — but never writing — the
 //! encoder KV cache. Both towers share the same Gemma 4 MoE layer stack.
 //!
-//! This module ports the **text path**. Its trunk reuses the parity-verified
+//! This module ports the text path and the optional image backbone. Its trunk reuses the parity-verified
 //! Gemma 4 building blocks wholesale ([`Gemma4Attention`], [`Gemma4Mlp`],
 //! [`Gemma4RmsNorm`], the proportional-RoPE helpers) and adds the pieces
 //! Gemma 4's text tower omits:
@@ -31,13 +31,16 @@
 //!
 //! # Scope
 //!
-//! Landed: config, the leaf MoE blocks, the 7-norm layer, the **encoder**
-//! model (causal, auto-masked, KV-collecting), and the **decoder** model
+//! Config, the leaf MoE blocks, the 7-norm layer, the **encoder** model
+//! (causal, auto-masked, KV-collecting), and the **decoder** model
 //! (fully-bidirectional canvas over `[encoder_kv | canvas]`, read-only
 //! encoder-KV concat via [`Gemma4Attention::forward_with_encoder_kv`],
-//! self-conditioning). Both are numerically parity-verified against the
+//! self-conditioning) are numerically parity-verified against the
 //! transformers oracle. The discrete-diffusion generation engine (block loop,
-//! entropy-bound sampler, stopping) is built in a later phase.
+//! entropy-bound sampler, stopping) is
+//! [`DiffusionGemmaForBlockDiffusion::generate`], with its per-step transforms
+//! parity-verified; the optional image backbone attaches through
+//! [`DiffusionGemmaForBlockDiffusion::attach_vision`].
 
 use pmetal_runtime::compat::{Array, Dtype, Exception, Param, nn, ops};
 use pmetal_runtime::impl_module_params;

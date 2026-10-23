@@ -15,17 +15,17 @@ set(MLX_BUILD_EXAMPLES OFF)
 set(MLX_BUILD_BENCHMARKS OFF)
 set(MLX_BUILD_PYTHON_BINDINGS OFF)
 
-# Pinned to a commit on upstream main, which we track: the latest release
-# (v0.32.3, 2026-09-28) trails main by the fused Metal SDPA backward
-# (#4563), the expert-offset gather_qmm rework (#4572), f32 split-K qmm
-# accumulation (#4641), the M1/M2 SDPA threadgroup fix (#4643) and the
-# macOS 27 build fix for the gated-delta VJP kernels (#4594), among others.
-# `just deps-check` reports how far this is behind main and the latest tag.
-# build.rs's BUNDLED_MLX_GIT_TAG must name the same commit.
+# Pinned to the commit of the v0.32.4 release (2026-10-14). It carries the
+# fused Metal SDPA backward (#4563), the expert-offset gather_qmm rework
+# (#4572), f32 split-K qmm accumulation (#4641), the M1/M2 SDPA threadgroup
+# fix (#4643), the macOS 27 build fix for the gated-delta VJP kernels (#4594)
+# and the Metal fence deadlock fix (#4689). A commit, not the tag, so the pin
+# cannot move. `just deps-check` reports how far this is behind main and the
+# latest tag. build.rs's BUNDLED_MLX_GIT_TAG must name the same commit.
 FetchContent_Declare(
   mlx
   GIT_REPOSITORY "https://github.com/ml-explore/mlx.git"
-  GIT_TAG bebd6422f8db88d56e6220520a35bcd146f823f8)
+  GIT_TAG 36969c094354086e15d2a327a9c50feb20b9cf11)
 FetchContent_MakeAvailable(mlx)
 
 # ── Expose include dir and libmlx.a for the cc::Build step ──

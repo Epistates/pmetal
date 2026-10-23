@@ -28,3 +28,7 @@ test-utils = []
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+# Apple Silicon only: document the platform the crate runs on.
+targets = ["aarch64-apple-darwin"]

@@ -7,8 +7,9 @@ use std::{
 
 /// The MLX revision this crate builds against, tag or commit.
 ///
-/// Currently a commit on upstream main: see `cmake/CMakeLists.txt` for why.
-const BUNDLED_MLX_GIT_TAG: &str = "bebd6422f8db88d56e6220520a35bcd146f823f8";
+/// Currently the commit of upstream's v0.32.4 release: see
+/// `cmake/CMakeLists.txt`.
+const BUNDLED_MLX_GIT_TAG: &str = "36969c094354086e15d2a327a9c50feb20b9cf11";
 
 // ── Deployment target ──────────────────────────────────────────────────────
 
@@ -744,5 +745,14 @@ fn main() {
     // Ensure Cargo re-runs build.rs when C++ sources change.
     // Without this, edits to bridge.cpp/bridge.h produce stale binaries.
     println!("cargo:rerun-if-changed=cpp/"); // any change in cpp/ dir
+    println!("cargo:rerun-if-env-changed=DOCS_RS");
+    // docs.rs builds documentation on a Linux host with no CMake toolchain,
+    // Metal compiler or Apple SDK, and rustdoc links nothing, so MLX is
+    // neither built nor linked there.
+    if env::var_os("DOCS_RS").is_some() {
+        println!("cargo:rustc-env=PMETAL_RUNTIME_MLX_KIND=bundled-upstream");
+        println!("cargo:rustc-env=PMETAL_RUNTIME_MLX_GIT_TAG={BUNDLED_MLX_GIT_TAG}");
+        return;
+    }
     build_and_link();
 }

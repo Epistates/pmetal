@@ -67,7 +67,7 @@ latest_tag_sha=$(awk -v t="refs/tags/$latest_tag^{}" -v l="refs/tags/$latest_tag
 echo "pinned:         $pin"
 echo "latest release: $latest_tag ($latest_tag_sha)"
 echo "main:           $main_sha"
-if [[ $pin == "$main_sha" || $pin == "$latest_tag" ]]; then
+if [[ $pin == "$main_sha" || $pin == "$latest_tag" || $pin == "$latest_tag_sha" ]]; then
     echo "up to date"
 else
     echo "behind: compare https://github.com/ml-explore/mlx/compare/$pin...main"

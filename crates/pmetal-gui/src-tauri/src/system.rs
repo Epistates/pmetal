@@ -90,6 +90,9 @@ pub struct ModelFitInfo {
     pub recommended_batch_size: u32,
     /// Where the numbers came from, when it matters.
     pub notes: Vec<String>,
+    /// Why pmetal cannot run the model, when its architecture is one pmetal
+    /// declines. The memory figures are still given.
+    pub unsupported: Option<String>,
 }
 
 impl ModelFitInfo {
@@ -105,13 +108,17 @@ impl ModelFitInfo {
             recommended_batch_size: u32::try_from(estimate.recommended_batch_size)
                 .unwrap_or(u32::MAX),
             notes: estimate.notes.clone(),
+            unsupported: None,
         }
     }
 }
 
 /// How the model in `spec` runs on `device`.
 pub fn fit(spec: &ModelSpec, device: &DeviceSpec) -> ModelFitInfo {
-    ModelFitInfo::of(&pmetal::hub::estimate_fit(spec, device))
+    ModelFitInfo {
+        unsupported: spec.unsupported.clone(),
+        ..ModelFitInfo::of(&pmetal::hub::estimate_fit(spec, device))
+    }
 }
 
 #[cfg(test)]
@@ -128,5 +135,27 @@ mod tests {
         assert!(huge.weights_gb > small.weights_gb);
         // The memory it is compared with is the device's, not the installed RAM.
         assert!((small.available_memory_gb - (8u64 << 30) as f64 / 1e9).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_declined_architecture_is_reported_beside_its_fit() {
+        let device = DeviceSpec::from_device(64 << 30, 400.0, true);
+        let config = serde_json::json!({
+            "model_type": "qwen3_vl", "hidden_size": 4096, "num_hidden_layers": 36,
+            "intermediate_size": 12288, "num_attention_heads": 32,
+            "num_key_value_heads": 8, "vocab_size": 151936,
+        });
+        let spec = pmetal::hub::model_spec_from_config(&config, None);
+        let info = fit(&spec, &device);
+        assert!(
+            info.unsupported
+                .as_deref()
+                .is_some_and(|r| r.contains("Qwen3-VL"))
+        );
+        assert!(
+            fit(&ModelSpec::new(0.5, "fp16"), &device)
+                .unsupported
+                .is_none()
+        );
     }
 }

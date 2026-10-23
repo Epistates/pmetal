@@ -66,7 +66,7 @@ jobs:
 
       - name: Fetch the wheel built on 3.11
         if: matrix.python != '3.11'
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: pmetal-wheel-macos-aarch64
           path: target/wheels
