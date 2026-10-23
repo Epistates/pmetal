@@ -316,10 +316,10 @@ impl PackedLinear {
     /// The words, scales and biases of an affine tensor, with its width and
     /// group size; `None` for a floating-point mode (no biases) or a tensor
     /// with a per-tensor factor, which an affine-only holder cannot run.
-    pub(crate) fn into_affine(self) -> Result<AffineParts, Self> {
+    pub(crate) fn into_affine(self) -> Option<AffineParts> {
         match (self.biases, self.tensor_scale) {
             (Some(biases), None) if self.params.mode == pmetal_runtime::QuantizedMode::Affine => {
-                Ok(AffineParts {
+                Some(AffineParts {
                     weight: self.weight,
                     scales: self.scales,
                     biases,
@@ -327,11 +327,7 @@ impl PackedLinear {
                     group_size: self.params.group_size,
                 })
             }
-            (biases, tensor_scale) => Err(Self {
-                biases,
-                tensor_scale,
-                ..self
-            }),
+            _ => None,
         }
     }
 }

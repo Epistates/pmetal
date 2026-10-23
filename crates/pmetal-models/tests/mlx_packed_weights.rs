@@ -109,7 +109,7 @@ fn check_arch_in(name: &str, config: &str, unpacked: &[&str], layout: Layout) ->
     );
     let want: BTreeSet<String> = quantized
         .iter()
-        .filter(|m| !unpacked.iter().any(|u| m.as_str() == *u))
+        .filter(|m| !unpacked.contains(&m.as_str()))
         .cloned()
         .collect();
     let got: BTreeSet<String> = packed_modules(&mut packed)

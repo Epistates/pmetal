@@ -324,7 +324,7 @@ pub(crate) fn install_gemma4_packed(
         };
         let (gate, up, down) = (gate.into_affine(), up.into_affine(), down.into_affine());
         match (gate, up, down) {
-            (Ok(gate), Ok(up), Ok(down))
+            (Some(gate), Some(up), Some(down))
                 if (gate.bits, gate.group_size) == (up.bits, up.group_size)
                     && (gate.bits, gate.group_size) == (down.bits, down.group_size) =>
             {
