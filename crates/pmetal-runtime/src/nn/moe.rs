@@ -7,7 +7,7 @@
 //! fills ([`Expert`]), and the step that sums the routed experts' outputs with
 //! the gated shared expert ([`moe_combine`]).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use crate::compat::{
@@ -229,7 +229,7 @@ impl ModuleParameters for Linear {
     }
 
     fn parameters(&self) -> ModuleParamRef<'_> {
-        let mut out = HashMap::new();
+        let mut out = BTreeMap::new();
         out.insert(Rc::from("weight"), NestedValue::Value(&self.weight));
         if let Some(adapter) = &self.adapter {
             out.insert(Rc::from("lora_a"), NestedValue::Value(&adapter.a));
@@ -239,7 +239,7 @@ impl ModuleParameters for Linear {
     }
 
     fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
-        let mut out = HashMap::new();
+        let mut out = BTreeMap::new();
         out.insert(Rc::from("weight"), NestedValue::Value(&mut self.weight));
         if let Some(adapter) = &mut self.adapter {
             out.insert(Rc::from("lora_a"), NestedValue::Value(&mut adapter.a));
@@ -252,7 +252,7 @@ impl ModuleParameters for Linear {
         let Some(adapter) = &self.adapter else {
             return self.parameters();
         };
-        let mut out = HashMap::new();
+        let mut out = BTreeMap::new();
         out.insert(Rc::from("lora_a"), NestedValue::Value(&adapter.a));
         out.insert(Rc::from("lora_b"), NestedValue::Value(&adapter.b));
         out

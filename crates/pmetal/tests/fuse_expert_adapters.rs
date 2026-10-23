@@ -17,7 +17,9 @@ use std::rc::Rc;
 use pmetal::lora::{AdaptedModel, save_safetensors_map};
 use pmetal::merge::{AccurateMergeConfig, streaming_lora_merge};
 use pmetal::models::dispatcher::DynamicModel;
-use pmetal::runtime::compat::{Array, Dtype, ModuleParametersExt, eval, ops, random};
+use pmetal::runtime::compat::{
+    Array, Dtype, FlattenedModuleParam, ModuleParametersExt, eval, ops, random,
+};
 use pmetal_core::LoraConfig;
 
 const CONFIG: &str = r#"{
@@ -135,9 +137,8 @@ fn adapted_logits(dir: &Path) -> Array {
     };
     let mut model = AdaptedModel::attach(base, config).expect("attach");
     random::seed(9);
-    let mut params: Vec<_> = model.lora_parameters().into_iter().collect();
-    params.sort_by(|a, b| a.0.cmp(&b.0));
-    let set: HashMap<Rc<str>, Array> = params
+    let set: FlattenedModuleParam = model
+        .lora_parameters()
         .into_iter()
         .map(|(name, p)| {
             (

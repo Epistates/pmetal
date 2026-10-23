@@ -9,7 +9,7 @@ use crate::error::{Result, VocoderError};
 use pmetal_runtime::compat::{
     Array, Dtype, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue, Param,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 /// A convolution weight, weight-normalised or plain.
@@ -104,7 +104,7 @@ impl ModuleParameters for NormedWeight {
     }
 
     fn parameters(&self) -> ModuleParamRef<'_> {
-        let mut out: ModuleParamRef<'_> = HashMap::new();
+        let mut out: ModuleParamRef<'_> = BTreeMap::new();
         match &self.magnitude {
             Some(g) => {
                 out.insert(Rc::from("weight_v"), NestedValue::Value(&self.weight.value));
@@ -118,7 +118,7 @@ impl ModuleParameters for NormedWeight {
     }
 
     fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
-        let mut out: ModuleParamMut<'_> = HashMap::new();
+        let mut out: ModuleParamMut<'_> = BTreeMap::new();
         match &mut self.magnitude {
             Some(g) => {
                 out.insert(

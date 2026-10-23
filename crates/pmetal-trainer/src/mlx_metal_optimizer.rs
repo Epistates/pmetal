@@ -653,7 +653,6 @@ pub fn is_mlx_metal_optimizer_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     struct Weights {
         params: Vec<Array>,
@@ -795,7 +794,7 @@ mod tests {
             .unwrap();
 
         // Create simple parameters
-        let mut params: FlattenedModuleParam = HashMap::new();
+        let mut params = FlattenedModuleParam::new();
         params.insert(
             Rc::from("weight"),
             Array::from_f32_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]),
@@ -803,7 +802,7 @@ mod tests {
 
         // Create gradients (constant)
         let grads: FlattenedModuleParam = {
-            let mut g = HashMap::new();
+            let mut g = FlattenedModuleParam::new();
             g.insert(
                 Rc::from("weight"),
                 Array::from_f32_slice(&[0.1f32, 0.1, 0.1, 0.1], &[4]),

@@ -165,8 +165,8 @@ impl DistributedGradientSync {
     /// the order in which parameters are flattened into the buffer. All nodes
     /// must have the same layout for all-reduce to produce correct results.
     fn init_layout(&mut self, grads: &FlattenedModuleParam) {
-        // Sort by parameter name for deterministic ordering across nodes
-        let mut entries: Vec<_> = grads
+        // A BTreeMap iterates by parameter name: the same order on every node.
+        let entries: Vec<_> = grads
             .iter()
             .map(|(name, arr)| {
                 let shape: Vec<i32> = arr.shape().to_vec();
@@ -174,7 +174,6 @@ impl DistributedGradientSync {
                 (name.to_string(), shape, count)
             })
             .collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
 
         let total_elements: usize = entries.iter().map(|e| e.2).sum();
         self.buffer.resize(total_elements, 0.0);

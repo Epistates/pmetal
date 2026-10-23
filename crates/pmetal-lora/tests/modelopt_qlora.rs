@@ -10,6 +10,7 @@
 
 mod common;
 
+use pmetal_runtime::compat::FlattenedModuleParam;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -86,9 +87,8 @@ fn drain() {
 
 fn randomize(model: &mut AdaptedModel) {
     random::seed(5);
-    let mut params: Vec<_> = model.lora_parameters().into_iter().collect();
-    params.sort_by(|a, b| a.0.cmp(&b.0));
-    let set: HashMap<Rc<str>, Array> = params
+    let params = model.lora_parameters();
+    let set: FlattenedModuleParam = params
         .into_iter()
         .map(|(k, p)| {
             (
@@ -136,13 +136,12 @@ fn adapters_on_a_packed_modelopt_base_are_qlora() {
             .multiply(&weights)
             .sum_all()
     };
-    let mut names: Vec<Rc<str>> = model.lora_parameters().into_keys().collect();
-    names.sort();
+    let names: Vec<Rc<str>> = model.lora_parameters().into_keys().collect();
     let live = model.lora_parameters();
     let params: Vec<Array> = names.iter().map(|n| live[n].clone()).collect();
     let (loss, grads) = value_and_grad(
         |arrays| {
-            let set: HashMap<Rc<str>, Array> =
+            let set: FlattenedModuleParam =
                 names.iter().cloned().zip(arrays.iter().cloned()).collect();
             model.set_lora_parameters(&set);
             objective(&mut model)
@@ -164,7 +163,7 @@ fn adapters_on_a_packed_modelopt_base_are_qlora() {
     assert!(g_norm > 1e-4, "the gradient is {g_norm}");
     let h = 1e-2_f32;
     let mut shifted = |sign: f32| {
-        let set: HashMap<Rc<str>, Array> = names
+        let set: FlattenedModuleParam = names
             .iter()
             .zip(params.iter().zip(&grads))
             .map(|(n, (p, g))| (n.clone(), p.add(&g.mul_scalar(sign * h / g_norm))))

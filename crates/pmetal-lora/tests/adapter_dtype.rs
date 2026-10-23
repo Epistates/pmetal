@@ -82,13 +82,11 @@ fn a_bf16_base_computes_in_bf16_and_keeps_f32_adapters() {
     }
 }
 
-/// Nonzero adapters, so a merge has something to fold. Drawn in key order:
-/// the map's own order differs between processes, which handed the seeded
-/// draws to different adapters on every run.
+/// Nonzero adapters, so a merge has something to fold. Drawn in key order, so
+/// every run hands the seeded draws to the same adapters.
 fn randomize_adapters(model: &mut AdaptedModel) {
     random::seed(3);
-    let mut params: Vec<_> = model.lora_parameters().into_iter().collect();
-    params.sort_by(|a, b| a.0.cmp(&b.0));
+    let params = model.lora_parameters();
     let set = params
         .into_iter()
         .map(|(k, p)| {

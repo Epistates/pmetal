@@ -29,9 +29,8 @@
 
 mod common;
 
-use std::collections::HashMap;
+use pmetal_runtime::compat::FlattenedModuleParam;
 use std::path::Path;
-use std::rc::Rc;
 
 use common::{ArchCase, SEQ_LEN, cases, config_int, every_projection, input_ids, stage};
 use pmetal_cache::test_utils::{
@@ -40,7 +39,7 @@ use pmetal_cache::test_utils::{
 use pmetal_core::LoraConfig;
 use pmetal_lora::{AdaptedModel, DynamicLoraModel, TrainableModel};
 use pmetal_models::dispatcher::DynamicModel;
-use pmetal_runtime::compat::{Array, ModuleParametersExt, in_key_order};
+use pmetal_runtime::compat::ModuleParametersExt;
 
 /// Both paths run the same ops in f32 over the same weights, so the only
 /// legitimate difference is op-ordering noise (a fused SDPA on one side and an
@@ -453,8 +452,8 @@ fn merging_preserves_the_adapted_output() {
     let mut adapted = AdaptedModel::attach(base, lora_config()).expect("attach");
 
     // Give the adapters something to contribute, as a training step would.
-    // In name order: the draws go to the same adapters on every run.
-    let trained: HashMap<Rc<str>, Array> = in_key_order(adapted.lora_parameters())
+    let trained: FlattenedModuleParam = adapted
+        .lora_parameters()
         .into_iter()
         .map(|(k, v)| {
             let value = if k.ends_with("lora_b") {
@@ -521,8 +520,8 @@ fn adapters_round_trip_through_a_file() {
     let base = DynamicModel::from_config(case.config_json).expect("build");
     let mut adapted = AdaptedModel::attach(base, lora_config()).expect("attach");
 
-    // In name order: the draws go to the same adapters on every run.
-    let seeded: HashMap<Rc<str>, Array> = in_key_order(adapted.lora_parameters())
+    let seeded: FlattenedModuleParam = adapted
+        .lora_parameters()
         .into_iter()
         .map(|(k, v)| {
             let value = pmetal_runtime::compat::random::uniform_range(

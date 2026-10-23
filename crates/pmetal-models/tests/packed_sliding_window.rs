@@ -61,7 +61,7 @@ fn host(logits: &Array, rows: usize) -> Vec<f32> {
 
 /// Fill every parameter of `model` with draws from [-0.5, 0.5).
 fn randomize(model: &mut impl ModuleParametersExt) {
-    for (_, p) in model.flatten_params_mut_sorted() {
+    for (_, p) in model.flatten_params_mut() {
         *p = random::uniform_range(-0.5, 0.5, p.shape(), Dtype::Float32);
     }
 }

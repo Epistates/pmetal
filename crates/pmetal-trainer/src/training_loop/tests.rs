@@ -8,6 +8,7 @@ use pmetal_data::{DataLoaderConfig, PackedTrainingBatch, Sample, TrainingBatch, 
 use pmetal_lora::AdaptedModel;
 use pmetal_models::architectures::llama::LlamaConfig;
 use pmetal_models::dispatcher::DynamicModel;
+use pmetal_runtime::compat::FlattenedModuleParam;
 use pmetal_runtime::compat::module::ModuleParameters;
 use pmetal_runtime::compat::{ModuleParametersExt, random};
 use std::sync::{Arc, Mutex};
@@ -876,7 +877,7 @@ fn neftune_noises_every_forward_and_cleans_up() {
 // Optimizers end to end
 // ---------------------------------------------------------------------------
 
-type LoraWeights = std::collections::HashMap<std::rc::Rc<str>, Array>;
+type LoraWeights = FlattenedModuleParam;
 
 fn lora_diff(a: &LoraWeights, b: &LoraWeights) -> f32 {
     assert_eq!(a.len(), b.len());
@@ -1450,10 +1451,10 @@ impl TrainableModel for Breaking {
     fn num_trainable_params(&self) -> usize {
         self.inner.num_trainable_params()
     }
-    fn lora_parameters(&self) -> std::collections::HashMap<std::rc::Rc<str>, Array> {
+    fn lora_parameters(&self) -> FlattenedModuleParam {
         self.inner.lora_parameters()
     }
-    fn set_lora_parameters(&mut self, params: &std::collections::HashMap<std::rc::Rc<str>, Array>) {
+    fn set_lora_parameters(&mut self, params: &FlattenedModuleParam) {
         self.inner.set_lora_parameters(params)
     }
     fn save_lora_weights(

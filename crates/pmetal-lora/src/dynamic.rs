@@ -25,16 +25,14 @@
 //! let logits = model.forward(&input_ids, None)?;
 //! ```
 
-use std::collections::HashMap;
 use std::path::Path;
-use std::rc::Rc;
 
 use pmetal_cache::kv_cache::KVCache;
 use pmetal_core::LoraConfig;
 use pmetal_models::dispatcher::{DynamicModel, DynamicModelLoadOptions};
 use pmetal_models::{ModelArchitecture, WeightFormatError};
-use pmetal_runtime::compat::Array;
 use pmetal_runtime::compat::Exception;
+use pmetal_runtime::compat::{Array, FlattenedModuleParam};
 
 use crate::{AdaptedModel, LoraError, PackedBase, QLoraConfig, TrainableModel};
 
@@ -356,11 +354,11 @@ impl TrainableModel for DynamicLoraModel {
         TrainableModel::num_trainable_params(&self.inner)
     }
 
-    fn lora_parameters(&self) -> HashMap<Rc<str>, Array> {
+    fn lora_parameters(&self) -> FlattenedModuleParam {
         TrainableModel::lora_parameters(&self.inner)
     }
 
-    fn set_lora_parameters(&mut self, params: &HashMap<Rc<str>, Array>) {
+    fn set_lora_parameters(&mut self, params: &FlattenedModuleParam) {
         TrainableModel::set_lora_parameters(&mut self.inner, params)
     }
 

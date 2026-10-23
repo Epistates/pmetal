@@ -3219,7 +3219,7 @@ mod tests {
             ..tiny_config()
         };
         let mut moe = Qwen3NextSparseMoeBlock::new(&config).unwrap();
-        for (_, p) in moe.flatten_params_mut_sorted() {
+        for (_, p) in moe.flatten_params_mut() {
             let shape = p.shape().to_vec();
             *p = pmetal_runtime::compat::random::normal(&shape, Dtype::Bfloat16);
         }

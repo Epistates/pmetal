@@ -43,6 +43,7 @@ pub use rewards::*;
 
 use pmetal_core::{ConfigValidator, TrainingConfig};
 use pmetal_lora::TrainableModel;
+use pmetal_runtime::compat::FlattenedModuleParam;
 use pmetal_runtime::compat::{
     Array, Exception,
     module::{Module, ModuleParameters},
@@ -318,7 +319,7 @@ pub struct GrpoTrainer {
     ///
     /// LoRA parameters are typically a few MB so this is cheap to hold in memory.
     /// Populated whenever `should_snapshot_best()` returns true; consumed on rollback.
-    best_lora_snapshot: Option<std::collections::HashMap<std::rc::Rc<str>, Array>>,
+    best_lora_snapshot: Option<FlattenedModuleParam>,
     checkpoint_manager: Option<crate::CheckpointManager>,
     best_checkpoint_loss: f64,
     last_loss: Option<f64>,
@@ -1853,7 +1854,7 @@ mod tests {
         group
     }
 
-    type Weights = std::collections::HashMap<std::rc::Rc<str>, Array>;
+    type Weights = FlattenedModuleParam;
 
     /// Train one generation batch with `config` from LoRA weights `init`.
     fn train_batch(

@@ -52,14 +52,13 @@ where
     M: ModuleParametersExt,
     F: FnMut(&mut M, &[Array]) -> Result<Array, Exception>,
 {
-    // Sorted so the order the parameters go in matches the order they come back
-    // out. A HashMap's iteration order does not survive between the two walks.
-    let mut names: Vec<String> = module
+    // In name order, so the order the parameters go in matches the order they
+    // come back out.
+    let names: Vec<String> = module
         .flatten_trainable_params()
         .keys()
         .map(|k| k.to_string())
         .collect();
-    names.sort_unstable();
 
     if names.is_empty() {
         // Nothing to differentiate inside this module, so checkpointing it would

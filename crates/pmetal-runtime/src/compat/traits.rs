@@ -29,25 +29,15 @@ pub trait ModuleParametersExt: ModuleParameters {
         out
     }
 
-    /// Flatten all mutable parameters into a `HashMap<String, &mut Array>`.
+    /// Flatten all mutable parameters into a `BTreeMap<String, &mut Array>`.
     ///
     /// Used by weight loaders that need to assign tensors by name.
-    fn flatten_params_mut(&mut self) -> std::collections::HashMap<String, &mut Array> {
+    fn flatten_params_mut(&mut self) -> std::collections::BTreeMap<String, &mut Array> {
         let tree = self.parameters_mut();
-        let mut out: std::collections::HashMap<String, &mut Array> =
-            std::collections::HashMap::new();
+        let mut out: std::collections::BTreeMap<String, &mut Array> =
+            std::collections::BTreeMap::new();
         super::flatten_nested_mut_owned(tree, "", &mut out);
         out
-    }
-
-    /// [`flatten_params_mut`](Self::flatten_params_mut) in name order.
-    ///
-    /// A `HashMap` iterates in an order that differs from run to run, so a
-    /// loop that draws a random value for each parameter gives each one a
-    /// different draw every time, whatever the seed. Anything that assigns
-    /// seeded random values to parameters goes through here.
-    fn flatten_params_mut_sorted(&mut self) -> Vec<(String, &mut Array)> {
-        super::in_key_order(self.flatten_params_mut())
     }
 
     /// Evaluate all parameters (materialise lazy computation graph).
@@ -206,8 +196,8 @@ where
             return;
         }
         // Promote sub-tree as a NestedValue::Map
-        let mut sub_map: std::collections::HashMap<std::rc::Rc<str>, NestedValue<&'a Array>> =
-            std::collections::HashMap::new();
+        let mut sub_map: std::collections::BTreeMap<std::rc::Rc<str>, NestedValue<&'a Array>> =
+            std::collections::BTreeMap::new();
         for (k, v) in sub {
             // Re-borrow with 'a lifetime: copy value references into sub_map
             // Safety: sub-struct lifetime >= 'a because self: 'a
@@ -222,8 +212,8 @@ where
         if sub.is_empty() {
             return;
         }
-        let mut sub_map: std::collections::HashMap<std::rc::Rc<str>, NestedValue<&'a Array>> =
-            std::collections::HashMap::new();
+        let mut sub_map: std::collections::BTreeMap<std::rc::Rc<str>, NestedValue<&'a Array>> =
+            std::collections::BTreeMap::new();
         for (k, v) in sub {
             sub_map.insert(k, unsafe { super::clone_nested_ref_lifetime(v) });
         }
@@ -235,8 +225,8 @@ where
         if sub.is_empty() {
             return;
         }
-        let mut sub_map: std::collections::HashMap<std::rc::Rc<str>, NestedValue<&'a mut Array>> =
-            std::collections::HashMap::new();
+        let mut sub_map: std::collections::BTreeMap<std::rc::Rc<str>, NestedValue<&'a mut Array>> =
+            std::collections::BTreeMap::new();
         for (k, v) in sub {
             sub_map.insert(k, unsafe { super::clone_nested_mut_lifetime(v) });
         }
@@ -413,21 +403,21 @@ macro_rules! impl_module_params {
 
             fn parameters(&self) -> $crate::compat::ModuleParamRef<'_> {
                 #[allow(unused_mut)] // a parameter-free layer lists no fields
-                let mut out = ::std::collections::HashMap::new();
+                let mut out = ::std::collections::BTreeMap::new();
                 $( $crate::compat::Parameter::collect_params(&self.$field, stringify!($field), &mut out); )*
                 out
             }
 
             fn trainable_parameters(&self) -> $crate::compat::ModuleParamRef<'_> {
                 #[allow(unused_mut)] // a parameter-free layer lists no fields
-                let mut out = ::std::collections::HashMap::new();
+                let mut out = ::std::collections::BTreeMap::new();
                 $( $crate::compat::Parameter::collect_trainable_params(&self.$field, stringify!($field), &mut out); )*
                 out
             }
 
             fn parameters_mut(&mut self) -> $crate::compat::ModuleParamMut<'_> {
                 #[allow(unused_mut)] // a parameter-free layer lists no fields
-                let mut out = ::std::collections::HashMap::new();
+                let mut out = ::std::collections::BTreeMap::new();
                 $( $crate::compat::Parameter::collect_params_mut(&mut self.$field, stringify!($field), &mut out); )*
                 out
             }
@@ -478,21 +468,21 @@ macro_rules! impl_module_params {
 
             fn parameters(&self) -> $crate::compat::ModuleParamRef<'_> {
                 #[allow(unused_mut)] // a parameter-free layer lists no fields
-                let mut out = ::std::collections::HashMap::new();
+                let mut out = ::std::collections::BTreeMap::new();
                 $( $crate::compat::Parameter::collect_params(&self.$field, stringify!($field), &mut out); )*
                 out
             }
 
             fn trainable_parameters(&self) -> $crate::compat::ModuleParamRef<'_> {
                 #[allow(unused_mut)] // a parameter-free layer lists no fields
-                let mut out = ::std::collections::HashMap::new();
+                let mut out = ::std::collections::BTreeMap::new();
                 $( $crate::compat::Parameter::collect_trainable_params(&self.$field, stringify!($field), &mut out); )*
                 out
             }
 
             fn parameters_mut(&mut self) -> $crate::compat::ModuleParamMut<'_> {
                 #[allow(unused_mut)] // a parameter-free layer lists no fields
-                let mut out = ::std::collections::HashMap::new();
+                let mut out = ::std::collections::BTreeMap::new();
                 $( $crate::compat::Parameter::collect_params_mut(&mut self.$field, stringify!($field), &mut out); )*
                 out
             }

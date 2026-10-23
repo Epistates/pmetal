@@ -59,11 +59,8 @@ fn write_checkpoint(dir: &Path, config_json: &str) {
     std::fs::write(dir.join("config.json"), config_json).unwrap();
     std::fs::write(dir.join("chat_template.jinja"), "{{ messages }}").unwrap();
     let mut writer = TensorWriter::with_dtype(dir, safetensors::Dtype::F32).unwrap();
-    let params = model.flatten_params();
-    let mut names: Vec<_> = params.keys().collect();
-    names.sort();
-    for name in names {
-        writer.write_tensor(name, &params[name]).unwrap();
+    for (name, value) in &model.flatten_params() {
+        writer.write_tensor(name, value).unwrap();
     }
     writer.finalize().unwrap();
 }
@@ -137,8 +134,7 @@ fn mean_abs_diff(a: &Array, b: &Array) -> f32 {
 
 fn param_diffs(a: &AdaptedModel, b: &AdaptedModel) -> Vec<(String, f32)> {
     let (pa, pb) = (a.model().flatten_params(), b.model().flatten_params());
-    let mut out: Vec<(String, f32)> = pa
-        .iter()
+    pa.iter()
         .map(|(name, value)| {
             (
                 name.to_string(),
@@ -150,9 +146,7 @@ fn param_diffs(a: &AdaptedModel, b: &AdaptedModel) -> Vec<(String, f32)> {
                     .item_f32(),
             )
         })
-        .collect();
-    out.sort_by(|x, y| x.0.cmp(&y.0));
-    out
+        .collect()
 }
 
 /// Train `model` for a few epochs, returning the losses of its steps.

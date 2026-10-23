@@ -25,7 +25,7 @@
 //! (t-schedule sampling, self-conditioning dropout, optimiser) lives in the
 //! training loop that consumes these primitives.
 
-use std::collections::HashMap;
+use pmetal_runtime::compat::FlattenedModuleParam;
 use std::rc::Rc;
 
 use pmetal_lora::{AdaptedModel, PackedBase, QLoraConfig, QLoraScheme, quantize_base};
@@ -360,10 +360,9 @@ impl DiffusionGemmaTrainer {
         targets: &Array,
         corrupted_mask: Option<&Array>,
     ) -> Result<DiffusionGemmaStepStats, Exception> {
-        // Adapter parameters in a stable order.
+        // Adapter parameters in name order (the map's own).
         let live = model.lora_parameters();
-        let mut keys: Vec<Rc<str>> = live.keys().cloned().collect();
-        keys.sort();
+        let keys: Vec<Rc<str>> = live.keys().cloned().collect();
         if keys.is_empty() {
             return Err(Exception::custom(
                 "DiffusionGemmaTrainer: the model carries no LoRA adapters",
@@ -378,7 +377,7 @@ impl DiffusionGemmaTrainer {
         // returns rather than becoming a NaN loss.
         let mut failure: Option<Exception> = None;
         let loss_fn = |all: &[Array]| -> Array {
-            let restored: HashMap<Rc<str>, Array> =
+            let restored: FlattenedModuleParam =
                 keys.iter().cloned().zip(all.iter().cloned()).collect();
             model.set_lora_parameters(&restored);
             let logits = model

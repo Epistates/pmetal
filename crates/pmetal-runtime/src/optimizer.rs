@@ -23,12 +23,14 @@
 
 use crate::InlineArray;
 use crate::compat::Dtype;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Named parameter set — maps parameter names to their [`InlineArray`] values.
 ///
-/// The `String`-keyed counterpart of `compat::FlattenedModuleParam`.
-pub type ParamSet = HashMap<String, InlineArray>;
+/// The `String`-keyed counterpart of `compat::FlattenedModuleParam`, and like
+/// it a `BTreeMap`: iterating a set visits the parameters in name order, the
+/// same on every run.
+pub type ParamSet = BTreeMap<String, InlineArray>;
 
 /// Whether the parameter called `name` trains without weight decay: biases
 /// and the weights of normalization layers.
