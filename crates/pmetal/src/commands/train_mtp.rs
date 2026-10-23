@@ -8,27 +8,28 @@ use pmetal_models::architectures::{
 };
 use pmetal_models::dispatcher::{DynamicModel, ModelArchitecture};
 use pmetal_trainer::{
-    MtpTrainingConfig, batch_from_tokens, initialize_qwen3_next_mtp_from_target,
+    CompositeCallback, MtpTrainingConfig, batch_from_tokens, initialize_qwen3_next_mtp_from_target,
     make_gemma4_assistant_config, make_qwen3_next_mtp_config, run_gemma4_assistant_mtp_training,
     run_qwen3_next_mtp_training,
 };
 
 use crate::cli::train_mtp::{TrainMtpArgs, TrainMtpFamily};
+use crate::commands::RunContext;
 use crate::commands::resume::find_resume_point;
 
 /// Run `pmetal train-mtp`.
 ///
 /// A request to stop (Ctrl-C, SIGTERM) ends the run after the step in flight,
-/// writes the final checkpoint and exits with status 130.
-pub(crate) async fn run_train_mtp(args: TrainMtpArgs) -> Result<()> {
-    let stop = crate::commands::stop::StopFlag::watch();
+/// writes the final checkpoint and exits with status 130
+/// ([`with_run_context`](crate::commands::with_run_context)).
+pub(crate) async fn run_train_mtp(args: TrainMtpArgs, ctx: RunContext) -> Result<()> {
+    let mut callbacks = CompositeCallback::from(ctx.callbacks);
     let resume = args
         .resume
         .as_deref()
         .map(|dir| find_resume_point(Path::new(dir)))
         .transpose()?;
     let mut config = build_config(&args);
-    config.stop = Some(stop.handle());
     config.resume_from = resume.as_ref().map(|point| point.dir.clone());
     // The batches the interrupted run had already consumed are not repeated.
     let batches = shard_batches(
@@ -76,8 +77,14 @@ pub(crate) async fn run_train_mtp(args: TrainMtpArgs) -> Result<()> {
                 initialize_qwen3_next_mtp_from_target(&target, &mut mtp);
                 mtp
             };
-            let result = run_qwen3_next_mtp_training(&mut target, &mut mtp, &config, batches)
-                .map_err(|e| anyhow::anyhow!("train Qwen MTP: {e}"))?;
+            let result = run_qwen3_next_mtp_training(
+                &mut target,
+                &mut mtp,
+                &config,
+                batches,
+                &mut callbacks,
+            )
+            .map_err(|e| anyhow::anyhow!("train Qwen MTP: {e}"))?;
             println!(
                 "Qwen MTP checkpoint saved to {} (final_loss={:.4})",
                 result.output_dir.display(),
@@ -109,9 +116,14 @@ pub(crate) async fn run_train_mtp(args: TrainMtpArgs) -> Result<()> {
                 Gemma4AssistantForCausalLM::new(assistant_config)
                     .map_err(|e| anyhow::anyhow!("create Gemma assistant: {e}"))?
             };
-            let result =
-                run_gemma4_assistant_mtp_training(&mut target, &mut assistant, &config, batches)
-                    .map_err(|e| anyhow::anyhow!("train Gemma assistant MTP: {e}"))?;
+            let result = run_gemma4_assistant_mtp_training(
+                &mut target,
+                &mut assistant,
+                &config,
+                batches,
+                &mut callbacks,
+            )
+            .map_err(|e| anyhow::anyhow!("train Gemma assistant MTP: {e}"))?;
             println!(
                 "Gemma assistant checkpoint saved to {} (final_loss={:.4})",
                 result.output_dir.display(),
@@ -120,7 +132,7 @@ pub(crate) async fn run_train_mtp(args: TrainMtpArgs) -> Result<()> {
         }
         TrainMtpFamily::Auto => unreachable!("auto is resolved before dispatch"),
     }
-    stop.finish(Ok(()))
+    Ok(())
 }
 
 fn resolve_family(requested: TrainMtpFamily, arch: ModelArchitecture) -> Result<TrainMtpFamily> {

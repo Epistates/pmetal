@@ -35,14 +35,14 @@ in `CLI_ONLY` in `parity.rs` with its reason.
 
 ## Event log and stopping
 
-`--log-events <file>` (global) writes the run's `JobEvent`s as JSONL. It is
-wired to `train`, `distill`, `grpo`, `rlkd` and `preference` through
-`commands::with_run_context`; a write that fails is reported when the run ends
-(`commands/events.rs`). The other trainers (`pretrain`, `embed-train`,
-`train-mtp`, `train-draft`, `train-diffusion`) write no event log, so `main`
-refuses the flag for them (`Commands::writes_event_log`) instead of leaving a
-caller to wait on an empty file. A command that gains an event log is added to
-that method.
+`--log-events <file>` (global) writes the run's `JobEvent`s as JSONL. Every
+trainer command takes it (`train`, `distill`, `grpo`, `rlkd`, `preference`,
+`pretrain`, `embed-train`, `train-mtp`, `train-draft`, `train-diffusion`)
+through `commands::with_run_context`; a write that fails is reported when the
+run ends (`commands/events.rs`). A command declares it on its spec
+(`#[spec(events)]`), and `main` refuses the flag for a command whose spec does
+not (`Commands::writes_event_log`) instead of leaving a caller to wait on an
+empty file. A command that gains an event log is added to that method.
 
 Every trainer command stops the same way: Ctrl-C or SIGTERM ends the run after
 the step in flight, saves what it has (`commands/stop.rs`) and exits with status

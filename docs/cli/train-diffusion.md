@@ -4,7 +4,7 @@ LoRA fine-tune a DiffusionGemma block-diffusion model.
 
 Trains LoRA adapters on the encoder and the decoder of a DiffusionGemma model (dense or mixture-of-experts) with the denoising loss. Every linear layer but the output head is adapted unless `--lora-targets` names a subset; MoE routers and experts are never adapted. With `--quantization` the frozen base is packed (QLoRA), which cuts the memory of the 26B MoE model a great deal. The adapter is written in the PEFT layout.
 
-Ctrl-C (SIGINT) or SIGTERM finishes the step in flight, saves the adapters and exits with status 130.
+Ctrl-C (SIGINT) or SIGTERM finishes the step in flight, saves the adapters and exits with status 130. `--log-events` (a global option) writes the run's events as JSONL.
 
 ## Usage
 

@@ -15,7 +15,7 @@ use pmetal_cache::{
     kv_cache::{KVCache, KVCacheConfig},
     speculative::SpecCapture,
 };
-use pmetal_core::{LearningRateScheduler, LrSchedulerType};
+use pmetal_core::{LearningRateScheduler, LrSchedulerType, TrainingCallback};
 use pmetal_models::architectures::{
     DFlashDraftModel, Gemma4AssistantConfig, Gemma4AssistantForCausalLM,
     Gemma4AssistantGenerationConfig, Gemma4Config, Gemma4ForCausalLM, Qwen3ForCausalLM,
@@ -328,11 +328,17 @@ pub fn gemma4_assistant_mtp_loss(
         .divide(&Array::from_f32((seq - 2) as f32)))
 }
 
+/// Train a Qwen3-Next MTP predictor against the frozen `target`.
+///
+/// `callbacks` follows the run (start, each step's metrics, each checkpoint
+/// written, the end) and can stop it after the step in flight, like
+/// `config.stop`; pass `&mut CompositeCallback::new()` for none.
 pub fn run_qwen3_next_mtp_training<I>(
     target: &mut Qwen3NextForCausalLM,
     mtp: &mut Qwen3NextMtpForCausalLM,
     config: &MtpTrainingConfig,
     batches: I,
+    callbacks: &mut dyn TrainingCallback,
 ) -> Result<MtpTrainingResult, Exception>
 where
     I: Iterator<Item = Array>,
@@ -343,6 +349,7 @@ where
         mtp,
         config,
         batches,
+        callbacks,
         MtpCheckpointKind::Qwen3Next,
         |model, batch| qwen3_next_mtp_loss(target, model, batch),
         |dir, model, optimizer, meta| {
@@ -351,11 +358,14 @@ where
     )
 }
 
+/// Train a Gemma 4 assistant against the frozen `target`; `callbacks` as in
+/// [`run_qwen3_next_mtp_training`].
 pub fn run_gemma4_assistant_mtp_training<I>(
     target: &mut Gemma4ForCausalLM,
     assistant: &mut Gemma4AssistantForCausalLM,
     config: &MtpTrainingConfig,
     batches: I,
+    callbacks: &mut dyn TrainingCallback,
 ) -> Result<MtpTrainingResult, Exception>
 where
     I: Iterator<Item = Array>,
@@ -365,6 +375,7 @@ where
         assistant,
         config,
         batches,
+        callbacks,
         MtpCheckpointKind::Gemma4Assistant,
         |model, batch| gemma4_assistant_mtp_loss(target, model, batch),
         |dir, model, optimizer, meta| {
@@ -381,11 +392,14 @@ where
     )
 }
 
+/// Train a DFlash draft against the frozen `target`; `callbacks` as in
+/// [`run_qwen3_next_mtp_training`].
 pub fn run_dflash_draft_training<I>(
     target: &mut Qwen3ForCausalLM,
     draft: &mut DFlashDraftModel,
     config: &MtpTrainingConfig,
     batches: I,
+    callbacks: &mut dyn TrainingCallback,
 ) -> Result<MtpTrainingResult, Exception>
 where
     I: Iterator<Item = Array>,
@@ -394,6 +408,7 @@ where
         draft,
         config,
         batches.enumerate(),
+        callbacks,
         MtpCheckpointKind::DFlashDraft,
         |model, (step, batch)| {
             let seq = batch.dim(1) as usize;
@@ -435,6 +450,7 @@ fn run_training_loop<M, I, B, F, S>(
     model: &mut M,
     config: &MtpTrainingConfig,
     mut batches: I,
+    callbacks: &mut dyn TrainingCallback,
     kind: MtpCheckpointKind,
     mut loss_fn: F,
     mut save_fn: S,
@@ -476,7 +492,10 @@ where
 
     let mut losses = Vec::with_capacity(config.num_steps);
     let start = std::time::Instant::now();
+    callbacks.on_train_start();
     for step in first_step..config.num_steps {
+        let step_start = std::time::Instant::now();
+        callbacks.on_step_start(step + 1);
         let lr = scheduler.get_lr(step) as f32;
         optimizer.set_lr(lr);
         let batch = batches.next().ok_or_else(|| {
@@ -489,11 +508,20 @@ where
             pmetal_runtime::training::clip_grad_norm_map(&mut grads, max_norm);
         }
         optimizer.update(model, grads)?;
-        pmetal_runtime::compat::eval_params(model.trainable_parameters())?;
-
-        loss.eval();
+        // One evaluation: the updated parameters and the loss.
+        let trainable = model.flatten_trainable_params();
+        pmetal_runtime::compat::eval(trainable.values().chain([&loss]))?;
+        drop(trainable);
         let loss_value = crate::step_check::check_step(step + 1, loss.item::<f32>())?;
         losses.push(loss_value);
+        callbacks.on_step_end_with_metrics(&crate::callbacks::plain_step_metrics(
+            step + 1,
+            config.num_steps,
+            f64::from(loss_value),
+            f64::from(lr),
+            0,
+            step_start.elapsed(),
+        ));
 
         if config.log_every > 0 && (step + 1) % config.log_every == 0 {
             let elapsed = start.elapsed().as_secs_f64().max(1e-9);
@@ -527,12 +555,14 @@ where
                 },
             )?;
             tracing::info!("checkpoint saved: {}", dir.display());
+            callbacks.on_save(&dir);
         }
 
-        if config
-            .stop
-            .as_ref()
-            .is_some_and(|s| s.load(Ordering::SeqCst))
+        if callbacks.should_stop()
+            || config
+                .stop
+                .as_ref()
+                .is_some_and(|s| s.load(Ordering::SeqCst))
         {
             tracing::info!(
                 "stop requested: ending after step {} of {}",
@@ -562,7 +592,9 @@ where
             "final checkpoint saved: {}",
             config.checkpoint_dir.display()
         );
+        callbacks.on_save(&config.checkpoint_dir);
     }
+    callbacks.on_train_end();
 
     Ok(MtpTrainingResult {
         losses,
@@ -751,6 +783,7 @@ pub fn batch_from_tokens(tokens: &[Vec<u32>]) -> Result<Array, Exception> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::callbacks::CompositeCallback;
     use pmetal_models::architectures::{DFlashDraftConfig, DFlashExtras};
 
     fn tiny_qwen_config() -> Qwen3NextConfig {
@@ -959,6 +992,7 @@ mod tests {
             &mut mtp,
             &settings(straight_dir.path(), 16, None),
             std::iter::repeat_n(batch.clone(), 16),
+            &mut CompositeCallback::new(),
         )
         .unwrap();
 
@@ -969,6 +1003,7 @@ mod tests {
             &mut mtp,
             &settings(half_dir.path(), 8, None),
             std::iter::repeat_n(batch.clone(), 8),
+            &mut CompositeCallback::new(),
         )
         .unwrap();
         let resumed = run_qwen3_next_mtp_training(
@@ -976,6 +1011,7 @@ mod tests {
             &mut mtp,
             &settings(half_dir.path(), 16, Some(half_dir.path().to_path_buf())),
             std::iter::repeat_n(batch.clone(), 8),
+            &mut CompositeCallback::new(),
         )
         .unwrap();
         pmetal_runtime::check_unobserved_error().unwrap();
@@ -1037,6 +1073,7 @@ mod tests {
             &mut mtp,
             &settings(16, None, Some(Arc::clone(&stop))),
             requesting,
+            &mut CompositeCallback::new(),
         )
         .unwrap();
         pmetal_runtime::check_unobserved_error().unwrap();
@@ -1051,9 +1088,87 @@ mod tests {
             &mut mtp,
             &settings(6, Some(dir.path().to_path_buf()), None),
             std::iter::repeat_n(batch, 3),
+            &mut CompositeCallback::new(),
         )
         .unwrap();
         assert_eq!(resumed.losses.len(), 3);
+    }
+
+    /// What a callback sees of a run: it starts, each step reports its
+    /// metrics, each checkpoint written is announced, it ends; and a callback
+    /// that asks to stop ends the run after the step in flight, saved.
+    #[test]
+    fn callbacks_follow_a_run_and_can_stop_it() {
+        #[derive(Clone, Default)]
+        struct Log(Arc<std::sync::Mutex<Vec<String>>>);
+        struct Recorder {
+            log: Log,
+            stop_after: usize,
+        }
+        impl TrainingCallback for Recorder {
+            fn on_train_start(&mut self) {
+                self.log.0.lock().unwrap().push("start".into());
+            }
+            fn on_step_end_with_metrics(&mut self, m: &pmetal_core::StepMetrics) {
+                assert!(m.loss.is_finite() && m.lr > 0.0 && m.total_steps == 16);
+                self.log.0.lock().unwrap().push(format!("step {}", m.step));
+            }
+            fn on_save(&mut self, _path: &Path) {
+                self.log.0.lock().unwrap().push("save".into());
+            }
+            fn on_train_end(&mut self) {
+                self.log.0.lock().unwrap().push("end".into());
+            }
+            fn should_stop(&self) -> bool {
+                self.log
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|l| l.starts_with("step"))
+                    .count()
+                    >= self.stop_after
+            }
+        }
+
+        let config = tiny_qwen_config();
+        let tokens: Vec<u32> = (0..16).map(|i| (i * 7 % 23) as u32 + 1).collect();
+        let batch = batch_from_tokens(&[tokens]).unwrap();
+        pmetal_runtime::compat::random::seed(9);
+        let mut target = Qwen3NextForCausalLM::new(config.clone()).unwrap();
+        let mut mtp = Qwen3NextMtpForCausalLM::new(config.clone()).unwrap();
+        initialize_qwen3_next_mtp_from_target(&target, &mut mtp);
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log::default();
+        let mut recorder = Recorder {
+            log: log.clone(),
+            stop_after: 2,
+        };
+        let stopped = run_qwen3_next_mtp_training(
+            &mut target,
+            &mut mtp,
+            &MtpTrainingConfig {
+                num_steps: 16,
+                learning_rate: 5e-3,
+                warmup_steps: 0,
+                lr_schedule: LrSchedulerType::Constant,
+                checkpoint_every: None,
+                checkpoint_dir: dir.path().to_path_buf(),
+                log_every: 0,
+                ..Default::default()
+            },
+            std::iter::repeat_n(batch, 16),
+            &mut recorder,
+        )
+        .unwrap();
+
+        assert_eq!(stopped.losses.len(), 2, "the callback stopped the run");
+        assert_eq!(
+            *log.0.lock().unwrap(),
+            ["start", "step 1", "step 2", "save", "end"]
+        );
+        assert!(dir.path().join("model.safetensors").exists(), "saved");
     }
 
     /// The predictor trains: against the target's own next-next choices the
@@ -1086,6 +1201,7 @@ mod tests {
                 ..Default::default()
             },
             std::iter::repeat_n(batch, 50),
+            &mut CompositeCallback::new(),
         )
         .unwrap();
         pmetal_runtime::check_unobserved_error().unwrap();
@@ -1210,6 +1326,7 @@ mod tests {
                 ..Default::default()
             },
             std::iter::repeat_n(batch, 40),
+            &mut CompositeCallback::new(),
         )
         .unwrap();
         pmetal_runtime::check_unobserved_error().unwrap();

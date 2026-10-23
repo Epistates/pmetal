@@ -6,7 +6,7 @@ use pmetal_core_derive::JobSpec;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JobSpec)]
-#[spec(kind = "Pretrain", subcommand = "pretrain")]
+#[spec(kind = "Pretrain", subcommand = "pretrain", events)]
 #[serde(rename_all = "snake_case")]
 pub struct PretrainSpec {
     #[job(label = "Architecture", group = "Model", argv = "--arch", required)]

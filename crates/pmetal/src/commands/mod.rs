@@ -32,6 +32,8 @@ pub(crate) mod merge;
 pub(crate) mod ollama;
 #[cfg(feature = "trainer")]
 pub(crate) mod preference;
+#[cfg(feature = "trainer")]
+pub(crate) mod pretrain;
 pub(crate) mod quantize;
 pub(crate) mod quantize_source;
 #[cfg(feature = "trainer")]

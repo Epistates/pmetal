@@ -491,4 +491,51 @@ impl TrainingCallback for CompositeCallback {
             cb.on_save(path);
         }
     }
+
+    fn on_lr_event(&mut self, event: &str) {
+        for cb in &mut self.callbacks {
+            cb.on_lr_event(event);
+        }
+    }
+
+    fn should_stop(&self) -> bool {
+        self.callbacks.iter().any(|cb| cb.should_stop())
+    }
+}
+
+impl From<Vec<Box<dyn TrainingCallback>>> for CompositeCallback {
+    fn from(callbacks: Vec<Box<dyn TrainingCallback>>) -> Self {
+        Self { callbacks }
+    }
+}
+
+/// The telemetry of one step of a loop with no epochs and no timing
+/// breakdown (pretraining, the MTP and draft trainers): what the callbacks'
+/// [`on_step_end_with_metrics`](TrainingCallback::on_step_end_with_metrics)
+/// takes. `tokens` is zero for a loop that does not count them.
+pub fn plain_step_metrics(
+    step: usize,
+    total_steps: usize,
+    loss: f64,
+    lr: f64,
+    tokens: usize,
+    elapsed: std::time::Duration,
+) -> StepMetrics {
+    let secs = elapsed.as_secs_f64();
+    StepMetrics {
+        step,
+        epoch: 0,
+        total_epochs: 1,
+        total_steps,
+        loss,
+        lr,
+        tok_sec: if secs > 0.0 {
+            tokens as f64 / secs
+        } else {
+            0.0
+        },
+        total_ms: secs * 1000.0,
+        tokens,
+        ..Default::default()
+    }
 }

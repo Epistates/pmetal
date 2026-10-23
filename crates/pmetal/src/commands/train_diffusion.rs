@@ -12,23 +12,27 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-use pmetal_core::LoraConfig;
 use pmetal_core::jobs::TrainDiffusionSpec;
+use pmetal_core::{LoraConfig, TrainingCallback};
 use pmetal_data::Tokenizer;
 use pmetal_lora::{AdaptedModel, QLoraConfig, QLoraScheme};
 use pmetal_models::DynamicModel;
 use pmetal_runtime::compat::Array;
 use pmetal_trainer::orchestrator::{QuantizationScheme, save_adapter};
 use pmetal_trainer::{
-    DiffusionGemmaTrainConfig, DiffusionGemmaTrainer, quantize_diffusion_gemma_base,
+    CompositeCallback, DiffusionGemmaTrainConfig, DiffusionGemmaTrainer,
+    callbacks::plain_step_metrics, quantize_diffusion_gemma_base,
 };
+
+use super::RunContext;
 
 /// Run `pmetal train-diffusion`.
 ///
 /// A request to stop (Ctrl-C, SIGTERM) ends the loop after the step in flight,
-/// saves the adapters and exits with status 130.
-pub(crate) async fn run_train_diffusion(args: TrainDiffusionSpec) -> Result<()> {
-    let stop = super::stop::StopFlag::watch();
+/// saves the adapters and exits with status 130
+/// ([`with_run_context`](super::with_run_context)).
+pub(crate) async fn run_train_diffusion(args: TrainDiffusionSpec, ctx: RunContext) -> Result<()> {
+    let mut callbacks = CompositeCallback::from(ctx.callbacks);
     // 1. Resolve + load the model through the inference dispatcher.
     let model_path = pmetal_hub::resolve_model_path(&args.model, None, None)
         .await
@@ -124,7 +128,10 @@ pub(crate) async fn run_train_diffusion(args: TrainDiffusionSpec) -> Result<()> 
     std::fs::create_dir_all(output_dir)
         .with_context(|| format!("create output dir {}", args.output))?;
     let mut running_loss = 0.0f64;
+    callbacks.on_train_start();
     for step in 0..args.steps {
+        let step_start = std::time::Instant::now();
+        callbacks.on_step_start(step + 1);
         let (prompt, response) = &examples[step % examples.len()];
         let ctx_ids = tokenizer
             .encode(prompt)
@@ -144,6 +151,14 @@ pub(crate) async fn run_train_diffusion(args: TrainDiffusionSpec) -> Result<()> 
         } else {
             0.98 * running_loss + 0.02 * stats.loss as f64
         };
+        callbacks.on_step_end_with_metrics(&plain_step_metrics(
+            step + 1,
+            args.steps,
+            f64::from(stats.loss),
+            f64::from(args.learning_rate),
+            0,
+            step_start.elapsed(),
+        ));
 
         if args.log_every > 0 && step % args.log_every == 0 {
             tracing::info!(
@@ -159,12 +174,13 @@ pub(crate) async fn run_train_diffusion(args: TrainDiffusionSpec) -> Result<()> 
         }
 
         if args.checkpoint_every > 0 && step > 0 && step % args.checkpoint_every == 0 {
-            save_adapter(&model, output_dir, &lora_cfg, Some(&args.model))
+            let saved = save_adapter(&model, output_dir, &lora_cfg, Some(&args.model))
                 .with_context(|| "checkpoint save")?;
             tracing::info!("checkpoint at step {step} → {}", output_dir.display());
+            callbacks.on_save(&saved);
         }
 
-        if stop.requested() {
+        if callbacks.should_stop() {
             tracing::info!(
                 "stop requested: ending after step {} of {}",
                 step + 1,
@@ -183,7 +199,9 @@ pub(crate) async fn run_train_diffusion(args: TrainDiffusionSpec) -> Result<()> 
         final_path.display(),
         running_loss
     );
-    stop.finish(Ok(()))
+    callbacks.on_save(&final_path);
+    callbacks.on_train_end();
+    Ok(())
 }
 
 /// Build the encoder context `[1, ctx]` from a prompt's token ids, truncated to

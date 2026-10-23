@@ -232,12 +232,12 @@ mod tests {
 
     #[test]
     fn a_command_with_no_event_log_follows_its_metrics_file() {
-        // Pretrain has an output but writes no event log and takes no
+        // Quantize has an output but writes no event log and takes no
         // `--log-metrics`: nothing to follow.
         let plan = LaunchPlan::for_spec(
-            &PretrainSpec {
-                output_dir: "/runs/p".into(),
-                ..PretrainSpec::default()
+            &QuantizeSpec {
+                output: "/runs/q".into(),
+                ..QuantizeSpec::default()
             },
             &LaunchOptions::default(),
         )
@@ -404,20 +404,20 @@ mod tests {
         check(BenchSpec::default(), false);
         check(DecideSpec::default(), false);
         check(DflashSpec::default(), false);
-        check(EmbedTrainSpec::default(), false);
+        check(EmbedTrainSpec::default(), true);
         check(EvalSpec::default(), false);
         check(FuseSpec::default(), false);
         check(ImatrixSpec::default(), false);
         check(InferSpec::default(), false);
         check(MergeSpec::default(), false);
         check(PackExpertsSpec::default(), false);
-        check(PretrainSpec::default(), false);
+        check(PretrainSpec::default(), true);
         check(QuantizeSpec::default(), false);
         check(ServeSpec::default(), false);
         check(TokenizeSpec::default(), false);
-        check(TrainDiffusionSpec::default(), false);
-        check(TrainDraftSpec::default(), false);
-        check(TrainMtpSpec::default(), false);
+        check(TrainDiffusionSpec::default(), true);
+        check(TrainDraftSpec::default(), true);
+        check(TrainMtpSpec::default(), true);
         check(VocodeSpec::default(), false);
     }
 }
