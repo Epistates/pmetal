@@ -8,6 +8,12 @@ the formats `pmetal train` reads; `--lora` scores a model with an adapter on top
 the base model on the same data. With `--json` the result is `model`, `dataset`, `num_samples`,
 `total_tokens`, `avg_nll` and `perplexity`.
 
+Plain text (and a task's prompts) start with the beginning-of-sequence token the model expects, once.
+The tokenizer adds it when it is built to (Llama, Gemma 3); a model whose tokenizer does not, but
+whose tokenizer config sets `add_bos_token` or whose chat template opens with `bos_token` (Gemma 4),
+is given it all the same. A model with none (Qwen) gets none, and text that already opens with the
+token is not given a second.
+
 ## Usage
 
 ```bash
