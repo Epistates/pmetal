@@ -62,7 +62,10 @@ pub enum FullFineTuneError {
 // Muon and a frozen embedding; batches of 1 to 16 sequences of up to 1024
 // tokens; with and without gradient checkpointing and cut cross-entropy. The
 // estimate came out 25% to 80% above the measured peak, never below. Other
-// architectures (MoE, wider MLPs) are extrapolations.
+// architectures (MoE, wider MLPs) are extrapolations. The activation figure
+// with gradient checkpointing was measured before checkpointing freed what it
+// should (see `memory::bound_command_buffer_memory`): it is now well above the
+// truth, so the estimate errs on the side of refusing a run that would fit.
 
 /// Bytes a trainable parameter costs in the gradient: an f32 accumulator. (The
 /// peak with AdamW measured 3 bytes a parameter beyond the moments and the f32
