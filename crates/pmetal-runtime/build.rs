@@ -745,5 +745,14 @@ fn main() {
     // Ensure Cargo re-runs build.rs when C++ sources change.
     // Without this, edits to bridge.cpp/bridge.h produce stale binaries.
     println!("cargo:rerun-if-changed=cpp/"); // any change in cpp/ dir
+    println!("cargo:rerun-if-env-changed=DOCS_RS");
+    // docs.rs builds documentation on a Linux host with no CMake toolchain,
+    // Metal compiler or Apple SDK, and rustdoc links nothing, so MLX is
+    // neither built nor linked there.
+    if env::var_os("DOCS_RS").is_some() {
+        println!("cargo:rustc-env=PMETAL_RUNTIME_MLX_KIND=bundled-upstream");
+        println!("cargo:rustc-env=PMETAL_RUNTIME_MLX_GIT_TAG={BUNDLED_MLX_GIT_TAG}");
+        return;
+    }
     build_and_link();
 }

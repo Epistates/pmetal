@@ -218,6 +218,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **MLX v0.32.4**, which fixes a Metal fence deadlock; Rust 1.99.1 (the minimum supported version stays 1.95); pyo3 0.30, serde-saphyr 2, parking_lot 0.13, tokio 1.54 and every other dependency at its latest release, bun 1.4.4 and the GUI's JavaScript dependencies at theirs. Eleven declared dependencies no crate used are gone.
 - **`--log-events` is refused by the commands that write no event log.** `pretrain`, `embed-train`, `train-mtp`, `train-draft` and `train-diffusion` accepted the global flag and wrote nothing, so a caller waiting on the file waited on an empty one. They now exit with an error; `train`, `distill`, `grpo`, `rlkd` and `preference` write the log as before.
 - **`pretrain --shards` and `--eval-shards` take several values**, so an unquoted shell glob that matches more than one shard works instead of failing as a usage error.
 - **`pmetal ollama --template deepseek`** matches the name the template listing prints; `deep-seek` stays as an alias.
@@ -461,6 +462,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **docs.rs can document the crates.** It runs rustdoc on a Linux host with no CMake toolchain, Metal compiler or Apple SDK, so `pmetal-runtime`, `pmetal-metal` and every crate above them failed to document there. The build scripts now skip MLX and the Metal kernels when `DOCS_RS` is set, and every published crate asks docs.rs for the `aarch64-apple-darwin` target.
 - **The GUI lists the models in the Hub cache `pmetal` uses.** It kept its own cache lookup, which appended `hub` to `HF_HUB_CACHE` and ignored `XDG_CACHE_HOME`, so a model downloaded with either set was not listed (and a "cache directory" setting changed nothing, because downloads go where `pmetal-hub` says). Models, datasets, search, fit estimates and downloads now use `pmetal-hub`; downloads show bytes, rate and time left and can be cancelled. Scanning a folder no longer writes a `config.json` into it, and deleting a model refuses anything outside the folders the app manages and anything a running job uses.
 - **A GUI server shows as serving when its port answers, not when the process starts.** Whether the server was up was guessed from words in its output ("listening", "serving", " ready"), which can be printed before the port is bound. The job runner waits for the address the server announces and connects to it (`a_server_that_cannot_bind_is_never_shown_as_serving`).
 - **GUI chat: the tail of a stopped reply no longer lands in the next one, a TurboQuant KV preset is sent, and generation stops at the next token.** Chat events carried no session, `tq2_5` and `tq3_5` went through `parseInt` and arrived as `null`, and generation ran on an async worker thread for as long as it lasted. Every event now names its session, the page chooses the session id, and generation runs on a blocking thread.
