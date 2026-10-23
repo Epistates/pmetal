@@ -386,14 +386,14 @@ impl PackedLinears {
                 return;
             }
             embedding.weight.value = packed.weight;
-            embedding.quant = Some(pmetal_runtime::compat::LinearQuant {
+            embedding.quant = Some(Box::new(pmetal_runtime::compat::LinearQuant {
                 scales: packed.scales,
                 biases: packed.biases,
                 params: packed.params,
                 dtype,
                 tensor_scale: packed.tensor_scale,
                 codebook: None,
-            });
+            }));
         });
         if let Some(e) = failure {
             return Err(e);

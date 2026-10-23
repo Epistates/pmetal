@@ -989,7 +989,10 @@ pub struct Embedding {
     /// [`Linear`]'s is: a lookup unpacks only the rows it gathers, and a tied
     /// head ([`Embedding::as_linear`]) runs the quantized matmul over the
     /// packed words, a quarter of the bytes a dense table reads each step.
-    pub quant: Option<LinearQuant>,
+    ///
+    /// Boxed: a table is a handful per model, and the embedding encoders
+    /// hold several inline.
+    pub quant: Option<Box<LinearQuant>>,
 }
 
 impl Embedding {
