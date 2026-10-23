@@ -23,7 +23,7 @@
 
 use crate::InlineArray;
 use crate::compat::Dtype;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 /// Named parameter set — maps parameter names to their [`InlineArray`] values.
 ///
@@ -321,7 +321,9 @@ pub struct AdamW {
     beta2: f32,
     eps: f32,
     step_count_inner: u64,
-    pub states: HashMap<String, AdamState>,
+    /// Per-parameter state, in name order (so a walk of it, and the master
+    /// copies a checkpoint saves from it, is the same on every run).
+    pub states: BTreeMap<String, AdamState>,
     /// Maps a parameter name to its [`ParamClass`].
     classifier: Box<dyn Fn(&str) -> ParamClass + Send>,
     /// Whether an update is one fused Metal dispatch ([`Self::with_fused`]).
@@ -361,7 +363,7 @@ impl AdamW {
             beta2: 0.999,
             eps: 1e-8,
             step_count_inner: 0,
-            states: HashMap::new(),
+            states: BTreeMap::new(),
             classifier: Box::new(default_classifier),
             fused: true,
             scalar_arrays: Vec::new(),
@@ -886,6 +888,28 @@ mod tests {
             p -= step * m / ((v.sqrt() / (1.0 - b2.powi(t as i32)).sqrt()) + eps);
         }
         p
+    }
+
+    /// The optimizer's state is walked in parameter-name order, the same on
+    /// every run: the f32 master copies a checkpoint saves come out of it.
+    #[test]
+    fn state_is_in_name_order() {
+        use crate::compat::Dtype;
+        let bf16 = Dtype::Bfloat16.as_i32();
+        // Inserted out of order, and enough of them that a hash map would
+        // not happen to walk them sorted.
+        let names: Vec<String> = (0..40).rev().map(|i| format!("layers.{i}.w")).collect();
+        let mut opt = AdamW::new(1e-3, 0.0);
+        opt.advance_step();
+        for name in &names {
+            let mut param = InlineArray::from_f32_slice(&[1.0, 2.0], &[2]).as_dtype(bf16);
+            let grad = InlineArray::from_f32_slice(&[0.5, 0.5], &[2]).as_dtype(bf16);
+            opt.step_single(name, &grad, &mut param);
+        }
+        let mut sorted = names.clone();
+        sorted.sort();
+        let walked: Vec<&String> = opt.states.keys().collect();
+        assert_eq!(walked, sorted.iter().collect::<Vec<_>>());
     }
 
     /// A bf16 parameter trains: its moments and its update are f32, and the
