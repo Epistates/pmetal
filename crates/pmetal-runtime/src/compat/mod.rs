@@ -277,12 +277,12 @@ pub enum NestedValue<V> {
     /// A leaf parameter value.
     Value(V),
     /// A sub-map of named nested values.
-    Map(std::collections::HashMap<std::rc::Rc<str>, NestedValue<V>>),
+    Map(std::collections::BTreeMap<std::rc::Rc<str>, NestedValue<V>>),
 }
 
 impl<V> NestedValue<V> {
-    /// Flatten the tree into a `HashMap<String, V>`.
-    pub fn flatten_into(self, prefix: &str, out: &mut std::collections::HashMap<String, V>) {
+    /// Flatten the tree into a `BTreeMap<String, V>`.
+    pub fn flatten_into(self, prefix: &str, out: &mut std::collections::BTreeMap<String, V>) {
         match self {
             NestedValue::Value(v) => {
                 out.insert(prefix.to_owned(), v);
@@ -301,15 +301,25 @@ impl<V> NestedValue<V> {
     }
 }
 
-/// Borrowed parameter tree (returned by `parameters()`).
-pub type ModuleParamRef<'a> = std::collections::HashMap<std::rc::Rc<str>, NestedValue<&'a Array>>;
+// The parameter maps are `BTreeMap`s, so every walk over parameters is in key
+// order. A `HashMap` iterates in an order that differs from run to run, which
+// made anything order-dependent (a global gradient norm summed in map order,
+// seeded random values drawn per parameter, the argument order of
+// `value_and_grad`) differ between two runs of the same program. Key order,
+// not insertion order, is the canonical one: it does not depend on how a
+// module registers its fields, so a checkpoint, an optimizer and a gradient
+// transform all agree on it. A model has hundreds of parameters, so the
+// `O(log n)` lookup is far below the cost of one GPU dispatch.
+
+/// Borrowed parameter tree (returned by `parameters()`), in key order.
+pub type ModuleParamRef<'a> = std::collections::BTreeMap<std::rc::Rc<str>, NestedValue<&'a Array>>;
 
 /// Mutably borrowed parameter tree (returned by `parameters_mut()`).
 pub type ModuleParamMut<'a> =
-    std::collections::HashMap<std::rc::Rc<str>, NestedValue<&'a mut Array>>;
+    std::collections::BTreeMap<std::rc::Rc<str>, NestedValue<&'a mut Array>>;
 
 /// Owned, flattened parameter map (used by optimizers and `value_and_grad`).
-pub type FlattenedModuleParam = std::collections::HashMap<std::rc::Rc<str>, Array>;
+pub type FlattenedModuleParam = std::collections::BTreeMap<std::rc::Rc<str>, Array>;
 
 // ── Module traits ─────────────────────────────────────────────────────────────
 
@@ -398,18 +408,6 @@ pub fn eval_params(params: ModuleParamRef<'_>) -> Result<(), Exception> {
         walk(v);
     }
     Ok(())
-}
-
-/// The entries of a map in key order.
-///
-/// A `HashMap` iterates in an order that differs from run to run, so a loop
-/// that draws a random value for each entry gives each one a different draw
-/// every time, whatever the seed. Anything that assigns seeded random values
-/// to named parameters (a test's adapters, say) walks them in this order.
-pub fn in_key_order<K: Ord, V>(entries: impl IntoIterator<Item = (K, V)>) -> Vec<(K, V)> {
-    let mut entries: Vec<(K, V)> = entries.into_iter().collect();
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    entries
 }
 
 // ── random sub-module ─────────────────────────────────────────────────────────
@@ -693,7 +691,7 @@ impl From<std::io::Error> for IoError {
 
 /// Flatten a borrowed nested-value tree into an owned FlattenedModuleParam by cloning each Array.
 fn flatten_nested_ref_owned(
-    map: &std::collections::HashMap<std::rc::Rc<str>, NestedValue<&Array>>,
+    map: &std::collections::BTreeMap<std::rc::Rc<str>, NestedValue<&Array>>,
     prefix: &str,
     out: &mut FlattenedModuleParam,
 ) {
@@ -715,9 +713,9 @@ fn flatten_nested_ref_owned(
 }
 
 fn flatten_nested_mut_owned<'a>(
-    map: std::collections::HashMap<std::rc::Rc<str>, NestedValue<&'a mut Array>>,
+    map: std::collections::BTreeMap<std::rc::Rc<str>, NestedValue<&'a mut Array>>,
     prefix: &str,
-    out: &mut std::collections::HashMap<String, &'a mut Array>,
+    out: &mut std::collections::BTreeMap<String, &'a mut Array>,
 ) {
     for (k, v) in map {
         let full: String = if prefix.is_empty() {
@@ -741,7 +739,7 @@ fn flatten_nested_mut_owned<'a>(
 /// Used by `nn::value_and_grad` to inject autograd-tracked parameter arrays
 /// back into the model before invoking the user's loss function.
 pub(crate) fn update_trainable_param(
-    pm: &mut std::collections::HashMap<std::rc::Rc<str>, NestedValue<&mut Array>>,
+    pm: &mut std::collections::BTreeMap<std::rc::Rc<str>, NestedValue<&mut Array>>,
     key: &std::rc::Rc<str>,
     value: Array,
 ) {
@@ -753,7 +751,7 @@ pub(crate) fn update_trainable_param(
 }
 
 fn update_trainable_param_recurse(
-    map: &mut std::collections::HashMap<std::rc::Rc<str>, NestedValue<&mut Array>>,
+    map: &mut std::collections::BTreeMap<std::rc::Rc<str>, NestedValue<&mut Array>>,
     remaining: &str,
     value: Array,
 ) {
@@ -989,7 +987,7 @@ unsafe fn clone_nested_ref_lifetime<'a>(v: NestedValue<&Array>) -> NestedValue<&
     match v {
         NestedValue::Value(r) => NestedValue::Value(unsafe { &*(r as *const Array) }),
         NestedValue::Map(m) => {
-            let mut out = std::collections::HashMap::new();
+            let mut out = std::collections::BTreeMap::new();
             for (k, child) in m {
                 out.insert(k, unsafe { clone_nested_ref_lifetime(child) });
             }
@@ -1003,7 +1001,7 @@ unsafe fn clone_nested_mut_lifetime<'a>(v: NestedValue<&mut Array>) -> NestedVal
     match v {
         NestedValue::Value(r) => NestedValue::Value(unsafe { &mut *(r as *mut Array) }),
         NestedValue::Map(m) => {
-            let mut out = std::collections::HashMap::new();
+            let mut out = std::collections::BTreeMap::new();
             for (k, child) in m {
                 out.insert(k, unsafe { clone_nested_mut_lifetime(child) });
             }

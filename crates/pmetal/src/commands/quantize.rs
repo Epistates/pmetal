@@ -1112,7 +1112,7 @@ mod tests {
         .unwrap();
         // Two shards with an index, the layout of a real download.
         let (first, second) = tensors.split_at(tensors.len() / 2);
-        let mut weight_map = serde_json::Map::new();
+        let mut weight_map = std::collections::BTreeMap::new();
         for (file, part) in [
             ("model-00001-of-00002.safetensors", first),
             ("model-00002-of-00002.safetensors", second),
@@ -1130,7 +1130,7 @@ mod tests {
             let views: Vec<(String, TensorView<'_>)> = bytes
                 .iter()
                 .map(|(name, shape, data)| {
-                    weight_map.insert(name.clone(), serde_json::json!(file));
+                    weight_map.insert(name.clone(), (*file).to_string());
                     (
                         name.clone(),
                         TensorView::new(StDtype::BF16, shape.clone(), data).unwrap(),
@@ -1139,11 +1139,9 @@ mod tests {
                 .collect();
             std::fs::write(dir.join(file), serialize(views, None).unwrap()).unwrap();
         }
-        std::fs::write(
-            dir.join("model.safetensors.index.json"),
-            serde_json::json!({"weight_map": weight_map}).to_string(),
-        )
-        .unwrap();
+        pmetal_core::safetensors_index::ShardIndex::new(weight_map, 0)
+            .write(&dir.join(pmetal_core::safetensors_index::INDEX_FILE))
+            .unwrap();
         tensors
     }
 

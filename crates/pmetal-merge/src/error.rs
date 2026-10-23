@@ -93,5 +93,19 @@ pub enum MergeError {
     },
 }
 
+impl From<pmetal_hub::safetensors_index::IndexError> for MergeError {
+    fn from(e: pmetal_hub::safetensors_index::IndexError) -> Self {
+        use pmetal_hub::safetensors_index::IndexError;
+        match e {
+            IndexError::Io { source, .. } => Self::Io(source),
+            IndexError::Json(e) => Self::Serde(e),
+            IndexError::ShardEscapes(shard) => {
+                Self::InvalidConfig(format!("shard filename '{shard}' contains path traversal"))
+            }
+            IndexError::Malformed(what) => Self::ModelLoad(what),
+        }
+    }
+}
+
 /// Result type for merge operations.
 pub type Result<T> = std::result::Result<T, MergeError>;

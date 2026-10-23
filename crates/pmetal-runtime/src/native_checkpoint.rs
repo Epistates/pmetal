@@ -14,6 +14,7 @@
 //! model from the one the checkpoint holds, which is how an unsupported
 //! feature (attention biases, an indexer) should fail instead.
 
+use crate::{RuntimeError, RuntimeResult};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -41,15 +42,16 @@ impl Checkpoint {
         tag: &'static str,
         model_dir: &Path,
         normalize: impl Fn(&str) -> Option<String>,
-    ) -> Result<Self, String> {
+    ) -> RuntimeResult<Self> {
         let shards = crate::native_loader::discover_safetensors_shards(model_dir)?;
         let mut tensors = HashMap::new();
         for shard in &shards {
-            let path = shard
-                .to_str()
-                .ok_or_else(|| format!("{tag}: non-UTF-8 shard path: {shard:?}"))?;
-            let entries = crate::inline_array::load_safetensors_shard(path)
-                .ok_or_else(|| format!("{tag}: failed to load shard: {path}"))?;
+            let path = shard.to_str().ok_or_else(|| {
+                RuntimeError::Weights(format!("{tag}: non-UTF-8 shard path: {shard:?}"))
+            })?;
+            let entries = crate::inline_array::load_safetensors_shard(path).ok_or_else(|| {
+                RuntimeError::Weights(format!("{tag}: failed to load shard: {path}"))
+            })?;
             for (key, array) in entries {
                 let Some(name) = normalize(&key) else {
                     continue;
@@ -57,12 +59,17 @@ impl Checkpoint {
                 // Two layouts normalising onto one key would resolve silently
                 // in whatever order the shards happened to be read.
                 if tensors.insert(name.clone(), array).is_some() {
-                    return Err(format!("{tag}: two checkpoint keys both read as {name}"));
+                    return Err(RuntimeError::Weights(format!(
+                        "{tag}: two checkpoint keys both read as {name}"
+                    )));
                 }
             }
         }
         if tensors.is_empty() {
-            return Err(format!("{tag}: no weights in {}", model_dir.display()));
+            return Err(RuntimeError::Weights(format!(
+                "{tag}: no weights in {}",
+                model_dir.display()
+            )));
         }
         let quantization = crate::native_loader::load_mlx_quantization(model_dir, &normalize)?;
         let dtype = detect_model_dtype(|key| tensors.get(key).map(|a| a.dtype_raw()));
@@ -102,7 +109,7 @@ impl Checkpoint {
     }
 
     /// Remove and return `key`; its absence names the nearest keys.
-    pub fn take(&mut self, key: &str) -> Result<InlineArray, String> {
+    pub fn take(&mut self, key: &str) -> RuntimeResult<InlineArray> {
         match self.tensors.remove(key) {
             Some(array) => Ok(array),
             None => {
@@ -113,10 +120,10 @@ impl Checkpoint {
                     .take(5)
                     .collect();
                 close.sort_unstable();
-                Err(format!(
+                Err(RuntimeError::Weights(format!(
                     "{}: missing weight key: {key} (close matches: {close:?})",
                     self.tag
-                ))
+                )))
             }
         }
     }
@@ -142,7 +149,7 @@ impl Checkpoint {
     }
 
     /// The linear at `module`, `[in, out]` dense or packed as stored.
-    pub fn linear(&mut self, module: &str) -> Result<LayerWeight, String> {
+    pub fn linear(&mut self, module: &str) -> RuntimeResult<LayerWeight> {
         let weight = self.take(&format!("{module}.weight"))?;
         let scales = self.take_opt(&format!("{module}.scales"));
         let biases = self.take_opt(&format!("{module}.biases"));
@@ -155,7 +162,7 @@ impl Checkpoint {
     }
 
     /// The embedding table at `module`, dense or packed.
-    pub fn embedding(&mut self, module: &str) -> Result<EmbeddingWeight, String> {
+    pub fn embedding(&mut self, module: &str) -> RuntimeResult<EmbeddingWeight> {
         let weight = self.take(&format!("{module}.weight"))?;
         let scales = self.take_opt(&format!("{module}.scales"));
         let biases = self.take_opt(&format!("{module}.biases"));
@@ -170,7 +177,7 @@ impl Checkpoint {
     /// Experts stacked over a leading axis at `module`, stored `[E, out, in]`
     /// like a Linear's weight: `[E, in, out]` when dense (what `gather_mm`
     /// takes), packed as stored otherwise.
-    pub fn stacked(&mut self, module: &str) -> Result<LayerWeight, String> {
+    pub fn stacked(&mut self, module: &str) -> RuntimeResult<LayerWeight> {
         let weight = self.take(&format!("{module}.weight"))?;
         let scales = self.take_opt(&format!("{module}.scales"));
         let biases = self.take_opt(&format!("{module}.biases"));
@@ -205,7 +212,7 @@ impl Checkpoint {
         prefix: &str,
         experts: usize,
         name: &str,
-    ) -> Result<Option<InlineArray>, String> {
+    ) -> RuntimeResult<Option<InlineArray>> {
         if !self.contains(&format!("{prefix}.0.{name}")) {
             return Ok(None);
         }
@@ -213,8 +220,9 @@ impl Checkpoint {
             .map(|e| self.take(&format!("{prefix}.{e}.{name}")))
             .collect::<Result<Vec<_>, _>>()?;
         let stacked = crate::compat::ops::stack_axis(&parts, 0);
-        crate::check_last_error()
-            .map_err(|e| format!("{}: stacking {prefix}.*.{name}: {e}", self.tag))?;
+        crate::check_last_error().map_err(|e| {
+            RuntimeError::Weights(format!("{}: stacking {prefix}.*.{name}: {e}", self.tag))
+        })?;
         Ok(Some(stacked))
     }
 }

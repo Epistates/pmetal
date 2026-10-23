@@ -160,7 +160,7 @@ pub(crate) fn unpack_mlx_quantized(
                 ))
             })?
             .for_tensors(&weight_key, has_biases)
-            .map_err(LoadError::SafeTensors)?;
+            .map_err(|e| LoadError::SafeTensors(e.to_string()))?;
 
         // Both the width *and* the group size can vary per tensor. Unpacking a
         // mixed-precision checkpoint at one model-wide setting produces
@@ -205,7 +205,9 @@ pub(crate) fn dequantize_sidecar_weights(
         weights.get(key).map(|w| w.dtype_raw())
     });
 
-    for (base, weight) in nl::take_modelopt_weights(weights).map_err(LoadError::SafeTensors)? {
+    for (base, weight) in
+        nl::take_modelopt_weights(weights).map_err(|e| LoadError::SafeTensors(e.to_string()))?
+    {
         let dense = weight
             .to_dense(dtype)
             .map_err(|e| LoadError::SafeTensors(format!("{base}.weight: {e}")))?;
@@ -458,7 +460,7 @@ pub(crate) fn take_packed_linears(
         .into_iter()
         .filter_map(|key| weights.remove(&key).map(|value| (key, value)))
         .collect();
-    let taken = take_modelopt_weights(weights).map_err(LoadError::SafeTensors);
+    let taken = take_modelopt_weights(weights).map_err(|e| LoadError::SafeTensors(e.to_string()));
     weights.extend(held);
     for (base, weight) in taken? {
         match weight
@@ -540,7 +542,7 @@ pub(crate) fn take_packed_mlx_linears(
         };
         let params = params
             .for_tensors(&weight_key, has_biases)
-            .map_err(LoadError::SafeTensors)?;
+            .map_err(|e| LoadError::SafeTensors(e.to_string()))?;
         let (Some(weight), Some(scales)) =
             (weights.remove(&weight_key), weights.remove(&scales_key))
         else {

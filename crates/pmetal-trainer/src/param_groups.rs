@@ -3,9 +3,9 @@
 //!
 //! Every training path reads the groups from one [`ParameterGroupConfig`]:
 //! the standard, packed and compiled loops run an optimizer per group
-//! ([`crate::ParamGroupOptimizer`]), and the Metal fused AdamW
-//! ([`crate::MlxMetalOptimizer`]) hands each group's rate and decay to its
-//! kernel. A run therefore trains the same way whichever loop it lands on.
+//! ([`crate::ParamGroupOptimizer`]), whose AdamW updates each parameter in one
+//! fused Metal dispatch at its group's rate and decay. A run therefore trains
+//! the same way whichever loop it lands on.
 //!
 //! | Group | Parameters | Learning rate | Weight decay |
 //! |-------|------------|---------------|--------------|

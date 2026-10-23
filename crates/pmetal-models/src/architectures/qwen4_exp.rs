@@ -392,7 +392,7 @@ impl Qwen4ExpConfig {
     /// `hidden_act`), resolved as for the rest of the Qwen3.5 family.
     pub fn gate_activation(&self) -> Result<GateActivation, Exception> {
         GateActivation::resolve(self.output_gate_type.as_deref(), Some(&self.hidden_act))
-            .map_err(Exception::custom)
+            .map_err(Exception::from)
     }
 
     /// RoPE as the reference resolves it: `rope_scaling` replaces
@@ -1963,9 +1963,10 @@ impl CheckpointFiles {
     fn open(dir: &Path) -> Result<Self, LoadError> {
         let index_path = dir.join("model.safetensors.index.json");
         let key_to_file: HashMap<String, String> = if index_path.exists() {
-            let index: crate::loader::WeightIndex =
-                serde_json::from_str(&std::fs::read_to_string(&index_path)?)?;
-            index.weight_map
+            crate::loader::WeightIndex::read(&index_path)?
+                .weight_map
+                .into_iter()
+                .collect()
         } else {
             let (_, tensors) = read_header(&dir.join("model.safetensors"))?;
             tensors

@@ -455,13 +455,11 @@ fn every_kind_resumes_bit_exactly_through_its_groups() {
             .build()
     };
     let snapshot = |model: &Net| -> Vec<(String, Vec<f32>)> {
-        let mut v: Vec<_> = model
+        model
             .flatten_params()
             .iter()
             .map(|(k, a)| (k.to_string(), values(a)))
-            .collect();
-        v.sort_by(|a, b| a.0.cmp(&b.0));
-        v
+            .collect()
     };
     let steps = |opt: &mut ParamGroupOptimizer, model: &mut Net, n: usize| {
         for _ in 0..n {

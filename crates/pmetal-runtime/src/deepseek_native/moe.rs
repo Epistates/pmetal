@@ -1,6 +1,7 @@
 //! Dense SwiGLU MLP and DeepSeek's routed MoE: the router (V3's `noaux_tc`
 //! and V2's softmax, plain or group-limited) and the routed experts.
 
+use crate::{RuntimeError, RuntimeResult};
 use serde::{Deserialize, Serialize};
 
 use crate::InlineArray;
@@ -115,27 +116,29 @@ impl DeepseekRouting {
     /// exceeds them, groups that do not divide them, or kept groups too small
     /// to hold `top_k` experts. The ops would otherwise return placeholder
     /// arrays rather than fail.
-    pub fn validate(&self, experts: i32) -> Result<(), String> {
+    pub fn validate(&self, experts: i32) -> RuntimeResult<()> {
         let (groups, kept, top_k) = (self.n_group, self.topk_group, self.top_k);
         if experts < 1 || top_k < 1 || top_k > experts {
-            return Err(format!(
+            return Err(RuntimeError::Config(format!(
                 "num_experts_per_tok {top_k} does not fit n_routed_experts {experts}"
-            ));
+            )));
         }
         if self.method != TopkMethod::Greedy {
             if groups < 1 || experts % groups != 0 {
-                return Err(format!(
+                return Err(RuntimeError::Config(format!(
                     "n_routed_experts {experts} does not divide into n_group {groups}"
-                ));
+                )));
             }
             if kept < 1 || kept > groups {
-                return Err(format!("topk_group {kept} is not within n_group {groups}"));
+                return Err(RuntimeError::Config(format!(
+                    "topk_group {kept} is not within n_group {groups}"
+                )));
             }
             if top_k > kept * (experts / groups) {
-                return Err(format!(
+                return Err(RuntimeError::Config(format!(
                     "num_experts_per_tok {top_k} exceeds the {} experts of the {kept} kept groups",
                     kept * (experts / groups)
-                ));
+                )));
             }
         }
         Ok(())

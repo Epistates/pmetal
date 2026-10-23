@@ -1,7 +1,6 @@
 //! The crate's error type and adapter-file IO.
 
 use std::collections::HashMap;
-use std::hash::Hash;
 use std::path::Path;
 
 use pmetal_runtime::compat::{Array, Exception};
@@ -42,13 +41,14 @@ pub fn load_safetensors_map(path: impl AsRef<Path>) -> Result<HashMap<String, Ar
     Ok(entries.into_iter().collect())
 }
 
-/// Save a named array map to a safetensors file.
-pub fn save_safetensors_map<K>(
+/// Save a named array map (a `HashMap` or a `BTreeMap`) to a safetensors file,
+/// the tensors in name order whatever order the map yields.
+pub fn save_safetensors_map<'a, K>(
     path: impl AsRef<Path>,
-    params: &HashMap<K, Array>,
+    params: impl IntoIterator<Item = (&'a K, &'a Array)>,
 ) -> Result<(), LoraError>
 where
-    K: AsRef<str> + Eq + Hash,
+    K: AsRef<str> + 'a,
 {
     let path = path.as_ref();
     let path_str = path.to_str().ok_or_else(|| {
@@ -57,10 +57,11 @@ where
             path.display()
         )))
     })?;
-    let entries: Vec<(&str, &Array)> = params
-        .iter()
+    let mut entries: Vec<(&str, &Array)> = params
+        .into_iter()
         .map(|(key, value)| (key.as_ref(), value))
         .collect();
+    entries.sort_unstable_by_key(|(name, _)| *name);
     Array::save_safetensors(path_str, &entries).map_err(Exception::from)?;
     Ok(())
 }

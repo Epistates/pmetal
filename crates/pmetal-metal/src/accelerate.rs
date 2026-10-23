@@ -750,33 +750,6 @@ pub fn softmax_inplace(data: &mut [f32], dim: usize, seq: usize) {
     }
 }
 
-/// One AdamW step over a parameter on the CPU, as `torch.optim.AdamW`
-/// computes it (see [`AdamWScalars`] for the update).
-///
-/// [`AdamWScalars`]: crate::kernels::AdamWScalars
-pub fn adamw_update(
-    w: &mut [f32],
-    g: &[f32],
-    m: &mut [f32],
-    v: &mut [f32],
-    s: &crate::kernels::AdamWScalars,
-) {
-    let n = w.len();
-    assert_eq!(n, g.len(), "gradient length");
-    assert_eq!(n, m.len(), "first moment length");
-    assert_eq!(n, v.len(), "second moment length");
-
-    for i in 0..n {
-        let gi = g[i];
-        let mi = m[i] + s.one_minus_beta1 * (gi - m[i]);
-        let vi = s.beta2 * v[i] + s.one_minus_beta2 * gi * gi;
-        m[i] = mi;
-        v[i] = vi;
-        let denom = vi.sqrt() / s.bias_correction2_sqrt + s.epsilon;
-        w[i] = w[i] * s.decay - s.step_size * (mi / denom);
-    }
-}
-
 /// SiLU activation in-place: `x[i] = x[i] * sigmoid(x[i])`.
 ///
 /// Uses vDSP for vectorized exp computation on macOS.
@@ -1056,30 +1029,6 @@ mod tests {
             (loss - expected_loss).abs() < 1e-4,
             "loss: {loss} vs {expected_loss}"
         );
-    }
-
-    #[test]
-    fn adamw_first_step_moves_each_weight_by_the_learning_rate() {
-        // m̂/√v̂ = g/|g| on the first step, so each weight moves by lr after
-        // its decay: p·(1 − lr·λ) − lr·sign(g).
-        let mut w = vec![1.0f32, 2.0, 3.0];
-        let g = vec![0.1, -0.2, 0.3];
-        let mut m = vec![0.0f32; 3];
-        let mut v = vec![0.0f32; 3];
-        let config = crate::kernels::AdamWConfig {
-            learning_rate: 0.001,
-            weight_decay: 0.1,
-            step: 1,
-            ..Default::default()
-        };
-        adamw_update(&mut w, &g, &mut m, &mut v, &config.scalars().unwrap());
-        let decay = 1.0 - 0.001 * 0.1;
-        for (got, want) in w
-            .iter()
-            .zip([decay - 0.001, 2.0 * decay + 0.001, 3.0 * decay - 0.001])
-        {
-            assert!((got - want).abs() < 1e-6, "{w:?}");
-        }
     }
 
     #[test]

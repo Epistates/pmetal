@@ -25,6 +25,7 @@
 //! "Reach" is one past the largest position a forward rotates, transformers'
 //! `max(position_ids) + 1`; only `dynamic` and `longrope` depend on it.
 
+use crate::{RuntimeError, RuntimeResult};
 use serde_json::{Map, Value};
 
 use crate::compat::{Array, Dtype, ops};
@@ -187,14 +188,16 @@ impl RopeScaling {
     pub fn from_params(
         params: Option<&Map<String, Value>>,
         config: &RopeConfig<'_>,
-    ) -> Result<Self, String> {
+    ) -> RuntimeResult<Self> {
         let Some(p) = params else {
             return Ok(Self::Default);
         };
         let rope_type = rope_type_of(p)?;
         let num = |key: &str| p.get(key).filter(|v| !v.is_null()).and_then(Value::as_f64);
         let required = |key: &str| {
-            num(key).ok_or_else(|| format!("rope_type {rope_type:?} needs a numeric `{key}`"))
+            num(key).ok_or_else(|| {
+                RuntimeError::Config(format!("rope_type {rope_type:?} needs a numeric `{key}`"))
+            })
         };
         let original = || {
             config
@@ -202,16 +205,18 @@ impl RopeScaling {
                 .or_else(|| num("original_max_position_embeddings"))
                 .or(config.max_position_embeddings)
                 .ok_or_else(|| {
-                    format!("rope_type {rope_type:?} needs `original_max_position_embeddings`")
+                    RuntimeError::Config(format!(
+                        "rope_type {rope_type:?} needs `original_max_position_embeddings`"
+                    ))
                 })
         };
         let at_least_one = |what: &str, factor: f64| {
             if factor.is_finite() && factor >= 1.0 {
                 Ok(factor)
             } else {
-                Err(format!(
+                Err(RuntimeError::Config(format!(
                     "rope_type {rope_type:?}: {what} {factor} must be at least 1"
-                ))
+                )))
             }
         };
         Ok(match rope_type.as_str() {
@@ -222,9 +227,12 @@ impl RopeScaling {
             },
             "dynamic" => Self::Dynamic {
                 factor: at_least_one("factor", required("factor")?)?,
-                max_position_embeddings: config
-                    .max_position_embeddings
-                    .ok_or("rope_type \"dynamic\" needs the config's `max_position_embeddings`")?,
+                max_position_embeddings: config.max_position_embeddings.ok_or_else(|| {
+                    RuntimeError::Config(
+                        "rope_type \"dynamic\" needs the config's `max_position_embeddings`"
+                            .to_string(),
+                    )
+                })?,
             },
             "yarn" => {
                 let original = original()?;
@@ -233,10 +241,9 @@ impl RopeScaling {
                 let factor = match num("factor") {
                     Some(f) => f,
                     None => {
-                        config
-                            .max_position_embeddings
-                            .ok_or("rope_type \"yarn\" needs a `factor`")?
-                            / original
+                        config.max_position_embeddings.ok_or_else(|| {
+                            RuntimeError::Config("rope_type \"yarn\" needs a `factor`".to_string())
+                        })? / original
                     }
                 };
                 let factor = at_least_one("factor", factor)?;
@@ -264,12 +271,14 @@ impl RopeScaling {
                 })
             }
             "longrope" | "su" => {
-                let factors = |key: &str| -> Result<Vec<f64>, String> {
+                let factors = |key: &str| -> RuntimeResult<Vec<f64>> {
                     p.get(key)
                         .and_then(Value::as_array)
                         .and_then(|a| a.iter().map(Value::as_f64).collect::<Option<Vec<_>>>())
                         .ok_or_else(|| {
-                            format!("rope_type \"longrope\" needs `{key}`, a list of numbers")
+                            RuntimeError::Config(format!(
+                                "rope_type \"longrope\" needs `{key}`, a list of numbers"
+                            ))
                         })
                 };
                 let original = original()?;
@@ -303,24 +312,29 @@ impl RopeScaling {
                     .get("factors")
                     .and_then(Value::as_array)
                     .and_then(|a| a.iter().map(Value::as_f64).collect::<Option<Vec<_>>>())
-                    .ok_or("rope_type \"frequency_factors\" needs `factors`, a list of numbers")?;
+                    .ok_or_else(|| {
+                        RuntimeError::Config(
+                            "rope_type \"frequency_factors\" needs `factors`, a list of numbers"
+                                .to_string(),
+                        )
+                    })?;
                 if let Some(bad) = factors.iter().find(|f| !(f.is_finite() && **f > 0.0)) {
-                    return Err(format!(
+                    return Err(RuntimeError::Config(format!(
                         "rope_type \"frequency_factors\": factor {bad} must be positive"
-                    ));
+                    )));
                 }
                 Self::FrequencyFactors { factors }
             }
             other => {
-                return Err(format!(
+                return Err(RuntimeError::Config(format!(
                     "rope_type {other:?} is not supported; supported: {SUPPORTED_ROPE_TYPES}"
-                ));
+                )));
             }
         })
     }
 }
 
-fn rope_type_of(p: &Map<String, Value>) -> Result<String, String> {
+fn rope_type_of(p: &Map<String, Value>) -> RuntimeResult<String> {
     match p
         .get("rope_type")
         .filter(|v| !v.is_null())
@@ -328,7 +342,9 @@ fn rope_type_of(p: &Map<String, Value>) -> Result<String, String> {
     {
         None | Some(Value::Null) => Ok("default".to_string()),
         Some(Value::String(s)) => Ok(s.clone()),
-        Some(other) => Err(format!("rope_type must be a string, got {other}")),
+        Some(other) => Err(RuntimeError::Config(format!(
+            "rope_type must be a string, got {other}"
+        ))),
     }
 }
 
@@ -370,11 +386,13 @@ impl<'a> RopeConfig<'a> {
 
     /// The rope dict in force: a non-empty `rope_scaling` wins over
     /// `rope_parameters`, as in transformers' `convert_rope_params_to_dict`.
-    pub fn params(&self) -> Result<Option<&'a Map<String, Value>>, String> {
+    pub fn params(&self) -> RuntimeResult<Option<&'a Map<String, Value>>> {
         let object = |name: &str, v: Option<&'a Value>| match v {
             None | Some(Value::Null) => Ok(None),
             Some(Value::Object(m)) => Ok(Some(m)),
-            Some(other) => Err(format!("{name} must be an object, got {other}")),
+            Some(other) => Err(RuntimeError::Config(format!(
+                "{name} must be an object, got {other}"
+            ))),
         };
         let scaling = object("rope_scaling", self.rope_scaling)?.filter(|m| !m.is_empty());
         match scaling {
@@ -443,7 +461,7 @@ impl Rotary {
         config: RopeConfig<'_>,
         default_theta: f64,
         default_partial_rotary_factor: f64,
-    ) -> Result<Self, String> {
+    ) -> RuntimeResult<Self> {
         let params = config.params()?;
         let num = |key: &str| {
             params
@@ -458,10 +476,14 @@ impl Rotary {
             .or(config.partial_rotary_factor)
             .unwrap_or(default_partial_rotary_factor);
         if !(theta.is_finite() && theta > 0.0) {
-            return Err(format!("rope_theta {theta} must be positive"));
+            return Err(RuntimeError::Config(format!(
+                "rope_theta {theta} must be positive"
+            )));
         }
         if !(partial > 0.0 && partial <= 1.0) {
-            return Err(format!("partial_rotary_factor {partial} is outside (0, 1]"));
+            return Err(RuntimeError::Config(format!(
+                "partial_rotary_factor {partial} is outside (0, 1]"
+            )));
         }
         let rotary = Self::new(
             head_dim,
@@ -474,22 +496,22 @@ impl Rotary {
     }
 
     /// Check the shape the frequencies need.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> RuntimeResult<()> {
         if self.dims < 2 || self.dims % 2 != 0 || self.dims > self.head_dim {
-            return Err(format!(
+            return Err(RuntimeError::Config(format!(
                 "head_dim {} x partial_rotary_factor {} = {} rotary dims; expected a positive \
-                 even number no larger than the head",
+             even number no larger than the head",
                 self.head_dim, self.partial_rotary_factor, self.dims
-            ));
+            )));
         }
         if let RopeScaling::FrequencyFactors { factors } = &self.scaling {
             let half = (self.dims / 2) as usize;
             if factors.len() != half {
-                return Err(format!(
+                return Err(RuntimeError::Config(format!(
                     "frequency_factors has {} entries; {} rotary dims need {half}",
                     factors.len(),
                     self.dims
-                ));
+                )));
             }
         }
         if let RopeScaling::LongRope(l) = &self.scaling {
@@ -499,11 +521,11 @@ impl Rotary {
                 ("long_factor", &l.long_factor),
             ] {
                 if f.len() != half {
-                    return Err(format!(
+                    return Err(RuntimeError::Config(format!(
                         "longrope {name} has {} entries; {} rotary dims need {half}",
                         f.len(),
                         self.dims
-                    ));
+                    )));
                 }
             }
         }
@@ -781,7 +803,7 @@ impl RotaryEmbedding {
         default_theta: f64,
         default_partial_rotary_factor: f64,
         traditional: bool,
-    ) -> Result<Self, String> {
+    ) -> RuntimeResult<Self> {
         Rotary::from_config(
             head_dim,
             config,

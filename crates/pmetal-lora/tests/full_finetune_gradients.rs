@@ -13,7 +13,8 @@
 
 mod common;
 
-use std::collections::{BTreeMap, HashMap};
+use pmetal_runtime::compat::FlattenedModuleParam;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use common::{SEQ_LEN, cases, input_ids, train_step};
@@ -64,13 +65,12 @@ fn gradients(
     weights: &Array,
 ) -> (f32, BTreeMap<String, Array>) {
     let live = model.lora_parameters();
-    let mut names: Vec<Rc<str>> = live.keys().cloned().collect();
-    names.sort();
+    let names: Vec<Rc<str>> = live.keys().cloned().collect();
     let params: Vec<Array> = names.iter().map(|n| live[n].clone()).collect();
     let (loss, grads) = with_training_mode(|| {
         let (loss, grads) = value_and_grad(
             |arrays| {
-                let restored: HashMap<Rc<str>, Array> =
+                let restored: FlattenedModuleParam =
                     names.iter().cloned().zip(arrays.iter().cloned()).collect();
                 model.set_lora_parameters(&restored);
                 loss_of(&model.forward(ids, None).unwrap(), weights)

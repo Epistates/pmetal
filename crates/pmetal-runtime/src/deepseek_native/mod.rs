@@ -22,6 +22,7 @@
 //!   * `moe` — dense SwiGLU MLP + the router and routed experts
 //!   * `forward` — full-model forward + prefill/prime/generate wrappers
 
+use crate::{RuntimeError, RuntimeResult};
 use serde::Deserialize;
 
 mod attention;
@@ -179,7 +180,7 @@ impl DeepSeekConfig {
     /// The interleaved rotary embedding of the `qk_rope_head_dim` channels,
     /// YaRN as `rope_scaling` gives it (frequencies and attention factor); an
     /// unknown `rope_type` is an error naming it.
-    pub fn rotary(&self) -> Result<crate::rope::RotaryEmbedding, String> {
+    pub fn rotary(&self) -> RuntimeResult<crate::rope::RotaryEmbedding> {
         crate::rope::RotaryEmbedding::from_config(
             self.qk_rope_head_dim,
             crate::rope::RopeConfig {
@@ -192,7 +193,7 @@ impl DeepSeekConfig {
             1.0,
             self.rope_interleave,
         )
-        .map_err(|e| format!("deepseek config: {e}"))
+        .map_err(|e| RuntimeError::Config(format!("deepseek config: {e}")))
     }
 
     /// Softmax scale — applied to Q before computing scores: `q_head_dim^-½`
@@ -234,8 +235,8 @@ impl DeepSeekConfig {
     }
 
     /// Refuse a config this engine would run as a different model.
-    pub fn validate(&self) -> Result<(), String> {
-        let bad = |what: String| Err(format!("deepseek config: {what}"));
+    pub fn validate(&self) -> RuntimeResult<()> {
+        let bad = |what: String| Err(RuntimeError::Config(format!("deepseek config: {what}")));
         if self.index_topk.is_some() {
             return bad(
                 "`index_topk` marks DeepSeek-V3.2's sparse-attention indexer, which \
@@ -267,15 +268,15 @@ impl DeepSeekConfig {
             norm_topk_prob: self.norm_topk_prob,
         }
         .validate(experts)
-        .map_err(|e| format!("deepseek config: {e}"))
+        .map_err(|e| RuntimeError::Config(format!("deepseek config: {e}")))
     }
 }
 
 /// Parse and check `config.json` from a model directory.
-pub fn load_config(model_dir: &std::path::Path) -> Result<DeepSeekConfig, String> {
+pub fn load_config(model_dir: &std::path::Path) -> RuntimeResult<DeepSeekConfig> {
     let text = crate::native_loader::read_config_json(model_dir)?;
-    let cfg: DeepSeekConfig =
-        serde_json::from_str(&text).map_err(|e| format!("failed to parse config.json: {e}"))?;
+    let cfg: DeepSeekConfig = serde_json::from_str(&text)
+        .map_err(|e| RuntimeError::Config(format!("failed to parse config.json: {e}")))?;
     cfg.validate()?;
     Ok(cfg)
 }
@@ -401,31 +402,37 @@ mod tests {
         assert!(
             with(serde_json::json!({"index_topk": 2048}))
                 .unwrap_err()
+                .to_string()
                 .contains("index_topk")
         );
         assert!(
             with(serde_json::json!({"attention_bias": true}))
                 .unwrap_err()
+                .to_string()
                 .contains("attention_bias")
         );
         assert!(
             with(serde_json::json!({"hidden_act": "gelu"}))
                 .unwrap_err()
+                .to_string()
                 .contains("gelu")
         );
         assert!(
             with(serde_json::json!({"n_group": 3}))
                 .unwrap_err()
+                .to_string()
                 .contains("n_group")
         );
         assert!(
             with(serde_json::json!({"topk_group": 5}))
                 .unwrap_err()
+                .to_string()
                 .contains("topk_group")
         );
         assert!(
             with(serde_json::json!({"num_experts_per_tok": 5}))
                 .unwrap_err()
+                .to_string()
                 .contains("kept groups")
         );
     }

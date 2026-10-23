@@ -116,7 +116,8 @@ pub fn load_native_runtime_info(model_path: &Path) -> Result<Option<NativeRuntim
 
     let info = match arch {
         NativeArch::Qwen3 | NativeArch::Qwen3_5 => {
-            let config = pmetal_runtime::qwen3_native::load_config(model_path)?;
+            let config =
+                pmetal_runtime::qwen3_native::load_config(model_path).map_err(|e| e.to_string())?;
             NativeRuntimeInfo {
                 arch,
                 num_layers: config.num_hidden_layers as usize,
@@ -127,7 +128,8 @@ pub fn load_native_runtime_info(model_path: &Path) -> Result<Option<NativeRuntim
             }
         }
         NativeArch::Llama4 => {
-            let config = pmetal_runtime::llama4_native::load_config(model_path)?;
+            let config = pmetal_runtime::llama4_native::load_config(model_path)
+                .map_err(|e| e.to_string())?;
             NativeRuntimeInfo {
                 arch,
                 num_layers: config.text().num_hidden_layers as usize,
@@ -138,7 +140,8 @@ pub fn load_native_runtime_info(model_path: &Path) -> Result<Option<NativeRuntim
             }
         }
         NativeArch::DeepSeek => {
-            let config = pmetal_runtime::deepseek_native::load_config(model_path)?;
+            let config = pmetal_runtime::deepseek_native::load_config(model_path)
+                .map_err(|e| e.to_string())?;
             NativeRuntimeInfo {
                 arch,
                 num_layers: config.num_hidden_layers as usize,
@@ -149,7 +152,8 @@ pub fn load_native_runtime_info(model_path: &Path) -> Result<Option<NativeRuntim
             }
         }
         NativeArch::GptOss => {
-            let config = pmetal_runtime::gpt_oss_native::load_config(model_path)?;
+            let config = pmetal_runtime::gpt_oss_native::load_config(model_path)
+                .map_err(|e| e.to_string())?;
             NativeRuntimeInfo {
                 arch,
                 num_layers: config.num_hidden_layers as usize,
@@ -161,7 +165,8 @@ pub fn load_native_runtime_info(model_path: &Path) -> Result<Option<NativeRuntim
             }
         }
         NativeArch::Gemma4 => {
-            let config = pmetal_runtime::gemma4_native::load_config(model_path)?;
+            let config = pmetal_runtime::gemma4_native::load_config(model_path)
+                .map_err(|e| e.to_string())?;
             // Use the full-attention KV-head count since it's the smaller of
             // the two per-layer-type dimensions — callers only use this to
             // estimate KV-cache memory budgets.
@@ -561,7 +566,7 @@ pub fn run_native_multimodal_inference_ext(
         images.len(),
         videos.len()
     );
-    let config = qwen3_native::load_config(model_path)?;
+    let config = qwen3_native::load_config(model_path).map_err(|e| e.to_string())?;
     let tables = config.mrope_tables(&encoded.positions.array());
     let prompt_ids = input_ids.to_vec();
     run_qwen3(
@@ -648,9 +653,9 @@ fn run_bridge_inference<Config, Weights, Cache>(
     max_tokens: usize,
     params: pmetal_runtime::decode::SamplingParams,
     on_token: &mut dyn FnMut(u32) -> bool,
-    load_config: impl Fn(&Path) -> Result<Config, String>,
+    load_config: impl Fn(&Path) -> Result<Config, pmetal_runtime::RuntimeError>,
     describe_config: impl Fn(&Config) -> String,
-    load_model: impl Fn(&Path, &Config) -> Result<Weights, String>,
+    load_model: impl Fn(&Path, &Config) -> Result<Weights, pmetal_runtime::RuntimeError>,
     build_cache: impl Fn(&Weights, &Config) -> Cache,
     prefill_first_token: impl Fn(
         &Weights,
@@ -668,11 +673,11 @@ fn run_bridge_inference<Config, Weights, Cache>(
         &mut dyn FnMut(u32) -> bool,
     ) -> (Vec<u32>, Option<pmetal_runtime::decode::DecodeMetrics>),
 ) -> Result<NativeGenerationOutput, String> {
-    let config = load_config(model_path)?;
+    let config = load_config(model_path).map_err(|e| e.to_string())?;
     tracing::debug!("{}", describe_config(&config));
 
     let t0 = std::time::Instant::now();
-    let weights = load_model(model_path, &config)?;
+    let weights = load_model(model_path, &config).map_err(|e| e.to_string())?;
     tracing::info!(
         elapsed_s = format!("{:.1}", t0.elapsed().as_secs_f64()),
         active_mb = format!(
@@ -901,8 +906,9 @@ pub fn benchmark_native(
     let trials = {
         match arch {
             NativeArch::Qwen3 | NativeArch::Qwen3_5 => {
-                let config = qwen3_native::load_config(model_path)?;
-                let weights = qwen3_native::load_model(model_path, &config)?;
+                let config = qwen3_native::load_config(model_path).map_err(|e| e.to_string())?;
+                let weights =
+                    qwen3_native::load_model(model_path, &config).map_err(|e| e.to_string())?;
                 run_benchmark_trials(prompt_ids.len(), generation_tokens, num_trials, || {
                     qwen3_native::benchmark_trial(
                         &weights,
@@ -914,24 +920,27 @@ pub fn benchmark_native(
             }
             NativeArch::Llama4 => {
                 use pmetal_runtime::llama4_native;
-                let config = llama4_native::load_config(model_path)?;
-                let weights = llama4_native::load_model(model_path, &config)?;
+                let config = llama4_native::load_config(model_path).map_err(|e| e.to_string())?;
+                let weights =
+                    llama4_native::load_model(model_path, &config).map_err(|e| e.to_string())?;
                 run_benchmark_trials(prompt_ids.len(), generation_tokens, num_trials, || {
                     llama4_native::benchmark_trial(&weights, prompt_ids, generation_tokens)
                 })
             }
             NativeArch::DeepSeek => {
                 use pmetal_runtime::deepseek_native;
-                let config = deepseek_native::load_config(model_path)?;
-                let weights = deepseek_native::load_model(model_path, &config)?;
+                let config = deepseek_native::load_config(model_path).map_err(|e| e.to_string())?;
+                let weights =
+                    deepseek_native::load_model(model_path, &config).map_err(|e| e.to_string())?;
                 run_benchmark_trials(prompt_ids.len(), generation_tokens, num_trials, || {
                     deepseek_native::benchmark_trial(&weights, prompt_ids, generation_tokens)
                 })
             }
             NativeArch::GptOss => {
                 use pmetal_runtime::gpt_oss_native;
-                let config = gpt_oss_native::load_config(model_path)?;
-                let weights = gpt_oss_native::load_model(model_path, &config)?;
+                let config = gpt_oss_native::load_config(model_path).map_err(|e| e.to_string())?;
+                let weights =
+                    gpt_oss_native::load_model(model_path, &config).map_err(|e| e.to_string())?;
                 run_benchmark_trials(prompt_ids.len(), generation_tokens, num_trials, || {
                     gpt_oss_native::benchmark_trial(&weights, prompt_ids, generation_tokens)
                 })

@@ -18,6 +18,7 @@ use crate::InlineArray;
 use crate::dtype;
 use crate::native_checkpoint::Checkpoint;
 use crate::native_weight::{EmbeddingWeight, LayerWeight, copy_fresh_arr};
+use crate::{RuntimeError, RuntimeResult};
 
 use super::DeepSeekConfig;
 use super::moe::{DeepseekRouting, Router};
@@ -145,7 +146,7 @@ fn trunk_key(key: &str, n_layers: usize) -> Option<String> {
 
 /// Dequantize every FP8 (E4M3) weight that has a `{weight}_scale_inv` beside
 /// it, block-wise, to the model dtype.
-fn dequantize_fp8(ckpt: &mut Checkpoint, dtype: i32) -> Result<(), String> {
+fn dequantize_fp8(ckpt: &mut Checkpoint, dtype: i32) -> RuntimeResult<()> {
     let scale_keys: Vec<String> = ckpt
         .keys()
         .filter(|k| k.ends_with("_scale_inv"))
@@ -160,7 +161,7 @@ fn dequantize_fp8(ckpt: &mut Checkpoint, dtype: i32) -> Result<(), String> {
         };
         let dense =
             crate::native_loader::dequantize_fp8_e4m3_scaled_weight(&weight, &scale_inv, dtype)
-                .map_err(|e| format!("deepseek: {weight_key}: {e}"))?;
+                .map_err(|e| RuntimeError::Weights(format!("deepseek: {weight_key}: {e}")))?;
         ckpt.put(weight_key, dense);
     }
     Ok(())
@@ -172,7 +173,7 @@ fn load_experts(
     ckpt: &mut Checkpoint,
     mlp: &str,
     config: &DeepSeekConfig,
-) -> Result<(LayerWeight, LayerWeight, LayerWeight), String> {
+) -> RuntimeResult<(LayerWeight, LayerWeight, LayerWeight)> {
     let experts = config.n_routed_experts.unwrap_or(0) as usize;
     let module = |proj: &str| format!("{mlp}.switch_mlp.{proj}");
 
@@ -200,15 +201,15 @@ fn load_experts(
     }
 
     // The releases': one module per expert, stacked here.
-    let mut stacked = |proj: &str| -> Result<LayerWeight, String> {
+    let mut stacked = |proj: &str| -> RuntimeResult<LayerWeight> {
         let prefix = format!("{mlp}.experts");
         let part = |ckpt: &mut Checkpoint, what: &str| {
             ckpt.stack_experts(&prefix, experts, &format!("{proj}.{what}"))
         };
         let weight = part(ckpt, "weight")?.ok_or_else(|| {
-            format!(
+            RuntimeError::Weights(format!(
                 "deepseek: no routed experts under {prefix} (expected {prefix}.0.{proj}.weight)"
-            )
+            ))
         })?;
         let (scales, biases) = (part(ckpt, "scales")?, part(ckpt, "biases")?);
         Ok(ckpt.stacked_from(&module(proj), weight, scales, biases))
@@ -220,7 +221,7 @@ fn load_experts(
     ))
 }
 
-fn load_mlp(ckpt: &mut Checkpoint, prefix: &str) -> Result<Mlp, String> {
+fn load_mlp(ckpt: &mut Checkpoint, prefix: &str) -> RuntimeResult<Mlp> {
     Ok(Mlp {
         gate: ckpt.linear(&format!("{prefix}.gate_proj"))?,
         up: ckpt.linear(&format!("{prefix}.up_proj"))?,
@@ -230,7 +231,7 @@ fn load_mlp(ckpt: &mut Checkpoint, prefix: &str) -> Result<Mlp, String> {
 
 /// The router's gate as `[hidden, experts]` `f32`, dequantized if packed
 /// (MLX conversions quantize it at 8 bits).
-fn load_gate(ckpt: &mut Checkpoint, module: &str) -> Result<InlineArray, String> {
+fn load_gate(ckpt: &mut Checkpoint, module: &str) -> RuntimeResult<InlineArray> {
     let weight = ckpt.take(&format!("{module}.weight"))?;
     let scales = ckpt.take_opt(&format!("{module}.scales"));
     let biases = ckpt.take_opt(&format!("{module}.biases"));
@@ -251,7 +252,7 @@ fn load_kv_b(
     sa: &str,
     config: &DeepSeekConfig,
     model_dtype: i32,
-) -> Result<(InlineArray, InlineArray), String> {
+) -> RuntimeResult<(InlineArray, InlineArray)> {
     let module = format!("{sa}.kv_b_proj");
     let weight = ckpt.take(&format!("{module}.weight"))?;
     let scales = ckpt.take_opt(&format!("{module}.scales"));
@@ -281,7 +282,7 @@ fn load_kv_b(
 pub fn load_model(
     model_dir: &std::path::Path,
     config: &DeepSeekConfig,
-) -> Result<NativeWeights, String> {
+) -> RuntimeResult<NativeWeights> {
     config.validate()?;
     let n_layers = config.num_hidden_layers as usize;
     let mut ckpt = Checkpoint::open("deepseek", model_dir, |key| trunk_key(key, n_layers))?;
@@ -323,10 +324,10 @@ pub fn load_model(
             let method = config.topk();
             let bias = ckpt.take_opt(&format!("{mlp}.gate.e_score_correction_bias"));
             if bias.is_none() && method == super::TopkMethod::NoauxTc {
-                return Err(format!(
+                return Err(RuntimeError::Weights(format!(
                     "deepseek: missing weight key: {mlp}.gate.e_score_correction_bias \
-                     (topk_method noaux_tc needs it)"
-                ));
+                 (topk_method noaux_tc needs it)"
+                )));
             }
             let shared = if config.n_shared_experts.unwrap_or(0) > 0 {
                 Some(load_mlp(&mut ckpt, &format!("{mlp}.shared_experts"))?)
@@ -386,12 +387,12 @@ pub fn load_model(
         .filter(|k| k.starts_with("model.layers."))
         .collect();
     if !unread.is_empty() {
-        return Err(format!(
+        return Err(RuntimeError::Weights(format!(
             "deepseek: {} checkpoint tensors in the trunk are not part of the model this \
-             engine runs, first: {:?}",
+         engine runs, first: {:?}",
             unread.len(),
             &unread[..unread.len().min(5)]
-        ));
+        )));
     }
 
     // Force every weight into a fresh Metal buffer (the splits above are
@@ -408,9 +409,9 @@ pub fn load_model(
         lw.make_fresh(&zero);
     }
     crate::check_unobserved_error()
-        .map_err(|e| format!("deepseek: loading the weights failed: {e}"))?;
+        .map_err(|e| RuntimeError::Weights(format!("deepseek: loading the weights failed: {e}")))?;
 
-    eprintln!(
+    tracing::info!(
         "[DEEPSEEK] load_model: {} layers ({} routed experts), dtype={}",
         layers.len(),
         n_routed,

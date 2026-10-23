@@ -17,6 +17,7 @@
 use crate::InlineArray;
 use crate::native_checkpoint::Checkpoint;
 use crate::native_weight::{EmbeddingWeight, LayerWeight, copy_fresh_arr};
+use crate::{RuntimeError, RuntimeResult};
 
 use super::Llama4Config;
 
@@ -163,7 +164,7 @@ fn text_key(key: &str) -> Option<String> {
     Some(key.to_string())
 }
 
-fn load_mlp(ckpt: &mut Checkpoint, prefix: &str) -> Result<Mlp, String> {
+fn load_mlp(ckpt: &mut Checkpoint, prefix: &str) -> RuntimeResult<Mlp> {
     Ok(Mlp {
         gate: ckpt.linear(&format!("{prefix}.gate_proj"))?,
         up: ckpt.linear(&format!("{prefix}.up_proj"))?,
@@ -177,7 +178,7 @@ fn load_experts(
     ckpt: &mut Checkpoint,
     ff: &str,
     expert_hidden: i32,
-) -> Result<(LayerWeight, LayerWeight, LayerWeight), String> {
+) -> RuntimeResult<(LayerWeight, LayerWeight, LayerWeight)> {
     let experts = format!("{ff}.experts");
     // Already `[E, in, out]`: no transpose, and gate comes first.
     if let Some(gate_up) = ckpt.take_opt(&format!("{experts}.gate_up_proj")) {
@@ -202,7 +203,7 @@ fn load_experts(
 pub fn load_model(
     model_dir: &std::path::Path,
     config: &Llama4Config,
-) -> Result<NativeWeights, String> {
+) -> RuntimeResult<NativeWeights> {
     let tc = config.text();
     let mut ckpt = Checkpoint::open("llama4", model_dir, text_key)?;
     let model_dtype = ckpt.dtype();
@@ -282,12 +283,12 @@ pub fn load_model(
         .filter(|k| k.starts_with("model.layers."))
         .collect();
     if !unread.is_empty() {
-        return Err(format!(
+        return Err(RuntimeError::Weights(format!(
             "llama4: {} checkpoint tensors in the text layers are not part of the model this \
-             engine runs, first: {:?}",
+         engine runs, first: {:?}",
             unread.len(),
             &unread[..unread.len().min(5)]
-        ));
+        )));
     }
 
     // Force every weight into a fresh Metal buffer (the expert split above is
@@ -337,9 +338,9 @@ pub fn load_model(
         }
     }
     crate::check_unobserved_error()
-        .map_err(|e| format!("llama4: loading the weights failed: {e}"))?;
+        .map_err(|e| RuntimeError::Weights(format!("llama4: loading the weights failed: {e}")))?;
 
-    eprintln!(
+    tracing::info!(
         "[LLAMA4_NATIVE] load_model: {} layers, dtype={}, chunk_size={}",
         layers.len(),
         model_dtype,

@@ -56,17 +56,21 @@ fn sanitize_gdn_chunk_size(chunk_size: i32) -> i32 {
 }
 
 /// The chunk size the environment asks for, else the default for a sequence
-/// of `seq_len` tokens.
+/// of `seq_len` tokens. The environment is read once: this runs for every
+/// layer of every forward pass.
 fn configured_gdn_chunk_size(seq_len: i32) -> i32 {
-    std::env::var(GDN_CHUNK_SIZE_ENV_VAR)
-        .ok()
-        .and_then(|value| value.parse::<i32>().ok())
-        .map(sanitize_gdn_chunk_size)
-        .unwrap_or(if seq_len >= LONG_SEQUENCE {
-            LONG_SEQUENCE_CHUNK_SIZE
-        } else {
-            DEFAULT_GDN_CHUNK_SIZE
-        })
+    static FROM_ENV: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
+    (*FROM_ENV.get_or_init(|| {
+        std::env::var(GDN_CHUNK_SIZE_ENV_VAR)
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .map(sanitize_gdn_chunk_size)
+    }))
+    .unwrap_or(if seq_len >= LONG_SEQUENCE {
+        LONG_SEQUENCE_CHUNK_SIZE
+    } else {
+        DEFAULT_GDN_CHUNK_SIZE
+    })
 }
 
 fn resolve_chunk_size_override(chunk_size_override: Option<i32>, seq_len: i32) -> Option<i32> {

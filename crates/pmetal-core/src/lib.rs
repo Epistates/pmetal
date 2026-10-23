@@ -20,6 +20,7 @@
 // for crates that consume their own derive macro.
 extern crate self as pmetal_core;
 
+pub mod adamw;
 mod config;
 mod config_file;
 pub mod constants;
@@ -32,6 +33,7 @@ pub mod jobs;
 pub mod logging;
 pub mod model_type;
 pub mod paths;
+pub mod safetensors_index;
 pub mod scheduler;
 mod secrets;
 pub mod sync;

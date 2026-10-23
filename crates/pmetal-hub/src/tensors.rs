@@ -56,18 +56,7 @@ impl SafetensorsSummary {
     }
 }
 
-/// Bits per element of a safetensors dtype name.
-pub fn dtype_bits(dtype: &str) -> Option<u64> {
-    Some(match dtype {
-        "F64" | "I64" | "U64" | "C64" => 64,
-        "F32" | "I32" | "U32" => 32,
-        "F16" | "BF16" | "I16" | "U16" => 16,
-        "I8" | "U8" | "BOOL" | "F8_E4M3" | "F8_E5M2" | "F8_E8M0" => 8,
-        "F6_E2M3" | "F6_E3M2" => 6,
-        "F4" => 4,
-        _ => return None,
-    })
-}
+pub use pmetal_core::safetensors_index::dtype_bits;
 
 fn bad(path: &Path, what: impl std::fmt::Display) -> PMetalError {
     PMetalError::Hub(format!("{}: {what}", path.display()))

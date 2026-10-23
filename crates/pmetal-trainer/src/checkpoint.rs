@@ -3,6 +3,7 @@
 //! This module provides utilities for saving and loading training state,
 //! including model weights, optimizer state, and training progress.
 
+use pmetal_runtime::compat::FlattenedModuleParam;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -29,7 +30,7 @@ use crate::{Result, SftError};
 ///
 /// The file is written atomically (beside the file, then renamed) to avoid leaving a
 /// partially-written snapshot that could corrupt a resume.
-pub fn save_best_snapshot(checkpoint_dir: &Path, weights: &HashMap<Rc<str>, Array>) -> Result<()> {
+pub fn save_best_snapshot(checkpoint_dir: &Path, weights: &FlattenedModuleParam) -> Result<()> {
     fs::create_dir_all(checkpoint_dir).map_err(|e| {
         SftError::Io(std::io::Error::new(
             e.kind(),
@@ -51,7 +52,7 @@ pub fn save_best_snapshot(checkpoint_dir: &Path, weights: &HashMap<Rc<str>, Arra
 /// Returns `None` if `best_snapshot.safetensors` does not exist.
 /// Errors in the file I/O are logged as warnings and `None` is returned so
 /// that a missing or corrupt snapshot degrades gracefully to a fresh start.
-pub fn load_best_snapshot(checkpoint_dir: &Path) -> Option<HashMap<Rc<str>, Array>> {
+pub fn load_best_snapshot(checkpoint_dir: &Path) -> Option<FlattenedModuleParam> {
     let path = checkpoint_dir.join("best_snapshot.safetensors");
     if !path.exists() {
         return None;
@@ -59,7 +60,7 @@ pub fn load_best_snapshot(checkpoint_dir: &Path) -> Option<HashMap<Rc<str>, Arra
 
     match inline_array::load_safetensors_shard(path_as_str(&path).ok()?) {
         Some(params) => {
-            let weights: HashMap<Rc<str>, Array> =
+            let weights: FlattenedModuleParam =
                 params.into_iter().map(|(k, v)| (Rc::from(k), v)).collect();
             tracing::info!(
                 "Loaded best snapshot from {:?} ({} params)",
@@ -76,7 +77,7 @@ pub fn load_best_snapshot(checkpoint_dir: &Path) -> Option<HashMap<Rc<str>, Arra
 }
 
 /// A loaded checkpoint: its parameters by name, and its metadata.
-pub type LoadedCheckpoint = (HashMap<Rc<str>, Array>, CheckpointMetadata);
+pub type LoadedCheckpoint = (FlattenedModuleParam, CheckpointMetadata);
 
 /// What a resumed run needs beyond the weights to take the steps the
 /// uninterrupted run would have: the optimizer's moments and counters (and the
@@ -343,7 +344,7 @@ impl CheckpointManager {
     /// * `is_best` - Whether this is the best checkpoint so far
     pub fn save_checkpoint(
         &self,
-        lora_params: &HashMap<Rc<str>, Array>,
+        lora_params: &FlattenedModuleParam,
         metadata: &CheckpointMetadata,
         is_best: bool,
     ) -> Result<PathBuf> {
@@ -355,7 +356,7 @@ impl CheckpointManager {
     /// and the data loader's position, which a resume continues from.
     pub fn save_checkpoint_with_state(
         &self,
-        lora_params: &HashMap<Rc<str>, Array>,
+        lora_params: &FlattenedModuleParam,
         metadata: &CheckpointMetadata,
         is_best: bool,
         state: &TrainState,
@@ -480,8 +481,8 @@ impl CheckpointManager {
                 )))
             })?;
 
-        // Convert HashMap<String, Array> to HashMap<Rc<str>, Array>
-        let params: HashMap<Rc<str>, Array> =
+        // Convert HashMap<String, Array> to FlattenedModuleParam
+        let params: FlattenedModuleParam =
             params.into_iter().map(|(k, v)| (Rc::from(k), v)).collect();
 
         // Load metadata
@@ -665,7 +666,7 @@ mod tests {
         let manager = CheckpointManager::new(temp_dir.path()).unwrap();
 
         // Create dummy parameters
-        let mut params: HashMap<Rc<str>, Array> = HashMap::new();
+        let mut params = FlattenedModuleParam::new();
         params.insert(
             Rc::from("test_param"),
             Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]),
@@ -692,7 +693,7 @@ mod tests {
         let manager = CheckpointManager::new(temp_dir.path()).unwrap();
 
         // Save multiple checkpoints
-        let mut params: HashMap<Rc<str>, Array> = HashMap::new();
+        let mut params = FlattenedModuleParam::new();
         params.insert(Rc::from("p1"), Array::from_f32(1.0));
 
         for step in [10, 20, 30] {
@@ -710,7 +711,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let manager = CheckpointManager::new(temp_dir.path()).unwrap();
 
-        let mut params: HashMap<Rc<str>, Array> = HashMap::new();
+        let mut params = FlattenedModuleParam::new();
         params.insert(Rc::from("p1"), Array::from_f32(1.0));
 
         let meta = CheckpointMetadata::new(100, 2, 0.3, 1e-4).with_best_val_loss(0.25);
@@ -731,7 +732,7 @@ mod tests {
             .unwrap()
             .with_max_checkpoints(3);
 
-        let mut params: HashMap<Rc<str>, Array> = HashMap::new();
+        let mut params = FlattenedModuleParam::new();
         params.insert(Rc::from("p1"), Array::from_f32(1.0));
 
         // Save 5 checkpoints

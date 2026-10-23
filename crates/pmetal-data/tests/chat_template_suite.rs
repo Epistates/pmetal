@@ -89,7 +89,10 @@ fn tools_from(case: &Value) -> Option<Vec<ToolDefinition>> {
         .map(|t| serde_json::from_value(Value::Array(t.clone())).expect("tool definitions"))
 }
 
-fn render_case(suite: &Value, case: &Value) -> Result<String, String> {
+fn render_case(
+    suite: &Value,
+    case: &Value,
+) -> Result<String, pmetal_data::chat_templates::ChatTemplateError> {
     let template = template_for(suite, case["template"].as_str().unwrap());
     let messages = messages_from(&case["messages"]);
     let tools = tools_from(case);

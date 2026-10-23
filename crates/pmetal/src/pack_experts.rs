@@ -76,14 +76,6 @@ struct TensorSource {
     slice: Option<TensorSliceSpec>,
 }
 
-#[derive(serde::Deserialize)]
-struct SafeTensorHeader {
-    #[serde(rename = "__metadata__")]
-    _metadata: Option<HashMap<String, String>>,
-    #[serde(flatten)]
-    tensors: HashMap<String, safetensors::tensor::TensorInfo>,
-}
-
 struct ShardReader {
     file: fs::File,
     data_offset: u64,
@@ -114,8 +106,12 @@ impl ShardReader {
                 path.display()
             )
         })?;
-        let header: SafeTensorHeader =
-            serde_json::from_slice(&header_bytes).with_context(|| {
+        // `Metadata` is the header type the `safetensors` crate itself parses
+        // (with its `__metadata__` entry and tensor table), so the header's
+        // shape is the crate's, not a copy of it here. `read_metadata` wants
+        // the whole file mapped; a shard of this size is read by seeks.
+        let metadata: safetensors::tensor::Metadata = serde_json::from_slice(&header_bytes)
+            .with_context(|| {
                 format!(
                     "Failed to parse safetensors JSON header from {}",
                     path.display()
@@ -125,7 +121,11 @@ impl ShardReader {
         Ok(Self {
             file,
             data_offset: 8 + header_len as u64,
-            tensors: header.tensors,
+            tensors: metadata
+                .tensors()
+                .into_iter()
+                .map(|(name, info)| (name, info.clone()))
+                .collect(),
         })
     }
 
@@ -438,14 +438,10 @@ pub fn pack_experts(model_dir: &Path, output_dir: &Path, bits: Option<u8>) -> Re
     // resolving against "model.safetensors".
     let index_path = model_dir.join("model.safetensors.index.json");
     let shard_map: HashMap<String, String> = if index_path.exists() {
-        let idx_text = fs::read_to_string(&index_path).context("Failed to read index.json")?;
-        let idx: serde_json::Value =
-            serde_json::from_str(&idx_text).context("Failed to parse index.json")?;
-        idx["weight_map"]
-            .as_object()
-            .context("index.json missing weight_map")?
-            .iter()
-            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+        pmetal_core::safetensors_index::ShardIndex::read(&index_path)
+            .context("Failed to read index.json")?
+            .weight_map
+            .into_iter()
             .collect()
     } else {
         HashMap::new()

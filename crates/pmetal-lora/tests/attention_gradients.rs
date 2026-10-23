@@ -16,13 +16,13 @@
 //! Metal path, then checks a few entries against finite differences of the
 //! loss itself.
 
-use std::collections::HashMap;
+use pmetal_runtime::compat::FlattenedModuleParam;
 use std::rc::Rc;
 
 use pmetal_core::LoraConfig;
 use pmetal_lora::{AdaptedModel, QLoraConfig, TrainableModel, quantize_base};
 use pmetal_models::dispatcher::DynamicModel;
-use pmetal_runtime::compat::{Array, Dtype, in_key_order, random};
+use pmetal_runtime::compat::{Array, Dtype, random};
 use pmetal_runtime::inline_array::value_and_grad;
 use pmetal_runtime::nn::with_training_mode;
 
@@ -97,8 +97,8 @@ fn drain() {
 /// both factors of every adapter have a gradient.
 fn randomize_adapters(model: &mut impl TrainableModel) {
     random::seed(11);
-    // In name order: the draws go to the same adapters on every run.
-    let params: HashMap<Rc<str>, Array> = in_key_order(model.lora_parameters())
+    let params: FlattenedModuleParam = model
+        .lora_parameters()
         .into_iter()
         .map(|(name, p)| {
             let r = random::uniform_range(-0.05, 0.05, p.shape(), Dtype::Float32)
@@ -146,7 +146,7 @@ fn step(
     model: &mut impl TrainableModel,
     mode: Mode,
     names: &[Rc<str>],
-) -> (f32, HashMap<Rc<str>, Array>) {
+) -> (f32, FlattenedModuleParam) {
     let live = model.lora_parameters();
     let params: Vec<Array> = names.iter().map(|n| live[n].clone()).collect();
     let (ids, weights, causal) = inputs();
@@ -154,7 +154,7 @@ fn step(
     let mut run = || {
         let (loss, grads) = value_and_grad(
             |arrays| {
-                let restored: HashMap<Rc<str>, Array> = names
+                let restored: FlattenedModuleParam = names
                     .iter()
                     .cloned()
                     .zip(arrays[..names.len()].iter().cloned())
@@ -182,8 +182,7 @@ fn step(
 }
 
 fn sorted_names(model: &impl TrainableModel) -> Vec<Rc<str>> {
-    let mut names: Vec<Rc<str>> = model.lora_parameters().into_keys().collect();
-    names.sort();
+    let names: Vec<Rc<str>> = model.lora_parameters().into_keys().collect();
     names
 }
 
@@ -196,8 +195,8 @@ fn max_abs(a: &Array) -> f32 {
 
 fn assert_same_gradients(
     case: &str,
-    (loss_a, grads_a): &(f32, HashMap<Rc<str>, Array>),
-    (loss_b, grads_b): &(f32, HashMap<Rc<str>, Array>),
+    (loss_a, grads_a): &(f32, FlattenedModuleParam),
+    (loss_b, grads_b): &(f32, FlattenedModuleParam),
 ) {
     assert!(
         (loss_a - loss_b).abs() <= 1e-4 * loss_b.abs().max(1.0),
@@ -228,7 +227,7 @@ fn assert_same_gradients(
 fn assert_finite_differences(
     case: &str,
     model: &mut impl TrainableModel,
-    grads: &HashMap<Rc<str>, Array>,
+    grads: &FlattenedModuleParam,
 ) {
     let (ids, weights, _) = inputs();
     let base = model.lora_parameters();

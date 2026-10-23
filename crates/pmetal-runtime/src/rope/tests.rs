@@ -1,7 +1,7 @@
 use super::*;
 use serde_json::json;
 
-fn rotary(config: Value, head_dim: i32) -> Result<Rotary, String> {
+fn rotary(config: Value, head_dim: i32) -> RuntimeResult<Rotary> {
     Rotary::from_config(head_dim, RopeConfig::from_json(&config), 10_000.0, 1.0)
 }
 
@@ -23,13 +23,13 @@ fn unknown_rope_types_are_refused_by_name() {
         let err =
             rotary(json!({"rope_scaling": {"rope_type": t, "factor": 2.0}}), 64).expect_err(t);
         assert!(
-            err.contains(t) && err.contains("not supported"),
+            err.to_string().contains(t) && err.to_string().contains("not supported"),
             "{t}: {err}"
         );
     }
     // The legacy `type` spelling is read, and refused just the same.
     let err = rotary(json!({"rope_scaling": {"type": "xpos"}}), 64).unwrap_err();
-    assert!(err.contains("xpos"), "{err}");
+    assert!(err.to_string().contains("xpos"), "{err}");
 }
 
 #[test]
@@ -56,7 +56,7 @@ fn missing_required_keys_are_refused_by_name() {
             64,
         )
         .expect_err(key);
-        assert!(err.contains(key), "{key}: {err}");
+        assert!(err.to_string().contains(key), "{key}: {err}");
     }
     let err = rotary(
         json!({"rope_scaling": {"rope_type": "longrope", "short_factor": vec![1.0; 4],
@@ -64,7 +64,10 @@ fn missing_required_keys_are_refused_by_name() {
         64,
     )
     .unwrap_err();
-    assert!(err.contains("short_factor has 4 entries"), "{err}");
+    assert!(
+        err.to_string().contains("short_factor has 4 entries"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -347,11 +350,14 @@ fn frequency_factors_must_match_the_rotated_dimensions() {
         64,
     )
     .unwrap_err();
-    assert!(err.contains("5 entries") && err.contains("32"), "{err}");
+    assert!(
+        err.to_string().contains("5 entries") && err.to_string().contains("32"),
+        "{err}"
+    );
     let err = rotary(
         json!({"rope_scaling": {"rope_type": "frequency_factors", "factors": vec![0.0; 32]}}),
         64,
     )
     .unwrap_err();
-    assert!(err.contains("positive"), "{err}");
+    assert!(err.to_string().contains("positive"), "{err}");
 }

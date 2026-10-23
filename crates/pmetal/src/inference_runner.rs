@@ -220,7 +220,8 @@ impl InferenceRunnerConfig {
             spec.no_thinking,
             spec.reasoning_effort.as_deref(),
             spec.no_preserve_thinking,
-        )?;
+        )
+        .map_err(|e| e.to_string())?;
         // `chat_template_kwargs='{"enable_thinking": false}'` is `no_thinking`.
         let no_thinking = spec.no_thinking || chat_template_kwargs.enable_thinking() == Some(false);
         let kv_turboquant_preset = spec
@@ -400,7 +401,7 @@ impl InferenceRunner {
         let mut template_kwargs = config.chat_template_kwargs.clone();
         template_kwargs
             .check_reserved()
-            .map_err(Exception::custom)?;
+            .map_err(|e| Exception::custom(e.to_string()))?;
         if config.no_thinking || (!is_instruct && use_chat) {
             // Base models don't understand <think> tags.
             template_kwargs.set(ChatTemplateKwargs::ENABLE_THINKING, false);
@@ -494,7 +495,7 @@ impl InferenceRunner {
 
             detected
                 .check_thinking_controls(&template_kwargs)
-                .map_err(Exception::custom)?;
+                .map_err(|e| Exception::custom(e.to_string()))?;
             let rendered = if has_media {
                 // The media are items of the prompt's message, rendered by
                 // the model's own template, as the server renders a
@@ -515,7 +516,7 @@ impl InferenceRunner {
                     )
                     .map(|formatted| formatted.text)
             };
-            let formatted = expand_media(rendered.map_err(Exception::custom)?)?;
+            let formatted = expand_media(rendered.map_err(|e| Exception::custom(e.to_string()))?)?;
 
             // The template wrote the model's BOS itself; the tokenizer's
             // post-processor would put a second one in front of it.

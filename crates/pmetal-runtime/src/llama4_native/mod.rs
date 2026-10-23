@@ -26,6 +26,7 @@
 //!   * `moe` — dense SwiGLU MLP + top-1 SwitchGLU with shared expert
 //!   * `forward` — full-model forward + prefill/prime/generate wrappers
 
+use crate::{RuntimeError, RuntimeResult};
 use serde::Deserialize;
 
 mod attention;
@@ -181,25 +182,25 @@ impl Llama4Config {
     /// `tie_word_embeddings` is the one text-level setting a nested config
     /// keeps outside `text_config`; it applies when the text config does not
     /// state it.
-    pub fn from_json(json: &serde_json::Value) -> Result<Self, String> {
+    pub fn from_json(json: &serde_json::Value) -> RuntimeResult<Self> {
         let mut text = json.get("text_config").unwrap_or(json).clone();
         if let (Some(obj), Some(tie)) = (text.as_object_mut(), json.get("tie_word_embeddings")) {
             obj.entry("tie_word_embeddings")
                 .or_insert_with(|| tie.clone());
         }
         let text: Llama4TextConfig = serde_json::from_value(text)
-            .map_err(|e| format!("failed to parse Llama4Config: {e}"))?;
+            .map_err(|e| RuntimeError::Config(format!("failed to parse Llama4Config: {e}")))?;
         if text.num_experts_per_tok < 1 || text.num_experts_per_tok > text.num_local_experts {
-            return Err(format!(
+            return Err(RuntimeError::Config(format!(
                 "llama4 config: num_experts_per_tok {} does not fit num_local_experts {}",
                 text.num_experts_per_tok, text.num_local_experts
-            ));
+            )));
         }
         if text.attention_chunk_size < 1 {
-            return Err(format!(
+            return Err(RuntimeError::Config(format!(
                 "llama4 config: attention_chunk_size {} is not positive",
                 text.attention_chunk_size
-            ));
+            )));
         }
         let model_type = json
             .get("model_type")
@@ -247,7 +248,7 @@ impl Llama4Config {
     /// The interleaved rotary embedding of the RoPE layers, with the Llama 3
     /// frequency bands `rope_scaling` gives (Scout: factor 16); an unknown
     /// `rope_type` is an error naming it.
-    pub fn rotary(&self) -> Result<crate::rope::RotaryEmbedding, String> {
+    pub fn rotary(&self) -> RuntimeResult<crate::rope::RotaryEmbedding> {
         let t = self.text();
         crate::rope::RotaryEmbedding::from_config(
             self.head_dim(),
@@ -261,7 +262,7 @@ impl Llama4Config {
             1.0,
             true,
         )
-        .map_err(|e| format!("llama4 config: {e}"))
+        .map_err(|e| RuntimeError::Config(format!("llama4 config: {e}")))
     }
 
     /// Number of KV heads.
@@ -275,10 +276,10 @@ impl Llama4Config {
 ///
 /// Handles both the flat text-only layout and the multi-modal layout where
 /// `text_config` is nested.
-pub fn load_config(model_dir: &std::path::Path) -> Result<Llama4Config, String> {
+pub fn load_config(model_dir: &std::path::Path) -> RuntimeResult<Llama4Config> {
     let text = crate::native_loader::read_config_json(model_dir)?;
-    let json: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("failed to parse config.json: {e}"))?;
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| RuntimeError::Config(format!("failed to parse config.json: {e}")))?;
     Llama4Config::from_json(&json)
 }
 
@@ -353,9 +354,24 @@ mod tests {
             }))
         };
         assert!(with(2, 8).is_ok());
-        assert!(with(0, 8).unwrap_err().contains("num_experts_per_tok"));
-        assert!(with(5, 8).unwrap_err().contains("num_experts_per_tok"));
-        assert!(with(1, 0).unwrap_err().contains("attention_chunk_size"));
+        assert!(
+            with(0, 8)
+                .unwrap_err()
+                .to_string()
+                .contains("num_experts_per_tok")
+        );
+        assert!(
+            with(5, 8)
+                .unwrap_err()
+                .to_string()
+                .contains("num_experts_per_tok")
+        );
+        assert!(
+            with(1, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("attention_chunk_size")
+        );
     }
 
     /// `tie_word_embeddings` sits outside `text_config` in a nested config and

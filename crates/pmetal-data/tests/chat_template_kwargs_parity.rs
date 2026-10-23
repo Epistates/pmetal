@@ -77,7 +77,10 @@ fn messages_from(value: &Value) -> Vec<Message> {
         .collect()
 }
 
-fn render_case(fixture: &Value, case: &Value) -> Result<String, String> {
+fn render_case(
+    fixture: &Value,
+    case: &Value,
+) -> Result<String, pmetal_data::chat_templates::ChatTemplateError> {
     let template = template_for(fixture, case["template"].as_str().unwrap());
     let messages = messages_from(&case["messages"]);
     let tools: Option<Vec<ToolDefinition>> = case["tools"]
@@ -211,7 +214,10 @@ fn unsupported_controls_are_reported() {
     let err = qwen
         .apply_inference_with_kwargs(&[Message::user("hi")], None, &effort("high"))
         .unwrap_err();
-    assert!(err.contains("Unexpected reasoning effort high"), "{err}");
+    assert!(
+        err.to_string().contains("Unexpected reasoning effort high"),
+        "{err}"
+    );
     // gpt-oss writes any string, so the documented levels are checked.
     assert!(gpt_oss.check_thinking_controls(&effort("high")).is_ok());
     assert!(gpt_oss.check_thinking_controls(&effort("xhigh")).is_err());

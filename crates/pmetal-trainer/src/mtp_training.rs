@@ -464,7 +464,7 @@ where
                 config.num_steps
             )));
         }
-        eprintln!("resumed from {} at step {first_step}", dir.display());
+        tracing::info!("resumed from {} at step {first_step}", dir.display());
     }
     let scheduler = LearningRateScheduler::new(
         config.learning_rate as f64,
@@ -497,7 +497,7 @@ where
 
         if config.log_every > 0 && (step + 1) % config.log_every == 0 {
             let elapsed = start.elapsed().as_secs_f64().max(1e-9);
-            eprintln!(
+            tracing::info!(
                 "step {:>6} | {} loss {:.4} | lr {:.2e} | {:.2} step/s",
                 step + 1,
                 kind.as_str(),
@@ -526,7 +526,7 @@ where
                     checkpoint_type: kind.as_str().to_string(),
                 },
             )?;
-            eprintln!("checkpoint saved: {}", dir.display());
+            tracing::info!("checkpoint saved: {}", dir.display());
         }
 
         if config
@@ -534,7 +534,7 @@ where
             .as_ref()
             .is_some_and(|s| s.load(Ordering::SeqCst))
         {
-            eprintln!(
+            tracing::info!(
                 "stop requested: ending after step {} of {}",
                 step + 1,
                 config.num_steps
@@ -558,7 +558,7 @@ where
                 checkpoint_type: kind.as_str().to_string(),
             },
         )?;
-        eprintln!(
+        tracing::info!(
             "final checkpoint saved: {}",
             config.checkpoint_dir.display()
         );

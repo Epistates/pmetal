@@ -799,14 +799,11 @@ mod tests {
             },
         )
         .unwrap();
-        let before = {
-            let mut params: Vec<_> = adapted.lora_parameters().into_iter().collect();
-            params.sort_by(|a, b| a.0.cmp(&b.0));
-            params
-                .into_iter()
-                .map(|(_, p)| p.as_dtype(Dtype::Float32.as_i32()))
-                .collect::<Vec<_>>()
-        };
+        let before: Vec<_> = adapted
+            .lora_parameters()
+            .into_values()
+            .map(|p| p.as_dtype(Dtype::Float32.as_i32()))
+            .collect();
         let mut trainer = EmbeddingTrainer::new(EmbeddingTrainerConfig {
             training: TrainingConfig {
                 learning_rate: 1e-2,
@@ -819,14 +816,11 @@ mod tests {
         pmetal_runtime::check_unobserved_error().unwrap();
         let (first, last) = (mean(&losses[..4]), mean(&losses[losses.len() - 4..]));
         assert!(last < 0.7 * first, "adapters: {first} -> {last}");
-        let after = {
-            let mut params: Vec<_> = adapted.lora_parameters().into_iter().collect();
-            params.sort_by(|a, b| a.0.cmp(&b.0));
-            params
-                .into_iter()
-                .map(|(_, p)| p.as_dtype(Dtype::Float32.as_i32()))
-                .collect::<Vec<_>>()
-        };
+        let after: Vec<_> = adapted
+            .lora_parameters()
+            .into_values()
+            .map(|p| p.as_dtype(Dtype::Float32.as_i32()))
+            .collect();
         let moved = before.iter().zip(&after).any(|(b, a)| {
             let d = a.subtract(b).abs().max(None);
             d.eval();

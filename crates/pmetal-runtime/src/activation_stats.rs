@@ -43,9 +43,10 @@
 //!     collector.flush();
 //! }
 //! let stats = collector.finish();
-//! # Ok::<(), String>(())
+//! # Ok::<(), pmetal_runtime::RuntimeError>(())
 //! ```
 
+use crate::{RuntimeError, RuntimeResult};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
@@ -131,9 +132,11 @@ impl Collector {
     /// other rank, or two registered weights are the same array.
     pub fn install<'a>(
         weights: impl IntoIterator<Item = (String, &'a InlineArray)>,
-    ) -> Result<Self, String> {
+    ) -> RuntimeResult<Self> {
         if ACTIVE.with(Cell::get) {
-            return Err("a collector is already installed on this thread".into());
+            return Err(RuntimeError::Config(
+                "a collector is already installed on this thread".into(),
+            ));
         }
         let mut targets = HashMap::new();
         for (name, weight) in weights {
@@ -141,9 +144,9 @@ impl Collector {
                 2 => None,
                 3 => Some(weight.dim(0) as usize),
                 n => {
-                    return Err(format!(
+                    return Err(RuntimeError::Config(format!(
                         "{name}: a {n}-dimensional weight cannot be measured"
-                    ));
+                    )));
                 }
             };
             let target = Target {
@@ -155,7 +158,10 @@ impl Collector {
                 rows: 0,
             };
             if let Some(previous) = targets.insert(weight.id(), target) {
-                return Err(format!("{name} and {} are the same array", previous.name));
+                return Err(RuntimeError::Config(format!(
+                    "{name} and {} are the same array",
+                    previous.name
+                )));
             }
         }
         STATE.with(|s| {
@@ -479,7 +485,7 @@ mod tests {
         let again = Collector::install([("w".to_string(), &w)]).unwrap();
         drop(again);
         let err = Collector::install([("a".to_string(), &w), ("b".to_string(), &w)]).err();
-        assert!(err.unwrap().contains("same array"));
+        assert!(err.unwrap().to_string().contains("same array"));
         assert!(!is_collecting());
     }
 

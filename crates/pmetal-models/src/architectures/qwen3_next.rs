@@ -289,7 +289,7 @@ impl Qwen3NextConfig {
     /// Activation of the gated-delta-net output gate.
     pub fn gdn_gate(&self) -> Result<GateActivation, Exception> {
         GateActivation::resolve(self.output_gate_type.as_deref(), self.hidden_act.as_deref())
-            .map_err(Exception::custom)
+            .map_err(Exception::from)
     }
 
     /// Get head dimension.
@@ -1630,7 +1630,9 @@ pub(crate) fn take_packed_experts(
     let dtype = detect_model_dtype(|key| weights.get(key).map(|w| w.dtype_raw()));
     let experts = num_experts;
     let mut parts: HashMap<(usize, usize), Vec<Option<LayerWeight>>> = HashMap::new();
-    for (base, weight) in take_modelopt_weights(weights).map_err(LoadError::SafeTensors)? {
+    for (base, weight) in
+        take_modelopt_weights(weights).map_err(|e| LoadError::SafeTensors(e.to_string()))?
+    {
         match routed_expert_module(&base) {
             Some((layer, expert, proj)) if expert < experts => {
                 let packed = weight
@@ -3219,7 +3221,7 @@ mod tests {
             ..tiny_config()
         };
         let mut moe = Qwen3NextSparseMoeBlock::new(&config).unwrap();
-        for (_, p) in moe.flatten_params_mut_sorted() {
+        for (_, p) in moe.flatten_params_mut() {
             let shape = p.shape().to_vec();
             *p = pmetal_runtime::compat::random::normal(&shape, Dtype::Bfloat16);
         }

@@ -42,7 +42,7 @@ pub struct PretrainConfig {
     /// Number of micro-batches to accumulate before one optimizer step.
     /// Effective batch = `batch_size * gradient_accumulation_steps`.
     pub gradient_accumulation_steps: usize,
-    /// Print step/loss/LR/tok-per-sec every N steps. 0 disables.
+    /// Log step/loss/LR/tok-per-sec every N steps. 0 disables.
     pub log_every: usize,
     /// Run eval on held-out batches every N steps. 0 disables.
     pub eval_every: usize,

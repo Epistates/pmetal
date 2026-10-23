@@ -114,7 +114,7 @@ fn run_rank(
         .expect("training");
     pmetal_runtime::check_unobserved_error().expect("no runtime op threw");
 
-    let mut weights: Vec<(String, Vec<f32>)> = model
+    let weights: Vec<(String, Vec<f32>)> = model
         .lora_parameters()
         .iter()
         .map(|(k, v)| {
@@ -122,7 +122,6 @@ fn run_rank(
             (k.to_string(), v.as_slice::<f32>().to_vec())
         })
         .collect();
-    weights.sort_by(|a, b| a.0.cmp(&b.0));
     (weights, training_loop.current_step())
 }
 

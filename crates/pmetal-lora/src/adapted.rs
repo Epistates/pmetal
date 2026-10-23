@@ -17,7 +17,7 @@ use std::rc::Rc;
 use pmetal_core::{LoraConfig, LoraInit};
 use pmetal_models::dispatcher::DynamicModel;
 use pmetal_runtime::compat::{
-    Array, ModuleParameters, ModuleParametersExt, NestedValue, VisitLinears,
+    Array, FlattenedModuleParam, ModuleParameters, ModuleParametersExt, NestedValue, VisitLinears,
 };
 
 use crate::init::{Quantizer, initialise};
@@ -412,7 +412,7 @@ impl AdaptedModel {
     /// fine-tune, every trainable parameter of the model, under the path the
     /// loader gave it (`model.layers.0.self_attn.q_proj.weight`): checkpoints
     /// and the optimizer see the same keys.
-    pub fn lora_parameters(&self) -> HashMap<Rc<str>, Array> {
+    pub fn lora_parameters(&self) -> FlattenedModuleParam {
         match &self.scope {
             Scope::Adapters => self
                 .model
@@ -440,7 +440,7 @@ impl AdaptedModel {
     /// `model.`-prefixed form are accepted too.
     ///
     /// [`lora_parameters`]: Self::lora_parameters
-    pub fn set_lora_parameters(&mut self, params: &HashMap<Rc<str>, Array>) {
+    pub fn set_lora_parameters(&mut self, params: &FlattenedModuleParam) {
         if let Scope::Full { frozen } = &self.scope {
             for (path, slot) in self.model.flatten_params_mut() {
                 if !frozen.contains(&path)
@@ -565,7 +565,7 @@ impl AdaptedModel {
         let ours = self.lora_parameters();
         let modules = self.module_index();
 
-        let mut keyed: HashMap<Rc<str>, Array> = HashMap::new();
+        let mut keyed: FlattenedModuleParam = FlattenedModuleParam::new();
         let mut unmatched: Vec<String> = Vec::new();
         for (name, value) in loaded {
             let Some(key) = native_key(&name, &modules, &ours) else {
@@ -709,7 +709,7 @@ fn canonical_module(name: &str) -> String {
 fn native_key(
     name: &str,
     modules: &HashMap<String, String>,
-    ours: &HashMap<Rc<str>, Array>,
+    ours: &FlattenedModuleParam,
 ) -> Option<String> {
     if let Some(rest) = name.strip_prefix(PEFT_PREFIX) {
         const PARTS: [(&str, &str); 6] = [
@@ -759,11 +759,11 @@ impl crate::TrainableModel for AdaptedModel {
         AdaptedModel::num_trainable_params(self)
     }
 
-    fn lora_parameters(&self) -> HashMap<Rc<str>, Array> {
+    fn lora_parameters(&self) -> FlattenedModuleParam {
         AdaptedModel::lora_parameters(self)
     }
 
-    fn set_lora_parameters(&mut self, params: &HashMap<Rc<str>, Array>) {
+    fn set_lora_parameters(&mut self, params: &FlattenedModuleParam) {
         AdaptedModel::set_lora_parameters(self, params)
     }
 

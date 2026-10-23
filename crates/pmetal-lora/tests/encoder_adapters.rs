@@ -10,14 +10,14 @@
 //! folding the adapters in gives the adapted output, padding stays masked, and
 //! a contrastive objective lowers.
 
-use std::collections::HashMap;
+use pmetal_runtime::compat::FlattenedModuleParam;
 use std::rc::Rc;
 
 use pmetal_cache::test_utils::max_abs_diff;
 use pmetal_core::LoraConfig;
 use pmetal_lora::AdaptedModel;
 use pmetal_models::dispatcher::DynamicModel;
-use pmetal_runtime::compat::{Array, Dtype, in_key_order, random};
+use pmetal_runtime::compat::{Array, Dtype, random};
 use pmetal_runtime::inline_array::value_and_grad;
 
 const BERT: &str = r#"{"model_type": "bert", "vocab_size": 120, "hidden_size": 32,
@@ -65,9 +65,8 @@ fn batch(valid: i32) -> (Array, Array) {
 
 fn randomize(model: &mut AdaptedModel) {
     random::seed(5);
-    let mut params: Vec<_> = model.lora_parameters().into_iter().collect();
-    params.sort_by(|a, b| a.0.cmp(&b.0));
-    let set: HashMap<Rc<str>, Array> = params
+    let params = model.lora_parameters();
+    let set: FlattenedModuleParam = params
         .into_iter()
         .map(|(k, p)| {
             (
@@ -122,10 +121,9 @@ fn encoder_adapters_reach_the_output_and_padding_stays_masked() {
         let reference = embed(&hidden, &mask);
 
         // Each adapter on its own: nudge B and the embedding must move.
-        // In name order: the draws go to the same adapters on every run.
-        let params = in_key_order(model.lora_parameters());
+        let params = model.lora_parameters();
         for (key, b) in params.iter().filter(|(k, _)| k.ends_with(".lora_b")) {
-            let nudged = HashMap::from([(
+            let nudged = FlattenedModuleParam::from([(
                 key.clone(),
                 b.add(&random::uniform_range(0.2, 0.4, b.shape(), Dtype::Float32)),
             )]);
@@ -134,7 +132,7 @@ fn encoder_adapters_reach_the_output_and_padding_stays_masked() {
                 &embed(&model.forward(&ids, Some(&mask)).unwrap(), &mask),
                 &reference,
             );
-            model.set_lora_parameters(&HashMap::from([(key.clone(), b.clone())]));
+            model.set_lora_parameters(&FlattenedModuleParam::from([(key.clone(), b.clone())]));
             assert!(moved.is_finite() && moved > 0.0, "{name}: {key} is silent");
         }
 
@@ -179,8 +177,7 @@ fn encoder_adapter_gradients_match_finite_differences() {
         let (ids, mask) = batch(8);
         let mut model = AdaptedModel::attach(build(config), lora()).unwrap();
         randomize(&mut model);
-        let mut names: Vec<Rc<str>> = model.lora_parameters().into_keys().collect();
-        names.sort();
+        let names: Vec<Rc<str>> = model.lora_parameters().into_keys().collect();
         let live = model.lora_parameters();
         let params: Vec<Array> = names.iter().map(|n| live[n].clone()).collect();
 
@@ -191,7 +188,7 @@ fn encoder_adapter_gradients_match_finite_differences() {
         };
         let (loss, grads) = value_and_grad(
             |arrays| {
-                let set: HashMap<Rc<str>, Array> =
+                let set: FlattenedModuleParam =
                     names.iter().cloned().zip(arrays.iter().cloned()).collect();
                 model.set_lora_parameters(&set);
                 objective(&mut model)
@@ -220,7 +217,7 @@ fn encoder_adapter_gradients_match_finite_differences() {
         // The step along the gradient's own direction: the loss changes at the
         // rate `|g|`.
         let mut shift = |sign: f32| {
-            let set: HashMap<Rc<str>, Array> = names
+            let set: FlattenedModuleParam = names
                 .iter()
                 .zip(params.iter().zip(&grads))
                 .map(|(n, (p, g))| (n.clone(), p.add(&g.mul_scalar(sign * H / g_norm))))
@@ -278,14 +275,13 @@ fn step(
 ) -> f32 {
     use pmetal_runtime::compat::ModuleParametersExt;
     use pmetal_runtime::compat::optimizers::Optimizer;
-    let mut names: Vec<Rc<str>> = model.flatten_trainable_params().into_keys().collect();
-    names.sort();
+    let names: Vec<Rc<str>> = model.flatten_trainable_params().into_keys().collect();
     let live = model.flatten_trainable_params();
     let params: Vec<Array> = names.iter().map(|n| live[n].clone()).collect();
     drop(live);
     let (loss, grads) = value_and_grad(
         |arrays| {
-            let set: HashMap<Rc<str>, Array> =
+            let set: FlattenedModuleParam =
                 names.iter().cloned().zip(arrays.iter().cloned()).collect();
             model.set_lora_parameters(&set);
             let ea = embed(&model.forward(ids_a, Some(mask)).unwrap(), mask);
