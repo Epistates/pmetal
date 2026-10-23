@@ -6,11 +6,15 @@ mod arch;
 mod config;
 #[cfg(test)]
 mod family_tests;
+mod recipe;
+#[cfg(test)]
+mod round_trip_tests;
 mod sentencepiece;
 mod tokenizer;
 
 pub(crate) use arch::ExportArch;
 pub(crate) use config::add_hf_config_metadata;
+pub(crate) use recipe::Recipe;
 pub(crate) use tokenizer::add_tokenizer_metadata;
 
 /// The model's name for `general.name`: the hub repository's name, or the
