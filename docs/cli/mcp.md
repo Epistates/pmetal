@@ -46,7 +46,7 @@ claude mcp add pmetal -- pmetal mcp
 
 ## Tools
 
-56 tools, grouped by what they do.
+57 tools, grouped by what they do.
 
 | Group | Tools |
 |-------|-------|
@@ -56,7 +56,7 @@ claude mcp add pmetal -- pmetal mcp
 | **Adaptive LR** | `job_set_lr`, `job_reduce_lr`, `job_reset_lr` |
 | **Models** | `search_models`, `download_model`, `list_local_models`, `model_info`, `model_fit`, `verify_model`, `delete_local_model`, `inspect_output` |
 | **Datasets** | `dataset_analyze`, `dataset_convert`, `dataset_download`, `dataset_filter`, `dataset_merge`, `dataset_prepare`, `dataset_preview`, `dataset_sample`, `dataset_split`, `dataset_template`, `dataset_validate`, `tokenize` |
-| **Model ops** | `merge_models`, `quantize`, `fuse_lora`, `pack_experts`, `vocode`, `ollama_create`, `ollama_modelfile` |
+| **Model ops** | `merge_models`, `quantize`, `imatrix`, `fuse_lora`, `pack_experts`, `vocode`, `ollama_create`, `ollama_modelfile` |
 | **Evaluation** | `eval_perplexity`, `bench_train`, `bench_gen`, `bench_corpus` |
 | **Device** | `device_info` |
 

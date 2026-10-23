@@ -2591,6 +2591,7 @@ async fn benchmark_real_training(
             output_dir: bench_dir.join("output").display().to_string(),
             lora,
             qlora: None,
+            full: None,
             training: TrainingConfig {
                 batch_size,
                 gradient_accumulation_steps: 1,

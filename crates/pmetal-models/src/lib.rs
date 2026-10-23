@@ -48,6 +48,7 @@
 mod ane_worker;
 pub mod architectures;
 pub mod cache_policy;
+pub mod calibration;
 pub(crate) mod checkpointing;
 pub mod common;
 pub mod ddtree;

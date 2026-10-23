@@ -30,7 +30,7 @@ not `--release`.
 
 Every `pmetal` subcommand has a spec class: `TrainSpec`, `GrpoSpec`,
 `PreferenceSpec`, `DistillSpec`, `RlkdSpec`, `EmbedTrainSpec`, `PretrainSpec`,
-`QuantizeSpec`, `MergeSpec`, `FuseSpec`, `ServeSpec`, `InferSpec`, `EvalSpec`,
+`QuantizeSpec`, `ImatrixSpec`, `MergeSpec`, `FuseSpec`, `ServeSpec`, `InferSpec`, `EvalSpec`,
 `DflashSpec`, `TrainMtpSpec`, `TrainDraftSpec`, `TrainDiffusionSpec`, `DecideSpec`,
 `TokenizeSpec`, `VocodeSpec`, `PackExpertsSpec` and `BenchSpec`. They wrap the
 job specs of `pmetal-core`, which define every field, default, bound and check
@@ -76,6 +76,36 @@ form. Callbacks are any object with some of these methods:
 
 An exception in a callback, like Ctrl-C, ends the run after the current step
 with the weights saved, and is raised from `train()`.
+
+## GRPO with Python reward functions
+
+`GrpoTrainer` runs a `GrpoSpec` in this process, with Python callables as rewards:
+
+```python
+def exact(prompts, completions, answer, **columns):
+    # One entry per completion; `answer` is a column of the dataset's row.
+    return [float(c.strip() == a) for c, a in zip(completions, answer)]
+
+
+result = pmetal.grpo(
+    "Qwen/Qwen3-0.6B",
+    "prompts.jsonl",
+    reward_funcs=[exact, length_penalty],
+    reward_weights=[1.0, 0.1],  # one per function; 1 each when left out
+    reward_regex=r"\d+",  # the spec's own rewards are summed in too
+)
+```
+
+A reward function is `fn(prompts, completions, **columns) -> list[float]`: `prompts` (as the model
+saw them, chat template applied) and `completions` are lists of strings, and every other column of
+the dataset's row arrives as a keyword argument, a list with one entry per completion. Return one
+number per completion. The GIL is released while the run trains and reacquired for each call, on the
+scorer's thread with `async_rewards`. A completion a function cannot score is an error, not a 0: a
+`None`, a result of the wrong length or a non-number is a `RewardError` (a `TrainingError`), and so is an
+exception the function raises, which is the error's `__cause__`; Ctrl-C inside one is a
+`KeyboardInterrupt`. `pmetal.grpo` takes the fields of `GrpoSpec` as keyword arguments, so
+`reward_cmd` (an external scoring process), `reward_regex` and `reward_json_schema` work from Python
+too.
 
 ## Every other command
 

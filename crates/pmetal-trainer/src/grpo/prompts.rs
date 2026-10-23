@@ -19,11 +19,13 @@
 //! follows the last `####`.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use pmetal_data::Tokenizer;
 use pmetal_data::chat_templates::{ChatTemplate, Message};
 use serde_json::Value;
 
+use super::DatasetRow;
 use crate::preference::data::{Turns, field, prompt_messages, read_rows, turns};
 
 const REFERENCE_FIELDS: &[&str] = &[
@@ -46,17 +48,42 @@ pub struct GrpoPrompt {
     pub reference: Option<String>,
     /// Images the prompt refers to (vision-language models).
     pub images: Option<Vec<PathBuf>>,
+    /// The row's other columns, as the dataset had them: what an external or
+    /// scripted reward scores a completion against (see
+    /// [`RewardBatch::columns`](super::RewardBatch::columns)). The prompt's
+    /// own columns and the images are not among them.
+    pub columns: DatasetRow,
 }
 
 impl GrpoPrompt {
-    /// A prompt of token ids, with no reference or images.
+    /// A prompt of token ids, with no reference, images or columns.
     pub fn new(input_ids: Vec<u32>) -> Self {
         Self {
             input_ids,
             reference: None,
             images: None,
+            columns: DatasetRow::default(),
         }
     }
+}
+
+/// The columns of `row` a reward may read: all of them but the ones that make
+/// up the prompt (the conversation, however the dataset names it) and the
+/// images, which a reward gets as tensors if it gets them at all.
+fn reward_columns(row: &Value, columns: &PromptColumns) -> DatasetRow {
+    const PROMPT_KEYS: &[&str] = &["prompt", "messages", "conversations", "images", "image"];
+    let Value::Object(map) = row else {
+        return DatasetRow::default();
+    };
+    let prompt_column = columns.prompt.as_deref();
+    Arc::new(
+        map.iter()
+            .filter(|(key, _)| {
+                !PROMPT_KEYS.contains(&key.as_str()) && Some(key.as_str()) != prompt_column
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
 }
 
 /// The reference a row names: text as it is (after a GSM8K-style `####`),
@@ -198,8 +225,8 @@ pub fn load_prompts_with(
     let mut prompts = Vec::with_capacity(rows.len());
     let mut skipped = 0usize;
     let mut truncated = 0usize;
-    for row in &rows {
-        let row = columns.normalize(row);
+    for raw in &rows {
+        let row = columns.normalize(raw);
         let row = &row;
         let Some((messages, reference)) = prompt_and_reference(row) else {
             skipped += 1;
@@ -221,6 +248,7 @@ pub fn load_prompts_with(
             input_ids: ids,
             reference,
             images: image_paths(row, &base),
+            columns: reward_columns(raw, columns),
         });
     }
     if skipped > 0 {
@@ -308,6 +336,25 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "what is 6*7?");
         assert_eq!(reference.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn a_reward_sees_every_column_but_the_prompt_and_the_images() {
+        let row = json!({
+            "prompt": "p", "messages": [], "images": ["a.png"], "problem": "q?",
+            "answer": "#### 42", "tests": ["assert f(1) == 2"], "id": 7
+        });
+        let columns = PromptColumns {
+            prompt: Some("problem".into()),
+            reference: None,
+        };
+        let got = reward_columns(&row, &columns);
+        let mut keys: Vec<&str> = got.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["answer", "id", "tests"]);
+        // The columns are the row's as it was, not the loader's reading of it.
+        assert_eq!(got["answer"], "#### 42");
+        assert!(reward_columns(&json!("not a row"), &columns).is_empty());
     }
 
     #[test]

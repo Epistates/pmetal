@@ -6,10 +6,62 @@
 //! [`RewardFunction::compute_with_references`]: the dataset row's answer is
 //! carried next to the prompt, so a reward never has to guess which prompt it
 //! is scoring. [`CombinedReward`] is their weighted sum.
+//!
+//! Rewards need not be built in. [`ExternalCommandReward`] scores with a
+//! long-lived process of the user's, [`RegexReward`] and [`JsonReward`] are
+//! verifiers over the completion's text, and a binding can implement
+//! [`RewardFunction`] over its own callables. All of them see the same
+//! [`RewardBatch`]: the prompts, the completions and each completion's
+//! dataset row.
+
+mod external;
+mod verifiers;
+
+pub use external::{ExternalCommandReward, ExternalRewardConfig};
+pub use verifiers::{JsonReward, RegexReward};
+
+use std::sync::Arc;
 
 use pmetal_runtime::compat::Array;
 
 use super::{GrpoError, GrpoResult};
+
+/// A dataset row's columns, as the row had them.
+pub type DatasetRow = Arc<serde_json::Map<String, serde_json::Value>>;
+
+/// One batch of completions to score, with everything a reward may look at.
+///
+/// Every slice has one entry per completion, except `columns`, which is empty
+/// when the caller has no dataset rows to give (a reward that needs a column
+/// then fails on its own terms, naming it).
+#[derive(Clone, Copy)]
+pub struct RewardBatch<'a> {
+    /// The prompt each completion answers, as the model saw it (chat
+    /// template applied).
+    pub prompts: &'a [String],
+    /// The completions' text.
+    pub completions: &'a [String],
+    /// Each completion's reference answer (`None` where the dataset has none).
+    pub references: &'a [Option<String>],
+    /// Each completion's dataset row, minus the prompt columns and images.
+    pub columns: &'a [DatasetRow],
+    /// Images the prompts refer to (vision-language models).
+    pub images: Option<&'a [Vec<Array>]>,
+}
+
+impl RewardBatch<'_> {
+    /// Check the dataset rows, when there are any, are one per completion.
+    pub(crate) fn validate(&self) -> GrpoResult<()> {
+        if !self.columns.is_empty() && self.columns.len() != self.completions.len() {
+            return Err(GrpoError::Reward(format!(
+                "a reward batch has {} completions but {} dataset rows",
+                self.completions.len(),
+                self.columns.len()
+            )));
+        }
+        Ok(())
+    }
+}
 
 /// Trait for GRPO reward functions.
 ///
@@ -34,6 +86,18 @@ pub trait RewardFunction: Send + Sync {
         images: Option<&[Vec<Array>]>,
     ) -> GrpoResult<Vec<f64>> {
         self.compute(prompts, completions, images)
+    }
+
+    /// Score a whole [`RewardBatch`]. Rewards that read the dataset's columns
+    /// override this; the default is
+    /// [`compute_with_references`](Self::compute_with_references).
+    fn score(&self, batch: &RewardBatch<'_>) -> GrpoResult<Vec<f64>> {
+        self.compute_with_references(
+            batch.prompts,
+            batch.completions,
+            batch.references,
+            batch.images,
+        )
     }
 
     /// A short name, for logs.
@@ -416,19 +480,31 @@ impl CombinedReward {
         references: &[Option<String>],
         images: Option<&[Vec<Array>]>,
     ) -> GrpoResult<Vec<f64>> {
+        self.score(&RewardBatch {
+            prompts,
+            completions,
+            references,
+            columns: &[],
+            images,
+        })
+    }
+
+    /// The weighted sum of the functions' rewards for `batch`. Every function
+    /// must return one finite reward per completion.
+    pub fn score(&self, batch: &RewardBatch<'_>) -> GrpoResult<Vec<f64>> {
         if self.functions.is_empty() {
             return Err(GrpoError::Reward("No reward functions configured".into()));
         }
-        let mut total = vec![0.0; completions.len()];
+        batch.validate()?;
+        let mut total = vec![0.0; batch.completions.len()];
         for (function, weight) in &self.functions {
-            let rewards =
-                function.compute_with_references(prompts, completions, references, images)?;
-            if rewards.len() != completions.len() {
+            let rewards = function.score(batch)?;
+            if rewards.len() != batch.completions.len() {
                 return Err(GrpoError::Reward(format!(
                     "reward function '{}' returned {} rewards for {} completions",
                     function.name(),
                     rewards.len(),
-                    completions.len()
+                    batch.completions.len()
                 )));
             }
             for (sum, reward) in total.iter_mut().zip(rewards) {
@@ -463,6 +539,10 @@ impl RewardFunction for CombinedReward {
         images: Option<&[Vec<Array>]>,
     ) -> GrpoResult<Vec<f64>> {
         CombinedReward::compute_with_references(self, prompts, completions, references, images)
+    }
+
+    fn score(&self, batch: &RewardBatch<'_>) -> GrpoResult<Vec<f64>> {
+        CombinedReward::score(self, batch)
     }
 
     fn name(&self) -> &str {

@@ -31,9 +31,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use pmetal_core::jobs::{
-    DflashSpec, DistillSpec, EmbedTrainSpec, EvalSpec, FuseSpec, GrpoSpec, InferSpec, MergeSpec,
-    PackExpertsSpec, PreferenceSpec, PretrainSpec, QuantizeSpec, RlkdSpec, ServeSpec, TokenizeSpec,
-    TrainDiffusionSpec, TrainDraftSpec, TrainMtpSpec, TrainSpec, VocodeSpec,
+    DflashSpec, DistillSpec, EmbedTrainSpec, EvalSpec, FuseSpec, GrpoSpec, ImatrixSpec, InferSpec,
+    MergeSpec, PackExpertsSpec, PreferenceSpec, PretrainSpec, QuantizeSpec, RlkdSpec, ServeSpec,
+    TokenizeSpec, TrainDiffusionSpec, TrainDraftSpec, TrainMtpSpec, TrainSpec, VocodeSpec,
 };
 use serde_json::Value;
 use turbomcp::prelude::*;
@@ -53,7 +53,7 @@ const INSTRUCTIONS: &str = "\
 PMetal trains, runs and manages language models on this Mac (Apple Silicon).
 
 Start with device_info and model_fit to see what fits. Long work (train, pretrain, distill, grpo, \
-rlkd, preference, embed_train, train_diffusion, train_draft, train_mtp, quantize, fuse_lora, \
+rlkd, preference, embed_train, train_diffusion, train_draft, train_mtp, quantize, imatrix, fuse_lora, \
 merge_models, pack_experts, tokenize, dflash, start_serve) runs as a background job: the tool \
 returns a job_id at once. Follow it with job_status (state, step, loss), job_logs (output; pass \
 `since` for only what is new) and stop_job. Steer a running training job with job_set_lr, \
@@ -210,6 +210,11 @@ pub fn spec_tool_list() -> Vec<Box<dyn SpecTool>> {
             JOB, Hints::OVERWRITE
         ),
         spec_tool!(
+            ImatrixSpec, "imatrix",
+            "Measure an importance matrix: run a model over calibration data and record how large the activations at each weight matrix are, writing a GGUF (or legacy .dat) file that quantize takes as imatrix (pmetal imatrix). Returns a job ID.",
+            JOB, Hints::OVERWRITE
+        ),
+        spec_tool!(
             FuseSpec, "fuse_lora",
             "Fuse a LoRA adapter into its base model, writing a standalone model (pmetal fuse). Returns a job ID.",
             JOB, Hints::OVERWRITE
@@ -248,7 +253,7 @@ pub fn spec_tool_list() -> Vec<Box<dyn SpecTool>> {
         ),
         spec_tool!(
             EvalSpec, "eval_perplexity",
-            "Evaluate a model's perplexity on a dataset, optionally with a LoRA adapter (pmetal eval). Blocks until done.",
+            "Evaluate a model's perplexity on a dataset, or with `task` a benchmark (gsm8k, mmlu, arc_challenge, hellaswag, ifeval-lite, custom), optionally with a LoRA adapter (pmetal eval). Blocks until done.",
             NOW, Hints::READ
         ),
         spec_tool!(

@@ -566,3 +566,19 @@ fn a_phi3_gguf_loads_to_the_model_its_safetensors_checkpoint_does() {
     );
     pmetal_runtime::check_unobserved_error().expect("a runtime op threw");
 }
+
+/// ⚠️ A file that does not say how large its vocabulary is cannot be loaded:
+/// the size used to default to 32000, which sized the embedding for a model it
+/// did not belong to.
+#[test]
+fn a_gguf_with_no_vocabulary_is_refused_not_defaulted() {
+    let mut b = GgufBuilder::with_model("llama", "no-vocab");
+    b.add_u32("llama.embedding_length", HIDDEN as u32)
+        .add_u32("llama.block_count", LAYERS as u32)
+        .add_u32("llama.attention.head_count", HEADS as u32)
+        .add_u32("llama.feed_forward_length", INTERMEDIATE as u32);
+    let bytes = b.build_to_bytes().expect("build");
+    let content = pmetal_gguf::GgufContent::read(&mut std::io::Cursor::new(bytes)).expect("read");
+    let err = pmetal_models::GgufModelConfig::from_gguf(&content).expect_err("no vocabulary");
+    assert!(err.to_string().contains("vocab_size"), "{err}");
+}

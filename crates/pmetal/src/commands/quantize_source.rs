@@ -23,21 +23,20 @@ pub(crate) struct TensorMeta {
     pub(crate) shape: Vec<usize>,
 }
 
-impl TensorMeta {
-    pub(crate) fn elements(&self) -> usize {
-        self.shape.iter().product()
-    }
-}
-
 /// A model's float tensors, readable one at a time.
 pub(crate) trait TensorSource {
     /// The float tensors, by name. Tensors of other kinds (integer buffers)
     /// are not quantizable and not listed.
     fn tensors(&self) -> &[TensorMeta];
 
-    /// One tensor's values as `f32`. A source that holds its tensors in memory
-    /// gives this one up (it is not read twice).
+    /// One tensor's values as `f32`. Reading a tensor does not use it up: the
+    /// calibration pass and the quantization both read every tensor.
     fn read_f32(&mut self, name: &str) -> anyhow::Result<Vec<f32>>;
+
+    /// The tensor will not be read again. A source that holds its tensors in
+    /// memory lets this one go; one that reads them from files has nothing to
+    /// release.
+    fn done_with(&mut self, _name: &str) {}
 }
 
 /// Names that mark a checkpoint whose weights are packed and need the loader
@@ -277,10 +276,12 @@ impl TensorSource for LoadedSource {
             .ok_or_else(|| anyhow::anyhow!("tensor '{name}' is not in the model"))?;
         let float32 = tensor.as_dtype(Dtype::Float32.as_i32());
         float32.eval();
-        let values = float32.as_slice::<f32>().to_vec();
-        // Read once; the array's buffer is let go with it.
+        Ok(float32.as_slice::<f32>().to_vec())
+    }
+
+    fn done_with(&mut self, name: &str) {
+        // The array's buffer is let go with it.
         self.weights.remove(name);
-        Ok(values)
     }
 }
 
@@ -371,6 +372,26 @@ mod tests {
         assert_eq!(source.read_f32("w").unwrap(), [1.0, -2.0, 0.5, 4.0]);
         assert_eq!(source.read_f32("x").unwrap(), [1.5, 2.5, -3.5]);
         assert!(source.read_f32("pos_ids").is_err());
+    }
+
+    /// ⚠️ The calibration pass reads every tensor and so does the quantization:
+    /// a source that gave a tensor up on its first read made `--kl-calibrate`
+    /// fail on any checkpoint the loader had to unpack.
+    #[test]
+    fn a_held_model_can_be_read_twice_and_lets_a_tensor_go_when_told() {
+        let mut weights = HashMap::new();
+        weights.insert("w".to_string(), Array::from_f32_slice(&[1.0, 2.0], &[2]));
+        let mut source = LoadedSource {
+            weights,
+            metas: vec![TensorMeta {
+                name: "w".into(),
+                shape: vec![2],
+            }],
+        };
+        assert_eq!(source.read_f32("w").unwrap(), [1.0, 2.0]);
+        assert_eq!(source.read_f32("w").unwrap(), [1.0, 2.0]);
+        source.done_with("w");
+        assert!(source.read_f32("w").is_err());
     }
 
     #[test]

@@ -60,6 +60,9 @@ class TokenizerError(PMetalError):
 class TrainingError(PMetalError):
     """A training run failed."""
 
+class RewardError(TrainingError):
+    """A reward function of a GRPO run failed: it raised, or returned something that is not one number per completion. The function's own exception is the ``__cause__``."""
+
 class QuantizationError(PMetalError):
     """Quantization failed."""
 
@@ -213,6 +216,75 @@ class Trainer:
         """Run the training.
 
         Raises:
+            TrainingError: The run failed (or the error's own type: ``ModelLoadError``,
+                ``HubError``, ``OutOfMemoryError``, ...).
+            KeyboardInterrupt: On Ctrl-C, after the step in flight.
+        """
+
+@final
+class GrpoResult:
+    """What a finished GRPO run produced."""
+
+    @property
+    def total_steps(self) -> int:
+        """Optimizer steps taken."""
+    @property
+    def stopped(self) -> bool:
+        """A callback asked the run to stop before it finished (the adapter is saved all the same)."""
+    @property
+    def output_dir(self) -> str:
+        """The run's output directory, where the adapter is."""
+    def to_dict(self) -> dict[str, Any]:
+        """The result as a dict."""
+
+@final
+class GrpoTrainer:
+    """GRPO reinforcement learning of one ``GrpoSpec``, in this process, with Python reward functions.
+
+    A reward function is any callable ``fn(prompts, completions, **columns) ->
+    list[float]``: ``prompts`` (the prompts as the model saw them, chat template
+    applied) and ``completions`` are lists of strings, one entry per completion,
+    and every other column of the dataset's row is a keyword argument, a list with
+    one entry per completion. Return one number per completion. A completion a
+    function cannot score is an error, not a 0: ``None`` and a list of the wrong
+    length are refused. Functions are weighted by ``reward_weights`` and summed
+    with the rewards the spec asks for (``reward_cmd``, ``reward_regex``,
+    ``reasoning_rewards``, ...).
+
+    ``train()`` runs ``pmetal grpo`` for the spec with the GIL released except
+    while a reward function runs, and stops cleanly on Ctrl-C. Callbacks are the
+    ones ``Trainer`` takes.
+    """
+
+    def __new__(
+        cls,
+        spec: GrpoSpec,
+        reward_funcs: Sequence[Callable[..., Sequence[float]]] | None = None,
+        reward_weights: Sequence[float] | None = None,
+        callbacks: Sequence[object] | None = None,
+    ) -> Self:
+        """
+        Args:
+            spec: What to train. Validated here: ``SpecValidationError`` lists every problem.
+            reward_funcs: Callables ``fn(prompts, completions, **columns) -> list[float]``.
+            reward_weights: One weight per function (1 each when omitted).
+            callbacks: Objects with any of the callback methods.
+
+        Raises:
+            TypeError: A reward function is not callable.
+            ConfigError: The weights do not match the functions, or are not finite.
+        """
+    @property
+    def spec(self) -> GrpoSpec:
+        """A copy of the spec the trainer runs."""
+    def add_callback(self, callback: object) -> None:
+        """Add a callback object."""
+    def train(self) -> GrpoResult:
+        """Run the training.
+
+        Raises:
+            RewardError: A reward function raised or returned a bad result; its own
+                exception is the ``__cause__``.
             TrainingError: The run failed (or the error's own type: ``ModelLoadError``,
                 ``HubError``, ``OutOfMemoryError``, ...).
             KeyboardInterrupt: On Ctrl-C, after the step in flight.

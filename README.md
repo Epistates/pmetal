@@ -59,8 +59,9 @@ pmetal merge --model-a model-a --model-b model-b --method slerp --t 0.5 --output
 pmetal fuse --model Qwen/Qwen3-0.6B --lora ./output/adapter_model.safetensors --output ./fused
 pmetal quantize --model ./fused --output model.gguf --method q4_k_m
 
-# Perplexity on a dataset
+# Perplexity on a dataset, and a benchmark
 pmetal eval --model Qwen/Qwen3-0.6B --dataset eval.jsonl
+pmetal eval --model Qwen/Qwen3-0.6B --task gsm8k --limit 50
 ```
 
 Speculative decoding with a Qwen3.6 checkpoint that bundles its own multi-token-prediction head, and with a predictor you trained yourself:
@@ -78,13 +79,13 @@ pmetal infer --model Qwen/Qwen3.6-35B-A3B --mtp --mtp-model ./qwen-mtp --prompt 
 
 | Command | Description |
 |---------|-------------|
-| `train` | LoRA/QLoRA/DoRA fine-tuning (SFT); `--ane` trains on the Neural Engine |
+| `train` | LoRA/QLoRA/DoRA fine-tuning (SFT); `--full` trains every weight and saves a whole model; `--ane` trains on the Neural Engine |
 | `train-mtp` | Train a Gemma 4 assistant or a Qwen3Next/Qwen3.6 MTP predictor for speculative decoding |
 | `train-draft` | Train a DFlash block-diffusion draft checkpoint |
 | `train-diffusion` | LoRA/QLoRA fine-tune a DiffusionGemma block-diffusion model |
 | `pretrain` | Pretrain from scratch (full-parameter, no LoRA) on tokenized shards |
 | `preference` | DPO, Robust DPO, IPO, hinge, SimPO, ORPO or KTO with LoRA (alias `dpo`) |
-| `grpo` | GRPO, DAPO, Dr. GRPO and GSPO reasoning training (VLM, reward models, async rewards) |
+| `grpo` | GRPO, DAPO, Dr. GRPO and GSPO reasoning training (VLM, reward models, reward commands, verifiers, async rewards) |
 | `rlkd` | GRPO with a distillation term from a teacher |
 | `distill` | Knowledge distillation (online, offline, progressive) |
 | `embed-train` | Sentence-embedding fine-tuning (InfoNCE, triplet, CoSENT) |
@@ -94,12 +95,13 @@ pmetal infer --model Qwen/Qwen3.6-35B-A3B --mtp --mtp-model ./qwen-mtp --prompt 
 | `dflash` | Block-diffusion speculative decoding |
 | `search`, `download`, `upload`, `verify` | Hugging Face Hub search with device fit, download, publish, integrity check |
 | `merge`, `fuse`, `quantize` | Model merging, LoRA fusing, GGUF and MLX quantization |
-| `eval` | Perplexity on a dataset |
+| `imatrix` | Measure an importance matrix on calibration data, for `quantize --imatrix` |
+| `eval` | Perplexity on a dataset, or a benchmark: GSM8K, MMLU, ARC, HellaSwag, IFEval subset, your own |
 | `dataset`, `tokenize` | Dataset analysis, conversion and preparation; pretraining shards |
 | `vocode` | Mel spectrogram to waveform with a BigVGAN vocoder |
 | `ollama` | Modelfile generation for Ollama |
 | `tui`, `dashboard` | The terminal UI; `dashboard` opens it on the Monitor tab |
-| `mcp` | MCP server over stdio (56 tools) |
+| `mcp` | MCP server over stdio (57 tools) |
 | `cluster` | Multi-Mac cluster: keys, discovery, status, benchmarks |
 | `info`, `memory`, `init`, `completions` | Device report, memory report, sample training config, shell completions |
 | `bench`, `bench-gen`, `bench-workload`, `bench-corpus`, `bench-gdn` | Training, generation, workload and kernel benchmarks |
@@ -146,7 +148,7 @@ cd crates/pmetal-gui && bun install && bun tauri dev
 
 ### MCP server
 
-`pmetal mcp` exposes 56 tools over stdio for Claude Desktop, Claude Code and other MCP clients: training, inference, model and dataset operations, device information and job control, with read-only resources and prompts. The tools are generated from the same job specs. See [`docs/cli/mcp.md`](docs/cli/mcp.md).
+`pmetal mcp` exposes 57 tools over stdio for Claude Desktop, Claude Code and other MCP clients: training, inference, model and dataset operations, device information and job control, with read-only resources and prompts. The tools are generated from the same job specs. See [`docs/cli/mcp.md`](docs/cli/mcp.md).
 
 ### Python
 
@@ -285,7 +287,7 @@ Common to the training commands: optimizers `adamw`, `sgd`, `lion`, `adafactor`,
 - **Server**: `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/messages` (with `/v1/messages/count_tokens`) and `/v1/models`, with streaming, tool calls parsed per model family, JSON-schema and `tool_choice` enforced by constrained decoding, `logit_bias`, logprobs (the prompt's too, with `echo`, for loglikelihood evaluation), `reasoning_content`, images and videos (Qwen3.5 family, Llama 3.2 Vision), prefix caching, `--continuous-batch`, speculative decoding on the GPU (`--mtp`, `--draft-model`: the model's own tokens, sooner), Prometheus metrics at `/metrics`, optional API keys and CORS origins. See [`crates/pmetal-serve/README.md`](crates/pmetal-serve/README.md).
 - **Datasets**: JSONL, JSON, Parquet, Arrow and CSV, or a directory of shards; messages, ShareGPT, Alpaca, prompt/completion, reasoning and plain-text rows are detected automatically. `pmetal dataset` analyzes, converts, filters, splits and prepares them.
 - **Merging**: 18 strategies in the library (14 on the command line: linear, SLERP, TIES, DARE, DELLA, task arithmetic, Breadcrumbs, Model Stock, consensus, Multi-SLERP, nearswap, passthrough and variants), streamed tensor by tensor from memory-mapped checkpoints, with FP8 inputs, layer slices and reproducible masks. See [`docs/models/merging.md`](docs/models/merging.md).
-- **Quantization**: GGUF (24 methods including K-quants, ternary, MXFP4 and NVFP4, with `--imatrix` and KL-calibrated `--kl-calibrate --target-bpw`) and MLX-format output. See [`docs/models/quantization.md`](docs/models/quantization.md).
+- **Quantization**: GGUF (26 methods including K-quants, IQ4_NL and IQ4_XS, ternary, MXFP4 and NVFP4, with importance matrices measured by `pmetal imatrix` or on the fly with `--calibration-dataset`, and KL-calibrated `--kl-calibrate --target-bpw`) and MLX-format output. See [`docs/models/quantization.md`](docs/models/quantization.md).
 - **Distillation**: online, offline (compressed top-k, int8/int4 or sampled logit caches) and progressive; KL, reverse KL, Jensen-Shannon, skew KL, soft cross-entropy, MSE and cross-vocabulary universal-logit losses; rationale distillation; on-policy generation. See [`docs/training/distillation.md`](docs/training/distillation.md).
 
 ## Multi-Mac cluster
@@ -387,7 +389,7 @@ crates/
 ├── pmetal-vocoder      # BigVGAN neural vocoder
 ├── pmetal-serve        # OpenAI- and Anthropic-compatible server
 ├── pmetal-supervisor   # Runs pmetal commands as supervised child processes
-├── pmetal-mcp          # MCP server (56 tools)
+├── pmetal-mcp          # MCP server (57 tools)
 ├── pmetal-py           # Python bindings (maturin / PyO3)
 ├── pmetal              # Umbrella crate: the CLI, the TUI and re-exports of the rest
 └── pmetal-gui          # Desktop app (Tauri + Svelte), its own workspace

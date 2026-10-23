@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use pmetal_data::Tokenizer;
 use pmetal_models::model_thread::{ModelThread, ModelThreadStartError};
-use pmetal_models::{DynamicModel, GenerationConfig, generate_cached_async_streaming};
+use pmetal_models::{DynamicModel, GenerationConfig};
 use pyo3::exceptions::PyValueError;
 use pyo3::panic::PanicException;
 use pyo3::prelude::*;
@@ -129,19 +129,10 @@ fn decode(
     config: GenerationConfig,
     on_token: impl FnMut(u32) -> bool,
 ) -> Result<(), String> {
-    let mut cache = model.create_cache(ids.len() + config.max_new_tokens + 64);
-    let mut mamba = model.create_mamba_cache();
-    generate_cached_async_streaming(
-        |input, cache| {
-            model.forward_with_hybrid_cache_last(input, None, Some(cache), mamba.as_mut())
-        },
-        ids,
-        config,
-        &mut cache,
-        on_token,
-    )
-    .map(|_| ())
-    .map_err(|e| e.to_string())
+    model
+        .generate_streaming(ids, config, on_token)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 #[pymethods]

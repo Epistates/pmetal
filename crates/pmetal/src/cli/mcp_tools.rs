@@ -45,7 +45,7 @@ fn every_spec_tool_builds_a_command_the_cli_parses() {
         let definition = serde_json::to_value(tool.definition()).unwrap();
         // Each required parameter is a Hub-style name, which is also a valid
         // relative path for the ones that name files.
-        let args: serde_json::Map<String, Value> = definition["inputSchema"]["required"]
+        let mut args: serde_json::Map<String, Value> = definition["inputSchema"]["required"]
             .as_array()
             .into_iter()
             .flatten()
@@ -60,6 +60,11 @@ fn every_spec_tool_builds_a_command_the_cli_parses() {
                 (name.to_string(), value)
             })
             .collect();
+        // A spec's own rules can need a parameter no descriptor marks required:
+        // `eval` takes a dataset (perplexity) or a task, so neither is.
+        if tool.name() == "eval_perplexity" {
+            args.insert("dataset".to_string(), json!("owner/name"));
+        }
         let prepared = tool
             .prepare(Value::Object(args), &policy)
             .unwrap_or_else(|e| panic!("{}: {e}", tool.name()));

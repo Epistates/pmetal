@@ -40,7 +40,7 @@ use std::thread;
 
 use pmetal_runtime::compat::Array;
 
-use crate::grpo::{GrpoError, GrpoResult, RewardFunction};
+use crate::grpo::{DatasetRow, GrpoError, GrpoResult, RewardBatch, RewardFunction};
 
 // ---------------------------------------------------------------------------
 // Internal channel types
@@ -52,6 +52,8 @@ struct ScoreRequest {
     completions: Vec<String>,
     /// Each completion's reference answer; empty when the prompts have none.
     references: Vec<Option<String>>,
+    /// Each completion's dataset row; empty when the caller has none.
+    columns: Vec<DatasetRow>,
     /// One-shot channel: the worker sends the result back here.
     response_tx: mpsc::SyncSender<GrpoResult<Vec<f64>>>,
 }
@@ -173,12 +175,13 @@ impl AsyncRewardModel {
                     } else {
                         req.references
                     };
-                    let result = inner.compute_with_references(
-                        &req.prompts,
-                        &req.completions,
-                        &references,
-                        None,
-                    );
+                    let result = inner.score(&RewardBatch {
+                        prompts: &req.prompts,
+                        completions: &req.completions,
+                        references: &references,
+                        columns: &req.columns,
+                        images: None,
+                    });
                     // Ignore send errors: the caller may have dropped the
                     // receiver if it timed out or exited early.
                     let _ = req.response_tx.send(result);
@@ -229,6 +232,19 @@ impl AsyncRewardModel {
         completions: Vec<String>,
         references: Vec<Option<String>>,
     ) -> GrpoResult<PendingRewards> {
+        self.score_async_with_columns(prompts, completions, references, Vec::new())
+    }
+
+    /// [`score_async_with_references`](Self::score_async_with_references) with
+    /// each completion's dataset row, for rewards that read the dataset's
+    /// columns.
+    pub fn score_async_with_columns(
+        &self,
+        prompts: Vec<String>,
+        completions: Vec<String>,
+        references: Vec<Option<String>>,
+        columns: Vec<DatasetRow>,
+    ) -> GrpoResult<PendingRewards> {
         // One-shot channel for this specific request's response.
         // SyncSender with capacity 1: the worker sends exactly one result.
         let (response_tx, response_rx) = mpsc::sync_channel(1);
@@ -237,6 +253,7 @@ impl AsyncRewardModel {
             prompts,
             completions,
             references,
+            columns,
             response_tx,
         };
 
@@ -281,6 +298,16 @@ impl RewardFunction for AsyncRewardModel {
             prompts.to_vec(),
             completions.to_vec(),
             references.to_vec(),
+        )?
+        .collect()
+    }
+
+    fn score(&self, batch: &RewardBatch<'_>) -> GrpoResult<Vec<f64>> {
+        self.score_async_with_columns(
+            batch.prompts.to_vec(),
+            batch.completions.to_vec(),
+            batch.references.to_vec(),
+            batch.columns.to_vec(),
         )?
         .collect()
     }
@@ -354,6 +381,18 @@ impl<'a> PipelinedGrpoSession<'a> {
         completions: Vec<String>,
         references: Vec<Option<String>>,
     ) -> GrpoResult<Option<Vec<f64>>> {
+        self.begin_step_with_columns(prompts, completions, references, Vec::new())
+    }
+
+    /// [`begin_step_with_references`](Self::begin_step_with_references) with
+    /// each completion's dataset row.
+    pub fn begin_step_with_columns(
+        &mut self,
+        prompts: Vec<String>,
+        completions: Vec<String>,
+        references: Vec<Option<String>>,
+        columns: Vec<DatasetRow>,
+    ) -> GrpoResult<Option<Vec<f64>>> {
         // Collect results from the previous step before we submit the new request
         // (the bounded channel has capacity 1 and would block if we submitted first).
         let prev_rewards = self.pending.take().map(|p| p.collect()).transpose()?;
@@ -361,7 +400,7 @@ impl<'a> PipelinedGrpoSession<'a> {
         // Submit the new scoring request for this step.
         let new_pending =
             self.model
-                .score_async_with_references(prompts, completions, references)?;
+                .score_async_with_columns(prompts, completions, references, columns)?;
         self.pending = Some(new_pending);
 
         Ok(prev_rewards)

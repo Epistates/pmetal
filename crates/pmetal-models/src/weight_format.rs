@@ -40,6 +40,12 @@ pub enum WeightFormatError {
     Json(#[from] serde_json::Error),
 }
 
+impl From<pmetal_gguf::config::GgufConfigError> for WeightFormatError {
+    fn from(e: pmetal_gguf::config::GgufConfigError) -> Self {
+        Self::Gguf(e.to_string())
+    }
+}
+
 /// Detected weight format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightFormat {
@@ -222,6 +228,17 @@ impl WeightLoader {
     /// GGUF uses names like `blk.0.attn_q.weight`
     /// HuggingFace uses names like `model.layers.0.self_attn.q_proj.weight`
     pub fn gguf_to_hf_name(gguf_name: &str) -> String {
+        // A bias is named as the weight beside it: `attn_q.bias` is the bias of
+        // `attn_q.weight`.
+        if let Some(stem) = gguf_name.strip_suffix(".bias") {
+            let weight = format!("{stem}.weight");
+            let mapped = Self::gguf_to_hf_name(&weight);
+            return match mapped.strip_suffix(".weight") {
+                Some(hf_stem) if mapped != weight => format!("{hf_stem}.bias"),
+                _ => gguf_name.to_string(),
+            };
+        }
+
         // Handle special cases first
         match gguf_name {
             "token_embd.weight" => return "model.embed_tokens.weight".to_string(),
@@ -334,6 +351,16 @@ impl WeightLoader {
     /// HuggingFace uses names like `model.layers.0.self_attn.q_proj.weight`;
     /// GGUF uses names like `blk.0.attn_q.weight`.
     pub fn hf_to_gguf_name(hf_name: &str) -> String {
+        // A bias is named as the weight beside it.
+        if let Some(stem) = hf_name.strip_suffix(".bias") {
+            let weight = format!("{stem}.weight");
+            let mapped = Self::hf_to_gguf_name(&weight);
+            return match mapped.strip_suffix(".weight") {
+                Some(gguf_stem) if mapped != weight => format!("{gguf_stem}.bias"),
+                _ => hf_name.to_string(),
+            };
+        }
+
         match hf_name {
             "model.embed_tokens.weight" => return "token_embd.weight".to_string(),
             "model.norm.weight" => return "output_norm.weight".to_string(),
@@ -360,12 +387,18 @@ impl WeightLoader {
             "post_attention_layernorm.weight" => "ffn_norm.weight",
             "mlp.gate.weight" => "ffn_gate_inp.weight",
             "mlp.router.weight" => "ffn_gate_inp.weight",
+            "block_sparse_moe.gate.weight" => "ffn_gate_inp.weight",
             "mlp.gate_proj.weight" => "ffn_gate.weight",
             "mlp.up_proj.weight" => "ffn_up.weight",
             "mlp.down_proj.weight" => "ffn_down.weight",
             "mlp.experts.gate_proj.weight" => "ffn_gate_exps.weight",
             "mlp.experts.up_proj.weight" => "ffn_up_exps.weight",
             "mlp.experts.down_proj.weight" => "ffn_down_exps.weight",
+            // The stacked layout an MLX conversion (and a loaded model's own
+            // parameter tree) holds the routed experts in.
+            "mlp.switch_mlp.gate_proj.weight" => "ffn_gate_exps.weight",
+            "mlp.switch_mlp.up_proj.weight" => "ffn_up_exps.weight",
+            "mlp.switch_mlp.down_proj.weight" => "ffn_down_exps.weight",
             "mlp.shared_expert.gate_proj.weight" => "ffn_gate_shexp.weight",
             "mlp.shared_expert.up_proj.weight" => "ffn_up_shexp.weight",
             "mlp.shared_expert.down_proj.weight" => "ffn_down_shexp.weight",
@@ -379,6 +412,32 @@ impl WeightLoader {
         };
 
         format!("blk.{layer_idx}.{gguf_suffix}")
+    }
+
+    /// [`hf_to_gguf_name`](Self::hf_to_gguf_name) for Gemma 2 and Gemma 3, the
+    /// inverse of [`gguf_to_hf_name_gemma4`](Self::gguf_to_hf_name_gemma4).
+    ///
+    /// Their four norms per block are named by what they wrap: the Hugging
+    /// Face `post_attention_layernorm` is the norm *after* attention
+    /// (`post_attention_norm`), and the feed-forward block has a pre- and a
+    /// post-norm of its own (`ffn_norm`, `post_ffw_norm`). Gemma 1 has the
+    /// Llama layout and uses the generic map.
+    pub fn hf_to_gguf_name_gemma(hf_name: &str) -> String {
+        if let Some(rest) = hf_name.strip_prefix("model.layers.")
+            && let Some((layer, suffix)) = rest.split_once('.')
+            && layer.parse::<usize>().is_ok()
+        {
+            let gguf_suffix = match suffix {
+                "post_attention_layernorm.weight" => Some("post_attention_norm.weight"),
+                "pre_feedforward_layernorm.weight" => Some("ffn_norm.weight"),
+                "post_feedforward_layernorm.weight" => Some("post_ffw_norm.weight"),
+                _ => None,
+            };
+            if let Some(gguf_suffix) = gguf_suffix {
+                return format!("blk.{layer}.{gguf_suffix}");
+            }
+        }
+        Self::hf_to_gguf_name(hf_name)
     }
 }
 
@@ -430,17 +489,10 @@ impl GgufModelConfig {
     /// states a scaling of its own as well would have two to apply, and gets an
     /// error rather than one of them.
     pub fn set_rope_frequency_factors(&mut self, factors: &[f32]) -> Result<(), WeightFormatError> {
-        if self.rope_scaling.is_some() {
-            return Err(WeightFormatError::Gguf(
-                "the file carries both a rope_freqs tensor and rope.scaling metadata; \
-                 applying one of them would be a guess"
-                    .into(),
-            ));
-        }
-        self.rope_scaling = Some(serde_json::json!({
-            "rope_type": "frequency_factors",
-            "factors": factors,
-        }));
+        self.rope_scaling = Some(pmetal_gguf::config::frequency_factors_scaling(
+            self.rope_scaling.as_ref(),
+            factors,
+        )?);
         Ok(())
     }
 
@@ -455,124 +507,39 @@ impl GgufModelConfig {
     }
 
     /// Extract config from GGUF metadata.
+    ///
+    /// The parameters are read by [`pmetal_gguf::config::GgufArchConfig`], which
+    /// the generated `config.json` is written from as well; this adds what
+    /// loading a model needs on top: the parameters every architecture has to
+    /// state (an error when the file leaves one out), and a default for the
+    /// ones with a conventional value. The vocabulary has none: a file that
+    /// does not say how large it is cannot be loaded as a guess.
     pub fn from_gguf(content: &pmetal_gguf::GgufContent) -> Result<Self, WeightFormatError> {
-        let arch = content
-            .architecture()
-            .ok_or_else(|| WeightFormatError::Gguf("Missing general.architecture".into()))?
-            .to_string();
-
-        // Helper to get metadata with architecture prefix
-        let get_u32 = |key: &str| -> Option<u32> {
-            let full_key = format!("{}.{}", arch, key);
-            match content.get_metadata(&full_key) {
-                Some(pmetal_gguf::MetadataValue::Uint32(v)) => Some(*v),
-                Some(pmetal_gguf::MetadataValue::Int32(v)) => Some(*v as u32),
-                Some(pmetal_gguf::MetadataValue::Uint64(v)) => Some(*v as u32),
-                Some(pmetal_gguf::MetadataValue::Int64(v)) => Some(*v as u32),
-                _ => None,
-            }
-        };
-
-        let get_f32 = |key: &str| -> Option<f32> {
-            let full_key = format!("{}.{}", arch, key);
-            match content.get_metadata(&full_key) {
-                Some(pmetal_gguf::MetadataValue::Float32(v)) => Some(*v),
-                Some(pmetal_gguf::MetadataValue::Float64(v)) => Some(*v as f32),
-                _ => None,
-            }
-        };
-
-        // `rope.scaling.*`: linear and YaRN are what a `rope_scaling` dict
-        // states; a type this loader does not know is an error, because the
-        // positions past the original context would be wrong without a word.
-        let rope_scaling = match content.get_str(&format!("{arch}.rope.scaling.type")) {
-            None | Some("none") | Some("") => None,
-            // LongRoPE's factors are tensors, not metadata: the dict stays
-            // incomplete here (the Phi loader completes it from the tensors) and
-            // a family that cannot read it is refused by the missing factors.
-            Some("longrope") => Some(serde_json::json!({ "rope_type": "longrope" })),
-            Some(kind @ ("linear" | "yarn")) => {
-                let factor = get_f32("rope.scaling.factor").ok_or_else(|| {
-                    WeightFormatError::Gguf(format!(
-                        "{arch}.rope.scaling.type is {kind:?} but {arch}.rope.scaling.factor is \
-                         missing"
-                    ))
-                })?;
-                let mut dict = serde_json::json!({ "rope_type": kind, "factor": factor });
-                if let Some(original) = get_u32("rope.scaling.original_context_length") {
-                    dict["original_max_position_embeddings"] = original.into();
-                }
-                Some(dict)
-            }
-            Some(other) => {
-                return Err(WeightFormatError::Gguf(format!(
-                    "{arch}.rope.scaling.type {other:?} is not supported (linear, yarn and none \
-                     are)"
-                )));
-            }
-        };
-
-        // Extract required values
-        let hidden_size = get_u32("embedding_length").ok_or_else(|| {
-            WeightFormatError::Gguf(format!("{}.embedding_length not found", arch))
-        })? as i32;
-
-        let num_hidden_layers = get_u32("block_count")
-            .ok_or_else(|| WeightFormatError::Gguf(format!("{}.block_count not found", arch)))?
-            as i32;
-
-        let num_attention_heads = get_u32("attention.head_count").ok_or_else(|| {
-            WeightFormatError::Gguf(format!("{}.attention.head_count not found", arch))
-        })? as i32;
-
-        let intermediate_size = get_u32("feed_forward_length").ok_or_else(|| {
-            WeightFormatError::Gguf(format!("{}.feed_forward_length not found", arch))
-        })? as i32;
-
-        // Get vocab size from tokenizer or estimate from token embedding
-        let vocab_size = content
-            .get_metadata("tokenizer.ggml.tokens")
-            .and_then(|v| match v {
-                pmetal_gguf::MetadataValue::Array(arr) => Some(arr.len() as i32),
-                _ => None,
+        let arch = pmetal_gguf::config::GgufArchConfig::from_gguf(content)?;
+        let required = |value: Option<u32>, key: &str| -> Result<i32, WeightFormatError> {
+            value.and_then(|v| i32::try_from(v).ok()).ok_or_else(|| {
+                WeightFormatError::Gguf(format!("{}.{key} not found", arch.architecture))
             })
-            .or_else(|| {
-                // Fallback: estimate from token embedding tensor shape
-                content
-                    .get_tensor_info("token_embd.weight")
-                    .map(|t| t.dimensions[0] as i32)
-            })
-            .unwrap_or(32000); // Default fallback
-
-        // Optional values with defaults
-        let num_kv_heads = get_u32("attention.head_count_kv").map(|v| v as i32);
-        let rms_norm_eps = get_f32("attention.layer_norm_rms_epsilon").unwrap_or(1e-5);
-        let rope_theta = get_f32("rope.freq_base").unwrap_or(10000.0);
-        let max_position_embeddings = get_u32("context_length").unwrap_or(4096) as i32;
-        let head_dim = get_u32("attention.head_dim")
-            .or_else(|| get_u32("attention.key_length"))
-            .or_else(|| get_u32("rope.dimension_count"))
-            .map(|v| v as i32);
-
-        let rope_dimension_count = get_u32("rope.dimension_count").map(|v| v as i32);
-        let original_context_length =
-            get_u32("rope.scaling.original_context_length").map(|v| v as i32);
+        };
+        let as_i32 = |value: Option<u32>| value.and_then(|v| i32::try_from(v).ok());
 
         Ok(Self {
-            architecture: arch,
-            hidden_size,
-            num_hidden_layers,
-            num_attention_heads,
-            num_kv_heads,
-            intermediate_size,
-            vocab_size,
-            rms_norm_eps,
-            rope_theta,
-            max_position_embeddings,
-            head_dim,
-            rope_dimension_count,
-            original_context_length,
-            rope_scaling,
+            hidden_size: required(arch.hidden_size, "embedding_length")?,
+            num_hidden_layers: required(arch.num_hidden_layers, "block_count")?,
+            num_attention_heads: required(arch.num_attention_heads, "attention.head_count")?,
+            intermediate_size: required(arch.intermediate_size, "feed_forward_length")?,
+            // No tokenizer, no `vocab_size`, no embedding to count rows of: the
+            // size is unknown, and 32000 would be somebody else's.
+            vocab_size: required(arch.vocab_size, "vocab_size")?,
+            num_kv_heads: as_i32(arch.num_key_value_heads),
+            rms_norm_eps: arch.rms_norm_eps.map_or(1e-5, |v| v as f32),
+            rope_theta: arch.rope_theta.map_or(10000.0, |v| v as f32),
+            max_position_embeddings: as_i32(arch.max_position_embeddings).unwrap_or(4096),
+            head_dim: as_i32(arch.head_dim),
+            rope_dimension_count: as_i32(arch.rope_dimension_count),
+            original_context_length: as_i32(arch.original_context_length),
+            rope_scaling: arch.rope_scaling,
+            architecture: arch.architecture,
         })
     }
 
@@ -647,24 +614,12 @@ impl GgufModelConfig {
         short: Option<&[f32]>,
         long: Option<&[f32]>,
     ) -> Result<(), WeightFormatError> {
-        let (short, long) = match (short, long) {
-            (None, None) => return Ok(()),
-            (Some(short), Some(long)) => (short, long),
-            _ => {
-                return Err(WeightFormatError::Gguf(
-                    "the file has only one of rope_factors_short and rope_factors_long".into(),
-                ));
-            }
-        };
-        let mut dict = serde_json::json!({
-            "rope_type": "longrope",
-            "short_factor": short,
-            "long_factor": long,
-        });
-        if let Some(original) = self.original_context_length {
-            dict["original_max_position_embeddings"] = original.into();
+        let original = self
+            .original_context_length
+            .and_then(|v| u32::try_from(v).ok());
+        if let Some(scaling) = pmetal_gguf::config::longrope_scaling(short, long, original)? {
+            self.rope_scaling = Some(scaling);
         }
-        self.rope_scaling = Some(dict);
         Ok(())
     }
 
@@ -909,6 +864,58 @@ mod tests {
         for name in names {
             let gguf = WeightLoader::hf_to_gguf_name(name);
             assert_eq!(WeightLoader::gguf_to_hf_name(&gguf), name);
+        }
+    }
+
+    /// A bias is named as the weight beside it, both ways: Qwen 2 has query,
+    /// key and value biases, and a file that names them `blk.N.self_attn.q_proj.bias`
+    /// has tensors no engine looks for.
+    #[test]
+    fn test_biases_follow_their_weights() {
+        for (hf, gguf) in [
+            ("model.layers.3.self_attn.q_proj.bias", "blk.3.attn_q.bias"),
+            ("model.layers.3.self_attn.k_proj.bias", "blk.3.attn_k.bias"),
+            ("model.layers.3.self_attn.v_proj.bias", "blk.3.attn_v.bias"),
+        ] {
+            assert_eq!(WeightLoader::hf_to_gguf_name(hf), gguf);
+            assert_eq!(WeightLoader::gguf_to_hf_name(gguf), hf);
+        }
+        // A bias outside the layers, with no weight of that name, is left as it is.
+        assert_eq!(
+            WeightLoader::hf_to_gguf_name("model.mystery.bias"),
+            "model.mystery.bias"
+        );
+    }
+
+    /// Gemma 2 and 3 name their four norms by what they wrap, and the reader
+    /// maps the names back.
+    #[test]
+    fn test_hf_to_gguf_name_gemma_round_trips_with_the_reader() {
+        for (hf, gguf) in [
+            (
+                "model.layers.4.post_attention_layernorm.weight",
+                "blk.4.post_attention_norm.weight",
+            ),
+            (
+                "model.layers.4.pre_feedforward_layernorm.weight",
+                "blk.4.ffn_norm.weight",
+            ),
+            (
+                "model.layers.4.post_feedforward_layernorm.weight",
+                "blk.4.post_ffw_norm.weight",
+            ),
+            (
+                "model.layers.4.input_layernorm.weight",
+                "blk.4.attn_norm.weight",
+            ),
+            (
+                "model.layers.4.self_attn.q_norm.weight",
+                "blk.4.attn_q_norm.weight",
+            ),
+            ("model.layers.4.mlp.up_proj.weight", "blk.4.ffn_up.weight"),
+        ] {
+            assert_eq!(WeightLoader::hf_to_gguf_name_gemma(hf), gguf);
+            assert_eq!(WeightLoader::gguf_to_hf_name_gemma4(gguf), hf);
         }
     }
 

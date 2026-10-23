@@ -29,16 +29,23 @@ struct Run {
 }
 
 impl Run {
-    /// Start `pmetal args...` with `--log-events` pointing at a file.
+    /// Start `pmetal args...`, with `--log-events` pointing at a file for the
+    /// commands that write an event log (the others refuse the flag).
     fn start(dir: &Path, args: &[&str]) -> Self {
         let (stdout, stderr, events) = (
             dir.join("stdout.log"),
             dir.join("stderr.log"),
             dir.join("events.jsonl"),
         );
-        let child = Command::new(env!("CARGO_BIN_EXE_pmetal"))
-            .args(["--log-events"])
-            .arg(&events)
+        let logs_events = matches!(
+            args.first().copied(),
+            Some("train" | "distill" | "grpo" | "rlkd" | "preference")
+        );
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pmetal"));
+        if logs_events {
+            command.arg("--log-events").arg(&events);
+        }
+        let child = command
             .args(args)
             .env("RUST_LOG", "info")
             .stdin(Stdio::null())
@@ -188,6 +195,199 @@ fn train_stops_after_its_step_and_keeps_the_adapter() {
 }
 
 #[test]
+fn full_fine_tune_stops_after_its_step_and_keeps_the_model() {
+    let (dir, model) = workspace();
+    let data = dir.path().join("data.jsonl");
+    fixtures::write_text_dataset(&data);
+    let out = dir.path().join("out");
+    let run = Run::start(
+        dir.path(),
+        &[
+            "train",
+            "--model",
+            s(&model),
+            "--dataset",
+            s(&data),
+            "--output",
+            s(&out),
+            "--full",
+            "--learning-rate",
+            "1e-5",
+            "--epochs",
+            "1000",
+            "--batch-size",
+            "2",
+            "--max-seq-len",
+            "32",
+        ],
+    );
+    stops_gracefully(run, event_log_has_a_step, &out.join("model.safetensors"));
+    // A whole model: what `infer` and `serve` load, not an adapter.
+    for file in ["config.json", "tokenizer.json"] {
+        assert!(out.join(file).exists(), "the saved model has no {file}");
+    }
+    assert!(!out.join("adapter_model.safetensors").exists());
+}
+
+#[test]
+fn a_fully_fine_tuned_model_is_one_infer_loads() {
+    let (dir, model) = workspace();
+    let data = dir.path().join("data.jsonl");
+    fixtures::write_text_dataset(&data);
+    let out = dir.path().join("out");
+    let train = Command::new(env!("CARGO_BIN_EXE_pmetal"))
+        .args([
+            "train",
+            "--model",
+            s(&model),
+            "--dataset",
+            s(&data),
+            "--output",
+            s(&out),
+            "--full",
+            "--freeze-embeddings",
+            "--learning-rate",
+            "1e-5",
+            "--max-steps",
+            "2",
+            "--batch-size",
+            "2",
+            "--max-seq-len",
+            "32",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        train.status.success(),
+        "{}",
+        String::from_utf8_lossy(&train.stderr)
+    );
+    let infer = Command::new(env!("CARGO_BIN_EXE_pmetal"))
+        .args([
+            "infer",
+            "--model",
+            s(&out),
+            "--prompt",
+            "the cat",
+            "--max-tokens",
+            "4",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        infer.status.success(),
+        "infer could not load the fine-tuned model:\n{}",
+        String::from_utf8_lossy(&infer.stderr)
+    );
+}
+
+#[test]
+fn a_full_fine_tune_that_will_not_fit_is_refused_before_it_loads() {
+    let (dir, model) = workspace();
+    let data = dir.path().join("data.jsonl");
+    fixtures::write_text_dataset(&data);
+    // A sequence length no device holds the activations of.
+    let refused = Command::new(env!("CARGO_BIN_EXE_pmetal"))
+        .args([
+            "train",
+            "--model",
+            s(&model),
+            "--dataset",
+            s(&data),
+            "--output",
+            s(&dir.path().join("out")),
+            "--full",
+            "--learning-rate",
+            "1e-5",
+            "--batch-size",
+            "1024",
+            "--max-seq-len",
+            "1000000",
+        ])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("recommended working set") && stderr.contains("--no-memory-check"),
+        "{stderr}"
+    );
+    assert!(!dir.path().join("out").join("model.safetensors").exists());
+}
+
+#[test]
+fn grpo_stops_and_takes_its_reward_command_with_it() {
+    let (dir, model) = workspace();
+    let data = dir.path().join("data.jsonl");
+    fixtures::write_prompt_dataset(&data);
+    let out = dir.path().join("out");
+    // A reward command that starts a helper of its own and records its pid.
+    let script = dir.path().join("reward.py");
+    let pids = dir.path().join("pids.txt");
+    std::fs::write(
+        &script,
+        format!(
+            "import json, os, subprocess, sys\n\
+             helper = subprocess.Popen(['sleep', '300'])\n\
+             open({pids:?}, 'w').write(f'{{os.getpid()}} {{helper.pid}}')\n\
+             for line in sys.stdin:\n\
+             \x20   n = len(json.loads(line)['completions'])\n\
+             \x20   print(json.dumps({{'rewards': [float(i) for i in range(n)]}}), flush=True)\n",
+            pids = pids.display().to_string(),
+        ),
+    )
+    .unwrap();
+    let command = format!("python3 {}", script.display());
+    let mut run = Run::start(
+        dir.path(),
+        &[
+            "grpo",
+            "--model",
+            s(&model),
+            "--dataset",
+            s(&data),
+            "--output",
+            s(&out),
+            "--epochs",
+            "1000",
+            "--num-generations",
+            "2",
+            "--max-completion-length",
+            "6",
+            "--max-seq-len",
+            "32",
+            "--lora-r",
+            "4",
+            "--reward-cmd",
+            &command,
+        ],
+    );
+    run.wait_until("a training step", event_log_has_a_step);
+    run.terminate();
+    assert_eq!(run.exit_code(), Some(130), "{}", run.output());
+    assert!(out.join("adapter_model.safetensors").exists());
+
+    // The command and its helper are gone with the run.
+    let recorded = std::fs::read_to_string(&pids).unwrap();
+    for pid in recorded.split_whitespace() {
+        let started = Instant::now();
+        while Command::new("kill")
+            .args(["-0", pid])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+        {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "process {pid} outlived the run"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+#[test]
 fn distill_stops_after_its_step_and_keeps_the_student() {
     let (dir, model) = workspace();
     let data = dir.path().join("data.jsonl");
@@ -331,6 +531,40 @@ fn preference_stops_after_its_step_and_keeps_the_adapter() {
         event_log_has_a_step,
         &out.join("adapter_model.safetensors"),
     );
+}
+
+#[test]
+fn full_preference_stops_after_its_step_and_keeps_the_model() {
+    let (dir, model) = workspace();
+    let data = dir.path().join("data.jsonl");
+    fixtures::write_preference_dataset(&data);
+    let out = dir.path().join("out");
+    let run = Run::start(
+        dir.path(),
+        &[
+            "preference",
+            "--model",
+            s(&model),
+            "--dataset",
+            s(&data),
+            "--output",
+            s(&out),
+            "--full",
+            "--loss",
+            "dpo",
+            "--epochs",
+            "1000",
+            "--batch-size",
+            "2",
+            "--max-length",
+            "32",
+            "--max-prompt-length",
+            "16",
+        ],
+    );
+    stops_gracefully(run, event_log_has_a_step, &out.join("model.safetensors"));
+    assert!(out.join("config.json").exists());
+    assert!(!out.join("adapter_model.safetensors").exists());
 }
 
 /// Tokenize the text dataset into shards with the real `pmetal tokenize`.

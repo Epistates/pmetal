@@ -144,6 +144,16 @@ fn leaving_a_parameter_out_gives_the_specs_default() {
         for name in &required {
             args.insert(name.clone(), sample(name, &properties[name], None));
         }
+        // A spec's own rules can need a parameter no descriptor marks required:
+        // `eval` takes a dataset (perplexity) or a task, so neither is.
+        let needed_by_rules: &[&str] = if tool.name() == "eval_perplexity" {
+            &["dataset"]
+        } else {
+            &[]
+        };
+        for name in needed_by_rules {
+            args.insert((*name).to_string(), sample(name, &properties[*name], None));
+        }
         // Required references and paths are given as paths under the allowed root.
         for (name, value) in args.iter_mut() {
             if value.is_string() && properties[name].get("enum").is_none() {

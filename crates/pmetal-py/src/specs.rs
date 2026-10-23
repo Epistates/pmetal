@@ -5,8 +5,8 @@
 
 use pmetal_core::jobs::{
     BenchSpec, DecideSpec, DflashSpec, DistillSpec, EmbedTrainSpec, EvalSpec, FuseSpec, GrpoSpec,
-    InferSpec, MergeSpec, PackExpertsSpec, PreferenceSpec, PretrainSpec, QuantizeSpec, RlkdSpec,
-    ServeSpec, TokenizeSpec, TrainDiffusionSpec, TrainDraftSpec, TrainMtpSpec, TrainSpec,
+    ImatrixSpec, InferSpec, MergeSpec, PackExpertsSpec, PreferenceSpec, PretrainSpec, QuantizeSpec,
+    RlkdSpec, ServeSpec, TokenizeSpec, TrainDiffusionSpec, TrainDraftSpec, TrainMtpSpec, TrainSpec,
     VocodeSpec,
 };
 use pyo3::prelude::*;
@@ -88,6 +88,12 @@ py_spec!(
     "QuantizeSpec",
     QuantizeSpec,
     "Model quantization (`pmetal quantize`)."
+);
+py_spec!(
+    PyImatrixSpec,
+    "ImatrixSpec",
+    ImatrixSpec,
+    "Importance-matrix measurement on calibration data (`pmetal imatrix`)."
 );
 py_spec!(
     PyMergeSpec,
@@ -175,6 +181,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEmbedTrainSpec>()?;
     m.add_class::<PyPretrainSpec>()?;
     m.add_class::<PyQuantizeSpec>()?;
+    m.add_class::<PyImatrixSpec>()?;
     m.add_class::<PyMergeSpec>()?;
     m.add_class::<PyFuseSpec>()?;
     m.add_class::<PyEvalSpec>()?;

@@ -60,6 +60,9 @@ class TokenizerError(PMetalError):
 class TrainingError(PMetalError):
     """A training run failed."""
 
+class RewardError(TrainingError):
+    """A reward function of a GRPO run failed: it raised, or returned something that is not one number per completion. The function's own exception is the ``__cause__``."""
+
 class QuantizationError(PMetalError):
     """Quantization failed."""
 
@@ -206,6 +209,9 @@ class TrainOptions(TypedDict, total=False):
     cut_cross_entropy: bool
     no_adaptive_lr: bool
     ane: bool
+    full_finetune: bool
+    freeze_embeddings: bool
+    no_memory_check: bool
     pack_max_seq_len: int | None
     distributed_peers: str | None
     distributed_auto: bool
@@ -333,6 +339,12 @@ class TrainSpec(_Spec):
     """Disable Adaptive LR. Flag: ``--no-adaptive-lr``. Default: ``False``."""
     ane: bool
     """Use ANE. Flag: ``--ane``. Default: ``False``."""
+    full_finetune: bool
+    """Full Fine-Tune. Train every weight instead of LoRA adapters, and save a whole model that `infer` and `serve` load. Needs several times the model's size in memory (weights, gradients and optimizer state): refused up front when it will not fit. Pass a learning rate of 1e-5 to 5e-5. Flag: ``--full``. Default: ``False``."""
+    freeze_embeddings: bool
+    """Freeze Embeddings. With --full, keep the input token embedding as loaded (a model that ties its output head to it keeps the head too): saves its gradient and optimizer state. Flag: ``--freeze-embeddings``. Default: ``False``."""
+    no_memory_check: bool
+    """No Memory Check. With --full, run without checking the memory estimate against the device's working set. Flag: ``--no-memory-check``. Default: ``False``."""
     pack_max_seq_len: int | None
     """Pack Max Seq Len. Flag: ``--pack-max-seq-len``. From 0 to 9.22337e+18. Default: ``None``."""
     distributed_peers: str | None
@@ -627,6 +639,14 @@ class GrpoOptions(TypedDict, total=False):
     reward_model_max_length: int
     reward_model_weight: float
     reward_model_template: str | None
+    reward_cmd: list[str]
+    reward_weight: list[str]
+    reward_timeout: int
+    reward_regex: str | None
+    reward_regex_weight: float
+    reward_json: bool
+    reward_json_schema: str | None
+    reward_json_weight: float
     async_rewards: bool
     prompt_column: str | None
     response_column: str | None
@@ -695,6 +715,22 @@ class GrpoSpec(_Spec):
     """Reward Model Weight. Flag: ``--reward-model-weight``. From 0 to 100. Default: ``1.0``."""
     reward_model_template: str | None
     """Reward Model Template. Flag: ``--reward-model-template``. Default: ``None``."""
+    reward_cmd: list[str]
+    """Reward Commands. A command that scores completions: started once, it reads one JSON request per line on stdin ({prompts, completions, plus the dataset's other columns}, one entry per completion) and answers one {"rewards": [...]} line on stdout. Repeat for several; each is summed with the others. Flag: ``--reward-cmd``. Default: ``[]``."""
+    reward_weight: list[str]
+    """Reward Command Weights. The weight of each --reward-cmd, in order (a number; 1 for a command without one). Flag: ``--reward-weight``. Default: ``[]``."""
+    reward_timeout: int
+    """Reward Command Timeout. Seconds a reward command has to answer one batch, its first included; past it the run fails. Flag: ``--reward-timeout``. From 1 to 86400. Default: ``120``."""
+    reward_regex: str | None
+    """Reward Regex. A pattern the completion should match anywhere (1 when it does, 0 when not); anchor it with ^ and $ to match the whole completion. Flag: ``--reward-regex``. Default: ``None``."""
+    reward_regex_weight: float
+    """Reward Regex Weight. Flag: ``--reward-regex-weight``. From -100 to 100. Default: ``1.0``."""
+    reward_json: bool
+    """Reward JSON. Reward a completion that is a JSON document, alone or in a fenced code block. Flag: ``--reward-json``. Default: ``False``."""
+    reward_json_schema: str | None
+    """Reward JSON Schema. A JSON Schema file: reward a completion that is a JSON document valid against it (this includes --reward-json). Flag: ``--reward-json-schema``. Default: ``None``."""
+    reward_json_weight: float
+    """Reward JSON Weight. Flag: ``--reward-json-weight``. From -100 to 100. Default: ``1.0``."""
     async_rewards: bool
     """Async Rewards. Flag: ``--async-rewards``. Default: ``False``."""
     prompt_column: str | None
@@ -732,6 +768,9 @@ class PreferenceOptions(TypedDict, total=False):
     optimizer: Literal['adamw', 'sgd', 'lion', 'adafactor', 'muon', 'adamw_schedule_free', 'adamw_8bit']
     lora_r: int
     lora_alpha: float
+    full_finetune: bool
+    freeze_embeddings: bool
+    no_memory_check: bool
     max_prompt_length: int
     max_length: int
     seed: int
@@ -790,6 +829,12 @@ class PreferenceSpec(_Spec):
     """LoRA r. Flag: ``--lora-r``. From 1 to 1024. Default: ``16``."""
     lora_alpha: float
     """LoRA α. Flag: ``--lora-alpha``. From 1 to 4096. Default: ``32.0``."""
+    full_finetune: bool
+    """Full Fine-Tune. Train every weight instead of a LoRA adapter, and save a whole model that `infer` and `serve` load (the reference is the model as it starts). Needs several times the model's size in memory: refused up front when it will not fit. Flag: ``--full``. Default: ``False``."""
+    freeze_embeddings: bool
+    """Freeze Embeddings. With --full, keep the input token embedding as loaded. Flag: ``--freeze-embeddings``. Default: ``False``."""
+    no_memory_check: bool
+    """No Memory Check. With --full, run without checking the memory estimate against the device's working set. Flag: ``--no-memory-check``. Default: ``False``."""
     max_prompt_length: int
     """Max Prompt Length. Flag: ``--max-prompt-length``. From 1 to 9.22337e+18. Default: ``512``."""
     max_length: int
@@ -1316,9 +1361,16 @@ class EvalOptions(TypedDict, total=False):
 
     model: str
     dataset: str
+    task: Literal['gsm8k', 'mmlu', 'arc_challenge', 'hellaswag', 'ifeval-lite', 'custom'] | None
+    fewshot: int | None
     lora: str | None
     max_seq_len: int
     num_samples: int
+    seed: int
+    batch_size: int
+    max_gen_tokens: int
+    output: str | None
+    log_samples: bool
     json: bool
 
 @final
@@ -1337,13 +1389,27 @@ class EvalSpec(_Spec):
     model: str
     """Model. Flag: ``--model``. Default: ``''``."""
     dataset: str
-    """Dataset. Flag: ``--dataset``. Default: ``''``."""
+    """Dataset. Perplexity: the text to score. With --task: a local file of the task's data to use in place of the standard dataset, and the questions of --task custom. Flag: ``--dataset``. Default: ``''``."""
+    task: Literal['gsm8k', 'mmlu', 'arc_challenge', 'hellaswag', 'ifeval-lite', 'custom'] | None
+    """Task. Score a benchmark instead of perplexity: gsm8k (chain-of-thought math, exact match), mmlu, arc_challenge and hellaswag (multiple choice by log-likelihood, accuracy), ifeval-lite (verifiable instructions) or custom (your JSONL: question and answer, or question and choices). Flag: ``--task``. One of: ``gsm8k``, ``mmlu``, ``arc_challenge``, ``hellaswag``, ``ifeval-lite``, ``custom``. Default: ``None``."""
+    fewshot: int | None
+    """Few-Shot Examples. Examples shown before each question. The task's usual number when not given: gsm8k 5, mmlu 5, arc_challenge 25, hellaswag 10, ifeval-lite and custom 0. Flag: ``--fewshot``. From 0 to 256. Default: ``None``."""
     lora: str | None
     """LoRA Adapter. Flag: ``--lora``. Default: ``None``."""
     max_seq_len: int
-    """Max Seq Len. Flag: ``--max-seq-len``. From 0 to 9.22337e+18. Default: ``1024``."""
+    """Max Seq Len. 0 = 1024 tokens for perplexity, 8192 for a task. A longer sequence loses the start of its context. Flag: ``--max-seq-len``. From 0 to 9.22337e+18. Default: ``0``."""
     num_samples: int
-    """Num Samples. 0 = all. Flag: ``--num-samples``. From 0 to 9.22337e+18. Default: ``0``."""
+    """Num Samples. Score this many samples (0 = all). A task of one subject scores its first items; mmlu draws them from every subject with --seed. Flag: ``--num-samples``. From 0 to 9.22337e+18. Default: ``0``."""
+    seed: int
+    """Seed. Seeds which items a limit keeps and which few-shot examples are drawn. Flag: ``--seed``. From 0 to 9.22337e+18. Default: ``1234``."""
+    batch_size: int
+    """Batch Size. Most sequences scored in one forward pass (a task's log-likelihoods). Flag: ``--batch-size``. From 1 to 1024. Default: ``16``."""
+    max_gen_tokens: int
+    """Max Generated Tokens. Most tokens a generation task may produce per item (ifeval-lite asks for more). Flag: ``--max-gen-tokens``. From 1 to 32768. Default: ``256``."""
+    output: str | None
+    """Results File. Write the results as JSON to this file: each metric with its standard error, per subject where there are any. Flag: ``--output``. Default: ``None``."""
+    log_samples: bool
+    """Log Samples. Keep every item's prompt, output and verdict, in a .samples.jsonl file next to --output. Flag: ``--log-samples``. Default: ``False``."""
     json: bool
     """JSON Output. Flag: ``--json``. Default: ``False``."""
 
@@ -1836,6 +1902,9 @@ class TrainCallOptions(TypedDict, total=False):
     cut_cross_entropy: bool
     no_adaptive_lr: bool
     ane: bool
+    full_finetune: bool
+    freeze_embeddings: bool
+    no_memory_check: bool
     pack_max_seq_len: int | None
     distributed_peers: str | None
     distributed_auto: bool
@@ -1843,6 +1912,47 @@ class TrainCallOptions(TypedDict, total=False):
     config_path: str | None
     resume: bool
     log_metrics: str | None
+
+@type_check_only
+class GrpoCallOptions(TypedDict, total=False):
+    """The fields of ``GrpoSpec`` that ``grpo`` takes as keyword arguments."""
+
+    output_dir: str
+    num_generations: int
+    beta: float
+    learning_rate: float
+    optimizer: Literal['adamw', 'sgd', 'lion', 'adafactor', 'muon', 'adamw_schedule_free', 'adamw_8bit']
+    epochs: int
+    lora_r: int
+    lora_alpha: float
+    max_seq_len: int
+    max_completion_length: int
+    seed: int
+    checkpoint_every: int
+    dapo: bool
+    loss_type: Literal['dapo', 'grpo', 'dr_grpo', 'gspo']
+    num_iterations: int
+    reasoning_rewards: bool
+    vlm: bool
+    max_image_size: int
+    reward_model: str | None
+    reward_model_max_length: int
+    reward_model_weight: float
+    reward_model_template: str | None
+    reward_cmd: list[str]
+    reward_weight: list[str]
+    reward_timeout: int
+    reward_regex: str | None
+    reward_regex_weight: float
+    reward_json: bool
+    reward_json_schema: str | None
+    reward_json_weight: float
+    async_rewards: bool
+    prompt_column: str | None
+    response_column: str | None
+    grpo_kv_bits: int | None
+    log_metrics: str | None
+    resume: bool
 
 
 # --------------------------------------------------------------------------
@@ -1903,6 +2013,75 @@ class Trainer:
         """Run the training.
 
         Raises:
+            TrainingError: The run failed (or the error's own type: ``ModelLoadError``,
+                ``HubError``, ``OutOfMemoryError``, ...).
+            KeyboardInterrupt: On Ctrl-C, after the step in flight.
+        """
+
+@final
+class GrpoResult:
+    """What a finished GRPO run produced."""
+
+    @property
+    def total_steps(self) -> int:
+        """Optimizer steps taken."""
+    @property
+    def stopped(self) -> bool:
+        """A callback asked the run to stop before it finished (the adapter is saved all the same)."""
+    @property
+    def output_dir(self) -> str:
+        """The run's output directory, where the adapter is."""
+    def to_dict(self) -> dict[str, Any]:
+        """The result as a dict."""
+
+@final
+class GrpoTrainer:
+    """GRPO reinforcement learning of one ``GrpoSpec``, in this process, with Python reward functions.
+
+    A reward function is any callable ``fn(prompts, completions, **columns) ->
+    list[float]``: ``prompts`` (the prompts as the model saw them, chat template
+    applied) and ``completions`` are lists of strings, one entry per completion,
+    and every other column of the dataset's row is a keyword argument, a list with
+    one entry per completion. Return one number per completion. A completion a
+    function cannot score is an error, not a 0: ``None`` and a list of the wrong
+    length are refused. Functions are weighted by ``reward_weights`` and summed
+    with the rewards the spec asks for (``reward_cmd``, ``reward_regex``,
+    ``reasoning_rewards``, ...).
+
+    ``train()`` runs ``pmetal grpo`` for the spec with the GIL released except
+    while a reward function runs, and stops cleanly on Ctrl-C. Callbacks are the
+    ones ``Trainer`` takes.
+    """
+
+    def __new__(
+        cls,
+        spec: GrpoSpec,
+        reward_funcs: Sequence[Callable[..., Sequence[float]]] | None = None,
+        reward_weights: Sequence[float] | None = None,
+        callbacks: Sequence[object] | None = None,
+    ) -> Self:
+        """
+        Args:
+            spec: What to train. Validated here: ``SpecValidationError`` lists every problem.
+            reward_funcs: Callables ``fn(prompts, completions, **columns) -> list[float]``.
+            reward_weights: One weight per function (1 each when omitted).
+            callbacks: Objects with any of the callback methods.
+
+        Raises:
+            TypeError: A reward function is not callable.
+            ConfigError: The weights do not match the functions, or are not finite.
+        """
+    @property
+    def spec(self) -> GrpoSpec:
+        """A copy of the spec the trainer runs."""
+    def add_callback(self, callback: object) -> None:
+        """Add a callback object."""
+    def train(self) -> GrpoResult:
+        """Run the training.
+
+        Raises:
+            RewardError: A reward function raised or returned a bad result; its own
+                exception is the ``__cause__``.
             TrainingError: The run failed (or the error's own type: ``ModelLoadError``,
                 ``HubError``, ``OutOfMemoryError``, ...).
             KeyboardInterrupt: On Ctrl-C, after the step in flight.
