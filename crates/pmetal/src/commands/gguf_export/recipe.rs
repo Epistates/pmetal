@@ -34,16 +34,30 @@ pub(crate) struct Recipe {
     /// The file has an `output.weight` of its own. Without one the head is the
     /// embedding, which is then quantized as a head.
     has_output: bool,
+    /// The layers that have an `attn_v` tensor. The reference counts the
+    /// tensors it meets, not the layers of the model, so a model whose
+    /// full-attention layers take their values from their keys (Gemma 4) is
+    /// promoted by position among the layers that have one.
+    value_layers: Vec<usize>,
 }
 
 impl Recipe {
-    pub(crate) fn new(
+    pub(crate) fn new<'a>(
         method: QuantizeMethod,
         arch: &ExportArch,
         config_json: Option<&serde_json::Value>,
         has_imatrix: bool,
-        has_output: bool,
+        tensors: impl IntoIterator<Item = &'a str>,
     ) -> Self {
+        let mut has_output = false;
+        let mut value_layers = Vec::new();
+        for name in tensors {
+            has_output |= name == "output.weight";
+            if name.ends_with(".attn_v.weight") {
+                value_layers.push(layer_of(name));
+            }
+        }
+        value_layers.sort_unstable();
         let count = |keys: &[&str]| {
             config_json
                 .and_then(|json| keys.iter().find_map(|key| json_usize(json, key)))
@@ -62,6 +76,7 @@ impl Recipe {
             llama: arch.name == "llama",
             has_imatrix,
             has_output,
+            value_layers,
         }
     }
 
@@ -127,14 +142,19 @@ impl Recipe {
         }
 
         if gguf_name.contains("attn_v.weight") {
+            // Position among the value projections the file has.
+            let (nth, of) = match self.value_layers.iter().position(|l| *l == layer) {
+                Some(position) => (position, self.value_layers.len()),
+                None => (layer, n_layers),
+            };
             dtype = match method {
                 M::Q2K if self.n_gqa() >= 4 => T::Q4K,
                 M::Q2K => T::Q3K,
-                M::Q3KM if layer < 2 => T::Q5K,
+                M::Q3KM if nth < 2 => T::Q5K,
                 M::Q3KM => T::Q4K,
                 M::Q3KL => T::Q5K,
-                M::Q4KM | M::Q5KM if use_more_bits(layer, n_layers) => T::Q6K,
-                M::Q4KS if layer < 4 => T::Q5K,
+                M::Q4KM | M::Q5KM if use_more_bits(nth, of) => T::Q6K,
+                M::Q4KS if nth < 4 => T::Q5K,
                 M::Iq4Nl | M::Iq4Xs if self.n_gqa() >= 4 => T::Q5K,
                 _ => dtype,
             };
@@ -267,7 +287,19 @@ mod tests {
             config["num_local_experts"] = json!(experts);
         }
         let arch = ExportArch::detect(Some(&config)).unwrap();
-        Recipe::new(method, &arch, Some(&config), has_imatrix, has_output)
+        let mut tensors: Vec<String> = (0..layers)
+            .map(|layer| format!("blk.{layer}.attn_v.weight"))
+            .collect();
+        if has_output {
+            tensors.push("output.weight".to_string());
+        }
+        Recipe::new(
+            method,
+            &arch,
+            Some(&config),
+            has_imatrix,
+            tensors.iter().map(String::as_str),
+        )
     }
 
     /// The models `recipe_reference.txt` is about.
@@ -329,8 +361,9 @@ mod tests {
     /// The table is what the reference quantizer wrote for synthetic models of
     /// these shapes. A `q3_k_m` that promotes `ffn_down` in the layers the
     /// reference does not (or fails to in those it does) is a different, and
-    /// here a worse, file under the same name: Qwen3-0.6B's perplexity went from
-    /// 94.7 against 92.1 to within noise of it with this recipe.
+    /// here a worse, file under the same name: Qwen3-0.6B's `q3_k_m` perplexity
+    /// was 94.56 against the reference's 91.98 (88.65 against 85.72 with an
+    /// importance matrix) and is now 92.11 (85.44) in a file of the same size.
     #[test]
     fn every_method_gives_every_tensor_the_type_the_reference_quantizer_gives_it() {
         use std::collections::HashMap;
@@ -498,6 +531,40 @@ mod tests {
             r.tensor_type("token_embd.weight", &[512, 256], GgmlType::Tq1_0),
             GgmlType::F16
         );
+    }
+
+    /// The reference counts the value projections it meets, not the layers: a
+    /// model whose full-attention layers have none (Gemma 4) is promoted by
+    /// position among those that do.
+    #[test]
+    fn value_projections_are_promoted_by_position_among_those_the_file_has() {
+        let config = json!({
+            "architectures": ["Qwen3ForCausalLM"], "num_hidden_layers": 12,
+            "num_attention_heads": 8, "num_key_value_heads": 2,
+        });
+        let arch = ExportArch::detect(Some(&config)).unwrap();
+        // Layers 5 and 11 have no value projection: 10 of them remain.
+        let names: Vec<String> = (0..12)
+            .filter(|l| l % 6 != 5)
+            .map(|l| format!("blk.{l}.attn_v.weight"))
+            .collect();
+        let recipe = Recipe::new(
+            QuantizeMethod::Q4KM,
+            &arch,
+            Some(&config),
+            false,
+            names.iter().map(String::as_str),
+        );
+        let promoted: Vec<usize> = (0..12)
+            .filter(|l| l % 6 != 5)
+            .filter(|l| {
+                recipe.tensor_type(&format!("blk.{l}.attn_v.weight"), &[64, 64], GgmlType::Q4K)
+                    == GgmlType::Q6K
+            })
+            .collect();
+        // Positions 0, 3, 6, 8 and 9 of 10 (the first eighth, the last, every
+        // third between): layers 0, 3, 7, 9 and 10.
+        assert_eq!(promoted, [0, 3, 7, 9, 10]);
     }
 
     #[test]

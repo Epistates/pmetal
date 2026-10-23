@@ -465,7 +465,10 @@ pub(crate) async fn run_quantization(
         arch.name,
         model_name(model_path, &resolved_model_path).as_str(),
     );
-    add_hf_config_metadata(&mut builder, &arch, config_json.as_ref(), method);
+    // The model's own configuration: the language model's, in a multimodal
+    // checkpoint. The tokenizer is found from the checkpoint's.
+    let model_config = arch.model_config(config_json.as_ref());
+    add_hf_config_metadata(&mut builder, &arch, model_config.as_ref(), method);
     add_tokenizer_metadata(&mut builder, &resolved_model_path, config_json.as_ref())?;
 
     // Each tensor's type. The header of a GGUF file comes first and names every
@@ -473,9 +476,9 @@ pub(crate) async fn run_quantization(
     let recipe = Recipe::new(
         method,
         &arch,
-        config_json.as_ref(),
+        model_config.as_ref(),
         has_imatrix,
-        entries.iter().any(|e| e.gguf_name == "output.weight"),
+        entries.iter().map(|e| e.gguf_name.as_str()),
     );
     let choose_type = |gguf_name: &str, shape_u64: &[u64]| {
         let proposed = if calibration_map.is_empty() {
