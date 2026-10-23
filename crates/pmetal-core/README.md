@@ -79,8 +79,10 @@ let mut spec = ServeSpec {
 spec.normalize().unwrap();
 let argv = spec.to_argv();
 assert_eq!(&argv[..2], ["--model", "Qwen/Qwen3-4B"]);
-// Only what differs from the default is passed.
-assert!(argv.contains(&"--port".to_string()) && !argv.contains(&"--host".to_string()));
+// Only what differs from the default is passed, so a config file's value can
+// apply, except the bind address, which is always stated.
+let has = |flag: &str| argv.iter().any(|a| a == flag);
+assert!(has("--port") && has("--host") && !has("--request-timeout"));
 assert_eq!(ServeSpec::subcommand(), "serve");
 
 // A job's events, one JSON object per line.
