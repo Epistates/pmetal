@@ -998,18 +998,23 @@ pub fn sanitize_checkpoint(
 ) -> std::collections::HashMap<String, Array> {
     weights
         .into_iter()
-        .filter(|(key, _)| !key.contains("vision_model") && !key.contains("multi_modal_projector"))
-        .map(|(key, value)| {
-            let key = if let Some(rest) = key.strip_prefix("language_model.") {
-                rest.to_string()
-            } else if let Some(rest) = key.strip_prefix("model.language_model.") {
-                format!("model.{rest}")
-            } else {
-                key
-            };
-            (key, value)
-        })
+        .filter_map(|(key, value)| Some((sanitize_key(&key)?, value)))
         .collect()
+}
+
+/// The text model's name for a checkpoint key (see [`sanitize_checkpoint`]), or
+/// `None` for a key of the vision tower or projector.
+pub fn sanitize_key(key: &str) -> Option<String> {
+    if key.contains("vision_model") || key.contains("multi_modal_projector") {
+        return None;
+    }
+    Some(if let Some(rest) = key.strip_prefix("language_model.") {
+        rest.to_string()
+    } else if let Some(rest) = key.strip_prefix("model.language_model.") {
+        format!("model.{rest}")
+    } else {
+        key.to_string()
+    })
 }
 
 // =============================================================================

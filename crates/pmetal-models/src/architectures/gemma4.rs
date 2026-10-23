@@ -813,6 +813,37 @@ impl Gemma4Experts {
         Ok(())
     }
 
+    /// Keep the experts of an MLX-quantized checkpoint packed: `gate_up` and
+    /// `down` are `(words, scales, biases)` as the checkpoint stores them
+    /// (the gate and up projections already fused along the output axis, which
+    /// packing allows since every row is quantized on its own), all at one
+    /// width and group size. The words stand in the parameters, as a packed
+    /// `Linear`'s do, and the forward runs [`Self::forward_quantized`].
+    pub fn install_packed(
+        &mut self,
+        gate_up: (Array, Array, Array),
+        down: (Array, Array, Array),
+        group_size: i32,
+        bits: i32,
+    ) {
+        *self.gate_up_proj = gate_up.0.clone();
+        *self.down_proj = down.0.clone();
+        self.quant = Some(Gemma4ExpertsQuant {
+            gate_up,
+            down,
+            group_size,
+            bits,
+        });
+        self.gate_up_t = None;
+        self.down_t = None;
+        self.transposed_sig = None;
+    }
+
+    /// Whether the experts run from packed words.
+    pub fn is_packed(&self) -> bool {
+        self.quant.is_some()
+    }
+
     /// Quantized expert dispatch via the fused `gather_qmm` (SwitchGLU rank),
     /// numerically equivalent to the dense [`Self::forward`] within quantization
     /// tolerance. `x [N, H] -> [N, 1, 1, H]`, gathered per `top_indices
@@ -908,6 +939,10 @@ impl Gemma4Experts {
     /// Eagerly build the transposed-weight cache (optional warm-up; the forward
     /// path builds it lazily on first use anyway).
     pub fn init_expert_cache(&mut self) -> Result<(), Exception> {
+        // Packed experts run from their words; there is nothing to transpose.
+        if self.quant.is_some() {
+            return Ok(());
+        }
         self.ensure_transposed()
     }
 

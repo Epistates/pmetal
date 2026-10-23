@@ -36,8 +36,12 @@ pub use families::*;
 /// The shard index of a checkpoint (`model.safetensors.index.json`).
 pub use pmetal_core::safetensors_index::ShardIndex as WeightIndex;
 
+pub(crate) use assign::{load_prepared, load_prepared_with, packable_paths};
 pub(crate) use checkpoint::validate_shard_path;
-pub(crate) use quant::{PackedLinears, dequantize_sidecar_weights, take_packed_linears};
+pub(crate) use families::{install_gemma4_packed, read_gemma4_checkpoint};
+pub(crate) use quant::{
+    PackedLinears, dequantize_sidecar_weights, report_unpacked, take_packed_linears,
+};
 
 use checkpoint::Checkpoint;
 use quant::QuantConfig;
@@ -191,8 +195,24 @@ where
 pub(crate) fn unpack_mlx_quantized_weights(
     model_dir: &Path,
     weights: &mut HashMap<String, Array>,
-) -> Result<(), LoadError> {
+) -> Result<Vec<String>, LoadError> {
     quant::unpack_mlx_quantized(weights, QuantConfig::read(model_dir)?.as_ref())
+}
+
+/// Whether `model_dir`'s `config.json` carries an MLX quantization block.
+pub(crate) fn is_mlx_quantized(model_dir: &Path) -> bool {
+    matches!(QuantConfig::read(model_dir), Ok(Some(_)))
+}
+
+/// Lift the MLX-quantized modules at `paths` out of `weights` still packed (see
+/// [`quant::take_packed_mlx_linears`]), for a loader that reads the checkpoint
+/// itself.
+pub(crate) fn lift_packed_mlx(
+    weights: &mut HashMap<String, Array>,
+    model_dir: &Path,
+    paths: &[String],
+) -> Result<PackedLinears, LoadError> {
+    quant::take_packed_mlx_linears(weights, QuantConfig::read(model_dir)?.as_ref(), paths)
 }
 
 pub(crate) fn load_weights_filtered<F>(
@@ -234,7 +254,10 @@ pub(crate) fn load_weights_keeping_packed(
         )?,
         None => PackedLinears::default(),
     };
-    unpack_mlx_quantized_weights(model_dir, &mut weights)?;
+    let unpacked = unpack_mlx_quantized_weights(model_dir, &mut weights)?;
+    if mlx_linears.is_some() {
+        quant::report_unpacked(&unpacked);
+    }
     let mut packed = quant::take_packed_linears(&mut weights)?;
     packed.absorb(&mut mlx_packed);
     dequantize_sidecar_weights(&mut weights)?;

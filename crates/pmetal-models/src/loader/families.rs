@@ -6,6 +6,8 @@ use pmetal_runtime::compat::{Array, ModuleParametersExt};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use super::assign::packable_paths;
+use super::quant::{QuantConfig, report_unpacked, take_packed_mlx_linears};
 use super::{
     LoadError, dequantize_sidecar_weights, load_weights_filtered_raw, take_packed_linears,
     unpack_mlx_quantized_weights,
@@ -13,8 +15,8 @@ use super::{
 use crate::architectures::gemma::GemmaForCausalLM;
 use crate::architectures::phi::PhiConfig;
 use crate::architectures::qwen3_next::{
-    Qwen3NextConfig, Qwen3NextFeedForward, Qwen3NextForCausalLM, Qwen3NextSanitizeOptions,
-    sanitize_weights, take_packed_experts,
+    PackedRoutedExperts, Qwen3NextConfig, Qwen3NextFeedForward, Qwen3NextForCausalLM,
+    Qwen3NextSanitizeOptions, sanitize_weights, take_packed_experts,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -25,11 +27,18 @@ pub struct Qwen3NextLoadOptions {
     /// quantized gather kernels (a quarter of the memory, and what a trainer
     /// of a dense copy must not have).
     pub unpack_quantized_experts: bool,
+    /// Keep an MLX-quantized checkpoint's projections, embedding table and
+    /// routed experts packed (see [`LoadPolicy::keep_quantized`]), where they
+    /// are unpacked to dense by default. Routed experts that are offloaded are
+    /// read from their own files and take no part.
+    pub keep_quantized: bool,
 }
 
 fn is_non_text_auxiliary_weight(key: &str) -> bool {
     key.starts_with("model.visual.")
         || key.starts_with("visual.")
+        || key.starts_with("vision_tower.")
+        || key.starts_with("model.vision_tower.")
         || key.starts_with("model.audio.")
         || key.starts_with("model.multi_modal_projector.")
 }
@@ -76,7 +85,27 @@ pub fn load_qwen3_next_weights_with_options(
     let model_dir = model_dir.as_ref();
     let keep = |key: &str| should_keep_qwen3_next_raw_weight(key, options);
     let mut weights = load_weights_filtered_raw(model_dir, keep)?;
-    unpack_mlx_quantized_weights(model_dir, &mut weights)?;
+    // An MLX-quantized checkpoint's projections, embedding table and routed
+    // experts come out still packed, when the caller asked to keep them so;
+    // what is left is unpacked to dense. The experts are named as an MLX
+    // conversion stores them stacked, `mlp.switch_mlp.{gate,up,down}_proj`.
+    let mut mlx_packed = if options.keep_quantized {
+        let mut paths = packable_paths(model);
+        if !options.skip_routed_experts {
+            for layer in 0..config.num_hidden_layers.max(0) as usize {
+                for projection in ["gate_proj", "up_proj", "down_proj"] {
+                    paths.push(format!("model.layers.{layer}.mlp.switch_mlp.{projection}"));
+                }
+            }
+        }
+        take_packed_mlx_linears(&mut weights, QuantConfig::read(model_dir)?.as_ref(), &paths)?
+    } else {
+        super::PackedLinears::default()
+    };
+    let unpacked = unpack_mlx_quantized_weights(model_dir, &mut weights)?;
+    if options.keep_quantized {
+        report_unpacked(&unpacked);
+    }
     // The dense projections of a ModelOpt checkpoint stay packed as well,
     // unless the caller asked for everything unpacked: a 27B NVFP4 release is
     // 15 GB on its kernels and 54 GB as dense bf16. They come out first, with
@@ -86,11 +115,35 @@ pub fn load_qwen3_next_weights_with_options(
     } else {
         take_packed_linears(&mut weights)?
     };
-    let packed = if options.skip_routed_experts || options.unpack_quantized_experts {
+    packed_linears.absorb(&mut mlx_packed);
+    let mut packed = if options.skip_routed_experts || options.unpack_quantized_experts {
         HashMap::new()
     } else {
         take_packed_experts(&mut weights, config.num_experts.max(0) as usize)?
     };
+    // The stacked experts of an MLX conversion, onto the same packed kernels.
+    for layer in 0..config.num_hidden_layers.max(0) as usize {
+        let path = |projection: &str| format!("model.layers.{layer}.mlp.switch_mlp.{projection}");
+        let taken = ["gate_proj", "up_proj", "down_proj"].map(|p| packed_linears.take(&path(p)));
+        match taken {
+            [Some(gate), Some(up), Some(down)] => {
+                packed.insert(
+                    layer,
+                    PackedRoutedExperts {
+                        gate: gate.into_layer_weight(),
+                        up: up.into_layer_weight(),
+                        down: down.into_layer_weight(),
+                    },
+                );
+            }
+            [None, None, None] => {}
+            _ => {
+                return Err(LoadError::SafeTensors(format!(
+                    "layer {layer} keeps only some of its routed experts' projections packed"
+                )));
+            }
+        }
+    }
     dequantize_sidecar_weights(&mut weights)?;
     weights.retain(|key, _| keep(key));
     // `sanitize_weights` renames the checkpoint's keys (the vision-language
@@ -161,7 +214,7 @@ pub fn load_qwen3_next_weights_with_options(
     drop(params);
     if !packed_linears.is_empty() {
         let count = packed_linears.install(model)?;
-        tracing::info!("{count} projections stay packed (ModelOpt)");
+        tracing::info!("{count} projections and tables stay packed");
     }
     // A packed projection's `weight` is replaced by its words, not loaded
     // from the map.
@@ -189,6 +242,126 @@ pub fn load_qwen3_next_weights_with_options(
     }
 
     tracing::info!("Qwen3Next weight loading: all {matched} weights matched successfully");
+    Ok(())
+}
+
+/// Where Gemma 4's model tree and its checkpoint spell the same module
+/// differently: `(model path segment, checkpoint segment)`. A packed module is
+/// found by the checkpoint's name and placed by the model's.
+const GEMMA4_SPELLINGS: [(&str, &str); 5] = [
+    (".moe.router.", ".router."),
+    (".per_layer_input_block.gate_proj", ".per_layer_input_gate"),
+    (".per_layer_input_block.projection", ".per_layer_projection"),
+    (
+        "model.per_layer_inputs.model_projection",
+        "model.per_layer_model_projection",
+    ),
+    (
+        "model.per_layer_inputs.embed_tokens",
+        "model.embed_tokens_per_layer",
+    ),
+];
+
+/// A Gemma 4 checkpoint's tensors, with (when `keep_quantized`) the MLX-quantized
+/// projections, embedding tables and routed experts the model can run packed
+/// lifted out of them: [`install_gemma4_packed`] puts them on the model after
+/// [`load_gemma4_weights`](crate::architectures::gemma4::load_gemma4_weights) has
+/// filled the rest. Each packed module's words stand in the tensors under the
+/// name the loader looks for, so the loader's account of what the checkpoint
+/// holds stays whole.
+pub(crate) fn read_gemma4_checkpoint(
+    model: &mut crate::architectures::gemma4::Gemma4ForCausalLM,
+    model_dir: &Path,
+    keep_quantized: bool,
+) -> Result<(HashMap<String, Array>, super::PackedLinears), LoadError> {
+    let paths = keep_quantized.then(|| {
+        let mut paths: Vec<String> = packable_paths(model)
+            .into_iter()
+            .map(|path| {
+                GEMMA4_SPELLINGS
+                    .iter()
+                    .fold(path, |path, (model, checkpoint)| {
+                        path.replace(model, checkpoint)
+                    })
+            })
+            .collect();
+        for (layer, block) in model.model.layers.iter().enumerate() {
+            if block.moe.is_some() {
+                for projection in ["gate_proj", "up_proj", "down_proj"] {
+                    paths.push(format!(
+                        "model.layers.{layer}.experts.switch_glu.{projection}"
+                    ));
+                }
+            }
+        }
+        paths
+    });
+    let (mut weights, packed) = super::load_weights_keeping_packed(model_dir, paths.as_deref())?;
+    weights.extend(packed.words());
+    Ok((weights, packed))
+}
+
+/// Put the packed modules [`read_gemma4_checkpoint`] lifted on the model: the
+/// routed experts on their block, everything else on the `Linear` or
+/// `Embedding` at its path.
+pub(crate) fn install_gemma4_packed(
+    model: &mut crate::architectures::gemma4::Gemma4ForCausalLM,
+    mut packed: super::PackedLinears,
+) -> Result<(), LoadError> {
+    if packed.is_empty() {
+        return Ok(());
+    }
+    let dtype = packed.dtype();
+    for (layer, block) in model.model.layers.iter_mut().enumerate() {
+        let Some(moe) = block.moe.as_mut() else {
+            continue;
+        };
+        let path =
+            |projection: &str| format!("model.layers.{layer}.experts.switch_glu.{projection}");
+        let taken = ["gate_proj", "up_proj", "down_proj"].map(|p| packed.take(&path(p)));
+        let [Some(gate), Some(up), Some(down)] = taken else {
+            continue;
+        };
+        let (gate, up, down) = (gate.into_affine(), up.into_affine(), down.into_affine());
+        match (gate, up, down) {
+            (Some(gate), Some(up), Some(down))
+                if (gate.bits, gate.group_size) == (up.bits, up.group_size)
+                    && (gate.bits, gate.group_size) == (down.bits, down.group_size) =>
+            {
+                // The gate and up projections fuse along the output axis; each
+                // output row is quantized on its own, so the words, scales and
+                // biases concatenate exactly.
+                let cat = |a: &Array, b: &Array| {
+                    pmetal_runtime::compat::ops::concatenate_axis(&[a, b], 1)
+                };
+                moe.experts.install_packed(
+                    (
+                        cat(&gate.weight, &up.weight),
+                        cat(&gate.scales, &up.scales),
+                        cat(&gate.biases, &up.biases),
+                    ),
+                    (down.weight, down.scales, down.biases),
+                    gate.group_size,
+                    gate.bits,
+                );
+            }
+            _ => {
+                return Err(LoadError::SafeTensors(format!(
+                    "layer {layer}: the routed experts are not all affine-quantized at one \
+                     width and group size, which the packed experts need"
+                )));
+            }
+        }
+    }
+    packed.rename(|module| {
+        GEMMA4_SPELLINGS
+            .iter()
+            .fold(module.to_string(), |module, (model, checkpoint)| {
+                module.replace(checkpoint, model)
+            })
+    });
+    let count = packed.install(model)?;
+    tracing::info!("{count} Gemma 4 projections and tables stay packed ({dtype:?})");
     Ok(())
 }
 

@@ -188,8 +188,32 @@ pub fn load_granite_weights(
     model: &mut GraniteForCausalLM,
     model_dir: &Path,
 ) -> Result<GraniteLoadReport, Exception> {
-    let loaded = crate::loader::load_weights(model_dir)
-        .map_err(|e| Exception::custom(format!("Granite: reading weights: {e:?}")))?;
+    load_granite_weights_with(model, model_dir, false)
+}
+
+/// [`load_granite_weights`], with an MLX-quantized checkpoint's projections and
+/// embedding table kept packed when `keep_quantized`.
+///
+/// A packed module is named as the model names it (the MLX conversion's spelling
+/// of anything else is unpacked to dense, as before), so it goes on its layer
+/// before the audit; its words stand in the tensors, where the shape check finds
+/// the shape the layer now has.
+pub fn load_granite_weights_with(
+    model: &mut GraniteForCausalLM,
+    model_dir: &Path,
+    keep_quantized: bool,
+) -> Result<GraniteLoadReport, Exception> {
+    let paths = keep_quantized.then(|| crate::loader::packable_paths(model));
+    let (mut loaded, packed) =
+        crate::loader::load_weights_keeping_packed(model_dir, paths.as_deref())
+            .map_err(|e| Exception::custom(format!("Granite: reading weights: {e:?}")))?;
+    loaded.extend(packed.words());
+    if !packed.is_empty() {
+        let count = packed
+            .install(model)
+            .map_err(|e| Exception::custom(format!("Granite: {e}")))?;
+        tracing::info!("{count} Granite projections and tables stay packed");
+    }
     assign_granite_weights(model, loaded)
 }
 
@@ -222,9 +246,15 @@ pub fn assign_granite_weights(
         assigned.insert(key);
         report.loaded += 1;
     }
+    // A packed layer's scales travel with its words (see
+    // [`load_granite_weights_with`]): they are the layer's own, not tensors the
+    // checkpoint was meant to carry under these names.
+    let packed_aux = |name: &str| {
+        name.ends_with(".scales") || name.ends_with(".biases") || name.ends_with(".tensor_scale")
+    };
     let mut missing: Vec<String> = params
         .keys()
-        .filter(|k| !assigned.contains(k.as_str()))
+        .filter(|k| !assigned.contains(k.as_str()) && !packed_aux(k))
         .cloned()
         .collect();
 
