@@ -84,8 +84,8 @@ pub struct ScanPlan {
 }
 
 impl ScanPlan {
-    /// The folders other apps keep models in (LM Studio's), which a scan reads
-    /// when they exist.
+    /// The folders other desktop apps keep downloaded models in, which a scan
+    /// reads when they exist.
     pub fn well_known_dirs() -> Vec<PathBuf> {
         let home = dirs::home_dir().unwrap_or_default();
         vec![
