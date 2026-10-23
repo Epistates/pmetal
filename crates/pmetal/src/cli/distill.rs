@@ -153,7 +153,7 @@ pub struct DistillArgs {
     #[arg(long = "response-column")]
     pub response_column: Option<String>,
 
-    /// Path to write JSONL metrics log (for TUI dashboard)
+    /// Write per-step metrics as JSONL to this file (a relative path is relative to --output).
     #[arg(long = "log-metrics")]
     pub log_metrics: Option<String>,
 }

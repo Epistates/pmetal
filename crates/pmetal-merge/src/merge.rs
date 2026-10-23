@@ -404,7 +404,7 @@ fn patch_layer_fields(map: &mut serde_json::Map<String, serde_json::Value>, laye
 }
 
 /// Create the appropriate merge method from configuration.
-fn create_merge_method(method: &MergeMethodConfig) -> Box<dyn MergeMethod> {
+pub fn create_merge_method(method: &MergeMethodConfig) -> Box<dyn MergeMethod> {
     match method {
         MergeMethodConfig::Linear => Box::new(LinearMerge::new()),
         MergeMethodConfig::Slerp => Box::new(SlerpMerge::new()),

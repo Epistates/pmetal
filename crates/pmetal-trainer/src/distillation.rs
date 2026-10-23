@@ -1124,11 +1124,10 @@ mod tests {
 
     /// Every adapter value, in parameter-name order.
     fn adapter_values(model: &impl TrainableModel) -> Vec<f32> {
-        let mut params: Vec<_> = model.lora_parameters().into_iter().collect();
-        params.sort_by(|a, b| a.0.cmp(&b.0));
-        params
-            .into_iter()
-            .flat_map(|(_, mut p)| {
+        model
+            .lora_parameters()
+            .into_values()
+            .flat_map(|mut p| {
                 let n = p.size();
                 p.to_f32_vec(n).unwrap()
             })

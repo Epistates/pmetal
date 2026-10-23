@@ -810,16 +810,6 @@ pub fn format_params(params_b: f64) -> String {
     }
 }
 
-/// Format bytes as a human-readable size, in decimal units like the Hub's.
-pub fn format_bytes(bytes: u64) -> String {
-    let gb = bytes as f64 / GB;
-    if gb >= 1.0 {
-        format!("{gb:.1} GB")
-    } else {
-        format!("{:.0} MB", bytes as f64 / 1e6)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1115,9 +1105,7 @@ mod tests {
     }
 
     #[test]
-    fn sizes_are_formatted_in_decimal_units() {
-        assert_eq!(format_bytes(1_500_000_000), "1.5 GB");
-        assert_eq!(format_bytes(250_000_000), "250 MB");
+    fn parameter_counts_are_formatted_in_billions_and_millions() {
         assert_eq!(format_params(7.6), "7.6B");
         assert_eq!(format_params(0.6), "600M");
     }

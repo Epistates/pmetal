@@ -30,6 +30,7 @@
 //! attends densely. The cache is still compressed at rest, which is what the
 //! mixed widths are for.
 
+use crate::{RuntimeError, RuntimeResult};
 use std::sync::Arc;
 
 use crate::InlineArray;
@@ -63,12 +64,12 @@ impl Split {
         dim: usize,
         config: TurboQuantTensorConfig,
         multiple: usize,
-    ) -> Result<Self, String> {
+    ) -> RuntimeResult<Self> {
         let floor = multiple.max(2);
         if dim < 2 * floor {
-            return Err(format!(
+            return Err(RuntimeError::Config(format!(
                 "TurboQuant: a {dim}-wide {what} cannot be split into two groups of {floor} or more"
-            ));
+            )));
         }
         let (regular_bits, outlier_bits, wanted) = match config {
             TurboQuantTensorConfig::Uniform { bits } => (bits, bits, dim / 4),
@@ -80,17 +81,17 @@ impl Split {
         };
         for bits in [regular_bits, outlier_bits] {
             if !(1..=8).contains(&bits) {
-                return Err(format!(
+                return Err(RuntimeError::Config(format!(
                     "TurboQuant {what} bits must be in 1..=8, got {bits}"
-                ));
+                )));
             }
         }
         let outliers = (wanted.div_ceil(multiple) * multiple).clamp(floor, dim - floor);
         let outliers = outliers / multiple * multiple;
         if (dim - outliers) % multiple != 0 || dim % multiple != 0 {
-            return Err(format!(
+            return Err(RuntimeError::Config(format!(
                 "TurboQuant: the {what} dimension {dim} must be a multiple of {multiple}"
-            ));
+            )));
         }
         Ok(Self {
             dim,
@@ -113,11 +114,7 @@ struct Plan {
 }
 
 impl Plan {
-    fn resolve(
-        key_dim: usize,
-        value_dim: usize,
-        config: &TurboQuantConfig,
-    ) -> Result<Self, String> {
+    fn resolve(key_dim: usize, value_dim: usize, config: &TurboQuantConfig) -> RuntimeResult<Self> {
         if matches!(
             (config.keys, config.values),
             (
@@ -125,10 +122,10 @@ impl Plan {
                 TurboQuantTensorConfig::Uniform { .. }
             )
         ) {
-            return Err(
+            return Err(RuntimeError::Config(
                 "TurboQuant: a mixed-precision cache needs a mixed key or value configuration"
                     .to_string(),
-            );
+            ));
         }
         Ok(Self {
             keys: Split::resolve("key", key_dim, config.keys, 4)?,
@@ -165,9 +162,9 @@ pub struct MixedTurboQuantState {
 
 impl MixedTurboQuantState {
     /// The state for `key_dim`-wide keys and `value_dim`-wide values.
-    pub fn new(key_dim: usize, value_dim: usize, config: TurboQuantConfig) -> Result<Self, String> {
+    pub fn new(key_dim: usize, value_dim: usize, config: TurboQuantConfig) -> RuntimeResult<Self> {
         let plan = Plan::resolve(key_dim, value_dim, &config)?;
-        let group = |outlier: bool| -> Result<Arc<TurboQuantState>, String> {
+        let group = |outlier: bool| -> RuntimeResult<Arc<TurboQuantState>> {
             let (k, v) = if outlier {
                 (plan.keys.outliers, plan.values.outliers)
             } else {
@@ -365,13 +362,13 @@ impl MixedQuantizedKvCache {
     }
 
     /// Append `[B, H, S, D]` keys and `[B, H, S, Dv]` values.
-    pub fn append(&mut self, keys: &InlineArray, values: &InlineArray) -> Result<(), String> {
+    pub fn append(&mut self, keys: &InlineArray, values: &InlineArray) -> RuntimeResult<()> {
         if keys.ndim() != 4 || values.ndim() != 4 {
-            return Err(format!(
+            return Err(RuntimeError::Config(format!(
                 "TurboQuant: expected [B, H, S, D] keys and values, got {} and {} dimensions",
                 keys.ndim(),
                 values.ndim()
-            ));
+            )));
         }
         let (key_dim, value_dim) = (keys.dim(3) as usize, values.dim(3) as usize);
         if self.state.is_none() {
@@ -380,11 +377,11 @@ impl MixedQuantizedKvCache {
         }
         let plan = self.state.as_ref().expect("adopted above").plan;
         if (plan.keys.dim, plan.values.dim) != (key_dim, value_dim) {
-            return Err(format!(
+            return Err(RuntimeError::Config(format!(
                 "TurboQuant: the shared state splits {}-wide keys and {}-wide values, \
-                 the cache is being given {key_dim} and {value_dim}",
+             the cache is being given {key_dim} and {value_dim}",
                 plan.keys.dim, plan.values.dim
-            ));
+            )));
         }
         if keys.dim(2) == 0 {
             return Ok(());
@@ -392,21 +389,21 @@ impl MixedQuantizedKvCache {
         if let Some((held, _)) = &self.channels
             && held.to_split.dim(1) != keys.dim(1)
         {
-            return Err(format!(
+            return Err(RuntimeError::Config(format!(
                 "TurboQuant: the cache holds {} KV heads, cannot append {:?} keys",
                 held.to_split.dim(1),
                 keys.shape()
-            ));
+            )));
         }
         if keys.dim(1) != values.dim(1)
             || keys.dim(0) != values.dim(0)
             || keys.dim(2) != values.dim(2)
         {
-            return Err(format!(
+            return Err(RuntimeError::Config(format!(
                 "TurboQuant: keys {:?} and values {:?} disagree on batch, heads or length",
                 keys.shape(),
                 values.shape()
-            ));
+            )));
         }
         if self.channels.is_none() {
             self.channels = Some((

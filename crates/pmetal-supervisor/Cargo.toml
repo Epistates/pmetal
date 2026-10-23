@@ -19,6 +19,7 @@ schemars = ["dep:schemars"]
 pmetal-core = { workspace = true }
 anstream = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
+dirs = { workspace = true }
 rustix = { workspace = true }
 schemars = { workspace = true, optional = true }
 serde = { workspace = true }

@@ -1378,12 +1378,12 @@ impl InferenceEngine {
     ) -> ServeResult<String> {
         self.chat_template
             .check_reasoning_effort_level(kwargs)
-            .map_err(ServeError::BadRequest)?;
+            .map_err(|e| ServeError::BadRequest(e.to_string()))?;
         let msgs = Self::template_messages(messages);
         self.chat_template
             .apply_inference_with_kwargs(&msgs, tools, kwargs)
             .map(|formatted| formatted.text)
-            .map_err(ServeError::BadRequest)
+            .map_err(|e| ServeError::BadRequest(e.to_string()))
     }
 
     /// Whether the model thinks under these chat template kwargs: its
@@ -1479,7 +1479,7 @@ impl InferenceEngine {
         }
         self.chat_template
             .check_reasoning_effort_level(kwargs)
-            .map_err(ServeError::BadRequest)?;
+            .map_err(|e| ServeError::BadRequest(e.to_string()))?;
         if let Vision::Unsupported(why) = &self.vision {
             return Err(ServeError::BadRequest(format!(
                 "model '{}' does not accept images or videos: {why}",

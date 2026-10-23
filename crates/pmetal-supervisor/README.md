@@ -42,7 +42,8 @@ pmetal-supervisor = "0.7"
 
 The supervisor runs whatever executable it is given as `pmetal` (by default,
 `resolve_pmetal_binary()`: `PMETAL_BIN`, a `pmetal` beside the running program,
-then `PATH`). `echo` stands in for it here:
+then `PATH`; `locate_pmetal_binary()` is the same search that reports why it
+found nothing). `echo` stands in for it here:
 
 ```rust
 use std::time::Duration;
@@ -69,6 +70,33 @@ async fn main() -> Result<(), pmetal_supervisor::Error> {
     Ok(())
 }
 ```
+
+From a job spec, the way every surface does it: a `LaunchPlan` is the command the
+spec stands for, the files the job is asked to write (`--log-events` for a
+command that reports events, else its metrics file) and where its results go.
+The plan's fields are what the supervisor follows for progress.
+
+```rust
+use pmetal_core::jobs::TrainSpec;
+use pmetal_supervisor::{LaunchOptions, LaunchPlan};
+
+let spec = TrainSpec {
+    model: "Qwen/Qwen3-0.6B".into(),
+    dataset: "data.jsonl".into(),
+    output_dir: "/tmp/run-a".into(),
+    ..TrainSpec::default()
+};
+let plan = LaunchPlan::for_spec(&spec, &LaunchOptions::default()).unwrap();
+assert_eq!(plan.subcommand, "train");
+assert_eq!(plan.events_file.as_deref(), Some(std::path::Path::new("/tmp/run-a/events.jsonl")));
+// Hand it to `Supervisor::spawn`, with credentials in the environment, not the arguments.
+let request = plan.into_request_with_env(vec![("HF_TOKEN".into(), "hf_...".into())]);
+assert_eq!(request.subcommand, "train");
+```
+
+`JobRequest::deltas` also publishes standard output as it arrives, in pieces
+(`EventKind::Delta`), for a job whose output is a reply being typed out
+(`pmetal infer`, which the desktop app's chat and the terminal UI's run this way).
 
 Following a job as it runs:
 

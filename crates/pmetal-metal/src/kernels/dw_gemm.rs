@@ -25,7 +25,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use crate::buffer::{BufferUsage, MetalBuffer};
 use crate::context::MetalContext;
 use crate::error::Result;
-use crate::kernels::fused_training::BatchedCommandBuffer;
+use crate::kernels::BatchedCommandBuffer;
 
 // Must match the Metal shader struct layout exactly.
 #[repr(C)]

@@ -295,8 +295,8 @@ pub struct NativeQwen3MtpVerifier {
 impl NativeQwen3MtpVerifier {
     /// Load a Qwen3 / Qwen3.5 checkpoint into the native engine.
     pub fn load(model_dir: &Path) -> Result<Self, Exception> {
-        let config = qwen3_native::load_config(model_dir).map_err(Exception::custom)?;
-        let weights = qwen3_native::load_model(model_dir, &config).map_err(Exception::custom)?;
+        let config = qwen3_native::load_config(model_dir).map_err(Exception::from)?;
+        let weights = qwen3_native::load_model(model_dir, &config).map_err(Exception::from)?;
         tracing::debug!(
             layers = config.num_hidden_layers,
             hidden = config.hidden_size,

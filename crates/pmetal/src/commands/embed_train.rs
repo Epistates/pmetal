@@ -59,7 +59,7 @@ fn copy_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
 /// `max_seq_length`; a full fine-tune writes the whole pipeline back out.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_embed_train(
-    model_path: &str,
+    model_id: &str,
     dataset_path: &str,
     output_dir: &str,
     loss_str: &str,
@@ -84,6 +84,14 @@ pub(crate) async fn run_embed_train(
     // `seed` also orders the batches; this covers MLX's own key (the LoRA
     // initialisation).
     pmetal_runtime::compat::random::seed(seed);
+
+    // A Hub id is downloaded, with the sentence-transformers files that say
+    // how the encoder is pooled (`modules.json`, `1_Pooling/config.json`); a
+    // path is used as it is.
+    let resolved = pmetal_hub::resolve_model_path(model_id, None, None).await?;
+    let model_path = resolved
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Non-UTF-8 model path: {}", resolved.display()))?;
 
     let loss_type = parse_loss(loss_str)?;
     let model_dir = Path::new(model_path);
@@ -159,6 +167,13 @@ pub(crate) async fn run_embed_train(
     let output = Path::new(output_dir);
     std::fs::create_dir_all(output)
         .map_err(|e| anyhow::anyhow!("Failed to create output dir: {}", e))?;
+    super::record_training(
+        output,
+        model_id,
+        &resolved,
+        dataset_path,
+        if lora.is_some() { "lora" } else { "full" },
+    );
 
     if let Some((rank, alpha)) = lora {
         let lora_config = pmetal_core::LoraConfig {
@@ -171,7 +186,7 @@ pub(crate) async fn run_embed_train(
         let mut model = pmetal_lora::AdaptedModel::attach(base, lora_config.clone())?;
         trainer.run(&mut model, &tokenizer, &dataset)?;
         tracing::info!("Saving the trained adapters to '{}'", output_dir);
-        pmetal_trainer::orchestrator::save_adapter(&model, output, &lora_config, Some(model_path))?;
+        pmetal_trainer::orchestrator::save_adapter(&model, output, &lora_config, Some(model_id))?;
         return stop.finish(Ok(()));
     }
 

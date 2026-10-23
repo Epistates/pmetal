@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use pmetal_core::safetensors_index::{INDEX_FILE, ShardIndex};
 use pmetal_core::{PMetalError, Result};
 
 use super::{TorchArchive, TorchTensor};
@@ -88,22 +89,17 @@ fn safetensors_name(pickle_name: &str) -> String {
 /// no code in them runs.
 pub fn convert_pytorch_dir(dir: &Path) -> Result<Vec<PathBuf>> {
     let index_path = dir.join("pytorch_model.bin.index.json");
-    let (shards, weight_map): (
-        Vec<String>,
-        Option<serde_json::Map<String, serde_json::Value>>,
-    ) = if index_path.exists() {
-        let bytes = std::fs::read(&index_path)?;
-        let index: serde_json::Value = serde_json::from_slice(&bytes)
+    let (shards, weight_map): (Vec<String>, Option<ShardIndex>) = if index_path.exists() {
+        let index = ShardIndex::read(&index_path)
             .map_err(|e| PMetalError::Serialization(format!("{}: {e}", index_path.display())))?;
-        let map = index
-            .get("weight_map")
-            .and_then(|m| m.as_object())
-            .cloned()
-            .ok_or_else(|| {
-                PMetalError::Serialization(format!("{} has no weight_map", index_path.display()))
-            })?;
-        let shards = crate::select::shards_in_index(&bytes)?;
-        (shards, Some(map))
+        let shards: Vec<String> = index.shards().into_iter().map(str::to_owned).collect();
+        if shards.is_empty() {
+            return Err(PMetalError::Serialization(format!(
+                "{} names no shards",
+                index_path.display()
+            )));
+        }
+        (shards, Some(index))
     } else if dir.join("pytorch_model.bin").exists() {
         (vec!["pytorch_model.bin".to_owned()], None)
     } else {
@@ -130,23 +126,16 @@ pub fn convert_pytorch_dir(dir: &Path) -> Result<Vec<PathBuf>> {
         outputs.push(dst);
     }
 
-    if let Some(map) = weight_map {
-        let renamed: BTreeMap<&String, String> = map
+    if let Some(index) = weight_map {
+        let renamed: BTreeMap<String, String> = index
+            .weight_map
             .iter()
-            .filter_map(|(tensor, shard)| Some((tensor, safetensors_name(shard.as_str()?))))
+            .map(|(tensor, shard)| (tensor.clone(), safetensors_name(shard)))
             .collect();
-        let index = serde_json::json!({
-            "metadata": { "total_size": total_size },
-            "weight_map": renamed,
-        });
-        let path = dir.join("model.safetensors.index.json");
-        let tmp = dir.join("model.safetensors.index.json.tmp");
-        std::fs::write(
-            &tmp,
-            serde_json::to_vec_pretty(&index)
-                .map_err(|e| PMetalError::Serialization(e.to_string()))?,
-        )?;
-        std::fs::rename(&tmp, &path)?;
+        let path = dir.join(INDEX_FILE);
+        ShardIndex::new(renamed, total_size)
+            .write(&path)
+            .map_err(|e| PMetalError::Serialization(format!("{}: {e}", path.display())))?;
     }
     Ok(outputs)
 }

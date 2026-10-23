@@ -82,7 +82,7 @@ impl FormTab for ServeTab {
     }
 
     fn plan(&self) -> Result<LaunchPlan, Vec<FormIssue>> {
-        self.panel.plan_for::<ServeSpec>(|_, _| {})
+        self.panel.plan_for::<ServeSpec>()
     }
 
     fn begin(&mut self) {

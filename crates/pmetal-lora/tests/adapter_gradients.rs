@@ -17,7 +17,7 @@
 
 mod common;
 
-use std::collections::HashMap;
+use pmetal_runtime::compat::FlattenedModuleParam;
 use std::rc::Rc;
 
 use common::{SEQ_LEN, cases, every_projection_lora, input_ids};
@@ -99,9 +99,8 @@ fn drain(case: &str) {
 /// every run gets the same values.
 fn randomize_adapters(model: &mut AdaptedModel) {
     random::seed(7);
-    let mut adapters: Vec<_> = model.lora_parameters().into_iter().collect();
-    adapters.sort_by(|a, b| a.0.cmp(&b.0));
-    let params: HashMap<Rc<str>, Array> = adapters
+    let adapters = model.lora_parameters();
+    let params: FlattenedModuleParam = adapters
         .into_iter()
         .map(|(name, p)| {
             let r = random::uniform_range(-0.05, 0.05, p.shape(), Dtype::Float32);
@@ -143,13 +142,13 @@ fn gradients(
     names: &[Rc<str>],
     ids: &Array,
     weights: &Array,
-) -> (f32, HashMap<Rc<str>, Array>) {
+) -> (f32, FlattenedModuleParam) {
     let live = model.lora_parameters();
     let params: Vec<Array> = names.iter().map(|n| live[n].clone()).collect();
     let (loss, grads) = with_training_mode(|| {
         let (loss, grads) = value_and_grad(
             |arrays| {
-                let restored: HashMap<Rc<str>, Array> =
+                let restored: FlattenedModuleParam =
                     names.iter().cloned().zip(arrays.iter().cloned()).collect();
                 model.set_lora_parameters(&restored);
                 loss_of(&model.forward(ids, None).unwrap(), weights)
@@ -181,8 +180,7 @@ fn check_architecture(name: &str, config_json: &str) -> Vec<String> {
     let ids = input_ids(vocab);
     let weights = loss_weights(vocab);
 
-    let mut names: Vec<Rc<str>> = model.lora_parameters().into_keys().collect();
-    names.sort();
+    let names: Vec<Rc<str>> = model.lora_parameters().into_keys().collect();
     let (loss, grads) = gradients(&mut model, &names, &ids, &weights);
     drain(name);
     if !loss.is_finite() {
@@ -277,12 +275,12 @@ fn step_with(
     names: &[Rc<str>],
     ids: &Array,
     loss: impl Fn(&mut AdaptedModel, &Array) -> Array,
-) -> (f32, HashMap<Rc<str>, Array>) {
+) -> (f32, FlattenedModuleParam) {
     let live = model.lora_parameters();
     let params: Vec<Array> = names.iter().map(|n| live[n].clone()).collect();
     let (value, grads) = value_and_grad(
         |arrays| {
-            let restored: HashMap<Rc<str>, Array> =
+            let restored: FlattenedModuleParam =
                 names.iter().cloned().zip(arrays.iter().cloned()).collect();
             model.set_lora_parameters(&restored);
             loss(model, ids)
@@ -420,8 +418,7 @@ fn cce_against_logits(
     logits: impl Fn(&mut AdaptedModel, &Array) -> Array,
     hidden: impl Fn(&mut AdaptedModel, &Array) -> Array,
 ) -> Vec<String> {
-    let mut names: Vec<Rc<str>> = model.lora_parameters().into_keys().collect();
-    names.sort();
+    let names: Vec<Rc<str>> = model.lora_parameters().into_keys().collect();
 
     let (want, want_grads) = step_with(model, &names, ids, |model, ids| {
         pmetal_runtime::training::causal_lm_loss(&logits(model, ids), ids, -100)

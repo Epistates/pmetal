@@ -68,6 +68,7 @@ mod tests {
     fn argv_round_trip() {
         let spec = PackExpertsSpec {
             model: "m".into(),
+            output: "packed".into(),
             ..Default::default()
         };
         let argv = spec.to_argv();

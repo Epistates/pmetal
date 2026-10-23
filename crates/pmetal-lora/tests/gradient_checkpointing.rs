@@ -11,7 +11,7 @@
 //! rather than the traced ones, every adapter gradient comes back zero. The
 //! loss still matches, the run still completes, and the adapter never moves.
 
-use std::collections::HashMap;
+use pmetal_runtime::compat::FlattenedModuleParam;
 use std::rc::Rc;
 
 use pmetal_core::LoraConfig;
@@ -233,15 +233,14 @@ fn build(config_json: &str) -> AdaptedModel {
 
 /// One training step. Returns the loss and the adapter gradients keyed by
 /// parameter path, so two runs can be compared name by name.
-fn step(model: &mut AdaptedModel, checkpoint: bool) -> (f32, HashMap<Rc<str>, Array>) {
+fn step(model: &mut AdaptedModel, checkpoint: bool) -> (f32, FlattenedModuleParam) {
     if checkpoint {
         model.enable_gradient_checkpointing(1);
     } else {
         model.disable_gradient_checkpointing();
     }
 
-    let mut names: Vec<Rc<str>> = model.flatten_trainable_params().into_keys().collect();
-    names.sort();
+    let names: Vec<Rc<str>> = model.flatten_trainable_params().into_keys().collect();
     let live = model.flatten_trainable_params();
     let params: Vec<Array> = names.iter().map(|name| live[name].clone()).collect();
     drop(live);
@@ -251,7 +250,7 @@ fn step(model: &mut AdaptedModel, checkpoint: bool) -> (f32, HashMap<Rc<str>, Ar
 
     let (loss, grads) = value_and_grad(
         |arrays| {
-            let restored: HashMap<Rc<str>, Array> = names
+            let restored: FlattenedModuleParam = names
                 .iter()
                 .cloned()
                 .zip(arrays[..names.len()].iter().cloned())

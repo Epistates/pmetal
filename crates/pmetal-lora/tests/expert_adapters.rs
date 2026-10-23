@@ -14,9 +14,8 @@ use pmetal_cache::test_utils::max_abs_diff;
 use pmetal_core::LoraConfig;
 use pmetal_lora::AdaptedModel;
 use pmetal_models::dispatcher::DynamicModel;
-use pmetal_runtime::compat::{Array, ModuleParametersExt, VisitLinears, random};
-use std::collections::HashMap;
-use std::rc::Rc;
+use pmetal_runtime::compat::FlattenedModuleParam;
+use pmetal_runtime::compat::{ModuleParametersExt, VisitLinears, random};
 
 /// Architectures whose routed experts are the shared stacked layout.
 const STACKED: [&str; 3] = ["qwen3_moe", "deepseek", "nemotron_h"];
@@ -48,9 +47,8 @@ fn drain() {
 
 fn randomize(model: &mut AdaptedModel) {
     random::seed(9);
-    let mut params: Vec<_> = model.lora_parameters().into_iter().collect();
-    params.sort_by(|a, b| a.0.cmp(&b.0));
-    let set: HashMap<Rc<str>, Array> = params
+    let params = model.lora_parameters();
+    let set: FlattenedModuleParam = params
         .into_iter()
         .map(|(name, p)| {
             (
@@ -177,7 +175,7 @@ fn expert_adapters_round_trip_through_a_file() {
 fn the_experts_train() {
     let ids = input_ids(256);
     let mut model = AdaptedModel::attach(build("qwen3_moe"), lora(8)).unwrap();
-    let before: HashMap<_, _> = model.lora_parameters();
+    let before: FlattenedModuleParam = model.lora_parameters();
     let mut optimizer = pmetal_runtime::compat::optimizers::AdamW::new(1e-2, 0.0);
     let losses: Vec<f32> = (0..10)
         .map(|_| common::train_step(&mut model, &mut optimizer, &ids))

@@ -1275,8 +1275,8 @@ impl GptOssForCausalLM {
     ) -> Result<bool, Exception> {
         use crate::loader::PackedLinears;
         use pmetal_runtime::native_loader::{discover_safetensors_shards, load_shards_into_map};
-        let shards = discover_safetensors_shards(model_dir).map_err(Exception::custom)?;
-        let mut raw = load_shards_into_map(&shards, model_dir).map_err(Exception::custom)?;
+        let shards = discover_safetensors_shards(model_dir).map_err(Exception::from)?;
+        let mut raw = load_shards_into_map(&shards, model_dir).map_err(Exception::from)?;
         let fused = raw.keys().any(|k| k.contains(".mlp.experts.gate_up_proj"));
         let stacked = raw
             .keys()
@@ -1319,7 +1319,7 @@ impl GptOssForCausalLM {
             let experts = if stacked {
                 stacked_experts(&mut raw, &mut packed, &prefix)?
             } else {
-                GptOssExperts::from_checkpoint(&raw, &prefix).map_err(Exception::custom)?
+                GptOssExperts::from_checkpoint(&raw, &prefix).map_err(Exception::from)?
             }
             .copy_fresh(&zero);
             raw.retain(|k, _| !k.starts_with(&format!("{prefix}.")));

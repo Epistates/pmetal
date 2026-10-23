@@ -1,5 +1,6 @@
 //! Safetensors loading + shape sanitization + quantized expert stacking.
 
+use crate::{RuntimeError, RuntimeResult};
 use std::collections::HashMap;
 
 use crate::{InlineArray, QuantParams, QuantizedMode};
@@ -86,7 +87,7 @@ const MXFP8_BITS: i32 = 8;
 pub fn load_model(
     model_dir: &std::path::Path,
     config: &Qwen3Config,
-) -> Result<NativeWeights, String> {
+) -> RuntimeResult<NativeWeights> {
     // ── Step 1+2: Shard discovery and bulk-load ─────────────────────────────
     let shard_paths = crate::native_loader::discover_safetensors_shards(model_dir)?;
     let mut raw = crate::native_loader::load_shards_into_map(&shard_paths, model_dir)?;
@@ -229,17 +230,21 @@ pub fn load_model(
             let packed_down_key = format!("{prefix}.experts.down_proj");
             if raw.contains_key(&packed_gate_up_key) && raw.contains_key(&packed_down_key) {
                 let gate_up = raw.remove(&packed_gate_up_key).ok_or_else(|| {
-                    format!("MoE: missing packed expert tensor {packed_gate_up_key}")
+                    RuntimeError::Weights(format!(
+                        "MoE: missing packed expert tensor {packed_gate_up_key}"
+                    ))
                 })?;
                 let down = raw.remove(&packed_down_key).ok_or_else(|| {
-                    format!("MoE: missing packed expert tensor {packed_down_key}")
+                    RuntimeError::Weights(format!(
+                        "MoE: missing packed expert tensor {packed_down_key}"
+                    ))
                 })?;
                 let hidden = config.moe_intermediate_size;
                 if hidden <= 0 {
-                    return Err(format!(
+                    return Err(RuntimeError::Weights(format!(
                         "MoE: invalid moe_intermediate_size={} for packed expert weights at layer {li}",
                         hidden
-                    ));
+                    )));
                 }
 
                 // gate_up: [E, 2I, in] splits into gate and up, [E, I, in]
@@ -265,12 +270,14 @@ pub fn load_model(
         }
         value
     };
-    let get = |key: &str| -> Result<InlineArray, String> {
+    let get = |key: &str| -> RuntimeResult<InlineArray> {
         take(key).ok_or_else(|| {
             let parts: Vec<&str> = key.rsplitn(2, '.').collect();
             let suffix = parts[0];
             let close: Vec<&String> = raw.keys().filter(|k| k.ends_with(suffix)).take(5).collect();
-            format!("missing weight key: {key} (close matches: {close:?})")
+            RuntimeError::Weights(format!(
+                "missing weight key: {key} (close matches: {close:?})"
+            ))
         })
     };
 
@@ -280,7 +287,7 @@ pub fn load_model(
     // modes `scales` alone), and how to read them (bits, group size, mode)
     // comes from the checkpoint's `quantization` block, a module's own entry
     // first. `None` when the module is dense.
-    let packed_params = |base_key: &str| -> Result<Option<QuantParams>, String> {
+    let packed_params = |base_key: &str| -> RuntimeResult<Option<QuantParams>> {
         if !raw.contains_key(&format!("{base_key}.scales")) {
             return Ok(None);
         }
@@ -301,7 +308,7 @@ pub fn load_model(
     // per-tensor scale where ModelOpt gave one.
     //
     // `base_key` is the full key WITHOUT the trailing `.weight` suffix.
-    let get_layer_weight = |base_key: &str| -> Result<LayerWeight, String> {
+    let get_layer_weight = |base_key: &str| -> RuntimeResult<LayerWeight> {
         let w_key = format!("{base_key}.weight");
         let s_key = format!("{base_key}.scales");
         let b_key = format!("{base_key}.biases");
@@ -355,7 +362,7 @@ pub fn load_model(
     // A stack of experts at `{base_key}`, `[E, out, in]` as MLX's converter saves it
     // and as the fused layout was split into above: packed as it stands,
     // dense pre-transposed to `[E, in, out]` for `gather_mm`.
-    let stacked_projection = |base_key: &str| -> Result<LayerWeight, String> {
+    let stacked_projection = |base_key: &str| -> RuntimeResult<LayerWeight> {
         let w_key = format!("{base_key}.weight");
         match packed_params(base_key)? {
             Some(params) => Ok(LayerWeight::Quantized {
@@ -449,7 +456,7 @@ pub fn load_model(
 
             // Stacked as the checkpoint ships them (`switch_mlp`, or the fused
             // layout split above), else one module per expert, stacked here.
-            let stacked = |proj: &str| -> Result<LayerWeight, String> {
+            let stacked = |proj: &str| -> RuntimeResult<LayerWeight> {
                 let base = format!("{p}.mlp.switch_mlp.{proj}");
                 if raw.contains_key(&format!("{base}.weight")) {
                     return stacked_projection(&base);
@@ -457,7 +464,8 @@ pub fn load_model(
                 let experts = (0..config.num_experts)
                     .map(|e| get_layer_weight(&format!("{p}.mlp.experts.{e}.{proj}")))
                     .collect::<Result<Vec<_>, _>>()?;
-                LayerWeight::stack(experts).map_err(|e| format!("{p}.mlp.experts.*.{proj}: {e}"))
+                LayerWeight::stack(experts)
+                    .map_err(|e| RuntimeError::Weights(format!("{p}.mlp.experts.*.{proj}: {e}")))
             };
             let moe_gate = stacked("gate_proj")?;
             let moe_up = stacked("up_proj")?;
@@ -661,13 +669,13 @@ pub fn load_model(
         let mut unread: Vec<&String> = raw.keys().filter(|k| !consumed.contains(*k)).collect();
         if !unread.is_empty() {
             unread.sort();
-            return Err(format!(
+            return Err(RuntimeError::Weights(format!(
                 "{} checkpoint tensor(s) were not consumed by the Qwen3.5 loader \
-                 (first {}): {:?}",
+             (first {}): {:?}",
                 unread.len(),
                 unread.len().min(10),
                 &unread[..unread.len().min(10)]
-            ));
+            )));
         }
     }
 
@@ -820,7 +828,7 @@ struct Fp8SidecarLoadStats {
 fn normalize_fp8_weight_scale_inv_sidecars(
     raw: &mut HashMap<String, InlineArray>,
     target_dtype: i32,
-) -> Result<Fp8SidecarLoadStats, String> {
+) -> RuntimeResult<Fp8SidecarLoadStats> {
     let scale_inv_keys: Vec<String> = raw
         .keys()
         .filter(|k| {
@@ -839,14 +847,16 @@ fn normalize_fp8_weight_scale_inv_sidecars(
             continue;
         };
 
-        let scale_inv = raw
-            .remove(&scale_inv_key)
-            .ok_or_else(|| format!("FP8 sidecar disappeared during load: {scale_inv_key}"))?;
+        let scale_inv = raw.remove(&scale_inv_key).ok_or_else(|| {
+            RuntimeError::Weights(format!(
+                "FP8 sidecar disappeared during load: {scale_inv_key}"
+            ))
+        })?;
         let Some(weight) = raw.remove(&weight_key) else {
             raw.insert(scale_inv_key.clone(), scale_inv);
-            return Err(format!(
+            return Err(RuntimeError::Weights(format!(
                 "FP8 scale sidecar {scale_inv_key} has no matching weight {weight_key}"
-            ));
+            )));
         };
 
         let dequant = crate::native_loader::dequantize_fp8_e4m3_scaled_weight(
@@ -854,7 +864,7 @@ fn normalize_fp8_weight_scale_inv_sidecars(
             &scale_inv,
             target_dtype,
         )
-        .map_err(|e| format!("{weight_key}: {e}"))?;
+        .map_err(|e| RuntimeError::Weights(format!("{weight_key}: {e}")))?;
 
         if can_repack_as_mxfp8(&dequant) {
             let Some(base_key) = weight_key.strip_suffix(".weight") else {
@@ -865,7 +875,11 @@ fn normalize_fp8_weight_scale_inv_sidecars(
             let mxfp8_scale_key = format!("{base_key}.mxfp8_scales");
             let (packed, scales) = dequant
                 .try_quantize_weights_mode(MXFP8_GROUP_SIZE, MXFP8_BITS, QuantizedMode::Mxfp8)
-                .map_err(|e| format!("{weight_key}: failed to repack FP8 as mxfp8: {e}"))?;
+                .map_err(|e| {
+                    RuntimeError::Weights(format!(
+                        "{weight_key}: failed to repack FP8 as mxfp8: {e}"
+                    ))
+                })?;
             raw.insert(weight_key, packed);
             raw.insert(mxfp8_scale_key, scales);
             stats.repacked_mxfp8 += 1;
@@ -893,14 +907,14 @@ struct ModelOptLoadStats {
 fn normalize_modelopt_sidecars(
     raw: &mut HashMap<String, InlineArray>,
     target_dtype: i32,
-) -> Result<ModelOptLoadStats, String> {
+) -> RuntimeResult<ModelOptLoadStats> {
     use crate::native_loader::NativeModelOpt;
 
     let mut stats = ModelOptLoadStats::default();
     for (base, weight) in crate::native_loader::take_modelopt_weights(raw)? {
         let native = weight
             .into_native(target_dtype)
-            .map_err(|e| format!("{base}.weight: {e}"))?;
+            .map_err(|e| RuntimeError::Weights(format!("{base}.weight: {e}")))?;
         match native {
             NativeModelOpt::Packed {
                 weight,

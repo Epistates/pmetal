@@ -6,8 +6,7 @@
 use crate::InlineArray;
 use crate::compat::Dtype;
 use crate::inline_array::{LogitRowStats, logit_row_stats};
-use std::collections::HashMap;
-use std::hash::Hash;
+use std::collections::BTreeMap;
 
 // ── Cross-entropy ─────────────────────────────────────────────────────────
 
@@ -322,15 +321,15 @@ pub fn clip_grad_norm(grads: &mut crate::optimizer::ParamSet, max_norm: f32) -> 
     clip_grad_norm_map(grads, max_norm)
 }
 
-/// Clip all gradients in any `HashMap<K, InlineArray>` by global L2 norm.
+/// Clip all gradients in any `BTreeMap<K, InlineArray>` by global L2 norm.
 ///
 /// This supports both bridge-native [`ParamSet`](crate::optimizer::ParamSet)
 /// and the compat layer's `FlattenedModuleParam` without duplicating the same
 /// lazy GPU expression in trainer crates. See [`clip_grad_norm`].
-pub fn clip_grad_norm_map<K>(grads: &mut HashMap<K, InlineArray>, max_norm: f32) -> InlineArray
-where
-    K: Eq + Hash + Ord,
-{
+pub fn clip_grad_norm_map<K: Ord>(
+    grads: &mut BTreeMap<K, InlineArray>,
+    max_norm: f32,
+) -> InlineArray {
     if max_norm <= 0.0 {
         return InlineArray::from_f32(0.0);
     }
@@ -351,14 +350,11 @@ where
 /// The global L2 norm of a map of gradients ([`global_grad_norm`]), summed in
 /// key order.
 ///
-/// An f32 sum depends on its order, and a `HashMap` iterates in an order that
-/// is different every time one is built, so summing in the map's order gave
-/// the same gradients a norm (and a clipping factor) that differed in its last
-/// bits from run to run. Key order is the same on every run.
-pub fn global_grad_norm_of<K: Ord>(grads: &HashMap<K, InlineArray>) -> InlineArray {
-    let mut ordered: Vec<(&K, &InlineArray)> = grads.iter().collect();
-    ordered.sort_by(|a, b| a.0.cmp(b.0));
-    global_grad_norm(ordered.into_iter().map(|(_, grad)| grad))
+/// An f32 sum depends on its order. A `BTreeMap` iterates in key order, the
+/// same on every run, so the same gradients always give the same norm (and
+/// clipping factor), down to the last bit.
+pub fn global_grad_norm_of<K>(grads: &BTreeMap<K, InlineArray>) -> InlineArray {
+    global_grad_norm(grads.values())
 }
 
 /// The global L2 norm of a set of gradients, an f32 scalar: the square root
@@ -597,10 +593,10 @@ mod tests {
         assert!((got - want).abs() < 1e-5, "{got} vs {want}");
     }
 
-    fn grads_of(dtype: Dtype, values: &[f32]) -> HashMap<&'static str, InlineArray> {
+    fn grads_of(dtype: Dtype, values: &[f32]) -> BTreeMap<&'static str, InlineArray> {
         let g =
             InlineArray::from_f32_slice(values, &[values.len() as i32]).as_dtype(dtype.as_i32());
-        HashMap::from([("g", g)])
+        BTreeMap::from([("g", g)])
     }
 
     /// Clipping scales by `max_norm / norm`, and an f16 gradient above 256
@@ -625,26 +621,26 @@ mod tests {
     }
 
     /// The global norm is a sum of f32 squares, and an f32 sum depends on its
-    /// order. A `HashMap` iterates in a different order every time one is
-    /// built, so the norm (and the clip it scales by) changed in its last bits
-    /// from run to run on the same gradients.
+    /// order. The map iterates in key order whatever order its entries were
+    /// inserted in, so the norm (and the clip it scales by) is the same on
+    /// every run.
     #[test]
-    fn the_global_norm_does_not_depend_on_the_order_a_map_iterates_in() {
+    fn the_global_norm_does_not_depend_on_the_order_a_map_was_built_in() {
         // Magnitudes across many binades, so different orders round differently.
         let values: Vec<f32> = (0..32)
             .map(|i| 1.7f32.powi((i * 7 % 23) - 9) * if i % 3 == 0 { -1.0 } else { 1.0 })
             .collect();
-        let norms: Vec<u32> = (0..64)
-            .map(|_| {
-                let grads: HashMap<String, InlineArray> = values
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| {
-                        (
-                            format!("layer.{i:02}.weight"),
-                            InlineArray::from_f32_slice(&[*v, *v * 0.37], &[2]),
-                        )
-                    })
+        let entry = |i: usize| {
+            (
+                format!("layer.{i:02}.weight"),
+                InlineArray::from_f32_slice(&[values[i], values[i] * 0.37], &[2]),
+            )
+        };
+        let norms: Vec<u32> = (0..values.len())
+            .map(|rotation| {
+                // Insert the same gradients starting from a different place.
+                let grads: BTreeMap<String, InlineArray> = (0..values.len())
+                    .map(|i| entry((i + rotation) % values.len()))
                     .collect();
                 read(&global_grad_norm_of(&grads))[0].to_bits()
             })

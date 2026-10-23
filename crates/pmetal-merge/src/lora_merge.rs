@@ -48,9 +48,10 @@ use safetensors::Dtype;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use crate::loader::{copy_side_files, decode_f32, write_atomic};
+use crate::loader::{copy_side_files, decode_f32};
 use crate::mapped::{MappedFile, TensorMeta};
 use crate::{MergeError, Result};
+use pmetal_hub::safetensors_index::{INDEX_FILE, IndexError, ShardIndex};
 
 // ---------------------------------------------------------------------------
 // Public configuration
@@ -1669,35 +1670,22 @@ fn merge_shard(
 // Sharded index helpers
 // ---------------------------------------------------------------------------
 
-/// Parsed `model.safetensors.index.json`.
-#[derive(Debug, Deserialize)]
-struct ShardIndex {
-    #[serde(default)]
-    metadata: serde_json::Value,
-    weight_map: BTreeMap<String, String>,
-}
-
-impl ShardIndex {
-    fn from_path(path: &Path) -> Result<Self> {
-        let contents = fs::read_to_string(path).map_err(|e| {
-            MergeError::ModelLoad(format!("failed to read {}: {}", path.display(), e))
-        })?;
-        let idx: ShardIndex = serde_json::from_str(&contents)
-            .map_err(|e| MergeError::ModelLoad(format!("failed to parse shard index: {}", e)))?;
-        if idx.weight_map.is_empty() {
-            return Err(MergeError::InvalidConfig(
-                "model.safetensors.index.json: weight_map is empty".to_string(),
-            ));
+/// The base model's `model.safetensors.index.json`, which must name at least
+/// one tensor.
+fn read_shard_index(path: &Path) -> Result<ShardIndex> {
+    let index = ShardIndex::read(path).map_err(|e| match e {
+        IndexError::Io { source, .. } => {
+            MergeError::ModelLoad(format!("failed to read {}: {}", path.display(), source))
         }
-        Ok(idx)
+        IndexError::Json(e) => MergeError::ModelLoad(format!("failed to parse shard index: {e}")),
+        other => other.into(),
+    })?;
+    if index.weight_map.is_empty() {
+        return Err(MergeError::InvalidConfig(
+            "model.safetensors.index.json: weight_map is empty".to_string(),
+        ));
     }
-
-    fn shard_filenames(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.weight_map.values().cloned().collect();
-        names.sort();
-        names.dedup();
-        names
-    }
+    Ok(index)
 }
 
 // ---------------------------------------------------------------------------
@@ -1719,32 +1707,15 @@ fn merge_sharded(
         ))
     })?;
 
-    for shard_filename in index.shard_filenames() {
-        // Guard against path traversal via a crafted index.json.
-        let component = Path::new(&shard_filename);
-        if component.is_absolute()
-            || component
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            return Err(MergeError::InvalidConfig(format!(
-                "shard filename '{shard_filename}' contains path traversal"
-            )));
-        }
-        let shard = MappedFile::open(&base_dir.join(&shard_filename))?;
-        merge_shard(&shard, ctx, &output_dir.join(&shard_filename), stats)?;
+    // The index was parsed with every shard name checked against path
+    // traversal, so these joins stay under the two directories.
+    for shard_filename in index.shards() {
+        let shard = MappedFile::open(&base_dir.join(shard_filename))?;
+        merge_shard(&shard, ctx, &output_dir.join(shard_filename), stats)?;
     }
 
     // The tensors keep their shards, so the index carries over unchanged.
-    let output_index = serde_json::json!({
-        "metadata": index.metadata,
-        "weight_map": index.weight_map,
-    });
-    let json = serde_json::to_string_pretty(&output_index).map_err(MergeError::Serde)?;
-    write_atomic(
-        &output_dir.join("model.safetensors.index.json"),
-        json.as_bytes(),
-    )?;
+    index.write(&output_dir.join(INDEX_FILE))?;
 
     Ok(())
 }
@@ -1874,7 +1845,7 @@ pub fn streaming_lora_merge(config: &AccurateMergeConfig) -> Result<LoraMergeSta
         if single.is_file() {
             BaseLayout::Single(single)
         } else if index_path.is_file() {
-            BaseLayout::Sharded(ShardIndex::from_path(&index_path)?)
+            BaseLayout::Sharded(read_shard_index(&index_path)?)
         } else {
             return Err(MergeError::ModelLoad(format!(
                 "base model directory '{}' contains neither model.safetensors \

@@ -561,7 +561,7 @@ fn dominant_dtype(dtypes: impl Iterator<Item = (Dtype, usize)>) -> Dtype {
 
 /// A fine-tuned model's parameters as a model reports them (path to value): what
 /// [`save_full_model`] writes.
-pub type Parameters = std::collections::HashMap<std::rc::Rc<str>, pmetal_runtime::compat::Array>;
+pub type Parameters = pmetal_runtime::compat::FlattenedModuleParam;
 
 /// The parameter paths of a model and their shapes, for [`plan_save`].
 pub fn parameter_shapes(parameters: &Parameters) -> BTreeMap<String, Vec<usize>> {

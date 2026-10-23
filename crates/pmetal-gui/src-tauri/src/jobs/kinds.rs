@@ -4,8 +4,10 @@
 //! spec's fields; [`spec_from_text`] builds the spec the command line would
 //! build from the same values, the spec's own `normalize` checks it, and
 //! `to_argv` writes the command. This module adds only what the app decides:
-//! where the job writes, whether a path is one it may write to, and which
-//! files the supervisor follows for progress.
+//! where the job writes and whether a path is one it may write to. The command
+//! itself, with the files the job is asked to write and the supervisor follows
+//! for progress, is the supervisor's `LaunchPlan`, the same one every surface
+//! starts its jobs from.
 
 use std::collections::{BTreeMap, HashSet};
 use std::marker::PhantomData;
@@ -19,6 +21,7 @@ use pmetal::core::jobs::{
     VocodeSpec,
 };
 use pmetal::core::{FieldKind, JobFields, default_text, spec_from_text};
+use pmetal_supervisor::{LaunchOptions, LaunchPlan};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -54,22 +57,12 @@ pub struct LaunchContext {
 /// A command ready to hand to the supervisor.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Launch {
-    pub subcommand: String,
-    pub argv: Vec<String>,
-    /// Where the job writes its results.
-    pub output: Option<PathBuf>,
-    /// The `--log-events` file the job was told to write.
-    pub events_file: Option<PathBuf>,
-    /// The `--log-metrics` file the job was told to write, when it reports no
-    /// events.
-    pub metrics_file: Option<PathBuf>,
+    /// The command, where it writes and what the supervisor follows.
+    pub plan: LaunchPlan,
     /// What to call the run: the model it works on.
     pub title: String,
     /// Two jobs with the same key would collide (a port both would bind).
     pub exclusive: Option<String>,
-    /// What to leave beside the job's results (`training_info.json`), so the
-    /// adapter list can say what an adapter was trained from.
-    pub record: Option<Value>,
 }
 
 /// A kind of job.
@@ -84,10 +77,6 @@ pub trait Kind: Send + Sync {
         ctx: &LaunchContext,
     ) -> Result<Launch, Vec<FieldIssue>>;
 }
-
-/// Commands whose `--log-events` the CLI honours, which is how the app learns
-/// what phase they are in and when a step finishes.
-const REPORTS_EVENTS: &[&str] = &["train", "distill", "grpo", "rlkd", "preference"];
 
 struct SpecKind<S> {
     key: &'static str,
@@ -285,7 +274,7 @@ impl<S: Spec> Kind for SpecKind<S> {
                 let Some(text) = json.get(d.name).and_then(Value::as_str) else {
                     continue;
                 };
-                let input = paths::expand_home(text);
+                let input = pmetal::core::paths::expand_home(text.trim());
                 // Only a full path can be a place on disk; "Qwen/Qwen3-0.6B" is
                 // a Hub id, whatever the working directory holds.
                 if input.is_absolute() && input.exists() && paths::overlaps(out, &input) {
@@ -305,28 +294,27 @@ impl<S: Spec> Kind for SpecKind<S> {
             }
         }
 
-        // The file the job logs its steps to, if it has one, kept beside its
-        // results.
-        let mut metrics_file = None;
-        if let Some(value) = json.get("log_metrics") {
-            let given = value.as_str().unwrap_or("").trim().to_string();
-            let path = if given.is_empty() {
-                output.as_ref().map(|out| out.join("metrics.jsonl"))
-            } else {
-                match paths::resolve_output(&given, &ctx.output_root) {
-                    Ok(path) => Some(path),
-                    Err(message) => {
-                        issues.push(FieldIssue::new("log_metrics", message));
-                        None
+        // The file the job logs its steps to, if it names one: relative to the
+        // job's results, as the command reads it, and a place the app lets a job
+        // write to. Left empty, it is beside the results (the plan's default).
+        if let Some(name) = S::LOG_METRICS_FIELD {
+            let given = json
+                .get(name)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !given.is_empty() {
+                let placed = match &output {
+                    Some(out) => pmetal::core::paths::resolve_in(out, &given),
+                    None => PathBuf::from(&given),
+                };
+                match paths::resolve_output(&placed.display().to_string(), &ctx.output_root) {
+                    Ok(path) => {
+                        json.insert(name.into(), Value::String(path.display().to_string()));
                     }
+                    Err(message) => issues.push(FieldIssue::new(name, message)),
                 }
-            };
-            if let Some(path) = path {
-                json.insert(
-                    "log_metrics".into(),
-                    Value::String(path.display().to_string()),
-                );
-                metrics_file = Some(path);
             }
         }
 
@@ -347,26 +335,8 @@ impl<S: Spec> Kind for SpecKind<S> {
                 .collect::<Vec<_>>()
         })?;
 
-        let mut argv = spec.to_argv();
-        let mut events_file = None;
-        if REPORTS_EVENTS.contains(&S::subcommand())
-            && let Some(out) = &output
-        {
-            let file = out.join("events.jsonl");
-            argv.extend(["--log-events".to_string(), file.display().to_string()]);
-            events_file = Some(file);
-            // The events carry the steps; following the metrics file too would
-            // count each step twice.
-            metrics_file = None;
-        }
-
-        let record = (events_file.is_some()).then(|| {
-            serde_json::json!({
-                "base_model": title,
-                "dataset": json.get("dataset").and_then(Value::as_str),
-                "created": ctx.now.to_rfc3339(),
-            })
-        });
+        let plan = LaunchPlan::for_spec(&spec, &LaunchOptions::default())
+            .map_err(|e| vec![FieldIssue::new("", e.to_string())])?;
 
         let exclusive = self.exclusive.and_then(|field| {
             let value = json.get(field)?;
@@ -379,14 +349,9 @@ impl<S: Spec> Kind for SpecKind<S> {
         });
 
         Ok(Launch {
-            subcommand: S::subcommand().to_string(),
-            argv,
-            output,
-            events_file,
-            metrics_file,
+            plan,
             title,
             exclusive,
-            record,
         })
     }
 }
@@ -460,11 +425,7 @@ pub fn all() -> &'static [Box<dyn Kind>] {
             spec_kind::<BenchSpec>("bench", "Benchmark", "Measure training throughput"),
             Box::new(local::bench_workload()),
             spec_kind::<EvalSpec>("eval", "Evaluate", "Perplexity of a model on a dataset"),
-            spec_kind::<MergeSpec>(
-                "merge",
-                "Merge models",
-                "Combine the weights of several models",
-            ),
+            spec_kind::<MergeSpec>("merge", "Merge models", "Combine the weights of two models"),
             spec_kind::<FuseSpec>(
                 "fuse",
                 "Fuse adapter",
@@ -568,6 +529,67 @@ mod tests {
     }
 
     #[test]
+    fn the_app_asks_for_an_event_log_where_the_spec_says_its_command_writes_one() {
+        // The same table the command line, the terminal UI and the MCP server
+        // are held to: the spec states it (`REPORTS_EVENTS`).
+        fn writes<S: Spec>() -> (&'static str, bool) {
+            (S::subcommand(), S::REPORTS_EVENTS)
+        }
+        let table = [
+            writes::<TrainSpec>(),
+            writes::<DistillSpec>(),
+            writes::<GrpoSpec>(),
+            writes::<RlkdSpec>(),
+            writes::<PreferenceSpec>(),
+            writes::<EmbedTrainSpec>(),
+            writes::<PretrainSpec>(),
+            writes::<TrainMtpSpec>(),
+            writes::<TrainDraftSpec>(),
+            writes::<TrainDiffusionSpec>(),
+            writes::<DflashSpec>(),
+            writes::<ServeSpec>(),
+            writes::<BenchSpec>(),
+            writes::<EvalSpec>(),
+            writes::<MergeSpec>(),
+            writes::<FuseSpec>(),
+            writes::<ImatrixSpec>(),
+            writes::<QuantizeSpec>(),
+            writes::<PackExpertsSpec>(),
+            writes::<TokenizeSpec>(),
+            writes::<VocodeSpec>(),
+            writes::<DecideSpec>(),
+        ];
+        let root = tempfile::tempdir().unwrap();
+        let mut checked = 0;
+        for kind in all() {
+            let values: BTreeMap<String, String> = kind
+                .form()
+                .fields
+                .iter()
+                .filter(|f| f.required)
+                .map(|f| (f.name.clone(), "owner/name".to_string()))
+                .collect();
+            let Ok(launch) = kind.prepare(&values, &ctx(root.path())) else {
+                continue;
+            };
+            let Some((_, writes_events)) = table
+                .iter()
+                .find(|(subcommand, _)| *subcommand == launch.plan.subcommand)
+            else {
+                continue;
+            };
+            assert_eq!(
+                launch.plan.events_file.is_some(),
+                *writes_events,
+                "{}",
+                kind.key()
+            );
+            checked += 1;
+        }
+        assert!(checked >= 15, "only {checked} jobs were checked");
+    }
+
+    #[test]
     fn a_form_is_listed_under_the_key_a_job_is_started_by() {
         for kind in all() {
             assert_eq!(kind.form().key, kind.key());
@@ -590,31 +612,33 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(launch.subcommand, "train");
-        assert_eq!(arg_after(&launch.argv, "--model"), Some("Qwen/Qwen3-0.6B"));
-        assert_eq!(arg_after(&launch.argv, "--epochs"), Some("2"));
-        assert_eq!(arg_after(&launch.argv, "--lora-r"), Some("8"));
-        // Not entered, so the spec's own default, not a number of the app's.
-        let default = TrainSpec::default();
+        assert_eq!(launch.plan.subcommand, "train");
         assert_eq!(
-            arg_after(&launch.argv, "--batch-size").map(str::to_string),
-            Some(default.batch_size.to_string())
+            arg_after(&launch.plan.argv, "--model"),
+            Some("Qwen/Qwen3-0.6B")
         );
+        assert_eq!(arg_after(&launch.plan.argv, "--epochs"), Some("2"));
+        assert_eq!(arg_after(&launch.plan.argv, "--lora-r"), Some("8"));
+        // Not entered, so not passed: the command's own default applies (and a
+        // config file's value would, which a flag at the default's value would
+        // have overridden).
+        assert_eq!(arg_after(&launch.plan.argv, "--batch-size"), None);
+        assert_eq!(arg_after(&launch.plan.argv, "--learning-rate"), None);
         // A folder of its own, named for the model, the job and the time.
-        let out = launch.output.unwrap();
+        let out = launch.plan.output.unwrap();
         assert_eq!(out, root.path().join("Qwen3-0.6B-train-20260318-214507"));
         assert_eq!(
-            arg_after(&launch.argv, "--output"),
+            arg_after(&launch.plan.argv, "--output"),
             Some(out.to_str().unwrap())
         );
         // Progress comes from the events file, and the steps are not counted twice.
-        let events = launch.events_file.unwrap();
+        let events = launch.plan.events_file.unwrap();
         assert_eq!(events, out.join("events.jsonl"));
         assert_eq!(
-            arg_after(&launch.argv, "--log-events"),
+            arg_after(&launch.plan.argv, "--log-events"),
             Some(events.to_str().unwrap())
         );
-        assert!(launch.metrics_file.is_none());
+        assert!(launch.plan.metrics_file.is_none());
         assert_eq!(launch.title, "Qwen/Qwen3-0.6B");
     }
 
@@ -674,7 +698,7 @@ mod tests {
                 &ctx(root.path()),
             )
             .unwrap();
-        assert_eq!(launch.output.unwrap(), root.path().join("my-run"));
+        assert_eq!(launch.plan.output.unwrap(), root.path().join("my-run"));
     }
 
     #[test]
@@ -736,8 +760,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(launch.exclusive.as_deref(), Some("port:9001"));
-        assert!(launch.output.is_none());
-        assert!(launch.events_file.is_none());
+        assert!(launch.plan.output.is_none());
+        assert!(launch.plan.events_file.is_none());
     }
 
     #[test]

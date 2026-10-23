@@ -27,7 +27,7 @@ fn an_error_in_the_middle_of_a_chain_is_reported() {
     let err = checked(|| a.matmul(&bad).add(&a).sum_all()).expect_err("a shape mismatch");
     match err {
         RuntimeError::CxxException(msg) => assert!(msg.contains("[matmul]"), "{msg}"),
-        RuntimeError::Unknown(msg) => panic!("expected a C++ exception, got: {msg}"),
+        other => panic!("expected a C++ exception, got: {other}"),
     }
     // Reading it cleared it.
     assert_eq!(check_unobserved_error(), Ok(()));

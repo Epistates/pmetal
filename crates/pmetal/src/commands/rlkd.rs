@@ -78,6 +78,13 @@ pub(crate) async fn run_rlkd(spec: RlkdSpec, ctx: RunContext) -> anyhow::Result<
     // 1. Resolve and download policy model
     tracing::info!("Resolving policy model: {}", model_id);
     let model_path = pmetal_hub::resolve_model_path(model_id, None, None).await?;
+    super::record_training(
+        std::path::Path::new(output_dir),
+        model_id,
+        &model_path,
+        dataset_path,
+        "rlkd",
+    );
 
     // 2. Resolve and download teacher model
     tracing::info!("Resolving teacher model: {}", teacher_model_id);
@@ -195,11 +202,7 @@ pub(crate) async fn run_rlkd(spec: RlkdSpec, ctx: RunContext) -> anyhow::Result<
     let mut trainer = RlkdTrainer::new(rlkd_config)?;
 
     if let Some(metrics_path) = _log_metrics {
-        let path = if metrics_path.contains('/') || metrics_path.contains('\\') {
-            PathBuf::from(metrics_path)
-        } else {
-            PathBuf::from(output_dir).join(metrics_path)
-        };
+        let path = pmetal_core::paths::resolve_in(std::path::Path::new(output_dir), metrics_path);
         let callback = pmetal_trainer::MetricsJsonCallback::new(&path)?.with_run_name(format!(
             "rlkd-{}",
             model_id.split('/').next_back().unwrap_or(model_id)

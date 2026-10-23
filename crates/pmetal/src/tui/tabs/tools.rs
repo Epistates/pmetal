@@ -76,7 +76,7 @@ impl ToolTab {
         Self {
             panel,
             tool,
-            plan: |panel| panel.plan_for::<S>(|_, _| {}),
+            plan: |panel| panel.plan_for::<S>(),
             readout: Readout::default(),
         }
     }

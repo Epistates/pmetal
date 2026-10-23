@@ -22,7 +22,8 @@
 //! (`A_log`, `dt_bias`, `conv1d`) are always kept at 8-bit or full precision
 //! because errors in these tensors have outsized downstream effects.
 
-use std::collections::HashMap;
+use crate::{RuntimeError, RuntimeResult};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use crate::InlineArray;
@@ -418,19 +419,23 @@ pub fn quantize_and_save_mlx(
     assignments: &[TensorQuant],
     output_dir: &Path,
     _group_size: i32,
-) -> Result<(), String> {
-    std::fs::create_dir_all(output_dir)
-        .map_err(|e| format!("failed to create output dir '{}: {e}", output_dir.display()))?;
+) -> RuntimeResult<()> {
+    std::fs::create_dir_all(output_dir).map_err(|e| {
+        RuntimeError::Weights(format!(
+            "failed to create output dir '{}: {e}",
+            output_dir.display()
+        ))
+    })?;
 
     // --- Estimate per-assignment byte sizes for shard partitioning ---
     let mut records: Vec<ShardRecord<'_>> = Vec::with_capacity(assignments.len());
 
     for (idx, assignment) in assignments.iter().enumerate() {
         let array = weights.get(&assignment.name).ok_or_else(|| {
-            format!(
+            RuntimeError::Weights(format!(
                 "weight '{}' in assignment not found in weights map",
                 assignment.name
-            )
+            ))
         })?;
 
         let byte_estimate = if assignment.bits == BITS_PASSTHROUGH {
@@ -456,14 +461,14 @@ pub fn quantize_and_save_mlx(
     let n_shards = shards.len();
 
     // weight_map: tensor key → shard filename
-    let mut weight_map: HashMap<String, String> = HashMap::new();
+    let mut weight_map: BTreeMap<String, String> = BTreeMap::new();
 
     for (shard_num, shard_record_indices) in shards.iter().enumerate() {
         let shard_filename = format!("model-{:05}-of-{:05}.safetensors", shard_num + 1, n_shards);
         let shard_path = output_dir.join(&shard_filename);
-        let shard_path_str = shard_path
-            .to_str()
-            .ok_or_else(|| format!("non-UTF-8 path: {}", shard_path.display()))?;
+        let shard_path_str = shard_path.to_str().ok_or_else(|| {
+            RuntimeError::Weights(format!("non-UTF-8 path: {}", shard_path.display()))
+        })?;
 
         // Materialise quantized arrays for this shard.
         // We need owned storage for packed/scales/biases so the references
@@ -520,7 +525,8 @@ pub fn quantize_and_save_mlx(
             .map(|(k, idx)| (k.as_str(), &owned_arrays[*idx]))
             .collect();
 
-        InlineArray::save_safetensors(shard_path_str, &save_entries).map_err(|e| e.to_string())?;
+        InlineArray::save_safetensors(shard_path_str, &save_entries)
+            .map_err(|e| RuntimeError::Weights(e.to_string()))?;
     }
 
     // --- Write weight-map index ---
@@ -529,11 +535,17 @@ pub fn quantize_and_save_mlx(
     Ok(())
 }
 
-/// Write `model.safetensors.index.json`.
+/// Write `model.safetensors.index.json`: in tensor-name order, so the file is
+/// the same on every run, and atomically (to a sibling file, then renamed), so
+/// a reader never sees half of it.
+///
+/// This crate depends on no other pmetal crate, so it writes the index here
+/// rather than through `pmetal_core::safetensors_index`; a test reads what it
+/// writes with that module.
 fn write_weight_map_index(
     output_dir: &Path,
-    weight_map: &HashMap<String, String>,
-) -> Result<(), String> {
+    weight_map: &BTreeMap<String, String>,
+) -> RuntimeResult<()> {
     use std::io::Write as _;
 
     let index = serde_json::json!({
@@ -544,13 +556,23 @@ fn write_weight_map_index(
     });
 
     let index_path = output_dir.join("model.safetensors.index.json");
-    let pretty = serde_json::to_string_pretty(&index)
-        .map_err(|e| format!("failed to serialise safetensors index: {e}"))?;
+    let partial = output_dir.join("model.safetensors.index.json.partial");
+    let pretty = serde_json::to_string_pretty(&index).map_err(|e| {
+        RuntimeError::Weights(format!("failed to serialise safetensors index: {e}"))
+    })?;
 
-    let mut f = std::fs::File::create(&index_path)
-        .map_err(|e| format!("failed to create index file: {e}"))?;
-    f.write_all(pretty.as_bytes())
-        .map_err(|e| format!("failed to write index file: {e}"))?;
+    let written = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&partial)?;
+        f.write_all(pretty.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&partial, &index_path)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&partial);
+        return Err(RuntimeError::Weights(format!(
+            "failed to write index file: {e}"
+        )));
+    }
 
     Ok(())
 }
@@ -624,12 +646,16 @@ pub fn write_quantization_config(
     default_bits: i32,
     group_size: i32,
     per_tensor_overrides: &HashMap<String, i32>,
-) -> Result<(), String> {
-    let raw = std::fs::read_to_string(source_config_path)
-        .map_err(|e| format!("failed to read '{}': {e}", source_config_path.display()))?;
+) -> RuntimeResult<()> {
+    let raw = std::fs::read_to_string(source_config_path).map_err(|e| {
+        RuntimeError::Weights(format!(
+            "failed to read '{}': {e}",
+            source_config_path.display()
+        ))
+    })?;
 
-    let mut json: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| format!("failed to parse config.json: {e}"))?;
+    let mut json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| RuntimeError::Weights(format!("failed to parse config.json: {e}")))?;
 
     // Build the quantization block.
     let mut quant = serde_json::json!({
@@ -653,16 +679,22 @@ pub fn write_quantization_config(
         serde_json::Value::Object(map) => {
             map.insert("quantization".to_owned(), quant);
         }
-        _ => return Err("config.json root is not a JSON object".to_owned()),
+        _ => {
+            return Err(RuntimeError::Config(
+                "config.json root is not a JSON object".to_owned(),
+            ));
+        }
     }
 
-    std::fs::create_dir_all(output_dir).map_err(|e| format!("failed to create output dir: {e}"))?;
+    std::fs::create_dir_all(output_dir)
+        .map_err(|e| RuntimeError::Weights(format!("failed to create output dir: {e}")))?;
 
     let out_path = output_dir.join("config.json");
     let serialised = serde_json::to_string_pretty(&json)
-        .map_err(|e| format!("failed to serialise config: {e}"))?;
-    std::fs::write(&out_path, &serialised)
-        .map_err(|e| format!("failed to write '{}': {e}", out_path.display()))?;
+        .map_err(|e| RuntimeError::Weights(format!("failed to serialise config: {e}")))?;
+    std::fs::write(&out_path, &serialised).map_err(|e| {
+        RuntimeError::Weights(format!("failed to write '{}': {e}", out_path.display()))
+    })?;
 
     Ok(())
 }
@@ -687,7 +719,7 @@ pub fn quantize_model(
     group_size: i32,
     bits_candidates: &[i32],
     extra_critical: &[&str],
-) -> Result<Vec<TensorQuant>, String> {
+) -> RuntimeResult<Vec<TensorQuant>> {
     // Sort deterministically so output is reproducible.
     let mut sorted_names: Vec<&String> = weights.keys().collect();
     sorted_names.sort();
@@ -770,6 +802,39 @@ pub fn quantize_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The index this crate writes is read back by the shared index module,
+    /// whole, and is the same bytes on every write.
+    #[test]
+    fn the_written_index_is_read_by_the_shared_module() {
+        let dir = tempfile::tempdir().unwrap();
+        let map: BTreeMap<String, String> = [
+            ("b.weight", "model-00002-of-00002.safetensors"),
+            ("a.weight", "model-00001-of-00002.safetensors"),
+        ]
+        .into_iter()
+        .map(|(t, s)| (t.to_owned(), s.to_owned()))
+        .collect();
+        write_weight_map_index(dir.path(), &map).unwrap();
+        let path = dir.path().join("model.safetensors.index.json");
+        let first = std::fs::read(&path).unwrap();
+        let read = pmetal_core::safetensors_index::ShardIndex::parse(&first).unwrap();
+        assert_eq!(read.weight_map, map);
+        assert_eq!(
+            read.shards(),
+            [
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors"
+            ]
+        );
+        write_weight_map_index(dir.path(), &map).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+        assert!(
+            !dir.path()
+                .join("model.safetensors.index.json.partial")
+                .exists()
+        );
+    }
 
     // ── MLX checkpoint layout (#30) ───────────────────────────────────────────
 

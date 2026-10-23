@@ -1,6 +1,6 @@
 # pmetal merge
 
-Merge two models with one of 14 merge methods.
+Merge two models with one of 16 merge methods.
 
 The command merges exactly two models at a time; task-vector methods take a base model with `--base`. For N-way merges and slice-based frankenmerging, build a `pmetal_merge::MergeConfig` and call `run_merge` directly: the command does not accept a merge config file. Merging is GPU-accelerated, FP8-aware, and streams large models. The merged model keeps the first model's tokenizer.
 
@@ -22,7 +22,7 @@ pmetal merge \
 | `-b`, `--model-b` | required | Second model: a path or Hub ID |
 | `-o`, `--output` | required | Output directory for the merged model |
 | `--method` | `slerp` | Merge method (see Methods) |
-| `--base` | none | Base model of the task-vector methods; required by `task_arithmetic`, `ties`, `dare_ties`, `dare_linear`, `della`, `della_linear`, `breadcrumbs`, `model_stock`, `consensus` and `nearswap` |
+| `--base` | none | Base model of the task-vector methods; required by every method but `linear`, `slerp`, `multislerp` and `passthrough` |
 | `--t` | `0.5` | Interpolation parameter of `slerp`: `0` is model A, `1` is model B |
 | `--weight-a` | `0.5` | Weight of model A in the `linear` and `ties` methods |
 | `--weight-b` | `0.5` | Weight of model B in the `linear` and `ties` methods |
@@ -46,9 +46,11 @@ pmetal merge \
 | `consensus` | TALL-mask consensus merging |
 | `multislerp` | Weighted spherical mean of the models |
 | `nearswap` | Per-parameter selection of the value nearest the base |
+| `ram` | RAM (Reinforced Agent Merging) |
+| `ram_plus` | RAM+ variant |
 | `passthrough` | Layer passthrough composition |
 
-More (`ram`, `ram_plus`, `fisher`, `regmean`, layer `slices`) are reachable by setting `MergeConfig.merge_method` or a YAML config directly.
+A method is spelled with underscores or hyphens, in any case (`dare-ties`). More (`fisher`, `regmean`, layer `slices`) are reachable by setting `MergeConfig.merge_method` or a YAML config directly.
 
 ## Examples
 

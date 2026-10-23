@@ -39,6 +39,7 @@
 use pmetal_core::{EvalMetrics, TrainingConfig};
 use pmetal_data::{DataLoader, DataLoaderConfig, TrainingDataset};
 use pmetal_lora::TrainableModel;
+use pmetal_runtime::compat::FlattenedModuleParam;
 use pmetal_runtime::compat::{Array, Exception, indexing::argmax_axis};
 
 use crate::checkpoint::TrainState;
@@ -254,7 +255,7 @@ pub struct TrainingLoop {
     pub(crate) adaptive_lr_override: Option<f32>,
     /// In-memory snapshot of the best LoRA weights for rollback.
     /// LoRA params are typically a few MB, so this is cheap to hold in memory.
-    pub(crate) best_lora_snapshot: Option<std::collections::HashMap<std::rc::Rc<str>, Array>>,
+    pub(crate) best_lora_snapshot: Option<FlattenedModuleParam>,
     /// When set, each in-memory snapshot is also persisted to this directory
     /// as `best_snapshot.safetensors` so it survives process interruptions.
     pub(crate) snapshot_persist_dir: Option<std::path::PathBuf>,
@@ -1009,7 +1010,7 @@ impl TrainingLoop {
     /// does not abort training.
     fn spawn_async_checkpoint(
         &mut self,
-        lora_params: std::collections::HashMap<std::rc::Rc<str>, Array>,
+        lora_params: FlattenedModuleParam,
         metadata: CheckpointMetadata,
         manager: &CheckpointManager,
         is_best: bool,

@@ -18,6 +18,7 @@
 //! calls `.t()` at load.
 
 use crate::{InlineArray, QuantizedMode};
+use crate::{RuntimeError, RuntimeResult};
 
 /// How a packed tensor was quantized.
 ///
@@ -53,17 +54,17 @@ impl QuantParams {
     ///
     /// A mismatch means the config block and the weights disagree about the
     /// scheme: read anyway, the module loads, runs, and decodes noise.
-    pub fn for_tensors(self, module: &str, has_biases: bool) -> Result<Self, String> {
+    pub fn for_tensors(self, module: &str, has_biases: bool) -> RuntimeResult<Self> {
         match (self.mode, has_biases) {
             (QuantizedMode::Affine, true) => Ok(self),
-            (QuantizedMode::Affine, false) => Err(format!(
+            (QuantizedMode::Affine, false) => Err(RuntimeError::Weights(format!(
                 "{module} has scales but no biases, which is not affine quantization; its \
-                 checkpoint's `quantization` block names no float mode for it (read as {self:?})"
-            )),
-            (mode, true) => Err(format!(
+             checkpoint's `quantization` block names no float mode for it (read as {self:?})"
+            ))),
+            (mode, true) => Err(RuntimeError::Weights(format!(
                 "{module} has biases, which only affine quantization has, but its \
-                 `quantization` block says {mode:?}"
-            )),
+             `quantization` block says {mode:?}"
+            ))),
             (_, false) => Ok(self),
         }
     }
@@ -412,15 +413,17 @@ impl LayerWeight {
     /// Every part has to be the same variant with the same parameters, since
     /// MLX's gather kernels read one layout for the whole stack. Per-tensor
     /// scales stack to `[E]`, one per expert.
-    pub fn stack(parts: Vec<Self>) -> Result<Self, String> {
+    pub fn stack(parts: Vec<Self>) -> RuntimeResult<Self> {
         let stack = |arrays: Vec<InlineArray>| {
             let stacked = crate::compat::ops::stack_axis(&arrays, 0);
             crate::check_last_error()
                 .map(|()| stacked)
-                .map_err(|e| format!("LayerWeight::stack: {e}"))
+                .map_err(|e| RuntimeError::Weights(format!("LayerWeight::stack: {e}")))
         };
         let Some(first) = parts.first() else {
-            return Err("LayerWeight::stack: no experts".to_string());
+            return Err(RuntimeError::Weights(
+                "LayerWeight::stack: no experts".to_string(),
+            ));
         };
         match first {
             // Each part is already `[in, out]`, so the stack is `[E, in, out]`.
@@ -428,7 +431,9 @@ impl LayerWeight {
                 let mut weights = Vec::with_capacity(parts.len());
                 for part in parts {
                     let Self::Dense(w) = part else {
-                        return Err("LayerWeight::stack: dense and packed experts mixed".into());
+                        return Err(RuntimeError::Weights(
+                            "LayerWeight::stack: dense and packed experts mixed".into(),
+                        ));
                     };
                     weights.push(w);
                 }
@@ -463,9 +468,9 @@ impl LayerWeight {
                             all_scales.extend(t);
                         }
                         _ => {
-                            return Err(
-                                "LayerWeight::stack: experts quantized differently".to_string()
-                            );
+                            return Err(RuntimeError::Weights(
+                                "LayerWeight::stack: experts quantized differently".to_string(),
+                            ));
                         }
                     }
                 }
@@ -1160,13 +1165,17 @@ mod tests {
             .for_tensors("model.layers.0.mlp.gate", false)
             .unwrap_err();
         assert!(
-            err.contains("model.layers.0.mlp.gate") && err.contains("no biases"),
+            err.to_string().contains("model.layers.0.mlp.gate")
+                && err.to_string().contains("no biases"),
             "{err}"
         );
         let err = mxfp4
             .for_tensors("model.layers.0.mlp.gate", true)
             .unwrap_err();
-        assert!(err.contains("biases") && err.contains("Mxfp4"), "{err}");
+        assert!(
+            err.to_string().contains("biases") && err.to_string().contains("Mxfp4"),
+            "{err}"
+        );
     }
 
     #[test]

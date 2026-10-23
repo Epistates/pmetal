@@ -160,6 +160,11 @@ fn leaving_a_parameter_out_gives_the_specs_default() {
                 *value = json!(dir.join(name).display().to_string());
             }
         }
+        // `generate` takes a prompt or a messages file, which the schema cannot
+        // say is required.
+        if tool.name() == "generate" {
+            args.insert("prompt".into(), json!("hi"));
+        }
         let prepared = tool
             .prepare(Value::Object(args.clone()), &policy)
             .unwrap_or_else(|e| panic!("{} with only {args:?}: {e}", tool.name()));
@@ -182,7 +187,7 @@ fn leaving_a_parameter_out_gives_the_specs_default() {
         }
         // And the command line is the one the spec itself builds.
         assert!(
-            !prepared.argv.is_empty() || tool.name() == "bench_train",
+            !prepared.plan.argv.is_empty() || tool.name() == "bench_train",
             "{}",
             tool.name()
         );

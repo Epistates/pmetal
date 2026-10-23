@@ -4,13 +4,13 @@
 //! runtime's own ops run them inside the lazy graph, with autodiff, faster
 //! than any kernel this crate carried for them, and so do the loss, the MoE
 //! expert dispatch (SSD-offloaded experts included), the quantized matmuls,
-//! merging and the KV-cache transforms. What remains is the fused AdamW update
-//! and the weight-gradient GEMM the ANE trainer batches into its own command
-//! buffer.
+//! merging and the KV-cache transforms, and so does the AdamW update (a fused
+//! kernel in `pmetal-runtime`). What remains is the weight-gradient GEMM the
+//! ANE trainer batches into its own command buffer.
 
+pub mod batched_command_buffer;
 pub mod dw_gemm;
-pub mod fused_training;
 
 // Re-export main types
+pub use batched_command_buffer::BatchedCommandBuffer;
 pub use dw_gemm::{DwGemm, GPU_DW_MIN_DIM, ScratchPool};
-pub use fused_training::{AdamWConfig, AdamWScalars, BatchedCommandBuffer, FusedAdamW, ParamInfo};

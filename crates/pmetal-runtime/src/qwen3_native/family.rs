@@ -10,6 +10,7 @@
 //! resolves it, with every value the engines cannot run refused by name
 //! instead of defaulted.
 
+use crate::{RuntimeError, RuntimeResult};
 use serde_json::{Map, Value};
 
 use crate::rope::{RopeConfig, RopeScaling, Rotary};
@@ -35,15 +36,15 @@ impl GdnGateActivation {
     pub fn resolve(
         output_gate_type: Option<&str>,
         hidden_act: Option<&str>,
-    ) -> Result<Self, String> {
+    ) -> RuntimeResult<Self> {
         let name = output_gate_type.or(hidden_act).unwrap_or("silu");
         match name.to_ascii_lowercase().as_str() {
             "silu" | "swish" => Ok(Self::Silu),
             "sigmoid" => Ok(Self::Sigmoid),
-            other => Err(format!(
+            other => Err(RuntimeError::Config(format!(
                 "unsupported gated-delta-net output gate activation {other:?} \
-                 (output_gate_type); supported: \"silu\"/\"swish\", \"sigmoid\""
-            )),
+             (output_gate_type); supported: \"silu\"/\"swish\", \"sigmoid\""
+            ))),
         }
     }
 
@@ -113,11 +114,13 @@ pub fn is_unused_by_text_model(key: &str) -> bool {
 
 /// The rotary embedding of a text config [`normalize_text_config`] returned:
 /// partial, at `rope_theta`, and YaRN-scaled when `rope_parameters` says so.
-pub fn rotary(text: &Value) -> Result<Rotary, String> {
+pub fn rotary(text: &Value) -> RuntimeResult<Rotary> {
     let head_dim = text
         .get("head_dim")
         .and_then(Value::as_i64)
-        .ok_or("config key `head_dim` must be an integer")?;
+        .ok_or_else(|| {
+            RuntimeError::Config("config key `head_dim` must be an integer".to_string())
+        })?;
     Rotary::from_config(head_dim as i32, RopeConfig::from_json(text), 10_000.0, 0.25)
 }
 
@@ -131,14 +134,18 @@ fn resolve_rope_parameters(
     text: &Map<String, Value>,
     rope_theta: f64,
     partial: f64,
-) -> Result<Map<String, Value>, String> {
+) -> RuntimeResult<Map<String, Value>> {
     let source = text
         .get("rope_parameters")
         .filter(|v| !v.is_null())
         .or_else(|| text.get("rope_scaling").filter(|v| !v.is_null()));
     let mut rope = match source {
         Some(Value::Object(map)) => map.clone(),
-        Some(other) => return Err(format!("rope_parameters must be an object, got {other}")),
+        Some(other) => {
+            return Err(RuntimeError::Config(format!(
+                "rope_parameters must be an object, got {other}"
+            )));
+        }
         None => Map::new(),
     };
     let max_pos = text.get("max_position_embeddings").and_then(Value::as_f64);
@@ -172,11 +179,11 @@ fn resolve_rope_parameters(
             rope.insert("truncate".into(), yarn.truncate.into());
         }
         other => {
-            return Err(format!(
+            return Err(RuntimeError::Config(format!(
                 "rope_parameters.rope_type {:?} is not supported; this family runs the \
-                 default (partial, multimodal-sectioned) rotary embedding and static \"yarn\"",
+             default (partial, multimodal-sectioned) rotary embedding and static \"yarn\"",
                 other.rope_type()
-            ));
+            )));
         }
     }
     Ok(rope)
@@ -266,10 +273,10 @@ pub fn is_qwen35_family(model_type: &str) -> bool {
     Family::of(model_type).is_some()
 }
 
-fn int(obj: &Map<String, Value>, key: &str) -> Result<i64, String> {
+fn int(obj: &Map<String, Value>, key: &str) -> RuntimeResult<i64> {
     obj.get(key)
         .and_then(Value::as_i64)
-        .ok_or_else(|| format!("config key `{key}` must be an integer"))
+        .ok_or_else(|| RuntimeError::Config(format!("config key `{key}` must be an integer")))
 }
 
 /// The text config of a Qwen3.5-family `config.json`, resolved the way
@@ -296,10 +303,10 @@ fn int(obj: &Map<String, Value>, key: &str) -> Result<i64, String> {
 /// default or YaRN, unknown or miscounted `layer_types`, head counts that do not
 /// divide, and a gated-delta-net key head dimension the Metal kernel cannot
 /// build for.
-pub fn normalize_text_config(config: &Value) -> Result<Value, String> {
+pub fn normalize_text_config(config: &Value) -> RuntimeResult<Value> {
     let outer = config
         .as_object()
-        .ok_or("config.json must be a JSON object")?;
+        .ok_or_else(|| RuntimeError::Config("config.json must be a JSON object".to_string()))?;
     let nested = outer.get("text_config").filter(|v| v.is_object());
     let mut text = nested.and_then(Value::as_object).unwrap_or(outer).clone();
     if !text.contains_key("model_type")
@@ -312,8 +319,9 @@ pub fn normalize_text_config(config: &Value) -> Result<Value, String> {
         .and_then(Value::as_str)
         .unwrap_or("qwen3_5_text")
         .to_string();
-    let family = Family::of(&model_type)
-        .ok_or_else(|| format!("{model_type:?} is not a Qwen3.5-family model_type"))?;
+    let family = Family::of(&model_type).ok_or_else(|| {
+        RuntimeError::Config(format!("{model_type:?} is not a Qwen3.5-family model_type"))
+    })?;
 
     for (key, default) in family.defaults() {
         if text.get(key).is_none_or(Value::is_null) {
@@ -335,10 +343,10 @@ pub fn normalize_text_config(config: &Value) -> Result<Value, String> {
         .unwrap_or("silu")
         .to_string();
     if !matches!(hidden_act.to_ascii_lowercase().as_str(), "silu" | "swish") {
-        return Err(format!(
+        return Err(RuntimeError::Config(format!(
             "unsupported hidden_act {hidden_act:?}: the MLP and the gated-delta-net convolution \
-             are SiLU"
-        ));
+         are SiLU"
+        )));
     }
 
     let gate = GdnGateActivation::resolve(
@@ -352,10 +360,10 @@ pub fn normalize_text_config(config: &Value) -> Result<Value, String> {
             text.insert("attn_output_gate".into(), true.into());
         }
         Some(other) => {
-            return Err(format!(
+            return Err(RuntimeError::Config(format!(
                 "attn_output_gate = {other} is not supported: every Qwen3.5-family full-attention \
-                 layer gates its output (q_proj is twice the head width)"
-            ));
+             layer gates its output (q_proj is twice the head width)"
+            )));
         }
     }
 
@@ -375,7 +383,9 @@ pub fn normalize_text_config(config: &Value) -> Result<Value, String> {
     let rope_theta = pick("rope_theta").unwrap_or(10_000.0);
     let partial = pick("partial_rotary_factor").unwrap_or(0.25);
     if !(partial > 0.0 && partial <= 1.0) {
-        return Err(format!("partial_rotary_factor {partial} is outside (0, 1]"));
+        return Err(RuntimeError::Config(format!(
+            "partial_rotary_factor {partial} is outside (0, 1]"
+        )));
     }
     text.insert("rope_theta".into(), rope_theta.into());
     text.insert("partial_rotary_factor".into(), partial.into());
@@ -389,32 +399,38 @@ pub fn normalize_text_config(config: &Value) -> Result<Value, String> {
     let layer_types: Vec<Value> = match text.get("layer_types").filter(|v| !v.is_null()) {
         Some(Value::Array(types)) => {
             if types.len() as i64 != n_layers {
-                return Err(format!(
+                return Err(RuntimeError::Config(format!(
                     "layer_types has {} entries for num_hidden_layers = {n_layers}",
                     types.len()
-                ));
+                )));
             }
             for (i, t) in types.iter().enumerate() {
                 match t.as_str() {
                     Some("linear_attention" | "full_attention") => {}
                     _ => {
-                        return Err(format!(
+                        return Err(RuntimeError::Config(format!(
                             "layer_types[{i}] = {t} is not supported; expected \
-                             \"linear_attention\" or \"full_attention\""
-                        ));
+                         \"linear_attention\" or \"full_attention\""
+                        )));
                     }
                 }
             }
             types.clone()
         }
-        Some(other) => return Err(format!("layer_types must be a list, got {other}")),
+        Some(other) => {
+            return Err(RuntimeError::Config(format!(
+                "layer_types must be a list, got {other}"
+            )));
+        }
         None => {
             let interval = text
                 .get("full_attention_interval")
                 .and_then(Value::as_i64)
                 .unwrap_or(4);
             if interval < 1 {
-                return Err(format!("full_attention_interval {interval} must be >= 1"));
+                return Err(RuntimeError::Config(format!(
+                    "full_attention_interval {interval} must be >= 1"
+                )));
             }
             (0..n_layers)
                 .map(|i| {
@@ -432,31 +448,31 @@ pub fn normalize_text_config(config: &Value) -> Result<Value, String> {
     let heads = int(&text, "num_attention_heads")?;
     let kv_heads = int(&text, "num_key_value_heads")?;
     if kv_heads <= 0 || heads % kv_heads != 0 {
-        return Err(format!(
+        return Err(RuntimeError::Config(format!(
             "num_attention_heads {heads} is not a multiple of num_key_value_heads {kv_heads}"
-        ));
+        )));
     }
     let lk = int(&text, "linear_num_key_heads")?;
     let lv = int(&text, "linear_num_value_heads")?;
     if lk <= 0 || lv % lk != 0 {
-        return Err(format!(
+        return Err(RuntimeError::Config(format!(
             "linear_num_value_heads {lv} is not a multiple of linear_num_key_heads {lk}"
-        ));
+        )));
     }
     let dk = int(&text, "linear_key_head_dim")?;
     if dk <= 0 || dk % GDN_KERNEL_DK_MULTIPLE != 0 {
-        return Err(format!(
+        return Err(RuntimeError::Config(format!(
             "linear_key_head_dim {dk} is not a multiple of {GDN_KERNEL_DK_MULTIPLE}, which the \
-             gated-delta-net Metal kernel requires"
-        ));
+         gated-delta-net Metal kernel requires"
+        )));
     }
     let head_dim = int(&text, "head_dim")?;
     let rotary = (head_dim as f64 * partial) as i64;
     if rotary < 2 || rotary % 2 != 0 {
-        return Err(format!(
+        return Err(RuntimeError::Config(format!(
             "head_dim {head_dim} x partial_rotary_factor {partial} = {rotary} rotary dims; \
-             expected a positive even number"
-        ));
+         expected a positive even number"
+        )));
     }
 
     Ok(Value::Object(text))
@@ -622,7 +638,7 @@ mod tests {
         );
         c["text_config"]["output_gate_type"] = "gelu".into();
         let err = normalize_text_config(&c).unwrap_err();
-        assert!(err.contains("output_gate_type"), "{err}");
+        assert!(err.to_string().contains("output_gate_type"), "{err}");
     }
 
     #[test]
@@ -643,7 +659,7 @@ mod tests {
             let mut c = qwen38_27b();
             c["text_config"][key] = value;
             let err = normalize_text_config(&c).expect_err(key);
-            assert!(err.contains(needle), "{key}: {err}");
+            assert!(err.to_string().contains(needle), "{key}: {err}");
         }
         let mut c = qwen38_27b();
         let mut types = vec![json!("linear_attention"); 64];
@@ -652,6 +668,7 @@ mod tests {
         assert!(
             normalize_text_config(&c)
                 .unwrap_err()
+                .to_string()
                 .contains("layer_types[5]")
         );
     }

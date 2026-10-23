@@ -14,7 +14,6 @@
 
 use super::{MicroBatchAction, ZBAction};
 use std::collections::HashMap;
-use std::fmt;
 
 /// One step of a stage's work, in the vocabulary all schedules share.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,24 +161,15 @@ impl Timeline {
 }
 
 /// A schedule that cannot run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ScheduleError {
     /// Every unfinished stage waits for a message no stage will send.
+    #[error("pipeline deadlock: {waiting:?}")]
     Deadlock {
         /// The action each stuck stage is waiting at.
         waiting: Vec<(usize, Op)>,
     },
 }
-
-impl fmt::Display for ScheduleError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Deadlock { waiting } => write!(f, "pipeline deadlock: {waiting:?}"),
-        }
-    }
-}
-
-impl std::error::Error for ScheduleError {}
 
 /// Run `schedules` (one list of actions per stage, stage 0 first).
 pub fn simulate(schedules: &[Vec<Op>], costs: Costs) -> Result<Timeline, ScheduleError> {

@@ -276,7 +276,7 @@ where
             let total_tokens =
                 (step + 1 - start_step) as f64 * gas as f64 * tokens_per_batch as f64;
             let tok_per_sec = total_tokens / elapsed;
-            eprintln!(
+            tracing::info!(
                 "step {:>6} | loss {:.4} | lr {:.2e} | {:.0} tok/s",
                 step + 1,
                 loss,
@@ -288,7 +288,7 @@ where
         if config.eval_every > 0 && (step + 1) % config.eval_every == 0 {
             if let Some(eval_iter) = eval_batches.as_mut() {
                 let eval = eval_loss(model, eval_iter, config.eval_batches, config.ignore_index)?;
-                eprintln!("step {:>6} | eval_loss {:.4}", step + 1, eval);
+                tracing::info!("step {:>6} | eval_loss {:.4}", step + 1, eval);
             }
         }
 
@@ -308,7 +308,7 @@ where
                         stream_position: last_stream_position,
                     },
                 )?;
-                eprintln!("checkpoint saved: {}", step_dir.display());
+                tracing::info!("checkpoint saved: {}", step_dir.display());
             }
         }
 
@@ -317,7 +317,7 @@ where
             .as_ref()
             .is_some_and(|stop| stop.load(std::sync::atomic::Ordering::SeqCst))
         {
-            eprintln!(
+            tracing::info!(
                 "stop requested: ending after step {} of {}",
                 step + 1,
                 config.num_steps
@@ -348,7 +348,7 @@ where
                     stream_position: last_stream_position,
                 },
             )?;
-            eprintln!("final checkpoint saved: {}", final_dir.display());
+            tracing::info!("final checkpoint saved: {}", final_dir.display());
         }
     }
     Ok(losses)

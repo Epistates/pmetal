@@ -40,7 +40,10 @@ fn options_for(request: &DownloadArgs) -> (String, DownloadOptions) {
 }
 
 fn human_rate(bytes_per_sec: f64) -> String {
-    format!("{}/s", pmetal_hub::fit::format_bytes(bytes_per_sec as u64))
+    format!(
+        "{}/s",
+        pmetal_core::format::human_size(bytes_per_sec as u64)
+    )
 }
 
 fn human_duration(d: std::time::Duration) -> String {
@@ -91,14 +94,14 @@ pub(crate) async fn run_download(request: DownloadArgs) -> anyhow::Result<()> {
         for file in &plan.model.files {
             println!(
                 "  {:>10}  {}",
-                pmetal_hub::fit::format_bytes(file.size),
+                pmetal_core::format::human_size(file.size),
                 file.path
             );
         }
         println!(
             "{} files, {}",
             plan.model.files.len(),
-            pmetal_hub::fit::format_bytes(plan.model.total_bytes())
+            pmetal_core::format::human_size(plan.model.total_bytes())
         );
         return Ok(());
     }
@@ -115,7 +118,7 @@ pub(crate) async fn run_download(request: DownloadArgs) -> anyhow::Result<()> {
     println!(
         "  {} weight file(s), {}",
         report.weight_files.len(),
-        pmetal_hub::fit::format_bytes(report.weight_bytes)
+        pmetal_core::format::human_size(report.weight_bytes)
     );
     Ok(())
 }

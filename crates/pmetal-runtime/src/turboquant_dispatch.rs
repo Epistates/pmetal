@@ -25,6 +25,7 @@
 
 use crate::InlineArray;
 use crate::turboquant::QuantizedKvCache;
+use crate::{RuntimeError, RuntimeResult};
 
 /// Run a TurboQuant attention layer step on the given cache.
 ///
@@ -41,7 +42,7 @@ pub fn turboquant_attention_step(
     scale: f32,
     prev: i32,
     trace_label: &'static str,
-) -> Result<InlineArray, String> {
+) -> RuntimeResult<InlineArray> {
     let s = queries.dim(2);
     if s == 1 {
         tq_cache
@@ -67,35 +68,28 @@ pub fn turboquant_attention_step(
                 &format!("prefill_path=dense_prompt_only seq={s}"),
             );
             crate::decode::try_sdpa_causal_like_mlx(queries, keys, values, scale, s)
-                .map_err(|err| err.to_string())
         } else {
             trace(
                 trace_label,
                 &format!("prefill_fallback=full_dequantized seq={s} prev={prev}"),
             );
             let full_keys = tq_cache.dequantize_keys().ok_or_else(|| {
-                format!(
+                RuntimeError::Config(format!(
                     "TurboQuant failed to dequantize keys for prefill fallback seq={s} prev={prev}"
-                )
+                ))
             })?;
             let full_values = tq_cache
-                .dequantize_values()
-                .ok_or_else(|| {
-                    format!(
-                        "TurboQuant failed to dequantize values for prefill fallback seq={s} prev={prev}"
-                    )
-                })?;
+                .dequantize_values().ok_or_else(|| RuntimeError::Config(format!("TurboQuant failed to dequantize values for prefill fallback seq={s} prev={prev}")))?;
             crate::decode::try_sdpa_causal_like_mlx(queries, &full_keys, &full_values, scale, s)
-                .map_err(|err| err.to_string())
         }
     }
 }
 
-/// True when `PMETAL_TRACE_TURBOQUANT` is set in the environment. Cheap;
-/// the env probe runs only when this is consulted by `trace`.
+/// True when `PMETAL_TRACE_TURBOQUANT` was set when this was first consulted.
+/// The environment is read once.
 #[inline]
 fn trace_enabled() -> bool {
-    std::env::var_os("PMETAL_TRACE_TURBOQUANT").is_some()
+    crate::env_flag::env_flag!("PMETAL_TRACE_TURBOQUANT")
 }
 
 #[inline]

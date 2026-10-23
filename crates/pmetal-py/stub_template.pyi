@@ -128,6 +128,10 @@ class _Spec:
 
     subcommand: ClassVar[str]
     """The ``pmetal`` subcommand this spec runs."""
+    reports_events: ClassVar[bool]
+    """Whether the command writes a ``--log-events`` stream of progress events."""
+    def _launch(self, events_dir: str | os.PathLike[str] | None = None) -> tuple[str, list[str], str | None]:
+        """The command that runs the spec as ``(subcommand, argv, events_file)``; the event log is in ``events_dir``."""
     @staticmethod
     def fields() -> list[FieldInfo]:
         """Every field with its type, default, bounds and help."""
@@ -696,7 +700,8 @@ def _start_job(
     binary: str | os.PathLike[str],
     subcommand: str,
     argv: Sequence[str],
-    log_events: bool = False,
+    events_file: str | os.PathLike[str] | None = None,
+    events_dir: str | os.PathLike[str] | None = None,
     stop_grace: float = 30.0,
     on_event: Callable[[dict[str, Any]], object] | None = None,
 ) -> _Job: ...

@@ -24,7 +24,7 @@ pmetal train \
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `-c`, `--config` | none | Path to a YAML configuration file (see [Configuration File](/configuration/config-file/)) |
+| `-c`, `--config` | none | Path to a YAML configuration file (see [Configuration File](/configuration/config-file/)). A flag you give beats the file, and the file beats the default |
 | `-m`, `--model` | required | HuggingFace model ID or local path |
 | `-d`, `--dataset` | required | Training dataset: a JSONL, JSON, Parquet, Arrow or CSV file, or a HuggingFace dataset ID |
 | `--eval-dataset` | none | Evaluation dataset (same forms as `--dataset`) |

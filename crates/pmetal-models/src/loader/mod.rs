@@ -29,10 +29,12 @@ mod quant;
 
 pub use assign::{assign_weights, load_generic_weights, load_generic_weights_with};
 pub use audit::{Exemption, LoadPolicy, NEVER_PARAMETERS, ParamSnapshot};
-pub use checkpoint::{WeightIndex, load_safetensors_file};
+pub use checkpoint::load_safetensors_file;
 pub use diffusion::*;
 pub use encoder::*;
 pub use families::*;
+/// The shard index of a checkpoint (`model.safetensors.index.json`).
+pub use pmetal_core::safetensors_index::ShardIndex as WeightIndex;
 
 pub(crate) use assign::{load_prepared, load_prepared_with, packable_paths};
 pub(crate) use checkpoint::validate_shard_path;
@@ -74,6 +76,21 @@ pub enum LoadError {
         /// A likely cause, when the config names one.
         hint: Option<String>,
     },
+}
+
+impl From<pmetal_core::safetensors_index::IndexError> for LoadError {
+    fn from(e: pmetal_core::safetensors_index::IndexError) -> Self {
+        use pmetal_core::safetensors_index::IndexError;
+        match e {
+            IndexError::Io { source, .. } => Self::Io(source),
+            IndexError::Json(e) => Self::Json(e),
+            IndexError::ShardEscapes(shard) => Self::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("Shard filename contains path traversal: {shard}"),
+            )),
+            IndexError::Malformed(what) => Self::SafeTensors(what),
+        }
+    }
 }
 
 impl From<pmetal_runtime::compat::Exception> for LoadError {
@@ -719,6 +736,21 @@ mod tests {
         )
         .unwrap();
         assert!(load_weights(sharded.path()).unwrap().contains_key("b"));
+    }
+
+    /// A crafted index cannot send the loader out of the model directory.
+    #[test]
+    fn an_index_naming_a_path_outside_the_directory_is_refused() {
+        let temp = tempdir().unwrap();
+        for shard in ["../victim.safetensors", "/etc/passwd", "a/../../b"] {
+            std::fs::write(
+                temp.path().join("model.safetensors.index.json"),
+                format!(r#"{{"weight_map":{{"model.norm.weight":{shard:?}}}}}"#),
+            )
+            .unwrap();
+            let err = load_weights(temp.path()).unwrap_err().to_string();
+            assert!(err.contains("path traversal"), "{shard}: {err}");
+        }
     }
 
     #[test]

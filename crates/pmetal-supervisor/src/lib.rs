@@ -41,14 +41,18 @@
 //! # }
 //! ```
 
+mod binary;
 mod group;
+mod launch;
 mod log;
 mod metrics;
 mod supervisor;
 mod tail;
 mod text;
 
-pub use group::{kill_group, resolve_pmetal_binary};
+pub use binary::{BINARY_ENV, locate_pmetal_binary, resolve_pmetal_binary};
+pub use group::kill_group;
+pub use launch::{EVENTS_FILE, EventsFile, LaunchOptions, LaunchPlan, METRICS_FILE};
 pub use log::{LogLine, LogPage, MAX_LINE_BYTES, MAX_LOG_BYTES, MAX_LOG_LINES, Stream};
 pub use metrics::{JobMetrics, parse_record};
 pub use supervisor::{

@@ -1,21 +1,37 @@
 //! Chat with a model inside the app.
 //!
-//! A conversation needs the whole history to reach the chat template, which
-//! `pmetal infer` does not take, so this is the one thing the app runs itself
-//! rather than as a supervised job. It runs on a blocking thread (a
-//! generation holds the thread for as long as it takes), reports into a sink,
-//! and can be stopped between tokens.
+//! A reply is `pmetal infer --messages-file`, run by the supervisor like every
+//! other job the app starts: the conversation is written to a private file, the
+//! command answers it, and what it prints is read as it arrives. Nothing here
+//! loads a model or samples a token; the command is the one place that does,
+//! so a chat answers exactly as `pmetal infer` does with the same settings.
+//!
+//! Chats have a supervisor of their own, apart from the jobs the person
+//! starts: a reply is not a job to list, and it must not take one of their
+//! slots or be stopped with them.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use pmetal::core::SecretString;
-use pmetal::core::jobs::InferSpec;
-use pmetal::data::chat_templates::{ChatTemplateKwargs, Message};
+use pmetal::core::jobs::{ChatMessage, InferSpec, parse_messages};
+use pmetal::core::sync::locked;
+use pmetal::data::infer_stream::{InferStream, split_reasoning, split_reasoning_streaming};
+use pmetal_supervisor::{
+    Error as SupervisorError, EventKind, JobId, LaunchOptions, LaunchPlan, Limits, ProcessStatus,
+    Supervisor,
+};
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast::error::RecvError;
 
 use crate::error::{AppError, Result};
+
+/// Replies that may be generated at once. A model each, so a few.
+const MAX_REPLIES: usize = 4;
+/// The most of a reply that is kept: a model that never stops is not allowed to
+/// grow the app without bound.
+const MAX_REPLY_BYTES: usize = 16 * 1024 * 1024;
 
 /// One turn of the conversation so far.
 #[derive(Debug, Deserialize, Clone)]
@@ -24,29 +40,14 @@ pub struct ChatTurn {
     pub content: String,
 }
 
-fn message_of(turn: &ChatTurn) -> std::result::Result<Message, String> {
-    match turn.role.as_str() {
-        "user" => Ok(Message::user(turn.content.clone())),
-        "assistant" => Ok(Message::assistant(turn.content.clone())),
-        "system" => Ok(Message::system(turn.content.clone())),
-        other => Err(format!(
-            "The conversation has a message from '{other}', which a chat model does not take. \
-             Only user, assistant and system messages can be sent."
-        )),
-    }
-}
-
 /// What a finished generation measured.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Metrics {
     pub session_id: String,
-    pub prompt_tokens: usize,
     pub generated_tokens: usize,
     pub total_ms: f64,
     pub ttft_ms: Option<f64>,
     pub tok_per_sec: Option<f64>,
-    pub avg_step_ms: Option<f64>,
-    pub p50_step_ms: Option<f64>,
     pub response_text: String,
     pub thinking: Option<String>,
     pub truncated_thinking: bool,
@@ -54,25 +55,57 @@ pub struct Metrics {
     pub stopped: bool,
 }
 
+/// New text of a reply: the model's reasoning and its answer, apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Piece<'a> {
+    pub thinking: &'a str,
+    pub text: &'a str,
+}
+
 /// Where a generation reports.
 pub trait Sink: Send + Sync + 'static {
-    fn token(&self, session_id: &str, text: &str);
+    fn token(&self, session_id: &str, piece: Piece<'_>);
     fn done(&self, metrics: &Metrics);
     fn failed(&self, session_id: &str, message: &str);
 }
 
-fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+struct Shared {
+    supervisor: Supervisor,
+    /// `Err` when no `pmetal` could be found: the reason, shown on start.
+    binary: std::result::Result<PathBuf, String>,
+    /// The replies being generated: session to job. A session is registered
+    /// before its job exists, so a second start for it is refused at once.
+    live: Mutex<HashMap<String, Option<JobId>>>,
 }
 
 /// The generations in progress.
-#[derive(Default)]
-pub struct Sessions {
-    flags: Mutex<HashMap<String, Arc<AtomicBool>>>,
+#[derive(Clone)]
+pub struct Chat {
+    shared: Arc<Shared>,
 }
 
-impl Sessions {
-    fn begin(&self, id: &str) -> Result<Arc<AtomicBool>> {
+impl Chat {
+    /// A chat running `binary` (or refusing every start with the reason it is
+    /// missing). Must be created inside a tokio runtime.
+    pub fn new(binary: std::result::Result<PathBuf, String>) -> Self {
+        let supervisor = Supervisor::new(
+            binary.clone().unwrap_or_else(|_| PathBuf::from("pmetal")),
+            Limits {
+                max_running: MAX_REPLIES,
+                max_finished: 2,
+                ..Limits::default()
+            },
+        );
+        Self {
+            shared: Arc::new(Shared {
+                supervisor,
+                binary,
+                live: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    fn begin(&self, id: &str) -> Result<()> {
         let valid = !id.is_empty()
             && id.len() <= 64
             && id
@@ -83,331 +116,564 @@ impl Sessions {
                 "The chat session id is not valid. Reload the window and try again.",
             ));
         }
-        let mut flags = locked(&self.flags);
-        if flags.contains_key(id) {
+        let mut live = locked(&self.shared.live);
+        if live.contains_key(id) {
             return Err(AppError::new("That chat session is already generating."));
         }
-        let flag = Arc::new(AtomicBool::new(false));
-        flags.insert(id.to_string(), flag.clone());
-        Ok(flag)
+        live.insert(id.to_string(), None);
+        Ok(())
     }
 
     fn end(&self, id: &str) {
-        locked(&self.flags).remove(id);
+        locked(&self.shared.live).remove(id);
     }
 
-    /// Ask one generation, or with `None` every generation, to stop.
+    /// Ask one generation, or with `None` every generation, to stop. The reply
+    /// ends after the token in flight and keeps what was written.
     pub fn cancel(&self, id: Option<&str>) {
-        for (key, flag) in locked(&self.flags).iter() {
-            if id.is_none_or(|id| id == key) {
-                flag.store(true, Ordering::SeqCst);
-            }
+        let jobs: Vec<JobId> = locked(&self.shared.live)
+            .iter()
+            .filter(|(key, _)| id.is_none_or(|id| id == key.as_str()))
+            .filter_map(|(_, job)| job.clone())
+            .collect();
+        for job in jobs {
+            // A reply that has just finished cannot be stopped; that is fine.
+            let _ = self.shared.supervisor.stop(&job);
         }
+    }
+
+    /// Stop every generation and wait for the commands to leave.
+    pub async fn shutdown(&self) {
+        self.shared.supervisor.shutdown().await;
     }
 
     #[cfg(test)]
     pub fn active(&self) -> usize {
-        locked(&self.flags).len()
+        locked(&self.shared.live).len()
     }
-}
 
-/// Start generating a reply for session `session_id`, which the caller chose so
-/// it can recognise the events before this returns. Tokens, the end and any
-/// failure arrive through `sink`, tagged with it.
-pub async fn start(
-    sessions: Arc<Sessions>,
-    spec: InferSpec,
-    history: Option<Vec<ChatTurn>>,
-    token: Option<SecretString>,
-    sink: Arc<dyn Sink>,
-    session_id: String,
-) -> Result<()> {
-    // Everything that can be wrong with the request is said before a thread is
-    // taken and a model is loaded.
-    let messages = history
-        .as_deref()
-        .map(|turns| {
-            turns
-                .iter()
-                .map(message_of)
-                .collect::<std::result::Result<Vec<_>, _>>()
-        })
-        .transpose()
-        .map_err(AppError::new)?;
-    if spec.model.trim().is_empty() {
-        return Err(AppError::new("Choose a model to chat with."));
-    }
-    let kv_turboquant_preset = match spec.kv_turboquant_preset.as_deref() {
-        None => None,
-        Some("q2_5") => Some(pmetal::inference_runner::TurboQuantPreset::Q2_5),
-        Some("q3_5") => Some(pmetal::inference_runner::TurboQuantPreset::Q3_5),
-        Some(other) => {
-            return Err(AppError::new(format!(
-                "Unknown TurboQuant preset '{other}'; the choices are q2_5 and q3_5."
-            )));
+    /// Start generating a reply for session `session_id`, which the caller
+    /// chose so it can recognise the events before this returns. Tokens, the
+    /// end and any failure arrive through `sink`, tagged with it.
+    ///
+    /// `spec` says what to run and how to sample; its prompt and system
+    /// message are replaced by the conversation, `system` first.
+    pub async fn start(
+        &self,
+        mut spec: InferSpec,
+        history: Vec<ChatTurn>,
+        token: Option<SecretString>,
+        sink: Arc<dyn Sink>,
+        session_id: String,
+    ) -> Result<()> {
+        // Everything that can be wrong with the request is said before a
+        // process is started and a model is loaded.
+        if spec.model.trim().is_empty() {
+            return Err(AppError::new("Choose a model to chat with."));
         }
-    };
-    let chat_template_kwargs = ChatTemplateKwargs::from_controls(
-        spec.chat_template_kwargs.as_deref(),
-        spec.no_thinking,
-        spec.reasoning_effort.as_deref(),
-        spec.no_preserve_thinking,
-    )
-    .map_err(AppError::new)?;
-    let mode = spec.mode.parse().map_err(AppError::new)?;
+        if let Err(reason) = &self.shared.binary {
+            return Err(AppError::new(reason.clone()));
+        }
+        let mut conversation = Vec::with_capacity(history.len() + 2);
+        if let Some(system) = spec.system.take().filter(|s| !s.trim().is_empty()) {
+            conversation.push(ChatMessage::new("system", system));
+        }
+        let prompt = std::mem::take(&mut spec.prompt);
+        conversation.extend(
+            history
+                .into_iter()
+                .map(|t| ChatMessage::new(t.role, t.content)),
+        );
+        if !prompt.trim().is_empty() {
+            conversation.push(ChatMessage::new("user", prompt));
+        }
+        let text = serde_json::to_string(&conversation)
+            .map_err(|e| AppError::new(format!("The conversation could not be written: {e}")))?;
+        // The command checks it again; saying what is wrong here puts it
+        // before the model is loaded and in words about the conversation.
+        parse_messages(&text)
+            .map_err(|e| AppError::new(format!("The conversation cannot be sent: {e}")))?;
 
-    let model_path = pmetal::hub::resolve_model_path(&spec.model, None, token.as_ref())
-        .await
-        .map_err(|e| {
-            AppError::new(format!(
-                "Could not get the model '{}': {e}. Check the name, the internet connection, \
-                 and for a gated model that an access token is saved in Settings.",
-                spec.model
-            ))
+        // The conversation is private: a file of its own that only this person
+        // can read, removed when the reply ends.
+        let file = tempfile::Builder::new()
+            .prefix("pmetal-chat-")
+            .suffix(".json")
+            .tempfile()
+            .and_then(|mut file| {
+                use std::io::Write;
+                file.write_all(text.as_bytes())?;
+                file.flush()?;
+                Ok(file)
+            })
+            .map_err(|e| AppError::new(format!("The conversation could not be saved: {e}")))?;
+        spec.messages_file = Some(file.path().display().to_string());
+        spec.normalize().map_err(|errors| {
+            AppError::new(
+                errors
+                    .iter()
+                    .map(|e| format!("{}: {}", e.field, e.message))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )
         })?;
+        let plan = LaunchPlan::for_spec(
+            &spec,
+            &LaunchOptions {
+                deltas: true,
+                ..LaunchOptions::default()
+            },
+        )
+        .map_err(|e| AppError::new(e.to_string()))?;
 
-    let config = pmetal::inference_runner::InferenceRunnerConfig {
-        model_path,
-        lora_path: spec.lora.clone(),
-        experts_dir: spec.experts_dir.clone(),
-        fp8: spec.fp8,
-        prompt: spec.prompt.clone(),
-        chat_messages: messages,
-        system_message: spec.system.clone(),
-        no_thinking: spec.no_thinking,
-        chat_template_kwargs,
-        temperature: spec.temperature,
-        top_k: spec.top_k,
-        top_p: spec.top_p,
-        min_p: spec.min_p,
-        max_tokens: spec.max_tokens,
-        repetition_penalty: spec.repetition_penalty,
-        frequency_penalty: spec.frequency_penalty,
-        presence_penalty: spec.presence_penalty,
-        seed: spec.seed,
-        kv_quant: spec.kv_quant,
-        kv_k_bits: spec.kv_k_bits,
-        kv_v_bits: spec.kv_v_bits,
-        kv_group_size: spec.kv_group_size,
-        kv_turboquant: spec.kv_turboquant,
-        kv_turboquant_preset,
-        kv_quant_preset: spec.kv_quant_preset.clone(),
-        no_kv_quant: spec.no_kv_quant,
-        kv_qjl: spec.kv_qjl,
-        mode,
-        detect_repetition: spec.detect_repetition,
-        ..Default::default()
-    };
+        self.begin(&session_id)?;
+        // Listening before starting, so no piece of the reply is missed.
+        let events = self.shared.supervisor.subscribe();
+        let env = token
+            .map(|t| vec![("HF_TOKEN".to_string(), t.expose_secret().to_string())])
+            .unwrap_or_default();
+        let job = match self
+            .shared
+            .supervisor
+            .spawn(plan.into_request_with_env(env))
+        {
+            Ok(job) => job,
+            Err(e) => {
+                self.end(&session_id);
+                return Err(AppError::new(match e {
+                    SupervisorError::TooManyRunning { .. } => {
+                        "Replies are already being generated. Stop one, or wait for it to finish."
+                            .to_string()
+                    }
+                    other => format!("Could not start `pmetal infer`: {other}"),
+                }));
+            }
+        };
+        locked(&self.shared.live).insert(session_id.clone(), Some(job.clone()));
 
-    let cancel = sessions.begin(&session_id)?;
-    let session = session_id;
-    tokio::task::spawn_blocking(move || {
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            generate(&session, config, &cancel, &*sink)
-        }));
-        match outcome {
-            Ok(Ok(metrics)) => sink.done(&metrics),
-            Ok(Err(message)) => sink.failed(&session, &message),
-            Err(_) => sink.failed(
-                &session,
-                "The model crashed while generating. Try again, or restart PMetal if it keeps happening.",
-            ),
-        }
-        sessions.end(&session);
-    });
-    Ok(())
+        let chat = self.clone();
+        tokio::spawn(async move {
+            // The file lives until the command has read it and gone.
+            let _file = file;
+            let outcome = follow(&chat.shared.supervisor, events, &job, &session_id, &*sink).await;
+            match outcome {
+                Ok(metrics) => sink.done(&metrics),
+                Err(message) => sink.failed(&session_id, &message),
+            }
+            chat.end(&session_id);
+        });
+        Ok(())
+    }
 }
 
-fn generate(
+/// What has been sent on of a reply, so each piece goes once.
+#[derive(Default)]
+struct Sent {
+    thinking: usize,
+    text: usize,
+}
+
+impl Sent {
+    /// Send what `text` (the reply so far, labels and all) has that was not
+    /// sent before.
+    fn advance(&mut self, text: &str, session: &str, sink: &dyn Sink) {
+        let (thinking, answer) = split_reasoning_streaming(text);
+        let thinking = thinking.unwrap_or("");
+        let piece = Piece {
+            thinking: thinking.get(self.thinking..).unwrap_or(""),
+            text: answer.get(self.text..).unwrap_or(""),
+        };
+        if piece == Piece::default() {
+            return;
+        }
+        self.thinking = self.thinking.max(thinking.len());
+        self.text = self.text.max(answer.len());
+        sink.token(session, piece);
+    }
+}
+
+/// Read the reply of `job` as it is generated, until the command ends.
+async fn follow(
+    supervisor: &Supervisor,
+    mut events: tokio::sync::broadcast::Receiver<pmetal_supervisor::Event>,
+    job: &str,
     session: &str,
-    config: pmetal::inference_runner::InferenceRunnerConfig,
-    cancel: &AtomicBool,
     sink: &dyn Sink,
 ) -> std::result::Result<Metrics, String> {
-    use pmetal::inference_runner::InferenceRunner;
-
-    let prompt_tokens = config.prompt.len();
-    let mut runner = InferenceRunner::prepare(config).map_err(|e| e.to_string())?;
-
-    let mut token_buf: Vec<u32> = Vec::new();
-    let mut streamed = String::new();
-    let start = std::time::Instant::now();
-    let mut first_token: Option<std::time::Instant> = None;
-    let mut generated = 0usize;
-    let mut stopped = false;
-
-    let tokenizer = &runner.tokenizer;
-    runner
-        .state
-        .generate_streaming(|token_id| {
-            if cancel.load(Ordering::SeqCst) {
-                stopped = true;
-                return false;
-            }
-            generated += 1;
-            first_token.get_or_insert_with(std::time::Instant::now);
-            token_buf.push(token_id);
-            // A token can end part-way through a character; send only what has
-            // become whole text since the last send.
-            if let Ok(text) = tokenizer.decode(&token_buf)
-                && text.len() > streamed.len()
-            {
-                let from = text.ceil_char_boundary(streamed.len());
-                if from < text.len() {
-                    sink.token(session, &text[from..]);
+    let mut stream = InferStream::new();
+    let mut sent = Sent::default();
+    // Everything the command printed, for when a piece was missed.
+    let mut printed = String::new();
+    let mut missed = false;
+    let status = loop {
+        match events.recv().await {
+            Ok(event) if event.job == job => match event.kind {
+                EventKind::Delta(piece) => {
+                    if printed.len() < MAX_REPLY_BYTES {
+                        printed.push_str(&piece);
+                        let text = stream.push(&piece).to_string();
+                        sent.advance(&text, session, sink);
+                    }
                 }
-                streamed = text;
-            }
-            true
-        })
-        .map_err(|e| e.to_string())?;
-
-    let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let ttft_ms = first_token.map(|t| t.duration_since(start).as_secs_f64() * 1000.0);
-    // The runtime's own decode metrics skip warm-up and stop-token overhead;
-    // without them, time the tokens after the first.
-    let (tok_per_sec, avg_step_ms, p50_step_ms) = match runner.state.last_decode_metrics {
-        Some(m) => (
-            Some(m.tok_per_sec),
-            Some(m.avg_step_ms),
-            Some(m.p50_step_ms),
-        ),
-        None => {
-            let decode_ms = ttft_ms.map(|ttft| total_ms - ttft);
-            let tps = decode_ms
-                .filter(|ms| *ms > 0.0 && generated > 1)
-                .map(|ms| (generated - 1) as f64 / (ms / 1000.0));
-            (tps, None, None)
+                EventKind::Exited(status) => break status,
+                _ => {}
+            },
+            Ok(_) => {}
+            // The webview is slower than the command: the pieces that were
+            // dropped are in the command's output.
+            Err(RecvError::Lagged(_)) => missed = true,
+            Err(RecvError::Closed) => return Err("The chat ended unexpectedly.".to_string()),
         }
     };
-    let parsed = pmetal::response_parser::parse_assistant_response(&streamed);
+
+    if missed {
+        // Whole lines of what it printed; the text between them is what was
+        // streamed, so this is as good as the stream was.
+        if let Ok(page) = supervisor.logs(job, usize::MAX, None) {
+            printed = page.lines.join("\n");
+        }
+    }
+    // The whole output is read afresh: it is authoritative, where the pieces
+    // that streamed in may have missed some.
+    let mut whole = InferStream::new();
+    whole.push(&printed);
+    let stats = whole.finish();
+    let complete = whole.is_complete();
+    let text = whole.text().to_string();
+
+    let stopped = match status {
+        ProcessStatus::Completed { .. } => false,
+        ProcessStatus::Stopped => true,
+        ProcessStatus::Failed { error, .. } => {
+            return Err(if error.trim().is_empty() {
+                "The model stopped without an answer.".to_string()
+            } else {
+                error
+            });
+        }
+        ProcessStatus::Running | ProcessStatus::Stopping => {
+            return Err("The chat did not end.".to_string());
+        }
+    };
+    let (thinking, answer) = split_reasoning(&text);
+    let (thinking, answer) = (
+        thinking.map(|t| t.trim().to_string()),
+        answer.trim().to_string(),
+    );
     Ok(Metrics {
         session_id: session.to_string(),
-        prompt_tokens,
-        generated_tokens: generated,
-        total_ms,
-        ttft_ms,
-        tok_per_sec,
-        avg_step_ms,
-        p50_step_ms,
-        response_text: parsed.response,
-        thinking: parsed.thinking,
-        truncated_thinking: parsed.truncated_thinking,
+        generated_tokens: if complete { stats.tokens } else { 0 },
+        total_ms: stats
+            .first_token_seconds
+            .map_or(0.0, |ttft| (ttft + stats.generating_seconds) * 1000.0),
+        ttft_ms: stats.first_token_seconds.map(|s| s * 1000.0),
+        tok_per_sec: (stats.tokens_per_second > 0.0).then_some(stats.tokens_per_second),
+        truncated_thinking: !stopped && thinking.is_some() && answer.is_empty(),
+        response_text: answer,
+        thinking,
         stopped,
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
     use super::*;
 
-    #[test]
-    fn user_assistant_and_system_messages_are_carried_over() {
-        for role in ["user", "assistant", "system"] {
-            let m = message_of(&ChatTurn {
-                role: role.into(),
-                content: "hi".into(),
-            })
-            .unwrap();
-            assert_eq!(m.role, role);
-            assert_eq!(m.content, "hi");
+    /// A stand-in for `pmetal`: prints what `pmetal infer` prints, so the chat
+    /// can be tested without a model. `body` is a shell script that runs with
+    /// `$MESSAGES` set to the conversation file it was given.
+    fn fake_pmetal(dir: &std::path::Path, body: &str) -> PathBuf {
+        let path = dir.join("pmetal");
+        let script = format!(
+            "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  [ \"$1\" = --messages-file ] && MESSAGES=\"$2\"\n  shift\ndone\n{body}\n"
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[derive(Default)]
+    struct Recorder {
+        pieces: Mutex<Vec<(String, String)>>,
+        done: Mutex<Option<Metrics>>,
+        failed: Mutex<Option<String>>,
+        ended: tokio::sync::Notify,
+    }
+
+    impl Sink for Arc<Recorder> {
+        fn token(&self, _: &str, piece: Piece<'_>) {
+            locked(&self.pieces).push((piece.thinking.to_string(), piece.text.to_string()));
+        }
+        fn done(&self, metrics: &Metrics) {
+            *locked(&self.done) = Some(metrics.clone());
+            self.ended.notify_one();
+        }
+        fn failed(&self, _: &str, message: &str) {
+            *locked(&self.failed) = Some(message.to_string());
+            self.ended.notify_one();
         }
     }
 
-    #[test]
-    fn a_message_from_nobody_the_model_knows_is_refused_by_name() {
-        let err = message_of(&ChatTurn {
-            role: "tool".into(),
-            content: "{}".into(),
-        })
-        .unwrap_err();
-        assert!(err.contains("'tool'"), "{err}");
+    fn spec() -> InferSpec {
+        InferSpec {
+            model: "org/model".into(),
+            prompt: "Capital of France?".into(),
+            system: Some("Be brief.".into()),
+            ..InferSpec::default()
+        }
     }
 
-    #[test]
-    fn a_stop_reaches_one_session_or_all_of_them() {
-        let sessions = Sessions::default();
-        let flag_a = sessions.begin("a").unwrap();
-        let flag_b = sessions.begin("b").unwrap();
-        sessions.cancel(Some("a"));
-        assert!(flag_a.load(Ordering::SeqCst));
-        assert!(!flag_b.load(Ordering::SeqCst));
-        sessions.cancel(None);
-        assert!(flag_b.load(Ordering::SeqCst));
-        sessions.end("a");
-        assert_eq!(sessions.active(), 1);
+    async fn ask(
+        chat: &Chat,
+        spec: InferSpec,
+        history: Vec<ChatTurn>,
+    ) -> (Arc<Recorder>, Result<()>) {
+        let recorder = Arc::new(Recorder::default());
+        let started = chat
+            .start(
+                spec,
+                history,
+                None,
+                Arc::new(recorder.clone()),
+                "s1".to_string(),
+            )
+            .await;
+        (recorder, started)
     }
 
-    #[test]
-    fn a_session_id_must_be_plain_and_unused() {
-        let sessions = Sessions::default();
-        sessions.begin("chat-1_a").unwrap();
+    async fn ended(recorder: &Recorder) {
+        tokio::time::timeout(Duration::from_secs(20), recorder.ended.notified())
+            .await
+            .expect("the reply did not end");
+    }
+
+    const FOOTER: &str = "printf '\\n\\n---\\nGenerated 6 tokens in 0.50s (0.20s to the first token, model load included)\\nStopped by: EOS token\\nDecode: 200 tok/s (avg=5ms p50=5ms over 5 steps)\\n'";
+
+    #[tokio::test]
+    async fn a_reply_streams_in_and_ends_with_its_statistics() {
+        let dir = tempfile::tempdir().unwrap();
+        // The conversation the command is given is kept, to be read back.
+        let kept = dir.path().join("conversation.json");
+        let binary = fake_pmetal(
+            dir.path(),
+            &format!(
+                "cp \"$MESSAGES\" {kept}\nprintf 'banner\\nGenerating...\\nThe capital '\nsleep 0.2\nprintf 'is Paris.'\n{FOOTER}",
+                kept = kept.display()
+            ),
+        );
+        let chat = Chat::new(Ok(binary));
+        let history = vec![
+            ChatTurn {
+                role: "user".into(),
+                content: "Hi".into(),
+            },
+            ChatTurn {
+                role: "assistant".into(),
+                content: "Hello!".into(),
+            },
+        ];
+        let (recorder, started) = ask(&chat, spec(), history).await;
+        started.unwrap();
+        ended(&recorder).await;
+
+        assert_eq!(locked(&recorder.failed).clone(), None);
+        let metrics = locked(&recorder.done).clone().unwrap();
+        assert_eq!(metrics.session_id, "s1");
+        assert_eq!(metrics.response_text, "The capital is Paris.");
+        assert_eq!(metrics.thinking, None);
+        assert_eq!(metrics.generated_tokens, 6);
+        assert_eq!(metrics.tok_per_sec, Some(200.0));
+        assert_eq!(metrics.ttft_ms, Some(200.0));
+        assert!(!metrics.stopped && !metrics.truncated_thinking);
+        // What streamed adds up to the reply, and the banner is not in it.
+        let streamed: String = locked(&recorder.pieces)
+            .iter()
+            .map(|(_, t)| t.as_str())
+            .collect();
+        assert_eq!(streamed, "The capital is Paris.");
+
+        // The command was given the whole conversation, system message first
+        // and the model's own prompt replaced by it.
+        let given: Vec<ChatMessage> =
+            serde_json::from_str(&std::fs::read_to_string(&kept).unwrap()).unwrap();
+        let roles: Vec<_> = given.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["system", "user", "assistant", "user"]);
+        assert_eq!(given[0].content, "Be brief.");
+        assert_eq!(given[3].content, "Capital of France?");
+        assert_eq!(chat.active(), 0);
+        chat.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reasoning_streams_apart_from_the_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = fake_pmetal(
+            dir.path(),
+            &format!(
+                "printf 'Generating...\\n[thinking]\\nCount the r'\nsleep 0.1\nprintf 'ight letters\\n\\n[ans'\nsleep 0.1\nprintf 'wer]\\nThree'\n{FOOTER}"
+            ),
+        );
+        let chat = Chat::new(Ok(binary));
+        let (recorder, started) = ask(&chat, spec(), Vec::new()).await;
+        started.unwrap();
+        ended(&recorder).await;
+
+        let metrics = locked(&recorder.done).clone().unwrap();
+        assert_eq!(metrics.thinking.as_deref(), Some("Count the right letters"));
+        assert_eq!(metrics.response_text, "Three");
+        let pieces = locked(&recorder.pieces).clone();
+        let thinking: String = pieces.iter().map(|(t, _)| t.as_str()).collect();
+        let text: String = pieces.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(thinking.trim_end(), "Count the right letters");
+        assert_eq!(text, "Three");
+        // Half of the label that ends the reasoning was never shown as reasoning.
+        assert!(!thinking.contains("[ans"), "{thinking:?}");
+        chat.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_model_still_thinking_when_it_ran_out_is_said_to_be() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = fake_pmetal(
+            dir.path(),
+            &format!("printf 'Generating...\\n[thinking]\\nHmm, let me'\n{FOOTER}"),
+        );
+        let chat = Chat::new(Ok(binary));
+        let (recorder, started) = ask(&chat, spec(), Vec::new()).await;
+        started.unwrap();
+        ended(&recorder).await;
+        let metrics = locked(&recorder.done).clone().unwrap();
+        assert!(metrics.truncated_thinking);
+        assert_eq!(metrics.response_text, "");
+        chat.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_command_that_fails_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = fake_pmetal(
+            dir.path(),
+            "echo 'error: model org/model not found' >&2\nexit 1",
+        );
+        let chat = Chat::new(Ok(binary));
+        let (recorder, started) = ask(&chat, spec(), Vec::new()).await;
+        started.unwrap();
+        ended(&recorder).await;
+        let failure = locked(&recorder.failed).clone().unwrap();
+        assert!(failure.contains("not found"), "{failure}");
+        assert!(locked(&recorder.done).is_none());
+        assert_eq!(chat.active(), 0);
+        chat.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stop_ends_the_reply_and_keeps_what_was_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = fake_pmetal(
+            dir.path(),
+            "trap 'exit 130' TERM\nprintf 'Generating...\\nSo far'\nwhile :; do sleep 0.05; done",
+        );
+        let chat = Chat::new(Ok(binary));
+        let (recorder, started) = ask(&chat, spec(), Vec::new()).await;
+        started.unwrap();
+        // Until the first words have arrived, a stop would end nothing worth keeping.
+        for _ in 0..200 {
+            if !locked(&recorder.pieces).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        chat.cancel(Some("s1"));
+        ended(&recorder).await;
+        let metrics = locked(&recorder.done).clone().unwrap();
+        assert!(metrics.stopped);
+        assert_eq!(metrics.response_text, "So far");
+        assert_eq!(chat.active(), 0);
+        chat.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_session_id_must_be_plain_and_unused() {
+        let chat = Chat::new(Err("none".into()));
+        chat.begin("chat-1_a").unwrap();
         assert!(
-            sessions.begin("chat-1_a").is_err(),
+            chat.begin("chat-1_a").is_err(),
             "a session cannot start twice"
         );
         for bad in ["", "a b", "x/../y", &"z".repeat(65)] {
-            assert!(sessions.begin(bad).is_err(), "{bad:?}");
+            assert!(chat.begin(bad).is_err(), "{bad:?}");
         }
+        chat.end("chat-1_a");
+        assert_eq!(chat.active(), 0);
     }
 
     struct Nobody;
     impl Sink for Nobody {
-        fn token(&self, _: &str, _: &str) {}
+        fn token(&self, _: &str, _: Piece<'_>) {}
         fn done(&self, _: &Metrics) {}
         fn failed(&self, _: &str, _: &str) {}
     }
 
     #[tokio::test]
-    async fn a_request_that_cannot_work_is_refused_before_a_model_is_loaded() {
-        let sessions = Arc::new(Sessions::default());
+    async fn a_request_that_cannot_work_is_refused_before_anything_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let chat = Chat::new(Ok(fake_pmetal(dir.path(), "exit 0")));
         let sink: Arc<dyn Sink> = Arc::new(Nobody);
+        let start = |spec: InferSpec, history: Vec<ChatTurn>, id: &str| {
+            chat.start(spec, history, None, sink.clone(), id.to_string())
+        };
 
-        let no_model = start(
-            sessions.clone(),
-            InferSpec::default(),
-            None,
-            None,
-            sink.clone(),
-            "s1".into(),
-        )
-        .await
-        .unwrap_err();
+        let no_model = start(InferSpec::default(), Vec::new(), "s1")
+            .await
+            .unwrap_err();
         assert!(no_model.message().contains("Choose a model"));
 
-        let spec = InferSpec {
-            model: "/some/model".into(),
-            ..InferSpec::default()
-        };
         let bad_role = start(
-            sessions.clone(),
-            spec.clone(),
-            Some(vec![ChatTurn {
-                role: "tool".into(),
+            spec(),
+            vec![ChatTurn {
+                role: "robot".into(),
                 content: "x".into(),
-            }]),
-            None,
-            sink.clone(),
-            "s2".into(),
+            }],
+            "s2",
         )
         .await
         .unwrap_err();
-        assert!(bad_role.message().contains("tool"));
+        assert!(
+            bad_role.message().contains("robot"),
+            "{}",
+            bad_role.message()
+        );
 
-        let bad_preset = start(
-            sessions.clone(),
+        // A conversation that ends on the model's own turn has nothing to answer.
+        let nothing_to_answer = start(
             InferSpec {
-                kv_turboquant_preset: Some("q9".into()),
-                ..spec
+                prompt: String::new(),
+                ..spec()
             },
-            None,
-            None,
-            sink,
-            "s3".into(),
+            vec![ChatTurn {
+                role: "assistant".into(),
+                content: "x".into(),
+            }],
+            "s3",
         )
         .await
         .unwrap_err();
-        assert!(bad_preset.message().contains("q9"));
-        assert_eq!(sessions.active(), 0);
+        assert!(
+            nothing_to_answer.message().contains("must be a user"),
+            "{}",
+            nothing_to_answer.message()
+        );
+
+        let missing = Chat::new(Err("PMetal's command-line tool was not found".into()));
+        let no_binary = missing
+            .start(spec(), Vec::new(), None, sink.clone(), "s4".into())
+            .await
+            .unwrap_err();
+        assert!(no_binary.message().contains("not found"));
+        assert_eq!(chat.active(), 0);
+        assert_eq!(missing.active(), 0);
     }
 }

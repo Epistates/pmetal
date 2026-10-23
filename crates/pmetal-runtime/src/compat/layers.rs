@@ -4,7 +4,7 @@ use super::{
 };
 use crate::QuantizedMode;
 use crate::native_weight::QuantParams;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 pub(super) fn fp8_weight_for_compute(weight: &Array) -> Array {
@@ -580,7 +580,7 @@ impl ModuleParameters for Linear {
     }
 
     fn parameters(&self) -> ModuleParamRef<'_> {
-        let mut out = HashMap::new();
+        let mut out = BTreeMap::new();
         Parameter::collect_params(&self.weight, "weight", &mut out);
         Parameter::collect_params(&self.bias, "bias", &mut out);
         if let Some(quant) = &self.quant {
@@ -610,7 +610,7 @@ impl ModuleParameters for Linear {
     }
 
     fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
-        let mut out = HashMap::new();
+        let mut out = BTreeMap::new();
         Parameter::collect_params_mut(&mut self.weight, "weight", &mut out);
         Parameter::collect_params_mut(&mut self.bias, "bias", &mut out);
         if let Some(quant) = &mut self.quant {
@@ -649,11 +649,11 @@ impl ModuleParameters for Linear {
     fn trainable_parameters(&self) -> ModuleParamRef<'_> {
         let Some(adapter) = self.adapter.as_deref() else {
             if self.quant.is_some() {
-                return HashMap::new();
+                return BTreeMap::new();
             }
             return self.parameters();
         };
-        let mut out = HashMap::new();
+        let mut out = BTreeMap::new();
         out.insert(Rc::from("lora_a"), NestedValue::Value(&adapter.a));
         out.insert(Rc::from("lora_b"), NestedValue::Value(&adapter.b));
         if let Some(magnitude) = adapter.magnitude.as_ref() {
@@ -1116,19 +1116,19 @@ impl super::ModuleParameters for Embedding {
     }
 
     fn parameters(&self) -> super::ModuleParamRef<'_> {
-        let mut out = std::collections::HashMap::new();
+        let mut out = std::collections::BTreeMap::new();
         super::Parameter::collect_params(&self.weight, "weight", &mut out);
         out
     }
 
     fn trainable_parameters(&self) -> super::ModuleParamRef<'_> {
-        let mut out = std::collections::HashMap::new();
+        let mut out = std::collections::BTreeMap::new();
         super::Parameter::collect_trainable_params(&self.weight, "weight", &mut out);
         out
     }
 
     fn parameters_mut(&mut self) -> super::ModuleParamMut<'_> {
-        let mut out = std::collections::HashMap::new();
+        let mut out = std::collections::BTreeMap::new();
         super::Parameter::collect_params_mut(&mut self.weight, "weight", &mut out);
         out
     }
@@ -1281,7 +1281,7 @@ impl<T: ModuleParameters> ModuleParameters for Vec<T> {
     }
 
     fn parameters(&self) -> ModuleParamRef<'_> {
-        let mut out = HashMap::new();
+        let mut out = BTreeMap::new();
         for (i, m) in self.iter().enumerate() {
             let sub = m.parameters();
             for (k, v) in sub {
@@ -1293,7 +1293,7 @@ impl<T: ModuleParameters> ModuleParameters for Vec<T> {
     }
 
     fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
-        let mut out = HashMap::new();
+        let mut out = BTreeMap::new();
         for (i, m) in self.iter_mut().enumerate() {
             let sub = m.parameters_mut();
             for (k, v) in sub {
@@ -1308,7 +1308,7 @@ impl<T: ModuleParameters> ModuleParameters for Vec<T> {
     /// parameter, a frozen or packed base weight included, and a checkpointed
     /// layer differentiates whatever this reports.
     fn trainable_parameters(&self) -> ModuleParamRef<'_> {
-        let mut out = HashMap::new();
+        let mut out = BTreeMap::new();
         for (i, m) in self.iter().enumerate() {
             for (k, v) in m.trainable_parameters() {
                 let full: Rc<str> = format!("{i}.{k}").into();
@@ -1327,17 +1327,18 @@ impl<T: ModuleParameters> ModuleParameters for Option<T> {
     }
 
     fn parameters(&self) -> ModuleParamRef<'_> {
-        self.as_ref().map_or(HashMap::new(), |m| m.parameters())
+        self.as_ref().map_or(BTreeMap::new(), |m| m.parameters())
     }
 
     fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
-        self.as_mut().map_or(HashMap::new(), |m| m.parameters_mut())
+        self.as_mut()
+            .map_or(BTreeMap::new(), |m| m.parameters_mut())
     }
 
     /// The module's own trainable set; see `Vec<T>`'s.
     fn trainable_parameters(&self) -> ModuleParamRef<'_> {
         self.as_ref()
-            .map_or(HashMap::new(), |m| m.trainable_parameters())
+            .map_or(BTreeMap::new(), |m| m.trainable_parameters())
     }
 }
 

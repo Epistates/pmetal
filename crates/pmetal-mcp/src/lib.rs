@@ -41,7 +41,7 @@ use turbomcp_types::{
     PromptsCapabilities, ResourcesCapabilities, ServerCapabilities, ToolsCapabilities,
 };
 
-use crate::jobs::{JobManager, JobRequest};
+use crate::jobs::JobManager;
 use crate::native::Core;
 use crate::policy::PathPolicy;
 use crate::results::{JobStarted, structured, text};
@@ -221,7 +221,7 @@ pub fn spec_tool_list() -> Vec<Box<dyn SpecTool>> {
         ),
         spec_tool!(
             MergeSpec, "merge_models",
-            "Merge two models with SLERP, TIES, DARE, linear or task arithmetic (pmetal merge). Returns a job ID.",
+            "Merge two models with SLERP, TIES, DARE, DELLA, linear, task arithmetic and the other methods of the `method` parameter (pmetal merge). Returns a job ID.",
             JOB, Hints::OVERWRITE
         ),
         spec_tool!(
@@ -339,25 +339,17 @@ impl PmetalMcpServer {
             Kind::Spec(i) => {
                 let tool = &inner.spec_tools[i];
                 let prepared = tool.prepare(args, &policy)?;
+                let plan = prepared.plan;
                 match tool.mode() {
                     Mode::Job => {
-                        let output = prepared.output.as_ref().map(|p| p.display().to_string());
-                        let id = inner
-                            .core
-                            .jobs
-                            .spawn(JobRequest {
-                                subcommand: prepared.subcommand.to_string(),
-                                argv: prepared.argv,
-                                output: prepared.output,
-                                metrics_file: prepared.metrics_file,
-                                ..JobRequest::default()
-                            })
-                            .await?;
-                        structured(&JobStarted::new(&id, prepared.subcommand, output))
+                        let output = plan.output.as_ref().map(|p| p.display().to_string());
+                        let subcommand = plan.subcommand.clone();
+                        let id = inner.core.jobs.spawn(plan.into()).await?;
+                        structured(&JobStarted::new(&id, &subcommand, output))
                     }
                     Mode::Blocking => {
-                        let mut argv = vec![prepared.subcommand.to_string()];
-                        argv.extend(prepared.argv);
+                        let mut argv = vec![plan.subcommand];
+                        argv.extend(plan.argv);
                         inner.core.run(&argv, ctx).await.map(text)
                     }
                 }

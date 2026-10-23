@@ -8,9 +8,10 @@
 //! every file atomically and finishes with the shard index Hugging Face
 //! loaders expect.
 
+use pmetal_hub::safetensors_index::{INDEX_FILE, IndexError, ShardIndex};
 use pmetal_runtime::compat::Array;
 use safetensors::Dtype;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -106,21 +107,16 @@ pub struct SafetensorsLoader {
 }
 
 /// Weight files named by a `model.safetensors.index.json`, in the index's
-/// own spelling, deduplicated.
+/// own spelling, deduplicated. An index that names a file outside the model
+/// directory is refused.
 fn indexed_shards(index_path: &Path) -> Result<Vec<String>> {
-    let raw = std::fs::read_to_string(index_path)?;
-    let value: serde_json::Value = serde_json::from_str(&raw)?;
-    let map = value
-        .get("weight_map")
-        .and_then(|m| m.as_object())
-        .ok_or_else(|| {
-            MergeError::ModelLoad(format!("{} has no weight_map object", index_path.display()))
-        })?;
-    let shards: BTreeSet<String> = map
-        .values()
-        .filter_map(|v| v.as_str().map(str::to_owned))
-        .collect();
-    Ok(shards.into_iter().collect())
+    let index = ShardIndex::read(index_path).map_err(|e| match e {
+        IndexError::Malformed(what) => {
+            MergeError::ModelLoad(format!("{}: {what}", index_path.display()))
+        }
+        other => other.into(),
+    })?;
+    Ok(index.shards().into_iter().map(str::to_owned).collect())
 }
 
 impl SafetensorsLoader {
@@ -939,24 +935,17 @@ impl TensorWriter {
             }
         }
 
-        let mut weight_map = serde_json::Map::new();
+        let mut weight_map = BTreeMap::new();
         let mut total_size = 0u64;
         for (shard, final_name) in self.closed.iter().zip(&final_names) {
             std::fs::rename(&shard.partial_path, self.output_path.join(final_name))?;
             for name in &shard.names {
-                weight_map.insert(name.clone(), serde_json::Value::String(final_name.clone()));
+                weight_map.insert(name.clone(), final_name.clone());
             }
             total_size += shard.size;
         }
         if total > 1 {
-            let index = serde_json::json!({
-                "metadata": { "total_size": total_size },
-                "weight_map": weight_map,
-            });
-            write_atomic(
-                &self.output_path.join("model.safetensors.index.json"),
-                serde_json::to_string_pretty(&index)?.as_bytes(),
-            )?;
+            ShardIndex::new(weight_map, total_size).write(&self.output_path.join(INDEX_FILE))?;
         }
         Ok(self.output_path.clone())
     }
@@ -1176,6 +1165,21 @@ mod tests {
         .unwrap();
         let err = load_error(dir.path());
         assert!(err.to_string().contains("gone.safetensors"), "{err}");
+    }
+
+    /// A crafted index cannot send the loader out of the model directory.
+    #[test]
+    fn an_index_naming_a_path_outside_the_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for shard in ["../victim.safetensors", "/etc/passwd", "a/../../b"] {
+            std::fs::write(
+                dir.path().join("model.safetensors.index.json"),
+                serde_json::json!({"weight_map": {"x": shard}}).to_string(),
+            )
+            .unwrap();
+            let err = load_error(dir.path());
+            assert!(err.to_string().contains("path traversal"), "{shard}: {err}");
+        }
     }
 
     #[test]

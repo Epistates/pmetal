@@ -2,78 +2,20 @@
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 
-/// `~/.cache/pmetal/logs`
-fn log_dir() -> PathBuf {
-    let dir = dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from(".cache"))
-        .join("pmetal")
-        .join("logs");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
-}
+use pmetal::core::logging::{LogOptions, LogOutput};
 
 /// Log to standard error and to `<component>.log`, keeping the previous run's
 /// log as `<component>.log.1`. Returns the log file's path for the panic hook.
 pub fn init(component: &str) -> Option<PathBuf> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new(
-            "pmetal_gui=info,pmetal_gui_lib=info,pmetal_supervisor=info,pmetal_trainer=info,\
-             pmetal_runtime=info,pmetal_hub=info,pmetal=info",
-        )
-    });
-    let dir = log_dir();
-    let path = dir.join(format!("{component}.log"));
-    if path.exists() {
-        let _ = std::fs::rename(&path, dir.join(format!("{component}.log.1")));
-    }
-    // Readable by the owner only: paths and model names are in it.
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path);
-    let Ok(file) = file else {
-        let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
-        return None;
-    };
-    let file = Arc::new(Mutex::new(file));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_ansi(false)
-        .with_writer(move || Tee {
-            stderr: std::io::stderr(),
-            file: file.clone(),
-        })
-        .try_init();
-    Some(path)
-}
-
-struct Tee {
-    stderr: std::io::Stderr,
-    file: Arc<Mutex<std::fs::File>>,
-}
-
-impl Write for Tee {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.stderr.write(buf)?;
-        if let Ok(mut f) = self.file.lock() {
-            let _ = f.write_all(&buf[..n]);
-        }
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.stderr.flush()?;
-        if let Ok(mut f) = self.file.lock() {
-            let _ = f.flush();
-        }
-        Ok(())
-    }
+    pmetal::core::logging::init(
+        LogOptions::new(component)
+            .output(LogOutput::StderrAndFile)
+            .default_filter(
+                "pmetal_gui=info,pmetal_gui_lib=info,pmetal_supervisor=info,pmetal_trainer=info,\
+                 pmetal_runtime=info,pmetal_hub=info,pmetal=info",
+            ),
+    )
 }
 
 /// On a panic: write what happened to the log file, and end the jobs. The jobs

@@ -80,7 +80,7 @@ impl RepoKind {
 
 /// `models--owner--name`: the cache folder of a repository.
 pub(crate) fn repo_folder(kind: RepoKind, repo_id: &str) -> String {
-    format!("{}--{}", kind.prefix(), repo_id.replace('/', "--"))
+    pmetal_core::paths::hub_repo_folder(kind.prefix(), repo_id)
 }
 
 /// Whether `revision` is a full commit id (40 hex digits), not a name.
@@ -300,14 +300,11 @@ fn list_repos(cache_root: &Path, kind: RepoKind) -> Vec<(String, PathBuf)> {
     let Ok(entries) = std::fs::read_dir(cache_root) else {
         return Vec::new();
     };
-    let prefix = format!("{}--", kind.prefix());
     let mut repos: Vec<(String, PathBuf)> = entries
         .flatten()
         .filter_map(|entry| {
             let folder = entry.file_name().into_string().ok()?;
-            let encoded = folder.strip_prefix(&prefix)?;
-            // The folder name is the repository id with `/` written `--`.
-            let repo_id = encoded.replace("--", "/");
+            let repo_id = pmetal_core::paths::hub_repo_id(kind.prefix(), &folder)?;
             let snapshot = find_snapshot(cache_root, kind, &repo_id, None, |s| {
                 std::fs::read_dir(s).is_ok_and(|mut files| files.next().is_some())
             })?;

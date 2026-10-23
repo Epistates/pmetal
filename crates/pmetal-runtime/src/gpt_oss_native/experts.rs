@@ -18,6 +18,7 @@
 //! Gate and up are interleaved along the fused projection's outputs
 //! (`gate_up[..., ::2]`, `gate_up[..., 1::2]`), biases included.
 
+use crate::{RuntimeError, RuntimeResult};
 use std::collections::HashMap;
 
 use crate::InlineArray;
@@ -73,14 +74,14 @@ fn interleaved(x: &InlineArray, axis: usize, which: i32) -> InlineArray {
 
 /// MXFP4 blocks `[..., out, G, 16]` `uint8` and scales `[..., out, G]` as an
 /// MLX mxfp4 weight: the bytes viewed as `uint32`, `[..., out, G * 4]`.
-fn mxfp4(blocks: &InlineArray, scales: InlineArray) -> Result<LayerWeight, String> {
+fn mxfp4(blocks: &InlineArray, scales: InlineArray) -> RuntimeResult<LayerWeight> {
     const UINT32: i32 = 3;
     let n = blocks.ndim();
     if n < 3 || blocks.dim(n - 1) != 16 {
-        return Err(format!(
+        return Err(RuntimeError::Weights(format!(
             "gpt_oss: MXFP4 blocks have shape {:?}; expected [..., out, groups, 16]",
             blocks.shape()
-        ));
+        )));
     }
     let mut shape: Vec<i32> = (0..n - 2).map(|i| blocks.dim(i)).collect();
     shape.push(blocks.dim(n - 2) * 4);
@@ -101,7 +102,7 @@ impl GptOssExperts {
     /// (`experts.{gate,up,down}_proj.{weight,scales[,biases]}` with the
     /// mode and widths the checkpoint's `quantization` block gives, `mxfp4`
     /// in the `MXFP4-Q8` conversions, and the biases beside them).
-    pub fn from_tensors(ckpt: &mut Checkpoint, prefix: &str) -> Result<Self, String> {
+    pub fn from_tensors(ckpt: &mut Checkpoint, prefix: &str) -> RuntimeResult<Self> {
         if ckpt.contains(&format!("{prefix}.gate_proj.scales")) {
             let proj = |name: &str| format!("{prefix}.{name}_proj");
             return Ok(Self {
@@ -127,17 +128,19 @@ impl GptOssExperts {
     pub fn from_checkpoint(
         raw: &HashMap<String, InlineArray>,
         prefix: &str,
-    ) -> Result<Self, String> {
+    ) -> RuntimeResult<Self> {
         if raw.contains_key(&format!("{prefix}.gate_proj.scales")) {
-            return Err(format!(
+            return Err(RuntimeError::Weights(format!(
                 "gpt_oss: the experts under {prefix} are an MLX quantization, which needs its \
-                 quantization block to read"
-            ));
+             quantization block to read"
+            )));
         }
         let get = |name: &str| {
             raw.get(&format!("{prefix}.{name}"))
                 .cloned()
-                .ok_or_else(|| format!("gpt_oss: missing weight key: {prefix}.{name}"))
+                .ok_or_else(|| {
+                    RuntimeError::Weights(format!("gpt_oss: missing weight key: {prefix}.{name}"))
+                })
         };
         let swap = |x: InlineArray| LayerWeight::Dense(x.transpose_axes(&[0, 2, 1]));
         let experts = if raw.contains_key(&format!("{prefix}.gate_up_proj_blocks")) {
@@ -176,8 +179,11 @@ impl GptOssExperts {
                 down_bias: get("down_proj.bias")?,
             }
         };
-        crate::check_unobserved_error()
-            .map_err(|e| format!("gpt_oss: reading the experts under {prefix} failed: {e}"))?;
+        crate::check_unobserved_error().map_err(|e| {
+            RuntimeError::Weights(format!(
+                "gpt_oss: reading the experts under {prefix} failed: {e}"
+            ))
+        })?;
         Ok(experts)
     }
 

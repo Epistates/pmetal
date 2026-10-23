@@ -28,9 +28,24 @@ pub struct InferSpec {
     #[serde(default)]
     pub lora: Option<String>,
 
-    #[job(label = "Prompt", group = "Input", argv = "--prompt", required)]
+    #[job(
+        label = "Prompt",
+        group = "Input",
+        argv = "--prompt",
+        help = "The text to answer; give this or a messages file"
+    )]
     #[serde(default)]
     pub prompt: String,
+
+    #[job(
+        label = "Messages File",
+        group = "Input",
+        argv = "--messages-file",
+        kind = "path",
+        help = "A JSON array of chat messages ({\"role\": \"user\", \"content\": \"...\"}) to continue instead of a prompt; the chat template, tools and images apply"
+    )]
+    #[serde(default)]
+    pub messages_file: Option<String>,
 
     #[job(
         label = "Max Tokens",
@@ -439,6 +454,7 @@ impl Default for InferSpec {
             model: String::new(),
             lora: None,
             prompt: String::new(),
+            messages_file: None,
             max_tokens: None,
             temperature: None,
             top_k: None,
@@ -493,6 +509,24 @@ impl InferSpec {
     /// Run descriptor + cross-field validation.
     pub fn normalize(&mut self) -> Result<(), Vec<FieldError>> {
         let mut errs = self.validate_descriptors();
+        // What to answer is a prompt or a conversation, not both and not neither
+        // (a benchmark makes its own).
+        let has_prompt = !self.prompt.trim().is_empty();
+        let has_messages = self
+            .messages_file
+            .as_deref()
+            .is_some_and(|f| !f.trim().is_empty());
+        if has_prompt && has_messages {
+            errs.push(FieldError::new(
+                "messages_file",
+                "use either a prompt or a messages file, not both",
+            ));
+        } else if !has_prompt && !has_messages && !self.benchmark {
+            errs.push(FieldError::new(
+                "prompt",
+                "needs a prompt or a messages file",
+            ));
+        }
         if self.video_fps.is_some() && self.video.is_empty() {
             errs.push(FieldError::new("video_fps", "needs at least one --video"));
         }
@@ -507,6 +541,87 @@ impl InferSpec {
         }
         if errs.is_empty() { Ok(()) } else { Err(errs) }
     }
+}
+
+/// One message of a conversation as `--messages-file` holds it (the OpenAI chat
+/// shape): the file is a JSON array of these.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatMessage {
+    /// `system`, `user`, `assistant` or `tool`.
+    pub role: String,
+    /// The text.
+    #[serde(default)]
+    pub content: String,
+    /// The thinking behind an assistant turn, apart from its content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    /// The tool calls an assistant turn made (OpenAI `tool_calls`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<serde_json::Value>>,
+    /// The call a `tool` message answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl ChatMessage {
+    /// A message of `role` with `content`.
+    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+            ..Self::default()
+        }
+    }
+}
+
+/// The most a messages file may hold.
+pub const MAX_MESSAGES_BYTES: usize = 32 * 1024 * 1024;
+
+/// The conversation in `text`, a JSON array of [`ChatMessage`], checked: it is
+/// not empty, every role is known, a system message is only the first, nothing
+/// but a tool call may be empty, and the last message is one a model can
+/// answer (a user's, or a tool's result). The error names the message.
+pub fn parse_messages(text: &str) -> Result<Vec<ChatMessage>, String> {
+    if text.len() > MAX_MESSAGES_BYTES {
+        return Err(format!("is larger than {} MiB", MAX_MESSAGES_BYTES >> 20));
+    }
+    let messages: Vec<ChatMessage> = serde_json::from_str(text)
+        .map_err(|e| format!("is not a JSON array of chat messages: {e}"))?;
+    if messages.is_empty() {
+        return Err("has no messages".to_string());
+    }
+    for (i, message) in messages.iter().enumerate() {
+        let n = i + 1;
+        match message.role.as_str() {
+            "system" if i > 0 => {
+                return Err(format!("message {n}: a system message can only come first"));
+            }
+            "system" | "user" | "assistant" | "tool" => {}
+            other => {
+                return Err(format!(
+                    "message {n}: '{other}' is not a role (use system, user, assistant or tool)"
+                ));
+            }
+        }
+        let empty = message.content.trim().is_empty();
+        let calls = message.tool_calls.as_ref().is_some_and(|c| !c.is_empty());
+        if empty && !(message.role == "assistant" && calls) {
+            return Err(format!(
+                "message {n}: the {} message is empty",
+                message.role
+            ));
+        }
+    }
+    let last = &messages[messages.len() - 1];
+    if !matches!(last.role.as_str(), "user" | "tool") {
+        let article = if last.role == "user" { "a" } else { "an" };
+        return Err(format!(
+            "ends with {article} {} message; the last message must be a user's (or a tool's result) for the model to answer",
+            last.role
+        ));
+    }
+    Ok(messages)
 }
 
 fn default_mode() -> String {
@@ -531,6 +646,72 @@ fn default_kv_group_size() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_prompt_or_a_messages_file_but_not_both_or_neither() {
+        let ask = |prompt: &str, file: Option<&str>| {
+            InferSpec {
+                model: "m".into(),
+                prompt: prompt.into(),
+                messages_file: file.map(Into::into),
+                ..Default::default()
+            }
+            .normalize()
+        };
+        assert!(ask("hi", None).is_ok());
+        assert!(ask("", Some("chat.json")).is_ok());
+        let both = ask("hi", Some("chat.json")).unwrap_err();
+        assert!(both.iter().any(|e| e.field == "messages_file"), "{both:?}");
+        let neither = ask("", None).unwrap_err();
+        assert!(neither.iter().any(|e| e.field == "prompt"), "{neither:?}");
+        // A benchmark makes its own prompt.
+        let mut bench = InferSpec {
+            model: "m".into(),
+            benchmark: true,
+            ..Default::default()
+        };
+        assert!(bench.normalize().is_ok());
+    }
+
+    #[test]
+    fn a_conversation_is_checked_message_by_message() {
+        let ok = parse_messages(
+            r#"[{"role":"system","content":"be brief"},{"role":"user","content":"hi"},
+                {"role":"assistant","content":"","tool_calls":[{"id":"c","function":{"name":"f","arguments":"{}"}}]},
+                {"role":"tool","content":"42","tool_call_id":"c"}]"#,
+        )
+        .unwrap();
+        assert_eq!(ok.len(), 4);
+        for (text, needle) in [
+            ("{}", "not a JSON array"),
+            ("[]", "no messages"),
+            (
+                r#"[{"role":"user","content":"a"},{"role":"system","content":"s"},{"role":"user","content":"b"}]"#,
+                "message 2: a system message",
+            ),
+            (
+                r#"[{"role":"robot","content":"a"}]"#,
+                "'robot' is not a role",
+            ),
+            (
+                r#"[{"role":"user","content":" "}]"#,
+                "message 1: the user message is empty",
+            ),
+            (r#"[{"role":"user","content":"a","tone":"x"}]"#, "tone"),
+            (
+                r#"[{"role":"user","content":"a"},{"role":"assistant","content":"b"}]"#,
+                "ends with an assistant message",
+            ),
+        ] {
+            let err = parse_messages(text).unwrap_err();
+            assert!(err.contains(needle), "{text}: {err}");
+        }
+        let one = vec![ChatMessage::new("user", "hi")];
+        assert_eq!(
+            parse_messages(&serde_json::to_string(&one).unwrap()).unwrap(),
+            one
+        );
+    }
 
     #[test]
     fn argv_round_trip() {

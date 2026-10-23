@@ -139,6 +139,45 @@ assert_eq!(
 );
 ```
 
+### Search Datasets
+
+`search_datasets` lists datasets most downloaded first, or the trending ones for an empty query.
+A result's id can be given to a trainer as it is.
+
+```rust,no_run
+use pmetal_hub::search::search_datasets;
+
+async fn find_data() -> Result<(), Box<dyn std::error::Error>> {
+    for dataset in search_datasets("alpaca", 10, None).await? {
+        println!("{} ({} downloads)", dataset.dataset_id, dataset.downloads);
+    }
+    Ok(())
+}
+```
+
+### Models on This Mac
+
+`local::scan` finds every model a plan reaches: the Hub cache, trained outputs (adapters with the
+model they were trained from, read from `training_info.json`), the folders you added and other
+apps' model folders. The desktop app, the terminal UI and the other surfaces list models through it,
+so they agree on what is there and what to call it.
+
+```rust,no_run
+use pmetal_hub::local::{ScanPlan, scan};
+
+fn list() {
+    let plan = ScanPlan {
+        hub_cache: pmetal_hub::cache_dir(),
+        output_root: "./output".into(),
+        custom_dirs: vec![],
+        well_known: ScanPlan::well_known_dirs(),
+    };
+    for model in scan(&plan) {
+        println!("{} ({:?}, {} bytes)", model.reference, model.source, model.size_bytes);
+    }
+}
+```
+
 ### Check a Local Model Directory
 
 ```rust

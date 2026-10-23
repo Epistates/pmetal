@@ -9,6 +9,21 @@
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 
+/// Why a chat template could not be applied.
+///
+/// The messages name the setting or the template at fault and are shown to
+/// the caller as written (an API client sees them in a 400 response).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ChatTemplateError {
+    /// The template keyword arguments are not valid, are reserved, or are
+    /// not supported by this template.
+    #[error("{0}")]
+    Kwargs(String),
+    /// The conversation could not be rendered with the template.
+    #[error("{0}")]
+    Render(String),
+}
+
 mod builtin;
 
 // ============================================================================
@@ -261,18 +276,24 @@ impl ChatTemplateKwargs {
 
     /// Build from a JSON object, refusing the names the renderer binds
     /// itself (`messages`, `tools`, `documents`, `add_generation_prompt`).
-    pub fn from_map(map: serde_json::Map<String, serde_json::Value>) -> Result<Self, String> {
+    pub fn from_map(
+        map: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Self, ChatTemplateError> {
         let kwargs = Self(map);
         kwargs.check_reserved()?;
         Ok(kwargs)
     }
 
     /// Parse a JSON object string, e.g. `{"enable_thinking": false}`.
-    pub fn from_json(json: &str) -> Result<Self, String> {
+    pub fn from_json(json: &str) -> Result<Self, ChatTemplateError> {
         match serde_json::from_str::<serde_json::Value>(json) {
             Ok(serde_json::Value::Object(map)) => Self::from_map(map),
-            Ok(_) => Err("chat template kwargs must be a JSON object".into()),
-            Err(e) => Err(format!("chat template kwargs are not valid JSON: {e}")),
+            Ok(_) => Err(ChatTemplateError::Kwargs(
+                "chat template kwargs must be a JSON object".into(),
+            )),
+            Err(e) => Err(ChatTemplateError::Kwargs(format!(
+                "chat template kwargs are not valid JSON: {e}"
+            ))),
         }
     }
 
@@ -284,7 +305,7 @@ impl ChatTemplateKwargs {
         no_thinking: bool,
         reasoning_effort: Option<&str>,
         no_preserve_thinking: bool,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ChatTemplateError> {
         let mut kwargs = match json.filter(|j| !j.trim().is_empty()) {
             Some(json) => Self::from_json(json)?,
             None => Self::new(),
@@ -302,15 +323,15 @@ impl ChatTemplateKwargs {
     }
 
     /// Refuse a name the renderer binds itself.
-    pub fn check_reserved(&self) -> Result<(), String> {
+    pub fn check_reserved(&self) -> Result<(), ChatTemplateError> {
         match self
             .0
             .keys()
             .find(|k| crate::jinja_chat::RESERVED_TEMPLATE_KWARGS.contains(&k.as_str()))
         {
-            Some(key) => Err(format!(
+            Some(key) => Err(ChatTemplateError::Kwargs(format!(
                 "`{key}` cannot be a chat template kwarg: it is set from the request itself"
-            )),
+            ))),
             None => Ok(()),
         }
     }
@@ -733,7 +754,7 @@ impl ChatTemplate {
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
         kwargs: &ChatTemplateKwargs,
-    ) -> Result<FormattedChat, String> {
+    ) -> Result<FormattedChat, ChatTemplateError> {
         let Some((last, earlier)) = messages
             .split_last()
             .filter(|(last, _)| last.role == "assistant")
@@ -798,7 +819,7 @@ impl ChatTemplate {
         earlier: &[Message],
         tools: Option<&[ToolDefinition]>,
         kwargs: &ChatTemplateKwargs,
-    ) -> Result<TrainingRender, String> {
+    ) -> Result<TrainingRender, ChatTemplateError> {
         let thinks = last
             .reasoning_content
             .as_deref()
@@ -865,7 +886,9 @@ impl ChatTemplate {
         // The template renders the turn in a way its prompt does not lead to
         // at all. Train on the text from the turn's content.
         let Some((k, text, _)) = renders.first() else {
-            return Err(first_error.unwrap_or_else(|| "no chat template to render".into()));
+            return Err(first_error.unwrap_or_else(|| {
+                ChatTemplateError::Render("no chat template to render".into())
+            }));
         };
         tracing::warn!(
             "the {:?} chat template does not render the final assistant turn as it prompts for \
@@ -976,7 +999,7 @@ impl ChatTemplate {
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
         kwargs: &ChatTemplateKwargs,
-    ) -> Result<FormattedChat, String> {
+    ) -> Result<FormattedChat, ChatTemplateError> {
         kwargs.check_reserved()?;
         let formatted = |text: String| FormattedChat {
             response_start: text.len(),
@@ -998,7 +1021,7 @@ impl ChatTemplate {
                 );
                 Ok(self.apply_builtin_inference(messages, tools, kwargs))
             }
-            Err(e) => Err(format!("chat template: {e}")),
+            Err(e) => Err(ChatTemplateError::Render(format!("chat template: {e}"))),
         }
     }
 
@@ -1066,16 +1089,19 @@ impl ChatTemplate {
     /// read by the template, and a `reasoning_effort` must be one of the
     /// documented levels where the template does not validate it itself
     /// (see [`documented_reasoning_effort_levels`]).
-    pub fn check_thinking_controls(&self, kwargs: &ChatTemplateKwargs) -> Result<(), String> {
+    pub fn check_thinking_controls(
+        &self,
+        kwargs: &ChatTemplateKwargs,
+    ) -> Result<(), ChatTemplateError> {
         for key in [
             ChatTemplateKwargs::REASONING_EFFORT,
             ChatTemplateKwargs::PRESERVE_THINKING,
         ] {
             if kwargs.get(key).is_some() && !self.reads_kwarg(key) {
-                return Err(format!(
+                return Err(ChatTemplateError::Kwargs(format!(
                     "this model's chat template has no `{key}` control ({:?} template)",
                     self.template_type
-                ));
+                )));
             }
         }
         self.check_reasoning_effort_level(kwargs)
@@ -1083,16 +1109,19 @@ impl ChatTemplate {
 
     /// Refuse a `reasoning_effort` outside the documented levels of a
     /// template that does not check it itself. Other kwargs pass.
-    pub fn check_reasoning_effort_level(&self, kwargs: &ChatTemplateKwargs) -> Result<(), String> {
+    pub fn check_reasoning_effort_level(
+        &self,
+        kwargs: &ChatTemplateKwargs,
+    ) -> Result<(), ChatTemplateError> {
         let Some(effort) = kwargs.get(ChatTemplateKwargs::REASONING_EFFORT) else {
             return Ok(());
         };
         if let Some(levels) = documented_reasoning_effort_levels(self.template_type) {
             if !effort.as_str().is_some_and(|e| levels.contains(&e)) {
-                return Err(format!(
+                return Err(ChatTemplateError::Kwargs(format!(
                     "unsupported reasoning_effort {effort}: this model accepts {}",
                     levels.join(", ")
-                ));
+                )));
             }
         }
         Ok(())
@@ -1139,7 +1168,7 @@ impl ChatTemplate {
         messages: &[Message],
         no_thinking: bool,
         tools: Option<&[ToolDefinition]>,
-    ) -> Result<String, String> {
+    ) -> Result<String, ChatTemplateError> {
         let kwargs =
             ChatTemplateKwargs::new().with(ChatTemplateKwargs::ENABLE_THINKING, !no_thinking);
         self.render_inference_jinja_with_kwargs(messages, tools, &kwargs)
@@ -1153,12 +1182,12 @@ impl ChatTemplate {
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
         kwargs: &ChatTemplateKwargs,
-    ) -> Result<String, String> {
+    ) -> Result<String, ChatTemplateError> {
         kwargs.check_reserved()?;
         let src = self
             .jinja_source
             .as_deref()
-            .ok_or("the model ships no chat template")?;
+            .ok_or_else(|| ChatTemplateError::Render("the model ships no chat template".into()))?;
         self.render_jinja(src, messages, true, tools, kwargs)
     }
 
@@ -1180,17 +1209,17 @@ impl ChatTemplate {
         tools: Option<&[ToolDefinition]>,
         kwargs: &ChatTemplateKwargs,
         add_generation_prompt: bool,
-    ) -> Result<String, String> {
+    ) -> Result<String, ChatTemplateError> {
         kwargs.check_reserved()?;
         match self.jinja_source.as_deref() {
             Some(src) => self.render_jinja(src, messages, add_generation_prompt, tools, kwargs),
             None => {
                 if messages.iter().any(Message::has_media) {
-                    return Err(
+                    return Err(ChatTemplateError::Render(
                         "the model ships no chat template, and the built-in formats \
                                 have no place for images or videos"
                             .into(),
-                    );
+                    ));
                 }
                 let mut kwargs = kwargs.clone();
                 if let Some(system) = &self.default_system_message {
@@ -1215,7 +1244,7 @@ impl ChatTemplate {
         add_generation_prompt: bool,
         tools: Option<&[ToolDefinition]>,
         kwargs: &ChatTemplateKwargs,
-    ) -> Result<String, String> {
+    ) -> Result<String, ChatTemplateError> {
         // Raw `<think>…</think>` text in an assistant message moves to
         // `reasoning_content` only for a template that renders that field as
         // a `<think>` block. Gemma 4's reads the field too, but writes its
@@ -1286,6 +1315,7 @@ impl ChatTemplate {
         };
 
         crate::jinja_chat::render_chat_template(src, &jinja_messages, &options)
+            .map_err(ChatTemplateError::Render)
     }
 }
 
@@ -1686,7 +1716,7 @@ impl TrainingSampleBuilder {
         let formatted = self
             .template
             .try_apply(messages, None, &ChatTemplateKwargs::new())
-            .map_err(pmetal_core::PMetalError::Tokenizer)?;
+            .map_err(|e| pmetal_core::PMetalError::Tokenizer(e.to_string()))?;
         Self::tokenize(&formatted, tokenizer, max_length)
     }
 

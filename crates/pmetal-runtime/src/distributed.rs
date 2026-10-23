@@ -241,12 +241,12 @@ pub const DEFAULT_BUCKET_BYTES: usize = 32 << 20;
 /// group, divided by its size and split back to their shapes. A group of one
 /// leaves the gradients as they are.
 pub fn average_gradients<K>(
-    grads: &mut std::collections::HashMap<K, InlineArray>,
+    grads: &mut std::collections::BTreeMap<K, InlineArray>,
     group: Option<&Group>,
     bucket_bytes: usize,
 ) -> RuntimeResult<()>
 where
-    K: Eq + std::hash::Hash + Ord + Clone,
+    K: Ord + Clone,
 {
     let size = group.map_or_else(|| Group::init(false).map(|g| g.size()), |g| Ok(g.size()))?;
     if size <= 1 {
@@ -258,17 +258,16 @@ where
 /// [`average_gradients`] with the collective given: `reduce` sums a flat
 /// bucket over `size` ranks.
 fn average_gradients_with<K>(
-    grads: &mut std::collections::HashMap<K, InlineArray>,
+    grads: &mut std::collections::BTreeMap<K, InlineArray>,
     size: i32,
     bucket_bytes: usize,
     reduce: impl Fn(&InlineArray) -> RuntimeResult<InlineArray>,
 ) -> RuntimeResult<()>
 where
-    K: Eq + std::hash::Hash + Ord + Clone,
+    K: Ord + Clone,
 {
-    // Every rank packs the same buckets in the same order: by dtype, then key.
-    let mut keys: Vec<K> = grads.keys().cloned().collect();
-    keys.sort();
+    // Every rank packs the same buckets in the same order: the map's key order.
+    let keys: Vec<K> = grads.keys().cloned().collect();
     let mut buckets: Vec<(i32, Vec<K>, usize)> = Vec::new();
     for key in keys {
         let grad = &grads[&key];
@@ -320,13 +319,13 @@ mod tests {
     #[test]
     fn averaging_gradients_unpacks_every_bucket_to_its_parameter() {
         use crate::compat::Dtype;
-        use std::collections::HashMap;
+        use std::collections::BTreeMap;
         let f32_ = Dtype::Float32.as_i32();
         let bf16 = Dtype::Bfloat16.as_i32();
         let make = |values: &[f32], shape: &[i32], dtype: i32| {
             InlineArray::from_f32_slice(values, shape).as_dtype(dtype)
         };
-        let mut grads: HashMap<String, InlineArray> = HashMap::from([
+        let mut grads: BTreeMap<String, InlineArray> = BTreeMap::from([
             (
                 "a".into(),
                 make(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], f32_),
@@ -358,7 +357,7 @@ mod tests {
     #[test]
     fn a_group_of_one_leaves_gradients_alone() {
         let group = Group::init(false).expect("init");
-        let mut grads = std::collections::HashMap::from([(
+        let mut grads = std::collections::BTreeMap::from([(
             "w".to_string(),
             InlineArray::from_f32_slice(&[1.0, 2.0], &[2]),
         )]);

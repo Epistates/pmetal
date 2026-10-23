@@ -811,18 +811,13 @@ fn rotary_tables(grids: &[[usize; 3]], merge: usize, inv_freq: &[f32]) -> (Vec<f
 pub fn load_visual_tensors(dir: &Path) -> Result<HashMap<String, Array>, Exception> {
     let index = dir.join("model.safetensors.index.json");
     let shards: Vec<PathBuf> = if index.is_file() {
-        let text = std::fs::read_to_string(&index)
-            .map_err(|e| Exception::custom(format!("{}: {e}", index.display())))?;
-        let value: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| Exception::custom(format!("{}: {e}", index.display())))?;
-        let map = value
-            .get("weight_map")
-            .and_then(|v| v.as_object())
-            .ok_or_else(|| Exception::custom("model.safetensors.index.json has no weight_map"))?;
+        let map = pmetal_core::safetensors_index::ShardIndex::read(&index)
+            .map_err(|e| Exception::custom(format!("{}: {e}", index.display())))?
+            .weight_map;
         let mut files: Vec<String> = map
             .iter()
             .filter(|(key, _)| PREFIXES.iter().any(|p| key.starts_with(p)))
-            .filter_map(|(_, file)| file.as_str().map(str::to_string))
+            .map(|(_, file)| file.clone())
             .collect();
         files.sort();
         files.dedup();

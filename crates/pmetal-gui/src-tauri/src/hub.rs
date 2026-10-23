@@ -5,19 +5,15 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use pmetal::core::SecretString;
+use pmetal::core::sync::locked;
 use pmetal::hub::{DeviceSpec, FitLevel, HfSearchResult, ProgressCallback, TransferProgress};
 use serde::Serialize;
 
 use crate::error::{AppError, Result};
-use crate::models::format_size;
-
-/// How long a Hub request may take.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
 // Search
@@ -116,78 +112,21 @@ pub async fn search_datasets(
     limit: usize,
     token: Option<&SecretString>,
 ) -> Result<Vec<DatasetSearchResult>> {
-    let endpoint = pmetal::hub::HubOptions::default().resolved_endpoint();
-    let query = query.trim();
-    let mut params: Vec<(&str, String)> = vec![
-        ("limit", limit.clamp(1, 100).to_string()),
-        (
-            "sort",
-            if query.is_empty() {
-                "trendingScore"
-            } else {
-                "downloads"
-            }
-            .to_string(),
-        ),
-        ("direction", "-1".to_string()),
-    ];
-    if !query.is_empty() {
-        params.push(("search", query.to_string()));
-    }
-    let client = reqwest::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .user_agent(concat!("pmetal-gui/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|e| hub_error("search for datasets", &e.to_string()))?;
-    let mut request = client
-        .get(format!("{endpoint}/api/datasets"))
-        .query(&params);
-    if let Some(token) = token {
-        request = request.bearer_auth(token.expose_secret());
-    }
-    let response = request
-        .send()
+    let found = pmetal::hub::search_datasets(query, limit, token)
         .await
         .map_err(|e| hub_error("search for datasets", &e.to_string()))?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(hub_error("search for datasets", &format!("HTTP {status}")));
-    }
-    let items: Vec<serde_json::Value> = response
-        .json()
-        .await
-        .map_err(|e| hub_error("search for datasets", &e.to_string()))?;
-    Ok(parse_datasets(&items))
-}
-
-fn parse_datasets(items: &[serde_json::Value]) -> Vec<DatasetSearchResult> {
-    items
-        .iter()
-        .filter_map(|v| {
-            let id = v["id"].as_str()?.to_string();
-            let downloads = v["downloads"].as_u64().unwrap_or(0);
-            Some(DatasetSearchResult {
-                author: id
-                    .split('/')
-                    .next()
-                    .filter(|_| id.contains('/'))
-                    .map(str::to_string),
-                downloads_formatted: pmetal::hub::format_downloads(downloads),
-                downloads,
-                likes: v["likes"].as_u64().unwrap_or(0),
-                tags: v["tags"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|t| t.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                description: v["description"].as_str().map(str::to_string),
-                id,
-            })
+    Ok(found
+        .into_iter()
+        .map(|d| DatasetSearchResult {
+            downloads_formatted: pmetal::hub::format_downloads(d.downloads),
+            id: d.dataset_id,
+            author: d.author,
+            downloads: d.downloads,
+            likes: d.likes,
+            tags: d.tags,
+            description: d.description,
         })
-        .collect()
+        .collect())
 }
 
 /// What failed against the Hub, and what to try.
@@ -224,12 +163,12 @@ pub fn cached_datasets(cache: &Path) -> Vec<CachedDatasetInfo> {
     pmetal::hub::list_cached_datasets_in(cache)
         .into_iter()
         .map(|d| {
-            let size = crate::models::dir_size(&d.snapshot);
+            let size = pmetal::hub::local::dir_size(&d.snapshot);
             CachedDatasetInfo {
                 name: d.repo_id,
                 path: d.snapshot.display().to_string(),
                 size_bytes: size,
-                size_formatted: format_size(size),
+                size_formatted: pmetal::core::format::human_size(size),
             }
         })
         .collect()
@@ -291,10 +230,6 @@ pub struct Downloads {
     inner: Arc<Mutex<HashMap<String, Entry>>>,
     permits: Arc<tokio::sync::Semaphore>,
     sink: DownloadSink,
-}
-
-fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Downloads {
@@ -462,6 +397,7 @@ impl Downloads {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     fn downloads(at_once: usize) -> (Downloads, Arc<Mutex<Vec<DownloadView>>>) {
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -604,21 +540,6 @@ mod tests {
         downloads
             .start("model", "acme/m", |_| async { Ok(PathBuf::new()) })
             .unwrap();
-    }
-
-    #[test]
-    fn dataset_results_are_read_leniently() {
-        let items: Vec<serde_json::Value> = serde_json::from_str(
-            r#"[{"id":"acme/data","downloads":1500,"likes":3,"tags":["a","b"],"description":"d"},
-                {"downloads":1},
-                {"id":"plain"}]"#,
-        )
-        .unwrap();
-        let results = parse_datasets(&items);
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].author.as_deref(), Some("acme"));
-        assert_eq!(results[0].downloads_formatted, "1.5K");
-        assert_eq!(results[1].author, None);
     }
 
     #[test]

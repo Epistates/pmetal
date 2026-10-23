@@ -7,8 +7,10 @@
 //! text as it arrives and the statistics when they do. The reasoning of a
 //! thinking model is in the text between the labels `pmetal_data`'s stream
 //! formatter writes.
+//!
+//! The terminal UI's chat and the desktop app's both read a reply this way.
 
-use pmetal_data::stream_format::{ANSWER_LABEL, THINKING_LABEL};
+use crate::stream_format::{ANSWER_LABEL, THINKING_LABEL};
 
 /// The lines that end the banner and start the text.
 const START_LINES: &[&str] = &["Generating...", "Loading model..."];
@@ -18,8 +20,15 @@ const FOOTER: &str = "\n---\n";
 /// What a finished generation reports.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct GenerationStats {
+    /// Tokens generated.
     pub tokens: usize,
+    /// The measured decode rate, else tokens over the time shown.
     pub tokens_per_second: f64,
+    /// Seconds spent generating after the first token. With
+    /// [`first_token_seconds`](Self::first_token_seconds), the whole run.
+    pub generating_seconds: f64,
+    /// Seconds to the first token, model load included, when the footer says.
+    pub first_token_seconds: Option<f64>,
 }
 
 /// Where the reader is in the output.
@@ -52,6 +61,7 @@ impl Default for InferStream {
 }
 
 impl InferStream {
+    /// A reader at the start of the output.
     pub fn new() -> Self {
         Self {
             phase: Phase::Banner,
@@ -158,6 +168,12 @@ impl InferStream {
                     .and_then(|r| r.split('s').next())
                     .and_then(|s| s.trim().parse::<f64>().ok())
                     .unwrap_or(0.0);
+                stats.generating_seconds = seconds;
+                // `(0.20s to the first token, model load included)`
+                stats.first_token_seconds = rest
+                    .split_once('(')
+                    .and_then(|(_, r)| r.split_once("s to the first token"))
+                    .and_then(|(s, _)| s.trim().parse::<f64>().ok());
             } else if let Some(rest) = line.strip_prefix("Decode: ") {
                 // `Decode: 310 tok/s (...)`: the measured decode rate.
                 if let Some(rate) = rest
@@ -176,17 +192,22 @@ impl InferStream {
     }
 }
 
-/// Length of the longest suffix of `text` that is a proper prefix of the
-/// footer marker.
-fn footer_prefix_len(text: &str) -> usize {
-    (1..FOOTER.len())
+/// Length of the longest suffix of `text` that is a proper prefix of `marker`.
+fn partial_marker_len(text: &str, marker: &str) -> usize {
+    (1..marker.len())
         .rev()
         .find(|&n| {
             text.len() >= n
                 && text.is_char_boundary(text.len() - n)
-                && FOOTER.starts_with(&text[text.len() - n..])
+                && marker.starts_with(&text[text.len() - n..])
         })
         .unwrap_or(0)
+}
+
+/// Length of the longest suffix of `text` that is a proper prefix of the
+/// footer marker.
+fn footer_prefix_len(text: &str) -> usize {
+    partial_marker_len(text, FOOTER)
 }
 
 /// A generation's text split into the model's reasoning and its answer.
@@ -200,6 +221,26 @@ pub fn split_reasoning(text: &str) -> (Option<&str>, &str) {
     match body.split_once(ANSWER_LABEL) {
         Some((thinking, answer)) => (Some(thinking), answer),
         None => (Some(body), ""),
+    }
+}
+
+/// [`split_reasoning`] for text that is still arriving: what could yet turn
+/// out to be the start of a label is held back, so the reasoning never shows
+/// half of the `[answer]` label that ends it, and a reply that opens with
+/// half of the `[thinking]` label shows nothing yet.
+pub fn split_reasoning_streaming(text: &str) -> (Option<&str>, &str) {
+    if !text.is_empty() && text.len() < THINKING_LABEL.len() && THINKING_LABEL.starts_with(text) {
+        return (None, "");
+    }
+    let Some(body) = text.strip_prefix(THINKING_LABEL) else {
+        return (None, text);
+    };
+    match body.split_once(ANSWER_LABEL) {
+        Some((thinking, answer)) => (Some(thinking), answer),
+        None => {
+            let settled = body.len() - partial_marker_len(body, ANSWER_LABEL);
+            (Some(&body[..settled]), "")
+        }
     }
 }
 
@@ -332,5 +373,44 @@ mod tests {
         let text = format!("{THINKING_LABEL}hmm");
         assert_eq!(split_reasoning(&text), (Some("hmm"), ""));
         assert_eq!(split_reasoning("just an answer"), (None, "just an answer"));
+    }
+
+    #[test]
+    fn streaming_reasoning_never_shows_half_a_label() {
+        // The reply opens with part of the thinking label: nothing is known yet.
+        for cut in 1..THINKING_LABEL.len() {
+            assert_eq!(
+                split_reasoning_streaming(&THINKING_LABEL[..cut]),
+                (None, "")
+            );
+        }
+        assert_eq!(
+            split_reasoning_streaming("[th is text"),
+            (None, "[th is text")
+        );
+        // The answer label arriving: the reasoning stops short of it.
+        let whole = format!("{THINKING_LABEL}plan{ANSWER_LABEL}Paris");
+        let at = THINKING_LABEL.len() + "plan".len();
+        for cut in at..whole.len() {
+            let (thinking, answer) = split_reasoning_streaming(&whole[..cut]);
+            assert_eq!(thinking, Some("plan"), "cut {cut}");
+            assert!("Paris".starts_with(answer), "cut {cut}: {answer:?}");
+        }
+        assert_eq!(split_reasoning_streaming(&whole), (Some("plan"), "Paris"));
+        // Text that is not reasoning is all answer, as it arrives.
+        assert_eq!(split_reasoning_streaming("Par"), (None, "Par"));
+    }
+
+    #[test]
+    fn the_footer_gives_the_time_to_the_first_token() {
+        let stream = read_in_pieces(&output("Generating...", "x", FOOTER_TEXT), 9);
+        let stats = stream.stats();
+        assert_eq!(stats.first_token_seconds, Some(0.20));
+        assert_eq!(stats.generating_seconds, 1.50);
+        let stream = read_in_pieces(
+            &output("Generating...", "x", "Generated 30 tokens in 2.00s\n"),
+            9,
+        );
+        assert_eq!(stream.stats().first_token_seconds, None);
     }
 }

@@ -11,6 +11,7 @@
 //! and the convolution state is the last inputs of the kept prefix.
 
 use crate::InlineArray;
+use crate::{RuntimeError, RuntimeResult};
 
 use super::cache::NativeCache;
 use super::forward::rollback_cache;
@@ -41,27 +42,29 @@ pub fn rewind_verify(
     replays: &[GdnReplay],
     verified: i32,
     accepted: i32,
-) -> Result<(), String> {
+) -> RuntimeResult<()> {
     if accepted >= verified {
         return Ok(());
     }
     if accepted < 0 {
-        return Err(format!("rewind_verify: accepted {accepted} of {verified}"));
+        return Err(RuntimeError::Config(format!(
+            "rewind_verify: accepted {accepted} of {verified}"
+        )));
     }
     if replays.len() != cache.gdn_caches.len() {
-        return Err(format!(
+        return Err(RuntimeError::Config(format!(
             "rewind_verify: {} GDN replays for {} GDN layers",
             replays.len(),
             cache.gdn_caches.len()
-        ));
+        )));
     }
     rollback_cache(cache, verified - accepted);
     for (layer, replay) in cache.gdn_caches.iter_mut().zip(replays) {
         let block = replay.keys.dim(1);
         if block != verified {
-            return Err(format!(
+            return Err(RuntimeError::Config(format!(
                 "rewind_verify: a replay holds {block} tokens, the verify {verified}"
-            ));
+            )));
         }
         let prefix = |x: &InlineArray| {
             let mut stop = x.shape().to_vec();
@@ -78,7 +81,7 @@ pub fn rewind_verify(
                 &prefix(&replay.g),
                 &prefix(&replay.beta),
             )
-            .map_err(|e| format!("rewind_verify: {e}"))?
+            .map_err(|e| RuntimeError::Config(format!("rewind_verify: {e}")))?
         });
         let (b, cd) = (replay.conv_input.dim(0), replay.conv_input.dim(2));
         layer.conv_state = Some(replay.conv_input.slice(

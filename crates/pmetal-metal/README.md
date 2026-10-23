@@ -10,7 +10,6 @@ It sits under the training and inference crates: `pmetal-trainer`, `pmetal-model
 
 ## Features
 
-- **Fused AdamW**: one-dispatch optimizer update over every parameter
 - **dW GEMM**: the f32 weight-gradient GEMM the ANE trainer batches into one command buffer
 - **Apple Neural Engine**: MIL program generation, IOSurface transfer, a compile-once training loop and the `AneLm` inference engine (prefill, decode and speculative verification on one set of kernels)
 - **CPU helpers**: vDSP and cblas wrappers (`accelerate`) and NEON f16/f32 bulk conversion (`neon_convert`)
@@ -25,7 +24,7 @@ pmetal-metal/
 │   ├── buffer.rs         # Type-safe GPU buffer abstraction
 │   ├── view.rs           # Zero-copy Metal views of runtime arrays
 │   ├── pipeline.rs       # Compute pipeline management
-│   ├── accelerate.rs     # vDSP/cblas wrappers (RMSNorm, Adam, GEMM, etc.)
+│   ├── accelerate.rs     # vDSP/cblas wrappers (RMSNorm, GEMM, etc.)
 │   ├── neon_convert.rs   # NEON f16 <-> f32 bulk conversion
 │   ├── kernels/
 │   │   ├── metal/        # .metal shader source files
@@ -73,28 +72,20 @@ pmetal-metal = "0.7"
 queue and pipeline cache are shared.
 
 ```rust,no_run
-use pmetal_metal::kernels::{AdamWConfig, FusedAdamW};
+use pmetal_metal::kernels::{BatchedCommandBuffer, DwGemm};
 use pmetal_metal::{BufferUsage, MetalBuffer, MetalContext, Result};
 
-fn adamw_step() -> Result<()> {
+fn weight_gradient() -> Result<()> {
     let ctx = MetalContext::global()?;
+    let (m, n, k) = (512, 256, 64);
+    let buffer = |len| MetalBuffer::<f32>::zeros(&ctx, len, BufferUsage::Shared);
+    let (a, b, c) = (buffer(m * k)?, buffer(n * k)?, buffer(m * n)?);
 
-    // Two parameters, flattened into one buffer each for the weights, the
-    // gradients and the two moments.
-    let sizes = [4096, 1024];
-    let total: usize = sizes.iter().sum();
-    let buffer = || MetalBuffer::<f32>::zeros(&ctx, total, BufferUsage::Shared);
-    let (params, grads, m, v) = (buffer()?, buffer()?, buffer()?, buffer()?);
-
-    let adamw = FusedAdamW::new(ctx.clone(), &sizes)?;
-    let info = MetalBuffer::from_slice(
-        &ctx,
-        &FusedAdamW::build_param_info(&sizes),
-        BufferUsage::Shared,
-    )?;
-    // One set of scalars per parameter group; step 1 of a 1e-4 run.
-    let groups = [AdamWConfig::default().scalars()?];
-    adamw.execute_update(&params, &grads, &m, &v, &info, &groups)
+    // Encode `C += A @ Bᵀ` for as many gradients as needed, then wait once.
+    let gemm = DwGemm::new(ctx.clone())?;
+    let mut batch = BatchedCommandBuffer::new(ctx.clone())?;
+    gemm.queue_gemm_accum(&mut batch, &a, &b, &c, m, n, k, 1.0, 1.0)?;
+    batch.execute()
 }
 ```
 
@@ -102,8 +93,9 @@ fn adamw_step() -> Result<()> {
 
 | Kernel | Memory | Description |
 |--------|--------|-------------|
-| `fused_training` | Same | One-dispatch AdamW over every parameter |
-| `dw_gemm` | Same | f32 weight-gradient GEMM for the ANE trainer |
+| `dw_gemm` | Shared | f32 weight-gradient GEMM for the ANE trainer |
+
+The AdamW update is not here: it is one fused kernel inside `pmetal-runtime`'s `AdamW`.
 
 ## Requirements
 

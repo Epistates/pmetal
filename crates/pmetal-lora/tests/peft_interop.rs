@@ -8,9 +8,9 @@
 
 mod common;
 
+use pmetal_runtime::compat::FlattenedModuleParam;
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
-use std::rc::Rc;
 
 use common::{cases, input_ids};
 use pmetal_cache::test_utils::max_abs_diff;
@@ -52,9 +52,8 @@ fn drain() {
 fn trained(config_json: &str, config: LoraConfig) -> AdaptedModel {
     let mut model = AdaptedModel::attach(build(config_json), config).expect("attach");
     random::seed(5);
-    let mut params: Vec<_> = model.lora_parameters().into_iter().collect();
-    params.sort_by(|a, b| a.0.cmp(&b.0));
-    let set: HashMap<Rc<str>, Array> = params
+    let params = model.lora_parameters();
+    let set: FlattenedModuleParam = params
         .into_iter()
         .map(|(name, p)| {
             let fresh = if name.ends_with(".lora_magnitude") {

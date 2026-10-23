@@ -9,7 +9,7 @@
 
 use pmetal_runtime::compat::{Array, ModuleParameters, ModuleParametersExt};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use super::LoadError;
@@ -41,7 +41,7 @@ const NAMESPACE_PROBE_KEYS: usize = 8;
 /// or when two prefixes explain them equally well — which leaves the mismatch
 /// for [`LoadReport`] to report rather than papering over it with a guess.
 fn detect_namespace_prefix(
-    params: &HashMap<String, &mut Array>,
+    params: &BTreeMap<String, &mut Array>,
     loaded: &HashMap<String, Array>,
 ) -> Option<String> {
     let explains = |prefix: &str| -> usize {
@@ -595,7 +595,7 @@ mod tests {
 
     /// Build a `flatten_params_mut`-shaped map without a real module, so the
     /// namespace probe can be exercised on layouts no architecture ships.
-    fn param_map<'a>(names: &[&str], slots: &'a mut [Array]) -> HashMap<String, &'a mut Array> {
+    fn param_map<'a>(names: &[&str], slots: &'a mut [Array]) -> BTreeMap<String, &'a mut Array> {
         assert_eq!(names.len(), slots.len());
         names
             .iter()

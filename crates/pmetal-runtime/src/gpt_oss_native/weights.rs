@@ -11,6 +11,7 @@
 use crate::InlineArray;
 use crate::native_checkpoint::Checkpoint;
 use crate::native_weight::{EmbeddingWeight, LayerWeight, copy_fresh_arr};
+use crate::{RuntimeError, RuntimeResult};
 
 use super::{AttentionLayerType, GptOssConfig, GptOssExperts};
 
@@ -117,7 +118,7 @@ impl std::fmt::Debug for NativeWeights {
 pub fn load_model(
     model_dir: &std::path::Path,
     config: &GptOssConfig,
-) -> Result<NativeWeights, String> {
+) -> RuntimeResult<NativeWeights> {
     let mut ckpt = Checkpoint::open("gpt_oss", model_dir, |key| Some(key.to_string()))?;
     let model_dtype = ckpt.dtype();
 
@@ -197,7 +198,7 @@ pub fn load_model(
         });
 
         if li == 0 {
-            eprintln!(
+            tracing::info!(
                 "[GPT-OSS] layer 0: type={:?} n_heads={n_heads} n_kv={n_kv_heads} \
                  head_dim={head_dim} experts={n_experts} top_k={top_k}",
                 layer_type,
@@ -213,12 +214,12 @@ pub fn load_model(
         .filter(|k| k.starts_with("model.layers."))
         .collect();
     if !unread.is_empty() {
-        return Err(format!(
+        return Err(RuntimeError::Weights(format!(
             "gpt_oss: {} checkpoint tensors in the layers are not part of the model this \
-             engine runs, first: {:?}",
+         engine runs, first: {:?}",
             unread.len(),
             &unread[..unread.len().min(5)]
-        ));
+        )));
     }
 
     // Force every weight into a fresh, contiguous Metal buffer (the expert
@@ -256,9 +257,9 @@ pub fn load_model(
         lw.moe_experts = lw.moe_experts.copy_fresh(&zero);
     }
     crate::check_unobserved_error()
-        .map_err(|e| format!("gpt_oss: loading the weights failed: {e}"))?;
+        .map_err(|e| RuntimeError::Weights(format!("gpt_oss: loading the weights failed: {e}")))?;
 
-    eprintln!("[GPT-OSS] load_model: all weights force-copied into fresh Metal buffers");
+    tracing::info!("[GPT-OSS] load_model: all weights force-copied into fresh Metal buffers");
 
     Ok(NativeWeights {
         embed_w,

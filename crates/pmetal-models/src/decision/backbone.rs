@@ -26,16 +26,16 @@ pub(crate) enum Backbone {
 
 impl Backbone {
     pub(crate) fn load(dir: &Path) -> Result<Self, DecisionError> {
-        let load_error = |e: String| DecisionError::Load(format!("backbone: {e}"));
+        let load_error = |e: &dyn std::fmt::Display| DecisionError::Load(format!("backbone: {e}"));
         if runs_natively(dir) {
-            let config = qwen3_native::load_config(dir).map_err(load_error)?;
-            let weights = qwen3_native::load_model(dir, &config).map_err(load_error)?;
+            let config = qwen3_native::load_config(dir).map_err(|e| load_error(&e))?;
+            let weights = qwen3_native::load_model(dir, &config).map_err(|e| load_error(&e))?;
             return Ok(Self::Native {
                 weights: Box::new(weights),
                 config: Box::new(config),
             });
         }
-        let model = DynamicModel::load(dir).map_err(|e| load_error(e.to_string()))?;
+        let model = DynamicModel::load(dir).map_err(|e| load_error(&e))?;
         Ok(Self::Dynamic(Box::new(model)))
     }
 

@@ -3,12 +3,9 @@
 //! This trait provides a common interface for models that can be trained
 //! with gradient descent, supporting both standard LoRA and QLoRA.
 
-use std::collections::HashMap;
-use std::rc::Rc;
-
 use pmetal_cache::kv_cache::KVCache;
-use pmetal_runtime::compat::Array;
 use pmetal_runtime::compat::ModuleParameters;
+use pmetal_runtime::compat::{Array, FlattenedModuleParam};
 
 use crate::LoraError;
 
@@ -220,12 +217,12 @@ pub trait TrainableModel: ModuleParameters {
     /// Get all LoRA parameters as a flat HashMap.
     ///
     /// This is used for checkpointing and saving adapters.
-    fn lora_parameters(&self) -> HashMap<Rc<str>, Array>;
+    fn lora_parameters(&self) -> FlattenedModuleParam;
 
     /// Set LoRA parameters from a HashMap.
     ///
     /// This is used for restoring from checkpoints.
-    fn set_lora_parameters(&mut self, params: &HashMap<Rc<str>, Array>);
+    fn set_lora_parameters(&mut self, params: &FlattenedModuleParam);
 
     /// Save LoRA weights to a safetensors file, in PEFT's layout.
     fn save_lora_weights(&self, path: impl AsRef<std::path::Path>) -> Result<(), LoraError>;

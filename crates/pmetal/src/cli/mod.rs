@@ -63,6 +63,49 @@ pub struct Cli {
     pub command: Commands,
 }
 
+impl Cli {
+    /// Parse `args`, and say which flags of the chosen subcommand were given
+    /// (spelled `--like-this`), as opposed to left at their defaults.
+    ///
+    /// A setting has three sources: a flag given, a config file, the default.
+    /// A default must not override the file, and a flag given its default's
+    /// value must; only the parser knows which is which (`clap`'s
+    /// `value_source`), so it says so here for the commands that merge a file.
+    pub fn parse_with_given_flags(
+        args: impl IntoIterator<Item = std::ffi::OsString>,
+    ) -> Result<(Self, std::collections::BTreeSet<String>), clap::Error> {
+        use clap::{CommandFactory, FromArgMatches, parser::ValueSource};
+        let command = Self::command();
+        let matches = command.clone().try_get_matches_from(args)?;
+        let cli = Self::from_arg_matches(&matches)?;
+        let given = matches
+            .subcommand()
+            .and_then(|(name, sub)| Some((command.find_subcommand(name)?, sub)))
+            .map(|(definition, sub)| {
+                sub.ids()
+                    .filter(|id| {
+                        sub.value_source(id.as_str())
+                            .is_some_and(|source| source != ValueSource::DefaultValue)
+                    })
+                    .filter_map(|id| {
+                        let argument = definition.get_arguments().find(|a| a.get_id() == id)?;
+                        Some(format!("--{}", argument.get_long()?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok((cli, given))
+    }
+
+    /// [`parse_with_given_flags`](Self::parse_with_given_flags) on the process's
+    /// own arguments; a usage error or `--help` ends the process as clap does.
+    pub fn parse_from_env() -> (Self, std::collections::BTreeSet<String>) {
+        use clap::CommandFactory;
+        Self::parse_with_given_flags(std::env::args_os())
+            .unwrap_or_else(|e| e.format(&mut Self::command()).exit())
+    }
+}
+
 #[derive(Subcommand, Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum Commands {
@@ -357,7 +400,7 @@ pub enum Commands {
         json: bool,
     },
 
-    /// Merge two or more models using various merge methods (SLERP, TIES, DARE, linear, etc.)
+    /// Merge two models with SLERP, TIES, DARE, linear, task arithmetic and other methods
     #[cfg(feature = "merge")]
     Merge(crate::cli::merge::MergeArgs),
 
@@ -392,20 +435,40 @@ pub enum Commands {
 }
 
 impl Commands {
-    /// Whether this command writes the `--log-events` file: the trainers that
-    /// run under `commands::with_run_context`. The others (`pretrain`,
-    /// `embed-train`, `train-mtp`, `train-draft`, `train-diffusion`) take no
-    /// event log, and `main` refuses the flag for them.
+    /// Whether this command writes the `--log-events` file. A spec says so
+    /// itself (`#[spec(events)]`, `JobFields::REPORTS_EVENTS`): the same fact
+    /// every surface that starts a job asks the file by, so the one list is the
+    /// specs'. `main` refuses the flag for a command that writes no event log.
     #[cfg(feature = "trainer")]
     pub fn writes_event_log(&self) -> bool {
-        matches!(
-            self,
-            Commands::Train(_)
-                | Commands::Distill(_)
-                | Commands::Grpo(_)
-                | Commands::Rlkd(_)
-                | Commands::Preference(_)
-        )
+        use pmetal_core::JobFields;
+        use pmetal_core::jobs::{DistillSpec, GrpoSpec, PreferenceSpec, RlkdSpec, TrainSpec};
+        match self {
+            Commands::Train(_) => TrainSpec::REPORTS_EVENTS,
+            Commands::Distill(_) => DistillSpec::REPORTS_EVENTS,
+            Commands::Grpo(_) => GrpoSpec::REPORTS_EVENTS,
+            Commands::Rlkd(_) => RlkdSpec::REPORTS_EVENTS,
+            Commands::Preference(_) => PreferenceSpec::REPORTS_EVENTS,
+            _ => false,
+        }
+    }
+
+    /// The commands that write the `--log-events` file, by name, for the
+    /// message that refuses the flag to the others.
+    #[cfg(feature = "trainer")]
+    pub fn event_log_commands() -> Vec<&'static str> {
+        use pmetal_core::JobFields;
+        use pmetal_core::jobs::{DistillSpec, GrpoSpec, PreferenceSpec, RlkdSpec, TrainSpec};
+        [
+            (TrainSpec::subcommand(), TrainSpec::REPORTS_EVENTS),
+            (DistillSpec::subcommand(), DistillSpec::REPORTS_EVENTS),
+            (GrpoSpec::subcommand(), GrpoSpec::REPORTS_EVENTS),
+            (RlkdSpec::subcommand(), RlkdSpec::REPORTS_EVENTS),
+            (PreferenceSpec::subcommand(), PreferenceSpec::REPORTS_EVENTS),
+        ]
+        .into_iter()
+        .filter_map(|(name, writes)| writes.then_some(name))
+        .collect()
     }
 
     /// Whether this command runs anything on MLX. The ones that don't skip the
@@ -430,6 +493,53 @@ impl Commands {
 
 #[cfg(test)]
 mod doc_examples;
+
+#[cfg(all(test, feature = "trainer"))]
+mod given_flags_tests {
+    use super::Cli;
+
+    fn given(args: &[&str]) -> Vec<String> {
+        let mut full = vec!["pmetal"];
+        full.extend_from_slice(args);
+        let (_, flags) =
+            Cli::parse_with_given_flags(full.into_iter().map(Into::into)).expect("parses");
+        flags.into_iter().collect()
+    }
+
+    /// What the parser says was given is what the config file yields to:
+    /// a flag given its default's value counts, a default does not.
+    #[test]
+    fn a_flag_given_is_told_from_a_default() {
+        assert_eq!(
+            given(&["train", "-m", "m", "-d", "d"]),
+            ["--dataset", "--model"]
+        );
+        assert_eq!(
+            given(&["train", "-m", "m", "-d", "d", "--epochs", "1", "--dora"]),
+            ["--dataset", "--dora", "--epochs", "--model"]
+        );
+        // Whatever the subcommand has none of is nothing, and so is no subcommand.
+        assert!(given(&["info"]).is_empty());
+    }
+
+    /// Every flag of `train` that `FILE_KEYS` names is a real flag the parser
+    /// reports when given, so a key can never be waiting on a flag that does
+    /// not exist.
+    #[test]
+    fn every_file_key_flag_is_a_flag_of_train() {
+        use clap::CommandFactory;
+        let command = Cli::command();
+        let train = command.find_subcommand("train").unwrap();
+        for (flag, _, _) in pmetal_core::jobs::FILE_KEYS {
+            assert!(
+                train
+                    .get_arguments()
+                    .any(|a| a.get_long().map(|l| format!("--{l}")).as_deref() == Some(*flag)),
+                "{flag}"
+            );
+        }
+    }
+}
 
 #[cfg(all(test, feature = "trainer"))]
 mod event_log_tests {
@@ -499,3 +609,5 @@ mod argv_roundtrip;
 mod mcp_tools;
 #[cfg(test)]
 mod parity;
+#[cfg(all(test, feature = "mcp", feature = "trainer", feature = "dashboard"))]
+mod surfaces;

@@ -20,6 +20,7 @@
 // for crates that consume their own derive macro.
 extern crate self as pmetal_core;
 
+pub mod adamw;
 mod config;
 mod config_file;
 pub mod constants;
@@ -27,11 +28,16 @@ pub mod control;
 mod error;
 pub mod events;
 pub mod fields;
+pub mod format;
 pub mod jobs;
+pub mod logging;
 pub mod model_type;
 pub mod paths;
+pub mod safetensors_index;
 pub mod scheduler;
 mod secrets;
+pub mod sync;
+mod training_info;
 mod traits;
 mod types;
 mod validation;
@@ -51,6 +57,7 @@ pub use fields::{
 };
 pub use scheduler::{LearningRateScheduler, total_training_steps, warmup_steps_for};
 pub use secrets::SecretString;
+pub use training_info::{TRAINING_INFO_FILE, TrainingInfo};
 pub use traits::*;
 pub use types::*;
 

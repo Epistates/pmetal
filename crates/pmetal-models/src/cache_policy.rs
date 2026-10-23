@@ -436,21 +436,13 @@ fn model_uses_weight_scale_inv_fp8(model_path: &Path) -> bool {
         }
     }
 
-    let index_path = model_path.join("model.safetensors.index.json");
-    let Ok(content) = std::fs::read_to_string(index_path) else {
-        return false;
-    };
-    let Ok(index) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return false;
-    };
-    index
-        .get("weight_map")
-        .and_then(serde_json::Value::as_object)
-        .is_some_and(|weight_map| {
-            weight_map
-                .keys()
-                .any(|key| key.ends_with("weight_scale_inv"))
-        })
+    let index_path = model_path.join(pmetal_core::safetensors_index::INDEX_FILE);
+    pmetal_core::safetensors_index::ShardIndex::read(&index_path).is_ok_and(|index| {
+        index
+            .weight_map
+            .keys()
+            .any(|key| key.ends_with("weight_scale_inv"))
+    })
 }
 
 fn json_quantization_config_is_fp8(value: Option<&serde_json::Value>) -> bool {

@@ -1,5 +1,6 @@
 //! `pmetal pretrain` — full-parameter pretraining (no LoRA).
 
+use super::default_seed;
 use crate::{FieldError, JobFields};
 use pmetal_core_derive::JobSpec;
 use serde::{Deserialize, Serialize};
@@ -302,9 +303,6 @@ fn default_log_every() -> usize {
 fn default_eval_batches() -> usize {
     10
 }
-fn default_seed() -> u64 {
-    42
-}
 
 #[cfg(test)]
 mod tests {
@@ -314,6 +312,7 @@ mod tests {
     fn argv_round_trip() {
         let spec = PretrainSpec {
             arch: "gpt-oss".into(),
+            steps: 7,
             ..Default::default()
         };
         let argv = spec.to_argv();

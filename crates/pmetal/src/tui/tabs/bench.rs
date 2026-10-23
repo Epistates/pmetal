@@ -284,7 +284,7 @@ impl FormTab for BenchTab {
         if self.is_workload() {
             self.workload_plan()
         } else {
-            self.panel.plan_for::<BenchSpec>(|_, _| {})
+            self.panel.plan_for::<BenchSpec>()
         }
     }
 

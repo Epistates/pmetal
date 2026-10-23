@@ -57,9 +57,105 @@ pub fn output_path(path: &str, what: &str) -> Result<PathBuf> {
     Ok(clean)
 }
 
+/// Where `path` is, when relative paths are relative to `dir`: an absolute
+/// `path` as it is, anything else beneath `dir`.
+///
+/// The rule for every file a command writes into its output directory
+/// (`--log-metrics`): the same answer for the command that writes the file and
+/// for whatever follows it.
+pub fn resolve_in(dir: &Path, path: &str) -> PathBuf {
+    let path = expand_home(path);
+    if path.is_absolute() {
+        path
+    } else {
+        dir.join(path)
+    }
+}
+
+/// The folder name the Hub's cache gives a repository: `models--owner--name`
+/// (`kind` is the prefix, `models` or `datasets`; the `/` of the id is written
+/// `--`). The one place the encoding is spelled.
+pub fn hub_repo_folder(kind: &str, repo_id: &str) -> String {
+    format!("{kind}--{}", repo_id.replace('/', "--"))
+}
+
+/// The repository id of a cache folder of `kind` (`models--owner--name` is
+/// `owner/name`), or `None` for a folder of another kind. Only the first `--`
+/// is the owner's: names may contain `--`.
+pub fn hub_repo_id(kind: &str, folder: &str) -> Option<String> {
+    let encoded = folder.strip_prefix(kind)?.strip_prefix("--")?;
+    Some(encoded.replacen("--", "/", 1))
+}
+
+/// `~` and `~/x` spelled out against the home directory; anything else (a
+/// `~user` path included) as it was.
+pub fn expand_home(text: &str) -> PathBuf {
+    if text == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+    }
+    if let Some(rest) = text.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
+    }
+    PathBuf::from(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_relative_path_is_beneath_the_directory_and_an_absolute_one_is_not() {
+        let dir = Path::new("/runs/a");
+        assert_eq!(
+            resolve_in(dir, "metrics.jsonl"),
+            PathBuf::from("/runs/a/metrics.jsonl")
+        );
+        assert_eq!(
+            resolve_in(dir, "logs/m.jsonl"),
+            PathBuf::from("/runs/a/logs/m.jsonl")
+        );
+        assert_eq!(
+            resolve_in(dir, "/elsewhere/m.jsonl"),
+            PathBuf::from("/elsewhere/m.jsonl")
+        );
+    }
+
+    #[test]
+    fn a_hub_cache_folder_and_its_repository_id_are_each_others_encoding() {
+        assert_eq!(
+            hub_repo_folder("models", "Qwen/Qwen3-0.6B"),
+            "models--Qwen--Qwen3-0.6B"
+        );
+        assert_eq!(hub_repo_folder("datasets", "gpt2"), "datasets--gpt2");
+        assert_eq!(
+            hub_repo_id("models", "models--Qwen--Qwen3-0.6B").as_deref(),
+            Some("Qwen/Qwen3-0.6B")
+        );
+        // A bare name has no owner; a name with `--` in it keeps it.
+        assert_eq!(
+            hub_repo_id("models", "models--gpt2").as_deref(),
+            Some("gpt2")
+        );
+        assert_eq!(
+            hub_repo_id("models", "models--o--a--b").as_deref(),
+            Some("o/a--b")
+        );
+        assert_eq!(hub_repo_id("models", "datasets--o--d"), None);
+        assert_eq!(hub_repo_id("models", "modelsx--o"), None);
+    }
+
+    #[test]
+    fn a_leading_tilde_is_the_home_directory() {
+        let home = dirs::home_dir().expect("a home directory");
+        assert_eq!(expand_home("~"), home);
+        assert_eq!(expand_home("~/models/a"), home.join("models/a"));
+        // Not the current user's home, and not a tilde at the start.
+        assert_eq!(expand_home("~other/x"), PathBuf::from("~other/x"));
+        assert_eq!(expand_home("a/~/b"), PathBuf::from("a/~/b"));
+        assert_eq!(expand_home("/abs"), PathBuf::from("/abs"));
+    }
 
     /// `..` is a path like any other, and a directory that does not exist yet
     /// is created: what `--output ../models/out.gguf` means.

@@ -88,8 +88,7 @@ fn label(dir: &Path) -> String {
     let text = dir.to_string_lossy();
     if let Some(repo) = text
         .split('/')
-        .find(|part| part.starts_with("models--"))
-        .map(|part| part.trim_start_matches("models--").replace("--", "/"))
+        .find_map(|part| pmetal_core::paths::hub_repo_id("models", part))
     {
         return repo;
     }

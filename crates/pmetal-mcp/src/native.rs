@@ -64,7 +64,7 @@ impl Core {
                 }
             }
         };
-        util::run_pmetal(self.jobs.binary(), argv, ctx).await
+        self.jobs.run(argv, ctx).await
     }
 }
 
@@ -255,9 +255,7 @@ async fn download_model(_core: &Core, args: Value, ctx: &RequestContext) -> McpR
             Verify::Sha256 => pmetal_hub::Verification::Sha256,
         },
         progress: Some(Arc::new(move |p: &pmetal_hub::TransferProgress| {
-            *sink
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(p.clone());
+            *pmetal_core::sync::locked(&sink) = Some(p.clone());
         })),
         ..pmetal_hub::DownloadOptions::default()
     };
@@ -288,17 +286,14 @@ async fn download_model(_core: &Core, args: Value, ctx: &RequestContext) -> McpR
                     return Err(McpError::cancelled("the download was cancelled"));
                 }
                 if ctx.wants_progress() {
-                    let snapshot = progress
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clone();
+                    let snapshot = pmetal_core::sync::locked(&progress).clone();
                     if let Some(p) = snapshot {
                         let message = format!(
                             "{} of {} files, {} of {}{}",
                             p.files_done,
                             p.total_files,
-                            pmetal_hub::fit::format_bytes(p.bytes_done),
-                            pmetal_hub::fit::format_bytes(p.total_bytes),
+                            pmetal_core::format::human_size(p.bytes_done),
+                            pmetal_core::format::human_size(p.total_bytes),
                             p.current_file.as_deref().map(|f| format!(", {f}")).unwrap_or_default(),
                         );
                         let _ = ctx
@@ -321,61 +316,27 @@ async fn list_local_models(_core: &Core, args: Value) -> McpResult<ToolResult> {
     parse::<NoArgs>(args)?;
     let models = tokio::task::spawn_blocking(|| {
         let cache = pmetal_hub::cache_dir();
-        let mut models = Vec::new();
-        let Ok(entries) = std::fs::read_dir(&cache) else {
-            return models;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Some(folder) = name.strip_prefix("models--") else {
-                continue;
-            };
-            let model_id = folder.replace("--", "/");
-            let snapshots: Vec<String> = std::fs::read_dir(entry.path().join("snapshots"))
-                .map(|d| {
-                    d.flatten()
-                        .map(|e| e.file_name().to_string_lossy().into_owned())
-                        .filter(|n| !n.starts_with('.'))
-                        .collect()
+        // The models the Hub cache holds a finished snapshot of, as every
+        // other surface lists them; a partial download is not a model yet.
+        pmetal_hub::list_cached_models_in(&cache)
+            .into_iter()
+            .map(|model| {
+                json!({
+                    "model_id": model.repo_id,
+                    "path": model.snapshot.display().to_string(),
+                    "complete": true,
+                    "snapshots": pmetal_hub::local::cached_snapshots(&cache, &model.repo_id),
+                    "size_gb": pmetal_hub::local::dir_size(&model.snapshot) as f64
+                        / (1024.0 * 1024.0 * 1024.0),
                 })
-                .unwrap_or_default();
-            if snapshots.is_empty() {
-                continue;
-            }
-            let loadable = pmetal_hub::find_cached_model(&model_id);
-            models.push(json!({
-                "model_id": model_id,
-                "path": loadable.as_ref().map(|p| p.display().to_string()),
-                "complete": loadable.is_some(),
-                "snapshots": snapshots,
-                "size_gb": dir_size(&entry.path()) as f64 / (1024.0 * 1024.0 * 1024.0),
-            }));
-        }
-        models.sort_by(|a, b| a["model_id"].as_str().cmp(&b["model_id"].as_str()));
-        models
+            })
+            .collect::<Vec<Value>>()
     })
     .await
     .map_err(|e| McpError::internal(format!("listing the cache failed: {e}")))?;
     structured(
         &json!({ "cache_dir": pmetal_hub::cache_dir().display().to_string(), "models": models }),
     )
-}
-
-/// Total size of the regular files under `path`. Links are not followed.
-fn dir_size(path: &Path) -> u64 {
-    let mut size = 0;
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            if let Ok(m) = entry.metadata() {
-                if m.is_dir() {
-                    size += dir_size(&entry.path());
-                } else {
-                    size += m.len();
-                }
-            }
-        }
-    }
-    size
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

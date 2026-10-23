@@ -6,6 +6,7 @@
 
 use crate::InlineArray;
 use crate::compat::Dtype;
+use crate::{RuntimeError, RuntimeResult};
 
 use super::kernels::{self, PartialsArgs, param};
 use super::quantizer::Quantizer;
@@ -118,7 +119,7 @@ pub(super) fn decode_attention(
     values: &Quantizer,
     cold: Option<&ColdStore>,
     dense: &DenseStore,
-) -> Result<InlineArray, String> {
+) -> RuntimeResult<InlineArray> {
     let DecodeShape {
         batch,
         q_heads,
@@ -127,9 +128,9 @@ pub(super) fn decode_attention(
         value_dim,
     } = *shape;
     if kv_heads == 0 || q_heads % kv_heads != 0 {
-        return Err(format!(
+        return Err(RuntimeError::Config(format!(
             "TurboQuant: {q_heads} query heads is not a multiple of {kv_heads} KV heads"
-        ));
+        )));
     }
     let groups = q_heads / kv_heads;
     let cap = max_groups(dim, value_dim, keys.bits(), values.bits());
@@ -204,7 +205,7 @@ fn decode_attention_launch(
     values: &Quantizer,
     cold: Option<&ColdStore>,
     dense: &DenseStore,
-) -> Result<InlineArray, String> {
+) -> RuntimeResult<InlineArray> {
     let Visibility {
         first_token,
         sink_logits: sinks,
@@ -217,9 +218,9 @@ fn decode_attention_launch(
         value_dim,
     } = *shape;
     if kv_heads == 0 || q_heads % kv_heads != 0 {
-        return Err(format!(
+        return Err(RuntimeError::Config(format!(
             "TurboQuant: {q_heads} query heads is not a multiple of {kv_heads} KV heads"
-        ));
+        )));
     }
     let groups = q_heads / kv_heads;
     let n_rows = batch * q_heads;
@@ -231,10 +232,10 @@ fn decode_attention_launch(
     let visible_cold = cold_tokens - cold_first;
     let visible_dense = dense_tokens - dense_first;
     if visible_cold + visible_dense == 0 {
-        return Err(format!(
+        return Err(RuntimeError::Config(format!(
             "TurboQuant: no cached token to attend to ({} cached, attending from position {first_token})",
             cold_tokens + dense_tokens
-        ));
+        )));
     }
     let plan = plan_blocks(visible_cold, visible_dense, n_kv_rows);
 
@@ -324,8 +325,7 @@ fn decode_attention_launch(
         n_rows,
         n_kv_rows,
         n_blocks: plan.total_blocks,
-    })
-    .map_err(|e| e.to_string())?;
+    })?;
 
     let out = kernels::attention_merge(
         &partials,
@@ -337,7 +337,6 @@ fn decode_attention_launch(
         n_rows,
         plan.total_blocks,
         queries.dtype_raw(),
-    )
-    .map_err(|e| e.to_string())?;
+    )?;
     Ok(out.reshape(&[batch as i32, q_heads as i32, 1, value_dim as i32]))
 }

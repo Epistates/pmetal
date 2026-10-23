@@ -604,25 +604,16 @@ impl<W: Write + Send + Sync> JsonlSink<W> {
 
     /// The first error a write returned, if any, leaving none behind.
     pub fn take_error(&self) -> Option<io::Error> {
-        self.first_error
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
+        crate::sync::locked(&self.first_error).take()
     }
 }
 
 impl<W: Write + Send + Sync> JobEventSink for JsonlSink<W> {
     fn emit(&self, event: JobEvent) {
         // A writer that panicked mid-event leaves a usable writer behind.
-        let mut w = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut w = crate::sync::locked(&self.inner);
         if let Err(e) = write_event(&mut *w, &event) {
-            self.first_error
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get_or_insert(e);
+            crate::sync::locked(&self.first_error).get_or_insert(e);
         }
     }
 }
@@ -684,20 +675,9 @@ pub fn parse_event(line: &str) -> Result<JobEvent, ParseError> {
 }
 
 /// Error returned by [`parse_event`].
-#[derive(Debug)]
-pub struct ParseError(serde_json::Error);
-
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "failed to parse JobEvent JSONL line: {}", self.0)
-    }
-}
-
-impl std::error::Error for ParseError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.0)
-    }
-}
+#[derive(Debug, thiserror::Error)]
+#[error("failed to parse JobEvent JSONL line: {0}")]
+pub struct ParseError(#[source] serde_json::Error);
 
 // ---------------------------------------------------------------------------
 // Adapter: existing TrainingCallback → JobEventSink

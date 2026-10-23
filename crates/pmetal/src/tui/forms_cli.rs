@@ -77,7 +77,7 @@ fn every_form_launches_a_command_the_cli_parses() {
             .unwrap_or_else(|issues| panic!("{tab}: {issues:?}"));
         // A command this build was compiled without (the server needs
         // `--features serve`) cannot be parsed; the interface says so instead.
-        if plan.missing_command().is_some() {
+        if crate::tui::jobs::missing_command(&plan).is_some() {
             assert_eq!(
                 plan.subcommand, "serve",
                 "{tab} launches a command that is not in this build"

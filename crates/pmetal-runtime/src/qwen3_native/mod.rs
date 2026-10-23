@@ -21,6 +21,7 @@
 //!   * `speculative` — rewinding GDN layers to a verified block's accepted prefix
 //!   * [`generate`] — prefill/prime/generate loops + benchmarks
 
+use crate::{RuntimeError, RuntimeResult};
 use serde::Deserialize;
 
 mod attention;
@@ -93,16 +94,16 @@ pub(super) fn validate_quantization_runtime_support_for(
     bits: i32,
     mlx_kind: &str,
     mlx_git_tag: &str,
-) -> Result<(), String> {
+) -> RuntimeResult<()> {
     if mlx_kind == "bundled-upstream" && !bundled_mlx_supports_quant_bits(bits) {
-        return Err(format!(
+        return Err(RuntimeError::Config(format!(
             "This pmetal build uses bundled upstream MLX {mlx_git_tag}, whose Metal affine quantized kernels only support bits in {{2, 3, 4, 5, 6, 8}}. The requested model uses {bits}-bit quantization. Rebuild pmetal against a compatible libmlx by setting PMETAL_MLX_LIB_DIR to the directory containing libmlx.dylib before running `cargo build --release -p pmetal`. 1-bit checkpoints such as PrismML Bonsai require a 1-bit-capable MLX fork."
-        ));
+        )));
     }
     Ok(())
 }
 
-pub(super) fn validate_quantization_runtime_support(bits: i32) -> Result<(), String> {
+pub(super) fn validate_quantization_runtime_support(bits: i32) -> RuntimeResult<()> {
     validate_quantization_runtime_support_for(
         bits,
         option_env!("PMETAL_RUNTIME_MLX_KIND").unwrap_or("bundled-upstream"),
@@ -432,7 +433,7 @@ impl Qwen3Config {
     }
 
     /// Activation of the gated-delta-net output gate.
-    pub fn gdn_gate(&self) -> Result<family::GdnGateActivation, String> {
+    pub fn gdn_gate(&self) -> RuntimeResult<family::GdnGateActivation> {
         family::GdnGateActivation::resolve(self.output_gate_type.as_deref(), None)
     }
 
@@ -452,14 +453,14 @@ impl Qwen3Config {
 }
 
 /// Parse `config.json` from a model directory.
-pub fn load_config(model_dir: &std::path::Path) -> Result<Qwen3Config, String> {
+pub fn load_config(model_dir: &std::path::Path) -> RuntimeResult<Qwen3Config> {
     let text = crate::native_loader::read_config_json(model_dir)?;
     parse_config_text(&text)
 }
 
-pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
-    let json: serde_json::Value =
-        serde_json::from_str(text).map_err(|e| format!("failed to parse config.json: {e}"))?;
+pub(super) fn parse_config_text(text: &str) -> RuntimeResult<Qwen3Config> {
+    let json: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| RuntimeError::Config(format!("failed to parse config.json: {e}")))?;
 
     let text_model_type = json
         .get("text_config")
@@ -505,14 +506,14 @@ pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
                 }
             }
         }
-        serde_json::to_string(&tc).map_err(|e| e.to_string())?
+        serde_json::to_string(&tc).map_err(|e| RuntimeError::Config(e.to_string()))?
     } else {
         text.to_owned()
     };
 
     refuse_unrun_features(&config_str)?;
-    let mut cfg: Qwen3Config =
-        serde_json::from_str(&config_str).map_err(|e| format!("failed to parse config: {e}"))?;
+    let mut cfg: Qwen3Config = serde_json::from_str(&config_str)
+        .map_err(|e| RuntimeError::Config(format!("failed to parse config: {e}")))?;
     // MLX's per-module overrides, with their paths canonicalized the way the
     // loader canonicalizes tensor keys so the two match (#30).
     cfg.mlx_quantization = serde_json::from_str::<serde_json::Value>(&config_str)
@@ -558,7 +559,7 @@ pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
     // `rope_type` is refused rather than run as plain RoPE.
     if cfg.rotary.is_none() {
         let flat: serde_json::Value = serde_json::from_str(&config_str)
-            .map_err(|e| format!("failed to parse config: {e}"))?;
+            .map_err(|e| RuntimeError::Config(format!("failed to parse config: {e}")))?;
         cfg.rotary = Some(crate::rope::Rotary::from_config(
             cfg.get_head_dim(),
             crate::rope::RopeConfig::from_json(&flat),
@@ -577,21 +578,21 @@ pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
 ///   inert, as in transformers.
 /// * `attention_bias`: biases on the attention projections, which the loader
 ///   does not read.
-fn refuse_unrun_features(config: &str) -> Result<(), String> {
-    let value: serde_json::Value =
-        serde_json::from_str(config).map_err(|e| format!("failed to parse config: {e}"))?;
+fn refuse_unrun_features(config: &str) -> RuntimeResult<()> {
+    let value: serde_json::Value = serde_json::from_str(config)
+        .map_err(|e| RuntimeError::Config(format!("failed to parse config: {e}")))?;
     let on = |key: &str| value.get(key).and_then(serde_json::Value::as_bool) == Some(true);
     if on("use_sliding_window") {
-        return Err(
+        return Err(RuntimeError::Config(
             "use_sliding_window is not supported: the native engine attends over the whole \
              context in every layer"
                 .into(),
-        );
+        ));
     }
     if on("attention_bias") {
-        return Err(
+        return Err(RuntimeError::Config(
             "attention_bias is not supported: the attention projections load no biases".into(),
-        );
+        ));
     }
     Ok(())
 }
@@ -631,7 +632,7 @@ mod tests {
         assert_eq!(rope.dims(), 16);
         let err = parse_config_text(&config(r#"{"rope_type": "xpos", "factor": 2.0}"#))
             .expect_err("unknown type refused");
-        assert!(err.contains("xpos"), "{err}");
+        assert!(err.to_string().contains("xpos"), "{err}");
     }
 
     /// What the engine would silently drop is refused by name: windowed
@@ -654,7 +655,7 @@ mod tests {
             (r#", "attention_bias": true"#, "attention_bias"),
         ] {
             let err = parse_config_text(&config(extra)).expect_err(extra);
-            assert!(err.contains(needle), "{extra}: {err}");
+            assert!(err.to_string().contains(needle), "{extra}: {err}");
         }
         for extra in [
             r#", "use_sliding_window": false, "sliding_window": 4096"#,
@@ -669,7 +670,7 @@ mod tests {
             "num_key_value_heads": 2, "head_dim": 32, "linear_key_head_dim": 32,
             "attention_bias": true}}"#;
         let err = parse_config_text(nested).expect_err("Qwen3.5 attention_bias");
-        assert!(err.contains("attention_bias"), "{err}");
+        assert!(err.to_string().contains("attention_bias"), "{err}");
     }
 
     #[test]
@@ -924,8 +925,8 @@ mod tests {
     fn bundled_upstream_mlx_rejects_one_bit_quantization() {
         let err = validate_quantization_runtime_support_for(1, "bundled-upstream", "v0.31.1")
             .expect_err("1-bit should be rejected");
-        assert!(err.contains("PMETAL_MLX_LIB_DIR"));
-        assert!(err.contains("1-bit"));
+        assert!(err.to_string().contains("PMETAL_MLX_LIB_DIR"));
+        assert!(err.to_string().contains("1-bit"));
     }
 
     #[test]

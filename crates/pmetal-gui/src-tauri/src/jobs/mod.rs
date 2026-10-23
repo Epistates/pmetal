@@ -15,15 +15,15 @@ mod typegen;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use pmetal::core::SecretString;
 use pmetal::core::events::{JobEvent, MetricPayload};
+use pmetal::core::sync::locked;
 use pmetal_supervisor::{
-    Error as SupervisorError, Event, EventKind, JobId, JobRequest, Limits, ProcessStatus, Stream,
-    Supervisor,
+    Error as SupervisorError, Event, EventKind, JobId, Limits, ProcessStatus, Stream, Supervisor,
 };
 use serde::Serialize;
 use tokio::sync::broadcast::error::RecvError;
@@ -193,10 +193,6 @@ struct Shared {
     touched: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<JobId>>>,
 }
 
-fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 /// The app's jobs.
 #[derive(Clone)]
 pub struct JobHub {
@@ -283,7 +279,7 @@ impl JobHub {
                 if !running {
                     continue;
                 }
-                if let (Some(mine), Some(theirs)) = (&launch.output, &other.output)
+                if let (Some(mine), Some(theirs)) = (&launch.plan.output, &other.output)
                     && crate::paths::overlaps(mine, theirs)
                 {
                     return Err(StartError::Message(AppError::new(format!(
@@ -304,45 +300,28 @@ impl JobHub {
             }
         }
 
-        let request = JobRequest {
-            subcommand: launch.subcommand.clone(),
-            argv: launch.argv,
-            output: launch.output.clone(),
-            metrics_file: launch.metrics_file,
-            events_file: launch.events_file,
-            deltas: false,
-            env: token
-                .map(|t| vec![("HF_TOKEN".to_string(), t.expose_secret().to_string())])
-                .unwrap_or_default(),
-        };
-        let id = self.shared.supervisor.spawn(request).map_err(|e| match e {
-            SupervisorError::TooManyRunning { limit, .. } => StartError::Message(AppError::new(
-                format!("{limit} jobs are already running. Stop one, or wait for one to finish."),
-            )),
-            other => StartError::Message(AppError::new(format!(
-                "Could not start `pmetal {}`: {other}",
-                launch.subcommand
-            ))),
-        })?;
-        if let (Some(record), Some(out)) = (&launch.record, &launch.output) {
-            // The supervisor made the folder for the progress file.
-            let written = serde_json::to_string_pretty(record)
-                .map_err(std::io::Error::from)
-                .and_then(|text| std::fs::write(out.join("training_info.json"), text));
-            if let Err(e) = written {
-                tracing::warn!(
-                    "could not record what {} was trained from: {e}",
-                    out.display()
-                );
-            }
-        }
+        let subcommand = launch.plan.subcommand.clone();
+        let output = launch.plan.output.clone();
+        let env = token
+            .map(|t| vec![("HF_TOKEN".to_string(), t.expose_secret().to_string())])
+            .unwrap_or_default();
+        let id = self
+            .shared
+            .supervisor
+            .spawn(launch.plan.into_request_with_env(env))
+            .map_err(|e| match e {
+                SupervisorError::Io(_) => StartError::Message(AppError::new(format!(
+                    "Could not start `pmetal {subcommand}`: {e}"
+                ))),
+                other => StartError::Message(AppError::new(other.to_string())),
+            })?;
         locked(&self.shared.meta).insert(
             id.clone(),
             Meta {
                 kind: kind.to_string(),
                 label,
                 title: launch.title,
-                output: launch.output,
+                output,
                 exclusive: launch.exclusive,
                 ..Meta::default()
             },

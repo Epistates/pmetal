@@ -32,6 +32,7 @@
 //! variance it adds costs more accuracy than the bias it removes (see the
 //! tests in `quality_tests`).
 
+use crate::RuntimeResult;
 use std::sync::Arc;
 
 use crate::InlineArray;
@@ -140,7 +141,7 @@ impl Quantizer {
     }
 
     /// Quantize `rows` (`[N, dim]`, any float dtype).
-    pub(super) fn encode(&self, rows: &InlineArray) -> Result<Encoded, String> {
+    pub(super) fn encode(&self, rows: &InlineArray) -> RuntimeResult<Encoded> {
         let n_rows = rows.dim(0) as usize;
         debug_assert_eq!(rows.dim(1) as usize, self.dim);
         let rotated = self.rotate(rows);
@@ -151,19 +152,18 @@ impl Quantizer {
             self.dim,
             self.bits,
             n_rows,
-        )
-        .map_err(|err| err.to_string())?;
+        )?;
         Ok(Encoded { packed, scales })
     }
 
     /// The stored rows back as vectors, `[N, dim]` f32 in the original basis.
-    pub(super) fn decode(&self, encoded: &Encoded) -> Result<InlineArray, String> {
+    pub(super) fn decode(&self, encoded: &Encoded) -> RuntimeResult<InlineArray> {
         Ok(self.decode_rotated(encoded)?.matmul(&self.rotation))
     }
 
     /// The stored rows as `|x| · codebook[idx]`, `[N, dim]` f32, in the
     /// rotated basis.
-    pub(super) fn decode_rotated(&self, encoded: &Encoded) -> Result<InlineArray, String> {
+    pub(super) fn decode_rotated(&self, encoded: &Encoded) -> RuntimeResult<InlineArray> {
         let n_rows = encoded.scales.dim(0) as usize;
         kernels::dequantize(
             &encoded.packed,
@@ -173,7 +173,6 @@ impl Quantizer {
             self.bits,
             n_rows,
         )
-        .map_err(|err| err.to_string())
     }
 }
 

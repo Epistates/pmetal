@@ -1,17 +1,24 @@
-//! Finding the `pmetal` command-line tool the jobs run.
+//! Finding the `pmetal` executable the jobs run.
 //!
-//! The search is the one every other surface makes (`PMETAL_BIN`, then a
-//! `pmetal` beside the running program), plus the usual install locations,
-//! because an app opened from Finder gets launchd's `PATH`, which has neither
-//! Homebrew's nor Cargo's `bin`.
+//! One search for every surface. After an explicit `PMETAL_BIN` it looks beside
+//! the running program (a bundled app carries its own copy; the command line
+//! finds itself), then in the usual install places, then on `PATH`. The install
+//! places matter because an app opened from Finder gets launchd's `PATH`,
+//! which has neither Homebrew's nor Cargo's `bin`.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-/// The `pmetal` to run, or the reason there is none.
-pub fn locate() -> Result<PathBuf, String> {
+/// The variable that names the executable to run.
+pub const BINARY_ENV: &str = "PMETAL_BIN";
+
+/// The `pmetal` to run, or why there is none.
+///
+/// An explicit `PMETAL_BIN` is never second-guessed: if it is not a file the
+/// answer is an error, not a quiet run of some other `pmetal`.
+pub fn locate_pmetal_binary() -> Result<PathBuf, String> {
     locate_with(
-        std::env::var_os("PMETAL_BIN"),
+        std::env::var_os(BINARY_ENV),
         std::env::current_exe().ok().as_deref(),
         std::env::var_os("CARGO_HOME").map(PathBuf::from),
         dirs::home_dir(),
@@ -23,24 +30,35 @@ pub fn locate() -> Result<PathBuf, String> {
     )
 }
 
-/// [`locate`] with its inputs given, so the search can be tested.
+/// The `pmetal` jobs run, for a caller that has no use for a reason: the
+/// explicit `PMETAL_BIN` as given (starting it reports what is wrong with it),
+/// else the one found, else plain `pmetal` for the operating system's own
+/// search.
+pub fn resolve_pmetal_binary() -> PathBuf {
+    explicit(std::env::var_os(BINARY_ENV))
+        .or_else(|| locate_pmetal_binary().ok())
+        .unwrap_or_else(|| PathBuf::from("pmetal"))
+}
+
+fn explicit(value: Option<OsString>) -> Option<PathBuf> {
+    value.filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+/// [`locate_pmetal_binary`] with its inputs given, so the search can be tested.
 pub fn locate_with(
-    explicit: Option<OsString>,
+    explicit_bin: Option<OsString>,
     exe: Option<&Path>,
     cargo_home: Option<PathBuf>,
     home: Option<PathBuf>,
     path_var: Option<OsString>,
     fixed: &[PathBuf],
 ) -> Result<PathBuf, String> {
-    // An explicit choice is never second-guessed: if it is wrong, say so,
-    // rather than quietly running a different pmetal.
-    if let Some(explicit) = explicit.filter(|v| !v.is_empty()) {
-        let path = PathBuf::from(explicit);
+    if let Some(path) = explicit(explicit_bin) {
         return if path.is_file() {
             Ok(path)
         } else {
             Err(format!(
-                "PMETAL_BIN points to {}, which is not a file. Unset it to use the \
+                "{BINARY_ENV} points to {}, which is not a file. Unset it to use the \
                  installed pmetal, or point it at the pmetal executable.",
                 path.display()
             ))
@@ -48,7 +66,8 @@ pub fn locate_with(
     }
 
     let mut candidates: Vec<PathBuf> = Vec::new();
-    // The bundled app carries it beside its own executable.
+    // The bundled app carries it beside its own executable; when the running
+    // program is `pmetal` itself, this is itself.
     if let Some(dir) = exe.and_then(Path::parent) {
         candidates.push(dir.join("pmetal"));
     }
@@ -62,8 +81,8 @@ pub fn locate_with(
 
     candidates.into_iter().find(|c| c.is_file()).ok_or_else(|| {
         "The pmetal command-line tool was not found, and every job needs it. \
-             Reinstall PMetal, install the tool (brew install pmetal, or cargo install pmetal), \
-             or set PMETAL_BIN to its path."
+         Reinstall PMetal, install the tool (brew install pmetal, or cargo install pmetal), \
+         or set PMETAL_BIN to its path."
             .to_string()
     })
 }
@@ -116,6 +135,14 @@ mod tests {
             err.contains("PMETAL_BIN") && err.contains("/no/such/pmetal"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn the_program_itself_is_found_when_it_is_pmetal() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = executable(&dir.path().join("bin"), "pmetal");
+        let found = locate_with(None, Some(&me), None, None, None, &[]).unwrap();
+        assert_eq!(found, me);
     }
 
     #[test]
@@ -174,5 +201,14 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("PMETAL_BIN"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_pmetal_bin_is_not_a_choice() {
+        assert_eq!(explicit(Some(OsString::new())), None);
+        assert_eq!(
+            explicit(Some("/x/pmetal".into())),
+            Some(PathBuf::from("/x/pmetal"))
+        );
     }
 }

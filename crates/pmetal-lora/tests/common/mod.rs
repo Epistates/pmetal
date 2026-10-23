@@ -10,7 +10,7 @@
     reason = "shared by several test binaries, each using a subset"
 )]
 
-use std::collections::HashMap;
+use pmetal_runtime::compat::FlattenedModuleParam;
 use std::rc::Rc;
 
 use pmetal_cache::test_utils::max_abs_diff;
@@ -535,7 +535,7 @@ pub fn stage(case: &ArchCase) -> Result<tempfile::TempDir, String> {
     }
     eval(params.values()).map_err(|e| format!("eval checkpoint tensors: {e}"))?;
 
-    let checkpoint: HashMap<Rc<str>, Array> = params
+    let checkpoint: FlattenedModuleParam = params
         .into_iter()
         .map(|(path, value)| (Rc::from(checkpoint_key(&path).as_str()), value))
         .collect();
@@ -630,7 +630,7 @@ pub fn silent_adapters(prepare: impl Fn(&mut DynamicModel)) -> Vec<String> {
             let key = path.strip_prefix("model.").unwrap_or(&path).to_string();
             let b_key: Rc<str> = Rc::from(format!("{key}.lora_b").as_str());
             let b = params.get(&b_key).unwrap_or_else(|| panic!("{key}.lora_b"));
-            let nudged: HashMap<Rc<str>, Array> = HashMap::from([(
+            let nudged = FlattenedModuleParam::from([(
                 b_key.clone(),
                 random::uniform_range(0.5, 1.0, b.shape(), Dtype::Float32),
             )]);
@@ -646,7 +646,7 @@ pub fn silent_adapters(prepare: impl Fn(&mut DynamicModel)) -> Vec<String> {
                     case.name
                 ));
             }
-            model.set_lora_parameters(&HashMap::from([(b_key, b.clone())]));
+            model.set_lora_parameters(&FlattenedModuleParam::from([(b_key, b.clone())]));
         }
     }
     silent
@@ -654,15 +654,14 @@ pub fn silent_adapters(prepare: impl Fn(&mut DynamicModel)) -> Vec<String> {
 
 /// One step of causal-LM training on the adapters alone. Returns the loss.
 pub fn train_step(model: &mut AdaptedModel, optimizer: &mut AdamW, ids: &Array) -> f32 {
-    let mut names: Vec<Rc<str>> = model.flatten_trainable_params().into_keys().collect();
-    names.sort();
+    let names: Vec<Rc<str>> = model.flatten_trainable_params().into_keys().collect();
     let live = model.flatten_trainable_params();
     let params: Vec<Array> = names.iter().map(|name| live[name].clone()).collect();
     drop(live);
 
     let (loss, grads) = value_and_grad(
         |arrays| {
-            let restored: HashMap<Rc<str>, Array> = names
+            let restored: FlattenedModuleParam = names
                 .iter()
                 .cloned()
                 .zip(arrays[..names.len()].iter().cloned())

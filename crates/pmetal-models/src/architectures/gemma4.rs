@@ -367,7 +367,7 @@ impl Gemma4Config {
             cfg.and_then(|c| c.factor),
             is_full,
         )
-        .map_err(Exception::custom)
+        .map_err(Exception::from)
     }
 
     pub fn uses_per_layer_inputs(&self) -> bool {
@@ -2569,7 +2569,7 @@ mod moe_tests {
         ] {
             let mut model = Gemma4ForCausalLM::new(config).unwrap();
             // Non-trivial weights, in the model's dtype.
-            for (_, p) in model.flatten_params_mut_sorted() {
+            for (_, p) in model.flatten_params_mut() {
                 let w = random::uniform_range(-0.3, 0.3, p.shape(), Dtype::Float32);
                 *p = w.as_dtype(bf16);
             }
@@ -2593,7 +2593,7 @@ mod moe_tests {
         for moe in [false, true] {
             random::seed(9);
             let mut model = Gemma4ForCausalLM::new(tiny_config(moe)).unwrap();
-            for (_, p) in model.flatten_params_mut_sorted() {
+            for (_, p) in model.flatten_params_mut() {
                 *p = random::uniform_range(-0.5, 0.5, p.shape(), Dtype::Float32);
             }
             let (first, second) = (11usize, 13usize); // window 8
