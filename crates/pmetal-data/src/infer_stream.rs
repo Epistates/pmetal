@@ -394,7 +394,7 @@ mod tests {
         for cut in at..whole.len() {
             let (thinking, answer) = split_reasoning_streaming(&whole[..cut]);
             assert_eq!(thinking, Some("plan"), "cut {cut}");
-            assert!(whole.ends_with(&answer.to_string()) || answer.is_empty());
+            assert!("Paris".starts_with(answer), "cut {cut}: {answer:?}");
         }
         assert_eq!(split_reasoning_streaming(&whole), (Some("plan"), "Paris"));
         // Text that is not reasoning is all answer, as it arrives.

@@ -35,9 +35,20 @@ struct Row {
     mcp: Option<bool>,
 }
 
+/// Whether a sample gives `d` a value: every field that must have one, and the
+/// one that `infer` and `eval` need though no descriptor marks it required (a
+/// prompt or a messages file; a dataset or a task).
+fn needs_value<S: Spec>(d: &pmetal_core::FieldDescriptor) -> bool {
+    d.required
+        || matches!(
+            (S::subcommand(), d.name),
+            ("infer", "prompt") | ("eval", "dataset")
+        )
+}
+
 /// The spec with a value in every field that must have one.
 fn sample<S: Spec>() -> S {
-    spec_from_text::<S>(|d| d.required.then(|| "owner/name".to_string()))
+    spec_from_text::<S>(|d| needs_value::<S>(d).then(|| "owner/name".to_string()))
         .unwrap_or_else(|e| panic!("{}: {e:?}", S::subcommand()))
 }
 
@@ -55,7 +66,10 @@ fn row<S: Spec>(tools: &[(&'static str, Option<bool>)]) -> Row {
 
     // The terminal UI: the form's own plan.
     let mut panel = JobPanel::new::<S>("T");
-    for d in S::field_descriptors().iter().filter(|d| d.required) {
+    for d in S::field_descriptors()
+        .iter()
+        .filter(|d| needs_value::<S>(d))
+    {
         panel.form.set_value(d.label, "owner/name");
     }
     let plan = panel
@@ -85,7 +99,7 @@ fn mcp_tools() -> Vec<(&'static str, Option<bool>)> {
     let mut found = Vec::new();
     for tool in pmetal_mcp::spec_tool_list() {
         let definition = serde_json::to_value(tool.definition()).unwrap();
-        let args: serde_json::Map<String, Value> = definition["inputSchema"]["required"]
+        let mut args: serde_json::Map<String, Value> = definition["inputSchema"]["required"]
             .as_array()
             .into_iter()
             .flatten()
@@ -100,6 +114,14 @@ fn mcp_tools() -> Vec<(&'static str, Option<bool>)> {
                 (name.to_string(), value)
             })
             .collect();
+        // `infer` takes a prompt or a messages file, so neither is required.
+        if tool.name() == "generate" {
+            args.insert("prompt".to_string(), json!("hello"));
+        }
+        // `eval` takes a dataset (perplexity) or a task, so neither is required.
+        if tool.name() == "eval_perplexity" {
+            args.insert("dataset".to_string(), json!("owner/name"));
+        }
         let prepared = tool
             .prepare(Value::Object(args), &policy)
             .unwrap_or_else(|e| panic!("{}: {e}", tool.name()));

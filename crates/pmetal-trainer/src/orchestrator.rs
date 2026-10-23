@@ -1900,9 +1900,11 @@ mod tests {
         full.dataset.dataset_id = "yaml.jsonl".to_string();
         full.training.num_epochs = 7;
 
-        let mut overrides = TrainingConfig::default();
-        overrides.num_epochs = 2;
-        overrides.max_steps = Some(5);
+        let overrides = TrainingConfig {
+            num_epochs: 2,
+            max_steps: Some(5),
+            ..TrainingConfig::default()
+        };
         let job = TrainingJobConfig {
             model_id: "cli/model".to_string(),
             dataset: "cli.jsonl".to_string(),
