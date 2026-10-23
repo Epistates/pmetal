@@ -108,8 +108,9 @@ File: crates/pmetal-runtime/src/nn/gated_delta.rs
 --------------------
 
 PMetal's GGUF quantization infrastructure (K-quant and IQ-quant block
-structures and quantization routines) and its GGUF pre-tokenizer table
-are based on the llama.cpp/GGML implementation.
+structures and quantization routines), the per-tensor type recipe of its
+quantization methods, and its GGUF pre-tokenizer table are based on the
+llama.cpp/GGML implementation.
 
     Copyright (c) 2023-2026 The ggml authors
 
@@ -135,6 +136,8 @@ Source: https://github.com/ggerganov/llama.cpp
 License: MIT
 Files: crates/pmetal-data/src/gguf_tokenizer/pre_table.rs (the pre-tokenizer
        patterns by `tokenizer.ggml.pre` name),
+       crates/pmetal/src/commands/gguf_export/recipe.rs (which tensors each
+       quantization method keeps at more bits),
        crates/pmetal-gguf/src/k_quants.rs,
        crates/pmetal-gguf/src/iq_quants.rs,
        crates/pmetal-gguf/src/quantize.rs
