@@ -27,6 +27,7 @@
 //! truncation by default), so the ratios describe the samples.
 
 mod config;
+mod job;
 mod loss;
 mod prompts;
 mod rewards;
@@ -35,6 +36,7 @@ mod teacher;
 pub(crate) use teacher::TeacherTerm;
 
 pub use config::*;
+pub use job::{GrpoJobOptions, GrpoJobResult, rewards_from_spec, run_grpo_job};
 pub use loss::{GrpoLoss, group_advantages, grpo_loss};
 pub use prompts::{GrpoPrompt, PromptColumns, load_prompts, load_prompts_with};
 pub use rewards::*;
@@ -232,6 +234,7 @@ struct ScoreRequest {
     prompts: Vec<String>,
     completions: Vec<String>,
     references: Vec<Option<String>>,
+    columns: Vec<DatasetRow>,
     images: Option<Vec<Vec<Array>>>,
 }
 
@@ -250,12 +253,13 @@ struct SyncScorer<'a>(&'a CombinedReward);
 impl Scorer for SyncScorer<'_> {
     fn submit(&mut self, request: ScoreRequest) -> GrpoResult<Option<Vec<f64>>> {
         self.0
-            .compute_with_references(
-                &request.prompts,
-                &request.completions,
-                &request.references,
-                request.images.as_deref(),
-            )
+            .score(&RewardBatch {
+                prompts: &request.prompts,
+                completions: &request.completions,
+                references: &request.references,
+                columns: &request.columns,
+                images: request.images.as_deref(),
+            })
             .map(Some)
     }
 
@@ -269,8 +273,12 @@ struct AsyncScorer<'a>(crate::ane_reward::PipelinedGrpoSession<'a>);
 impl Scorer for AsyncScorer<'_> {
     fn submit(&mut self, request: ScoreRequest) -> GrpoResult<Option<Vec<f64>>> {
         // The worker thread scores text; images stay with the batch.
-        self.0
-            .begin_step_with_references(request.prompts, request.completions, request.references)
+        self.0.begin_step_with_columns(
+            request.prompts,
+            request.completions,
+            request.references,
+            request.columns,
+        )
     }
 
     fn flush(&mut self) -> GrpoResult<Option<Vec<f64>>> {
@@ -1216,6 +1224,7 @@ impl GrpoTrainer {
                         prompts: vec![prompt_text; n],
                         completions: completions_text,
                         references: vec![prompt.reference.clone(); n],
+                        columns: vec![prompt.columns.clone(); n],
                         images,
                     })?;
                     pending.push_back(PendingBatch {

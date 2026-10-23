@@ -21,6 +21,7 @@ pmetal-trainer = "0.7"
 |--------|-------------|----------|
 | **SFT** | Supervised Fine-Tuning | General instruction tuning |
 | **LoRA** | Low-Rank Adaptation | Parameter-efficient fine-tuning |
+| **Full fine-tune** | Every weight trains; saves a whole model | Memory-checked up front (`full_finetune`) |
 | **DPO / Robust DPO / IPO / hinge** | Preference optimization against a reference | Pairwise preference data |
 | **GRPO** | Group Relative Policy Optimization | Efficient PPO alternative |
 | **DAPO** | Decoupled Clip and Dynamic Sampling PO | GRPO mode (`GrpoConfig::for_dapo`) |
@@ -148,6 +149,95 @@ fn train_with_checkpoints(
     // Hand the manager to `run` and it saves on the configured cadence.
     training_loop.run(&mut model, train_dataset, None, Some(&checkpoints))?;
     Ok(model)
+}
+```
+
+### Full-Parameter Fine-Tuning
+
+`DynamicLoraModel::from_pretrained_full` is the inference path's own model with no adapters and every
+parameter trainable, so it runs through the same `TrainingLoop` (optimizers, gradient checkpointing,
+packing). `full_finetune` estimates the memory a run needs, so it can be refused before anything
+loads, and saves the result as a whole Hugging Face-layout model.
+
+```rust,no_run
+use std::path::Path;
+
+use pmetal_data::TrainingDataset;
+use pmetal_lora::{DynamicLoraModel, FullFineTune};
+use pmetal_runtime::compat::ModuleParametersExt;
+use pmetal_trainer::TrainingLoop;
+use pmetal_trainer::full_finetune::{plan_for_model, save_full_model};
+
+fn full_finetune(
+    source: &Path,
+    output: &Path,
+    dataset: TrainingDataset,
+    mut training_loop: TrainingLoop,
+) -> anyhow::Result<()> {
+    let mut model = DynamicLoraModel::from_pretrained_full(
+        source,
+        FullFineTune { freeze_embeddings: false },
+    )?;
+    // Every parameter must land under a tensor name the source checkpoint has;
+    // find out now, not after the run.
+    let plan = plan_for_model(source, &model.flatten_params())?;
+
+    training_loop.run(&mut model, dataset, None, None)?;
+
+    // Sharded safetensors under the checkpoint's own names, with its config,
+    // tokenizer and chat template.
+    save_full_model(&model.flatten_params(), &plan, source, output)?;
+    Ok(())
+}
+```
+
+### GRPO Rewards
+
+A `CombinedReward` is a weighted sum of `RewardFunction`s. Besides the built-in ones, an
+`ExternalCommandReward` keeps one process of yours for the run and scores each batch over JSON lines
+(prompts, completions and the dataset row's other columns in; `{"rewards": [...]}` out), with a
+timeout, a process-group kill when it is dropped, and an error, never a zero, for a completion it
+cannot score. `RegexReward` and `JsonReward` (optionally against a JSON Schema) check the text. The
+whole job a `GrpoSpec` describes is `grpo::run_grpo_job`, which takes rewards of the caller's own in
+`GrpoJobOptions::extra_rewards`.
+
+```rust,no_run
+use std::time::Duration;
+
+use pmetal_trainer::{
+    CombinedReward, ExternalCommandReward, ExternalRewardConfig, GrpoError, JsonReward, RegexReward,
+};
+
+fn rewards() -> Result<CombinedReward, GrpoError> {
+    let judge = ExternalCommandReward::spawn(
+        ExternalRewardConfig::from_command_line("python3 judge.py --strict")?
+            .with_timeout(Duration::from_secs(60)),
+    )?;
+    Ok(CombinedReward::new()
+        .add(Box::new(judge), 2.0)
+        .add(Box::new(RegexReward::new(r"^\d+$")?), 0.1)
+        .add(Box::new(JsonReward::any()), 0.5))
+}
+```
+
+### Task Evaluation
+
+`eval::evaluate` scores a benchmark task (GSM8K, MMLU, ARC-Challenge, HellaSwag, a subset of IFEval,
+or your own JSONL) against anything that implements `EvalModel` (the log-likelihood of a
+continuation, and a greedy generation); `LoadedModel` is the inference path's own model. A
+`TaskReport` holds each metric with its standard error.
+
+```rust,no_run
+use pmetal_data::Tokenizer;
+use pmetal_models::DynamicModel;
+use pmetal_trainer::eval::{EvalError, LoadedModel, Task, TaskData, TaskOptions, evaluate};
+
+fn score(model: DynamicModel, tokenizer: &Tokenizer, data: &TaskData) -> Result<(), EvalError> {
+    let mut model = LoadedModel::base(model).with_batch_size(16);
+    let options = TaskOptions { limit: 50, ..TaskOptions::default() };
+    let report = evaluate(&mut model, tokenizer, Task::Gsm8k, data, &options, &mut |_, _| {})?;
+    println!("{:?}", report.metrics["exact_match,strict-match"]);
+    Ok(())
 }
 ```
 

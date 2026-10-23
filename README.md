@@ -59,8 +59,9 @@ pmetal merge --model-a model-a --model-b model-b --method slerp --t 0.5 --output
 pmetal fuse --model Qwen/Qwen3-0.6B --lora ./output/adapter_model.safetensors --output ./fused
 pmetal quantize --model ./fused --output model.gguf --method q4_k_m
 
-# Perplexity on a dataset
+# Perplexity on a dataset, and a benchmark
 pmetal eval --model Qwen/Qwen3-0.6B --dataset eval.jsonl
+pmetal eval --model Qwen/Qwen3-0.6B --task gsm8k --limit 50
 ```
 
 Speculative decoding with a Qwen3.6 checkpoint that bundles its own multi-token-prediction head, and with a predictor you trained yourself:
@@ -78,13 +79,13 @@ pmetal infer --model Qwen/Qwen3.6-35B-A3B --mtp --mtp-model ./qwen-mtp --prompt 
 
 | Command | Description |
 |---------|-------------|
-| `train` | LoRA/QLoRA/DoRA fine-tuning (SFT); `--ane` trains on the Neural Engine |
+| `train` | LoRA/QLoRA/DoRA fine-tuning (SFT); `--full` trains every weight and saves a whole model; `--ane` trains on the Neural Engine |
 | `train-mtp` | Train a Gemma 4 assistant or a Qwen3Next/Qwen3.6 MTP predictor for speculative decoding |
 | `train-draft` | Train a DFlash block-diffusion draft checkpoint |
 | `train-diffusion` | LoRA/QLoRA fine-tune a DiffusionGemma block-diffusion model |
 | `pretrain` | Pretrain from scratch (full-parameter, no LoRA) on tokenized shards |
 | `preference` | DPO, Robust DPO, IPO, hinge, SimPO, ORPO or KTO with LoRA (alias `dpo`) |
-| `grpo` | GRPO, DAPO, Dr. GRPO and GSPO reasoning training (VLM, reward models, async rewards) |
+| `grpo` | GRPO, DAPO, Dr. GRPO and GSPO reasoning training (VLM, reward models, reward commands, verifiers, async rewards) |
 | `rlkd` | GRPO with a distillation term from a teacher |
 | `distill` | Knowledge distillation (online, offline, progressive) |
 | `embed-train` | Sentence-embedding fine-tuning (InfoNCE, triplet, CoSENT) |
@@ -95,7 +96,7 @@ pmetal infer --model Qwen/Qwen3.6-35B-A3B --mtp --mtp-model ./qwen-mtp --prompt 
 | `search`, `download`, `upload`, `verify` | Hugging Face Hub search with device fit, download, publish, integrity check |
 | `merge`, `fuse`, `quantize` | Model merging, LoRA fusing, GGUF and MLX quantization |
 | `imatrix` | Measure an importance matrix on calibration data, for `quantize --imatrix` |
-| `eval` | Perplexity on a dataset |
+| `eval` | Perplexity on a dataset, or a benchmark: GSM8K, MMLU, ARC, HellaSwag, IFEval subset, your own |
 | `dataset`, `tokenize` | Dataset analysis, conversion and preparation; pretraining shards |
 | `vocode` | Mel spectrogram to waveform with a BigVGAN vocoder |
 | `ollama` | Modelfile generation for Ollama |

@@ -62,6 +62,48 @@ result = trainer.train()
 `pmetal.MetricsJsonCallback(path)` are the trainer's own. An exception in a callback, like Ctrl-C,
 ends the run after the current step with the weights saved, and is raised from `train()`.
 
+## GRPO with Python reward functions
+
+`pmetal.grpo(model, dataset, reward_funcs=[...], reward_weights=[...], **GrpoSpec fields)` (or
+`pmetal.GrpoTrainer(spec, reward_funcs, reward_weights, callbacks).train()`) runs `pmetal grpo` in
+this process with Python callables as rewards:
+
+```python
+import json
+import pmetal
+
+def valid_json(prompts, completions, **columns):
+    # prompts and completions are lists of strings, one entry per completion; every other
+    # column of the dataset's row arrives as a keyword argument (a list, one entry per completion).
+    def ok(text):
+        try:
+            json.loads(text)
+            return 1.0
+        except ValueError:
+            return 0.0
+    return [ok(c) for c in completions]
+
+def matches_answer(prompts, completions, answer, **columns):
+    return [float(a in c) for c, a in zip(completions, answer)]
+
+result = pmetal.grpo(
+    "Qwen/Qwen3-0.6B",
+    "prompts.jsonl",
+    reward_funcs=[valid_json, matches_answer],
+    reward_weights=[0.5, 1.0],
+    num_generations=8,
+)
+print(result.total_steps, result.output_dir)
+```
+
+The weights multiply each function's rewards before they are summed with each other and with the
+spec's own (`reasoning_rewards`, `reward_cmd`, `reward_regex`, `reward_json_schema`, ...). The GIL
+is released while the run trains and taken for each call (on the scorer's thread with
+`async_rewards=True`). A completion a function cannot score is an error, not a zero: returning
+`None`, the wrong number of rewards or a non-number raises `pmetal.RewardError` (a `TrainingError`),
+as does an exception in the function, which is the error's `__cause__`. See
+[`pmetal grpo`](/cli/grpo/#rewards) for the reward commands and verifiers the spec adds.
+
 ## Running any command
 
 `pmetal.run(spec)` runs the `pmetal` command a spec stands for under the job supervisor the TUI, MCP

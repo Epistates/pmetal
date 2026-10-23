@@ -240,6 +240,23 @@ pub struct TrainArgs {
     #[arg(long = "ane")]
     pub ane: bool,
 
+    /// Train every weight instead of LoRA adapters, and save a whole model
+    /// that `infer` and `serve` load. Needs several times the model's size in
+    /// memory (weights, gradients, optimizer state) and is refused up front
+    /// when it will not fit. Use a learning rate of 1e-5 to 5e-5.
+    #[arg(long = "full")]
+    pub full: bool,
+
+    /// With --full, keep the input token embedding as loaded (a model that
+    /// ties its output head to it keeps the head too).
+    #[arg(long = "freeze-embeddings", requires = "full")]
+    pub freeze_embeddings: bool,
+
+    /// With --full, run without checking the memory estimate against the
+    /// device's working set.
+    #[arg(long = "no-memory-check", requires = "full")]
+    pub no_memory_check: bool,
+
     /// Distributed training: comma-separated peer addresses (ip:port).
     #[arg(long = "distributed-peers", value_delimiter = ',')]
     pub distributed_peers: Option<Vec<String>>,
@@ -306,6 +323,9 @@ impl From<TrainArgs> for TrainSpec {
             cut_cross_entropy: a.cut_cross_entropy,
             no_adaptive_lr: a.no_adaptive_lr,
             ane: a.ane,
+            full_finetune: a.full,
+            freeze_embeddings: a.freeze_embeddings,
+            no_memory_check: a.no_memory_check,
             pack_max_seq_len: a.pack_max_seq_len,
             distributed_peers: csv(a.distributed_peers),
             distributed_auto: a.distributed_auto,

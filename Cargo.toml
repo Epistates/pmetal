@@ -188,6 +188,10 @@ anstream = "1.0"
 parking_lot = "0.13"
 regex = "1.13"
 uuid = "1.28"
+# Splits a user's command line into arguments without a shell (pmetal-trainer rewards)
+shlex = "2.0"
+# JSON Schema validation (pmetal-trainer's schema reward); no HTTP: a schema never fetches
+jsonschema = { version = "0.60", default-features = false }
 
 # Proc-macro authoring (pmetal-core-derive)
 proc-macro2 = "1.0"

@@ -93,6 +93,31 @@ impl DynamicLoraModel {
         Ok((Self { inner }, packed))
     }
 
+    /// A full-parameter fine-tune of a model that is already built.
+    pub fn full(model: DynamicModel, options: crate::FullFineTune) -> Result<Self, LoraError> {
+        Ok(Self {
+            inner: AdaptedModel::full(model, options)?,
+        })
+    }
+
+    /// Load a checkpoint for a full-parameter fine-tune: no adapters, every
+    /// parameter trainable but the ones `options` freezes. The model is the
+    /// inference path's own, so what trains is what `pmetal infer` and `serve`
+    /// run.
+    ///
+    /// (The type's name is from when LoRA was all it trained; it is the one
+    /// trainable-model shell the trainer, the CLI and the GUI name.)
+    pub fn from_pretrained_full(
+        model_dir: impl AsRef<Path>,
+        options: crate::FullFineTune,
+    ) -> Result<Self, DynamicLoraError> {
+        let model = DynamicModel::load(model_dir.as_ref())?;
+        tracing::info!("Loaded {} for full fine-tuning", model.architecture());
+        Ok(Self {
+            inner: AdaptedModel::full(model, options)?,
+        })
+    }
+
     /// Load from a GGUF file or a directory containing one, then attach
     /// adapters.
     pub fn from_gguf(

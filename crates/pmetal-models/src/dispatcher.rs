@@ -4,6 +4,7 @@
 //! eliminating the need for hardcoded model types in application code.
 
 use crate::architectures::*;
+use crate::generation::{GenerationConfig, GenerationOutput};
 use crate::loader::{
     Exemption, LoadPolicy, ParamSnapshot, Qwen3NextLoadOptions, assign_weights,
     load_encoder_weights, load_generic_weights_with, load_qwen3_next_weights_with_options,
@@ -2240,6 +2241,33 @@ impl DynamicModel {
         }
     }
 
+    /// Generate from `ids` with the model's own caches (the attention KV cache
+    /// and, for a hybrid architecture, the recurrent state), as `pmetal infer`
+    /// does: the pipelined decode loop, calling `on_token` with each token as
+    /// it is read back. `on_token` returns `false` to stop.
+    ///
+    /// The one call every in-process caller that has a model in hand makes
+    /// (the Python bindings, task evaluation), so the cache sizing and the
+    /// hybrid wiring are written once.
+    pub fn generate_streaming(
+        &mut self,
+        ids: &[u32],
+        config: GenerationConfig,
+        on_token: impl FnMut(u32) -> bool,
+    ) -> Result<GenerationOutput, Exception> {
+        let mut cache = self.create_cache(ids.len() + config.max_new_tokens + 64);
+        let mut mamba = self.create_mamba_cache();
+        crate::generation::generate_cached_async_streaming(
+            |input, cache| {
+                self.forward_with_hybrid_cache_last(input, None, Some(cache), mamba.as_mut())
+            },
+            ids,
+            config,
+            &mut cache,
+            on_token,
+        )
+    }
+
     /// Whether this architecture has a fused `[N, 1]` batched-decode
     /// implementation. Continuous batching falls back to the per-slot
     /// serial path when this is `false`. Hybrid attn+recurrent archs
@@ -2555,6 +2583,20 @@ fn drop_routers(tree: &mut pmetal_runtime::compat::module::ModuleParamRef<'_>, p
     });
 }
 
+impl DynamicModel {
+    /// Every parameter a gradient can move, a MoE router's included: what a
+    /// full fine-tune trains. Buffers (a router's load-balancing bias) are
+    /// absent, as they are from [`trainable_parameters`], which also leaves
+    /// out the routers.
+    ///
+    /// [`trainable_parameters`]: ModuleParameters::trainable_parameters
+    pub fn trainable_parameters_with_routers(
+        &self,
+    ) -> pmetal_runtime::compat::module::ModuleParamRef<'_> {
+        dispatch_uniform!(self, trainable_parameters)
+    }
+}
+
 impl ModuleParameters for DynamicModel {
     fn parameters(&self) -> pmetal_runtime::compat::module::ModuleParamRef<'_> {
         dispatch_uniform!(self, parameters)
@@ -2565,7 +2607,7 @@ impl ModuleParameters for DynamicModel {
     /// (or weight decay) on it reroutes tokens the experts were never tuned
     /// for. Buffers and parameter-free layers are absent from the tree already.
     fn trainable_parameters(&self) -> pmetal_runtime::compat::module::ModuleParamRef<'_> {
-        let mut tree = dispatch_uniform!(self, trainable_parameters);
+        let mut tree = self.trainable_parameters_with_routers();
         drop_routers(&mut tree, "");
         tree
     }

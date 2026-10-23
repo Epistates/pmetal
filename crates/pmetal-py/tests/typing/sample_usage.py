@@ -62,6 +62,19 @@ def training() -> None:
     result2 = pmetal.finetune("m", "d", epochs=1, lora_r=4, optimizer="adamw")
     print(result2.total_steps)
 
+    def exact(prompts: list[str], completions: list[str], **columns: object) -> list[float]:
+        return [float(len(c)) for c in completions]
+
+    grpo_result: pmetal.GrpoResult = pmetal.grpo(
+        "m", "d", reward_funcs=[exact], reward_weights=[0.5], num_generations=4, reward_regex=r"\d+"
+    )
+    print(grpo_result.total_steps, grpo_result.stopped)
+    grpo_trainer = pmetal.GrpoTrainer(pmetal.GrpoSpec(model="m", dataset="d", reward_cmd=["./score.sh"]), [exact])
+    try:
+        grpo_trainer.train()
+    except pmetal.RewardError as error:
+        print(error.__cause__)
+
 
 def inference() -> None:
     model = pmetal.Model.load("Qwen/Qwen3-0.6B", fp8=False)
