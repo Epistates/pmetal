@@ -240,7 +240,8 @@ check-version:
 check-lockfile:
     cargo metadata --locked --format-version 1 > /dev/null || (echo "FAIL: Cargo.lock is out of date -- run cargo update --workspace" && exit 1)
     cargo metadata --locked --format-version 1 --manifest-path crates/pmetal-gui/src-tauri/Cargo.toml > /dev/null || (echo "FAIL: the GUI's Cargo.lock is out of date -- run cargo update --workspace --manifest-path crates/pmetal-gui/src-tauri/Cargo.toml" && exit 1)
-    @echo "Cargo.lock and the GUI's Cargo.lock satisfy the manifests"
+    cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null || (echo "FAIL: fuzz/Cargo.lock is out of date -- run cargo update --workspace --manifest-path fuzz/Cargo.toml" && exit 1)
+    @echo "Cargo.lock, the GUI's and fuzz's satisfy the manifests"
 
 # Bump version across all crates (updates workspace, gui, changelog stub)
 bump new_version:
