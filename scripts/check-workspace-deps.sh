@@ -53,6 +53,14 @@ for manifest in $members; do
             # so publishing strips it rather than asking the registry for the
             # version being published.
             continue
+        elif [[ $sec == "[dev-dependencies]" && $rest =~ ^\{\ *path\ *=\ *\"([^\"]+)\"\ *\}$ ]] &&
+            grep -qx "$(cd "$(dirname "$manifest")/${BASH_REMATCH[1]}" 2>/dev/null && pwd)/Cargo.toml" <<<"$members"; then
+            # A test-only edge to another workspace crate that is published
+            # after this one (pmetal-runtime's tests holding its loader and
+            # AdamW to pmetal-core's). No version, so publishing strips it and
+            # the publish order does not have to account for it; a versioned
+            # entry would need the other crate on the registry first.
+            continue
         elif [[ $name == "<table>" ]]; then
             fail "$rel: $sec: write it as one line, \`dep = { workspace = true }\`"
         elif [[ $name == *.workspace && $rest == true* ]]; then
