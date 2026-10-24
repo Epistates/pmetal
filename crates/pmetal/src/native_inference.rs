@@ -50,6 +50,13 @@ impl NativeArch {
         matches!(self, Self::Qwen3 | Self::Qwen3_5 | Self::Llama4)
     }
 
+    /// Whether the engine's cache can hold affine-quantized keys and values
+    /// (`--kv-quant`). Gemma 4's keeps them in the model's dtype, so asking
+    /// it for a quantized cache would run an unquantized one without saying.
+    pub fn supports_quantized_kv_cache(self) -> bool {
+        !matches!(self, Self::Gemma4)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Qwen3 => "Qwen3",
@@ -73,6 +80,86 @@ pub struct NativeRuntimeInfo {
 }
 
 // ============================================================================
+// Engine selection
+// ============================================================================
+
+/// Which implementation decodes a checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Engine {
+    /// The architecture's own engine in `pmetal-runtime`.
+    Native,
+    /// The shared `DynamicModel` that `pmetal serve` runs.
+    Shared,
+}
+
+/// The engine a checkpoint runs on, and why, for the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineChoice {
+    pub engine: Engine,
+    pub reason: String,
+}
+
+/// What a run asks of the engine besides the checkpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EngineRequest {
+    /// A LoRA adapter is merged into the weights.
+    pub lora: bool,
+    /// Dense weights are quantized to FP8 at load.
+    pub fp8: bool,
+    /// Routed experts stream from a packed directory on disk.
+    pub expert_offload: bool,
+    /// A Gemma 4 draft model (an MTP assistant) proposes tokens the target
+    /// verifies.
+    pub gemma_draft_model: bool,
+}
+
+/// Choose the engine for the checkpoint in `model_path`.
+///
+/// The rule is: the architecture's native engine, unless the run asks for
+/// something only the shared model does. A native engine is never the slower
+/// choice for a checkpoint it accepts: `tests/engine_ab_real_weights.rs`
+/// decodes the same prompt on both, from the same rest, and fails when the
+/// selected one is more than 10% behind (it measures 1.0x to 1.6x for Qwen3,
+/// Qwen3.5 and Gemma 4, dense and mixture-of-experts, bf16 and 4-bit). A
+/// checkpoint that decodes slowly decodes slowly on both: on the M4 Max that
+/// was measured on, a GPU that has just been busy for a couple of seconds runs
+/// at about half the speed of one that has rested.
+pub fn select_engine(model_path: &Path, request: &EngineRequest) -> EngineChoice {
+    let shared = |reason: &str| EngineChoice {
+        engine: Engine::Shared,
+        reason: reason.to_string(),
+    };
+    // Escape hatch for comparing the native engine against the shared model on
+    // the same checkpoint, which is the only way to tell which of the two is
+    // wrong when they disagree.
+    if std::env::var_os("PMETAL_DISABLE_NATIVE_BRIDGE").is_some() {
+        return shared("PMETAL_DISABLE_NATIVE_BRIDGE is set");
+    }
+    if request.lora {
+        return shared("a LoRA adapter is merged into the shared model");
+    }
+    if request.fp8 {
+        return shared("FP8 quantization runs on the shared model");
+    }
+    if request.expert_offload {
+        return shared("expert offload runs on the shared model");
+    }
+    if request.gemma_draft_model {
+        return shared("Gemma 4 draft-model decoding verifies on the shared model");
+    }
+    match detect_arch(model_path) {
+        Some(arch) => EngineChoice {
+            engine: Engine::Native,
+            reason: format!(
+                "the {} native engine decodes as fast or faster",
+                arch.label()
+            ),
+        },
+        None => shared("no native engine for this architecture"),
+    }
+}
+
+// ============================================================================
 // Architecture detection
 // ============================================================================
 
@@ -81,12 +168,6 @@ pub struct NativeRuntimeInfo {
 /// Checks `text_config.model_type` first (multi-modal configs), then falls
 /// back to the top-level `model_type` field.
 pub fn detect_arch(model_path: &Path) -> Option<NativeArch> {
-    // Escape hatch for comparing the native engine against the generic
-    // `pmetal-models` path on the same checkpoint, which is the only way to
-    // tell which of the two is wrong when they disagree.
-    if std::env::var_os("PMETAL_DISABLE_NATIVE_BRIDGE").is_some() {
-        return None;
-    }
     let data = std::fs::read_to_string(model_path.join("config.json")).ok()?;
     let v: serde_json::Value = serde_json::from_str(&data).ok()?;
 
@@ -109,8 +190,20 @@ pub fn detect_arch(model_path: &Path) -> Option<NativeArch> {
     }
 }
 
-pub fn load_native_runtime_info(model_path: &Path) -> Result<Option<NativeRuntimeInfo>, String> {
-    let Some(arch) = detect_arch(model_path) else {
+/// The native engine's view of the checkpoint, or `None` when
+/// [`select_engine`] gives it to the shared model. The choice and its reason
+/// are logged either way.
+pub fn load_native_runtime_info(
+    model_path: &Path,
+    request: &EngineRequest,
+) -> Result<Option<NativeRuntimeInfo>, String> {
+    let choice = select_engine(model_path, request);
+    tracing::info!(
+        engine = ?choice.engine,
+        reason = %choice.reason,
+        "Engine selected"
+    );
+    let (Engine::Native, Some(arch)) = (choice.engine, detect_arch(model_path)) else {
         return Ok(None);
     };
 
@@ -190,7 +283,9 @@ pub fn load_native_runtime_info(model_path: &Path) -> Result<Option<NativeRuntim
 
 #[cfg(test)]
 mod tests {
-    use super::{NativeArch, detect_arch, load_native_runtime_info};
+    use super::{
+        Engine, EngineRequest, NativeArch, detect_arch, load_native_runtime_info, select_engine,
+    };
     use std::fs;
     use tempfile::TempDir;
 
@@ -198,6 +293,69 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("config.json"), json).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_checkpoint_with_a_native_engine_runs_on_it_and_says_why() {
+        let dir = write_temp_config(r#"{"model_type":"gemma4_text"}"#);
+        let choice = select_engine(dir.path(), &EngineRequest::default());
+        assert_eq!(choice.engine, Engine::Native);
+        assert!(choice.reason.contains("Gemma4"), "{}", choice.reason);
+    }
+
+    #[test]
+    fn a_checkpoint_without_one_runs_on_the_shared_model() {
+        let dir = write_temp_config(r#"{"model_type":"llama"}"#);
+        let choice = select_engine(dir.path(), &EngineRequest::default());
+        assert_eq!(choice.engine, Engine::Shared);
+        assert!(
+            choice.reason.contains("no native engine"),
+            "{}",
+            choice.reason
+        );
+    }
+
+    /// Each of these is something only the shared model does: the native
+    /// engines have no adapter to merge, no FP8 to quantize to, no experts
+    /// to stream and no draft to verify.
+    #[test]
+    fn a_request_the_native_engine_cannot_run_goes_to_the_shared_model() {
+        let dir = write_temp_config(r#"{"model_type":"qwen3"}"#);
+        let wants = [
+            (
+                EngineRequest {
+                    lora: true,
+                    ..EngineRequest::default()
+                },
+                "LoRA",
+            ),
+            (
+                EngineRequest {
+                    fp8: true,
+                    ..EngineRequest::default()
+                },
+                "FP8",
+            ),
+            (
+                EngineRequest {
+                    expert_offload: true,
+                    ..EngineRequest::default()
+                },
+                "expert offload",
+            ),
+            (
+                EngineRequest {
+                    gemma_draft_model: true,
+                    ..EngineRequest::default()
+                },
+                "draft-model",
+            ),
+        ];
+        for (request, why) in wants {
+            let choice = select_engine(dir.path(), &request);
+            assert_eq!(choice.engine, Engine::Shared, "{why}");
+            assert!(choice.reason.contains(why), "{}", choice.reason);
+        }
     }
 
     #[test]
@@ -298,7 +456,9 @@ mod tests {
                 }
             }"#,
         );
-        let info = load_native_runtime_info(dir.path()).unwrap().unwrap();
+        let info = load_native_runtime_info(dir.path(), &EngineRequest::default())
+            .unwrap()
+            .unwrap();
         assert_eq!(info.arch, NativeArch::Qwen3_5);
         assert_eq!(info.num_layers, 28);
         assert_eq!(info.num_kv_heads, 2);
@@ -324,7 +484,9 @@ mod tests {
                 }
             }"#,
         );
-        let info = load_native_runtime_info(dir.path()).unwrap().unwrap();
+        let info = load_native_runtime_info(dir.path(), &EngineRequest::default())
+            .unwrap()
+            .unwrap();
         assert_eq!(info.arch, NativeArch::Qwen3_5);
         assert_eq!(info.num_layers, 40);
         assert_eq!(info.num_kv_heads, 2);
@@ -350,7 +512,9 @@ mod tests {
                 "intermediate_size":2880
             }"#,
         );
-        let info = load_native_runtime_info(dir.path()).unwrap().unwrap();
+        let info = load_native_runtime_info(dir.path(), &EngineRequest::default())
+            .unwrap()
+            .unwrap();
         assert_eq!(info.arch, NativeArch::GptOss);
         // Its attention sinks have no place in TurboQuant's kernels.
         assert!(!info.supports_turboquant);
@@ -377,7 +541,9 @@ mod tests {
                 "use_qk_norm":true
             }"#,
         );
-        let info = load_native_runtime_info(dir.path()).unwrap().unwrap();
+        let info = load_native_runtime_info(dir.path(), &EngineRequest::default())
+            .unwrap()
+            .unwrap();
         assert_eq!(info.arch, NativeArch::Llama4);
         assert!(info.supports_turboquant);
     }
@@ -398,7 +564,9 @@ mod tests {
                 "qk_nope_head_dim":128
             }"#,
         );
-        let info = load_native_runtime_info(dir.path()).unwrap().unwrap();
+        let info = load_native_runtime_info(dir.path(), &EngineRequest::default())
+            .unwrap()
+            .unwrap();
         assert_eq!(info.arch, NativeArch::DeepSeek);
         assert_eq!(info.num_layers, 61);
         assert_eq!(info.num_kv_heads, 128);
