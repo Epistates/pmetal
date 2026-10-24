@@ -59,8 +59,11 @@ impl MemoryStats {
 /// command buffer may read before it is committed.
 const MAX_MB_PER_BUFFER: &str = "MLX_MAX_MB_PER_BUFFER";
 
-/// What a training run asks of it: a buffer is committed after reading 4 MB.
-const TRAINING_MB_PER_BUFFER: &str = "4";
+/// What a training run asks of it: a buffer is committed after reading 8 MB
+/// (MLX's own is 40 to 50). The command queue then pins about 80 MB, not 500.
+/// A lower limit saves the same memory and commits twice as often; 16 and up
+/// stopped freeing what a small model's checkpoint frees.
+const TRAINING_MB_PER_BUFFER: &str = "8";
 
 /// Make the GPU command queue pin less memory, for a training run.
 ///
@@ -71,10 +74,10 @@ const TRAINING_MB_PER_BUFFER: &str = "4";
 /// that window releases, so the activations a backward pass recomputes and
 /// frees, and the ones gradient checkpointing exists to throw away, are still
 /// held when the next ones are made. On Qwen3-0.6B the peak of a step came
-/// out a fifth (LoRA) to two fifths (full fine-tune) above what it needs with
+/// out a fifth (LoRA) to under a tenth (full fine-tune) above what it needs without
 /// this limit, and gradient checkpointing saved a fraction of what it does
-/// with it. Step time did not change: a training op is large enough that
-/// committing after a few of them costs nothing.
+/// with it. The cost is more commits: a few percent of step time on a model
+/// that small (3 to 10% at a limit of 4 MB), less on one whose ops are large.
 ///
 /// MLX reads the variable once, when it first touches the GPU, so this has to
 /// run before the first MLX operation of the process, and has no effect after.
