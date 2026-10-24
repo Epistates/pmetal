@@ -2887,9 +2887,9 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
-    /// The 4B model's released config (`mlx-community/gemma-3-4b-it-4bit`
-    /// carries it as the authors wrote it) lists five text keys and leaves the
-    /// heads, vocabulary and rope bases to `Gemma3TextConfig`'s defaults.
+    /// The 4B model's config as the authors released it (converted checkpoints
+    /// carry it unchanged) lists five text keys and leaves the heads,
+    /// vocabulary and rope bases to `Gemma3TextConfig`'s defaults.
     #[test]
     fn a_gemma_3_multimodal_config_that_states_only_what_differs_parses() {
         let released = r#"{
