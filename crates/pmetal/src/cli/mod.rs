@@ -584,19 +584,16 @@ mod event_log_tests {
             &["grpo", "-m", "m", "-d", "d"],
             &["rlkd", "-m", "m", "--teacher-model", "t", "-d", "d"],
             &["preference", "-m", "m", "-d", "d"],
-        ] {
-            assert!(writes_event_log(argv), "{argv:?}");
-        }
-        for argv in [
-            &["pretrain", "-a", "llama", "-s", "a.bin"][..],
+            &["pretrain", "-a", "llama", "-s", "a.bin"],
             &["embed-train", "-m", "m", "-d", "d"],
             &["train-mtp", "-m", "m", "-s", "a.bin"],
             &["train-draft", "--target", "t", "-s", "a.bin"],
             &["train-diffusion", "--model", "m", "--dataset", "d"],
-            &["info"],
         ] {
-            assert!(!writes_event_log(argv), "{argv:?}");
+            assert!(writes_event_log(argv), "{argv:?}");
         }
+        // Anything that is not a training run refuses it.
+        assert!(!writes_event_log(&["info"]));
     }
 
     #[test]
