@@ -26,6 +26,7 @@ use crate::spec;
 
 /// The `InferSpec` fields only the command line honours.
 pub(crate) const COMMAND_LINE_ONLY: &[&str] = &[
+    "messages_file",
     "image",
     "video",
     "video_fps",
