@@ -603,11 +603,12 @@ fn shards(dir: &Path, model: &Path) -> PathBuf {
         .expect("tokenize wrote a shard")
 }
 
-/// A training line on stderr: `step N | ... loss ...`.
+/// A training line on stderr: `step N | ... loss ...`, after the log line's
+/// timestamp, level and target.
 fn stderr_has_a_step(output: &str) -> bool {
-    output
-        .lines()
-        .any(|line| line.trim_start().starts_with("step") && line.contains("loss"))
+    output.lines().any(|line| {
+        (line.trim_start().starts_with("step") || line.contains(": step ")) && line.contains("loss")
+    })
 }
 
 #[test]
