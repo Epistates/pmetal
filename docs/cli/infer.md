@@ -147,6 +147,19 @@ pmetal infer \
   --profile-output qwen35_layer_profile.json
 ```
 
+## Which Engine Decodes
+
+A model is decoded by one of two implementations, and `pmetal infer` logs which one and why at startup (the `Engine selected` line).
+
+- **The architecture's own engine.** Qwen3 (dense and MoE), Qwen3.5/3.6/3.8, Gemma 4 (dense, MoE and the QAT releases), Llama 4, DeepSeek V3 and gpt-oss each have one, built for that architecture's layers and cache. It is the default for these.
+- **The shared model**, the one `pmetal serve` runs, for every other architecture, and for a run that asks for something only it does: `--lora`, `--fp8`, `--experts-dir`, a Gemma 4 `--draft-model`, or a KV cache mode the architecture's engine does not have (for example `--kv-quant` on Gemma 4, whose cache is not quantized).
+
+An architecture's engine is used only while it is no slower than the shared model. On an M4 Max, decoding the same prompt on both from the same rest, the engines measure 1.0x to 1.6x the shared model's speed (Qwen3 1.0x, Gemma 4 1.0x to 1.2x, Qwen3.5 1.6x), and their greedy outputs agree except where two tokens are within bf16 rounding of each other. `tests/engine_ab_real_weights.rs` repeats that measurement on a checkpoint you point it at.
+
+Setting `PMETAL_DISABLE_NATIVE_BRIDGE` runs the shared model whatever the checkpoint, to compare the two on the same files.
+
+Decode speed on a laptop is not steady: on the M4 Max this was measured on, a GPU that has just been busy for a couple of seconds decodes at about half the speed of one that has rested, with either engine. Compare engines, or two builds, by running each from rest, one after the other, in both orders.
+
 ## Quantized Checkpoints
 
 An MLX-quantized checkpoint (an `mlx-community` 4-bit model) is run from its packed weights,
