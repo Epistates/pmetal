@@ -32,6 +32,10 @@ enum Family {
     Gemma4,
 }
 
+/// The multimodal Gemma 3 (4B, 12B, 27B): the Gemma 3 language model nested in
+/// a wrapper with a vision tower, the way Gemma 4's is.
+const GEMMA3_MULTIMODAL: &str = "Gemma3ForConditionalGeneration";
+
 /// The Hugging Face architectures that are exported, with the GGUF
 /// architecture each becomes.
 const ARCHITECTURES: &[(&str, &str, Family)] = &[
@@ -48,6 +52,7 @@ const ARCHITECTURES: &[(&str, &str, Family)] = &[
     ("GemmaForCausalLM", "gemma", Family::Gemma),
     ("Gemma2ForCausalLM", "gemma2", Family::GemmaPrePostNorm),
     ("Gemma3ForCausalLM", "gemma3", Family::GemmaPrePostNorm),
+    (GEMMA3_MULTIMODAL, "gemma3", Family::GemmaPrePostNorm),
     ("Gemma4ForCausalLM", "gemma4", Family::Gemma4),
     ("Gemma4ForConditionalGeneration", "gemma4", Family::Gemma4),
     (
@@ -63,6 +68,10 @@ pub(crate) struct ExportArch {
     /// `general.architecture`.
     pub name: &'static str,
     family: Family,
+    /// A multimodal Gemma 3: the language model's config is nested under
+    /// `text_config` (stating only what differs from `transformers`'
+    /// defaults), and its tensors under `language_model`.
+    gemma3_multimodal: bool,
     num_heads: usize,
     num_kv_heads: usize,
     /// The head is the embedding: no `output.weight` is written.
@@ -101,10 +110,13 @@ impl ExportArch {
                 )
             })?;
 
+        let gemma3_multimodal = declared == GEMMA3_MULTIMODAL;
         let text = if family == Family::Gemma4 {
             let text = text_config(config);
             reject_unsupported_gemma4(&text)?;
             text
+        } else if gemma3_multimodal {
+            gemma3_text_config(config)
         } else {
             config.clone()
         };
@@ -119,6 +131,7 @@ impl ExportArch {
         Ok(Self {
             name,
             family,
+            gemma3_multimodal,
             num_heads,
             num_kv_heads,
             tie_embeddings,
@@ -136,16 +149,34 @@ impl ExportArch {
     }
 
     /// The configuration of the model proper: the language model's, nested in
-    /// the multimodal wrapper a Gemma 4 checkpoint has, and the config itself
-    /// for every other family.
+    /// the multimodal wrapper a Gemma 3 or Gemma 4 checkpoint has, and the
+    /// config itself for every other family.
     pub(crate) fn model_config(&self, config: Option<&Value>) -> Option<Value> {
         config.map(|config| {
             if self.family == Family::Gemma4 {
                 text_config(config)
+            } else if self.gemma3_multimodal {
+                gemma3_text_config(config)
             } else {
                 config.clone()
             }
         })
+    }
+
+    /// The configuration the tokenizer's metadata is written from: the
+    /// checkpoint's own, with the vocabulary size of the language model where
+    /// the checkpoint's config nests it. The file's vocabulary is as long as the
+    /// embedding, and a multimodal Gemma's has rows its tokenizer has no token
+    /// for.
+    pub(crate) fn tokenizer_config(&self, config: Option<&Value>) -> Option<Value> {
+        let mut config = config?.clone();
+        let vocab_size = self
+            .model_config(Some(&config))
+            .and_then(|model| model.get("vocab_size").cloned());
+        if let (Some(object), Some(vocab_size)) = (config.as_object_mut(), vocab_size) {
+            object.entry("vocab_size").or_insert(vocab_size);
+        }
+        Some(config)
     }
 
     /// The name `hf_name` has in the file, or `None` for a tensor the file
@@ -164,6 +195,17 @@ impl ExportArch {
             return Ok(None);
         }
         let name = match self.family {
+            Family::GemmaPrePostNorm if self.gemma3_multimodal => {
+                // The language model only: the vision tower and the projector
+                // have no place in a text GGUF.
+                let Some(text_name) = pmetal_models::dispatcher::gemma_text_key(hf_name) else {
+                    return Ok(None);
+                };
+                if self.tie_embeddings && text_name == "lm_head.weight" {
+                    return Ok(None);
+                }
+                WeightLoader::hf_to_gguf_name_gemma(&text_name)
+            }
             Family::GemmaPrePostNorm => WeightLoader::hf_to_gguf_name_gemma(hf_name),
             Family::Gemma4 => {
                 // The language model only: a multimodal checkpoint's towers
@@ -287,9 +329,9 @@ fn is_gguf_name(name: &str) -> bool {
 }
 
 /// The language model's configuration, nested under `text_config` in a
-/// multimodal Gemma 4 checkpoint. The wrapper's `tie_word_embeddings` governs
-/// the text model's head when the text config says nothing, as the loader reads
-/// it.
+/// multimodal Gemma 3 or Gemma 4 checkpoint. The wrapper's
+/// `tie_word_embeddings` governs the text model's head when the text config
+/// says nothing, as the loader reads it.
 fn text_config(config: &Value) -> Value {
     let Some(mut text) = config
         .get("text_config")
@@ -303,6 +345,15 @@ fn text_config(config: &Value) -> Value {
             .entry("tie_word_embeddings")
             .or_insert_with(|| tie.clone());
     }
+    text
+}
+
+/// The language model's configuration of a multimodal Gemma 3: the nested
+/// `text_config`, as [`text_config`] reads it, with the values `transformers`
+/// gives the keys the released config leaves out.
+fn gemma3_text_config(config: &Value) -> Value {
+    let mut text = text_config(config);
+    pmetal_models::dispatcher::with_gemma3_text_defaults(&mut text);
     text
 }
 
@@ -520,6 +571,107 @@ mod tests {
         assert_eq!(name("model.vision_tower.encoder.layers.0.weight"), None);
         assert_eq!(name("model.embed_audio.embedding_projection.weight"), None);
         assert_eq!(name("lm_head.weight"), None);
+    }
+
+    /// A multimodal Gemma 3 as its authors released it (the 4B model): a text
+    /// config of five keys, the rest left to `transformers`' defaults.
+    fn gemma3_multimodal() -> (ExportArch, Value) {
+        let config = json!({
+            "architectures": ["Gemma3ForConditionalGeneration"],
+            "model_type": "gemma3",
+            "text_config": {
+                "hidden_size": 2560, "intermediate_size": 10240,
+                "model_type": "gemma3_text", "num_hidden_layers": 34,
+                "rope_scaling": {"factor": 8.0, "rope_type": "linear"},
+                "sliding_window": 1024,
+            },
+            "vision_config": {"model_type": "siglip_vision_model"},
+        });
+        (ExportArch::detect(Some(&config)).unwrap(), config)
+    }
+
+    #[test]
+    fn gemma_3_multimodal_names_its_language_model_and_leaves_the_towers_out() {
+        let (gemma, _) = gemma3_multimodal();
+        assert_eq!(gemma.name, "gemma3");
+        let name = |hf: &str| gemma.tensor_name(hf).unwrap();
+        // The authors' layout nests the model one level (`language_model.model`),
+        // transformers 5's names it `model.language_model`; both are the same
+        // text model.
+        for layer in [
+            "language_model.model.layers.7",
+            "model.language_model.layers.7",
+        ] {
+            for (hf, gguf) in [
+                ("input_layernorm.weight", "attn_norm.weight"),
+                (
+                    "post_attention_layernorm.weight",
+                    "post_attention_norm.weight",
+                ),
+                ("pre_feedforward_layernorm.weight", "ffn_norm.weight"),
+                ("post_feedforward_layernorm.weight", "post_ffw_norm.weight"),
+                ("self_attn.q_proj.weight", "attn_q.weight"),
+                ("self_attn.k_norm.weight", "attn_k_norm.weight"),
+                ("mlp.down_proj.weight", "ffn_down.weight"),
+            ] {
+                assert_eq!(
+                    name(&format!("{layer}.{hf}")).as_deref(),
+                    Some(format!("blk.7.{gguf}").as_str()),
+                    "{layer}.{hf}"
+                );
+            }
+        }
+        for embedding in [
+            "language_model.model.embed_tokens.weight",
+            "model.language_model.embed_tokens.weight",
+        ] {
+            assert_eq!(name(embedding).as_deref(), Some("token_embd.weight"));
+        }
+        for norm in [
+            "language_model.model.norm.weight",
+            "model.language_model.norm.weight",
+        ] {
+            assert_eq!(name(norm).as_deref(), Some("output_norm.weight"));
+        }
+        for tower in [
+            "vision_tower.vision_model.encoder.layers.0.self_attn.q_proj.weight",
+            "model.vision_tower.vision_model.post_layernorm.weight",
+            "multi_modal_projector.mm_input_projection_weight",
+            "model.multi_modal_projector.mm_soft_emb_norm.weight",
+        ] {
+            assert_eq!(name(tower), None, "{tower}");
+        }
+        // Gemma ties its head to the embedding.
+        assert_eq!(name("language_model.lm_head.weight"), None);
+        assert_eq!(name("lm_head.weight"), None);
+        // ...and a norm gains 1, as in the text-only Gemma 3.
+        let mut norm = vec![0.5f32, -1.0];
+        gemma.lay_out(
+            "language_model.model.layers.0.input_layernorm.weight",
+            &[2],
+            &mut norm,
+        );
+        assert_eq!(norm, [1.5, 0.0]);
+    }
+
+    #[test]
+    fn gemma_3_multimodal_reads_its_text_config_with_the_defaults_it_leaves_out() {
+        let (gemma, config) = gemma3_multimodal();
+        let text = gemma.model_config(Some(&config)).unwrap();
+        let number = |key: &str| text.get(key).and_then(Value::as_f64).unwrap();
+        // Stated by the config.
+        assert_eq!(number("hidden_size"), 2560.0);
+        assert_eq!(number("num_hidden_layers"), 34.0);
+        assert_eq!(number("sliding_window"), 1024.0);
+        // `Gemma3TextConfig`'s.
+        assert_eq!(number("num_attention_heads"), 8.0);
+        assert_eq!(number("num_key_value_heads"), 4.0);
+        assert_eq!(number("head_dim"), 256.0);
+        assert_eq!(number("vocab_size"), 262_208.0);
+        assert_eq!(number("rope_theta"), 1_000_000.0);
+        assert_eq!(number("rope_local_base_freq"), 10_000.0);
+        // The head is the embedding.
+        assert_eq!(gemma.tensor_name("lm_head.weight").unwrap(), None);
     }
 
     /// Gemma 4's norm multiplies by its weight: unlike Gemma 1 to 3, no norm

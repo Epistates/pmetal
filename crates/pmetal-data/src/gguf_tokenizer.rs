@@ -422,7 +422,16 @@ fn add_bos_and_eos(
     if bos.is_none() && eos.is_none() {
         return Ok(());
     }
+    tokenizer.with_post_processor(Some(special_tokens_processor(bos, eos)?));
+    Ok(())
+}
 
+/// A post-processor that puts `bos` in front of an encoding that asks for
+/// special tokens, and `eos` after it; each is a token's text and id.
+pub(crate) fn special_tokens_processor(
+    bos: Option<(String, u32)>,
+    eos: Option<(String, u32)>,
+) -> Result<TemplateProcessing> {
     // A template piece is a token's text, or `$A` / `$B` for the sequences.
     let special = |(token, _): &(String, u32)| token.clone();
     let mut single = Vec::new();
@@ -435,16 +444,14 @@ fn add_bos_and_eos(
     pair.extend(eos.iter().map(special));
 
     let tokens: HashMap<String, u32> = bos.iter().chain(&eos).cloned().collect();
-    let processor = TemplateProcessing::builder()
+    TemplateProcessing::builder()
         .try_single(single)
         .map_err(|e| config_error("template", e))?
         .try_pair(pair)
         .map_err(|e| config_error("template", e))?
         .special_tokens(tokens.into_iter().collect::<Vec<_>>())
         .build()
-        .map_err(|e| config_error("template", e))?;
-    tokenizer.with_post_processor(Some(processor));
-    Ok(())
+        .map_err(|e| config_error("template", e))
 }
 
 #[cfg(test)]

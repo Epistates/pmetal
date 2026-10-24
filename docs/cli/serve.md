@@ -4,6 +4,8 @@ Start an OpenAI-compatible inference server.
 
 Start an HTTP inference server with OpenAI- and Anthropic-compatible APIs. The prebuilt release binary and the Homebrew formula include this command; a build from source needs the `serve` feature (see the note at the end of this page).
 
+The server always decodes on the shared model, not on an architecture's own engine as [`pmetal infer`](/cli/infer/#which-engine-decodes) does for the architectures that have one. Greedy output is the same except where two tokens are within bf16 rounding of each other, and the shared model decodes at 60% to 100% of the engines' speed (the low end is Qwen3.5).
+
 ## Usage
 
 ```bash

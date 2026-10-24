@@ -409,16 +409,15 @@ impl InferenceRunner {
 
         // 3. Sampling defaults are loaded after template detection (step 6b)
         //    because mode presets depend on the detected model family.
-        let native_bridge_info = if config.lora_path.is_none()
-            && !config.fp8
-            && config.experts_dir.is_none()
-            && (!mtp_requested || config.qwen_mtp)
-        {
-            crate::native_inference::load_native_runtime_info(model_path)
-                .map_err(Exception::custom)?
-        } else {
-            None
+        let engine_request = crate::native_inference::EngineRequest {
+            lora: config.lora_path.is_some(),
+            fp8: config.fp8,
+            expert_offload: config.experts_dir.is_some(),
+            gemma_draft_model: config.mtp_assistant_path.is_some(),
         };
+        let native_bridge_info =
+            crate::native_inference::load_native_runtime_info(model_path, &engine_request)
+                .map_err(Exception::custom)?;
         let native_bridge_candidate = native_bridge_info.is_some();
         let multimodal = if !has_media {
             None
@@ -1466,7 +1465,9 @@ fn native_cache_mode_supported(
         CacheMode::TurboQuant { config } => info.supports_turboquant && config.validate().is_ok(),
         // Zero-overhead quantized KV cache via quantized_matmul.
         // MLX supports 2, 3, 4, 5, 6, 8 bits for affine group quantization.
-        CacheMode::Quantized { bits, .. } => matches!(bits, 2 | 3 | 4 | 5 | 6 | 8),
+        CacheMode::Quantized { bits, .. } => {
+            info.arch.supports_quantized_kv_cache() && matches!(bits, 2 | 3 | 4 | 5 | 6 | 8)
+        }
         _ => false,
     }
 }
@@ -1974,6 +1975,46 @@ mod tests {
             CacheMode::TurboQuant {
                 config: TurboQuantConfig::uniform(8, 8),
             }
+        ));
+    }
+
+    /// Gemma 4's native cache keeps keys and values in the model's dtype, so a
+    /// run that asks for a quantized one (`--kv-quant 8`, or the cache policy
+    /// choosing one for a long context) has to run on the shared model, whose
+    /// cache quantizes. Handing it to the native engine ran an unquantized
+    /// cache and said nothing.
+    #[test]
+    fn a_quantized_kv_cache_is_not_handed_to_an_engine_that_cannot_hold_one() {
+        let info = |arch| NativeRuntimeInfo {
+            arch,
+            num_layers: 48,
+            num_kv_heads: 8,
+            head_dim: 256,
+            value_head_dim: 256,
+            supports_turboquant: false,
+        };
+        let quantized = CacheMode::Quantized {
+            bits: 8,
+            group_size: 64,
+        };
+
+        assert!(!native_cache_mode_supported(
+            info(NativeArch::Gemma4),
+            quantized
+        ));
+        for arch in [
+            NativeArch::Qwen3,
+            NativeArch::Qwen3_5,
+            NativeArch::Llama4,
+            NativeArch::DeepSeek,
+            NativeArch::GptOss,
+        ] {
+            assert!(native_cache_mode_supported(info(arch), quantized));
+        }
+        // The plain cache is every engine's.
+        assert!(native_cache_mode_supported(
+            info(NativeArch::Gemma4),
+            CacheMode::Standard
         ));
     }
 

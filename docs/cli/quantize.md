@@ -69,7 +69,7 @@ A GGUF file names and lays out its tensors per architecture, and an engine loads
 | `LlamaForCausalLM`, `MistralForCausalLM`, `MixtralForCausalLM` | `llama` |
 | `Qwen2ForCausalLM`, `Qwen2MoeForCausalLM` | `qwen2`, `qwen2moe` |
 | `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM` | `qwen3`, `qwen3moe` |
-| `GemmaForCausalLM`, `Gemma2ForCausalLM`, `Gemma3ForCausalLM` | `gemma`, `gemma2`, `gemma3` |
+| `GemmaForCausalLM`, `Gemma2ForCausalLM`, `Gemma3ForCausalLM`, `Gemma3ForConditionalGeneration` (the 4B, 12B and 27B models: the language model only, the vision tower and projector are left out) | `gemma`, `gemma2`, `gemma3` |
 | `Gemma4ForCausalLM`, `Gemma4ForConditionalGeneration`, `Gemma4UnifiedForConditionalGeneration` (the dense text models; the towers of a multimodal checkpoint are left out) | `gemma4` |
 
 The file holds what an engine expects, which is not always what the checkpoint holds: the query and key rows of a `llama` model are reordered for its rotary pairing, Llama 3.x's rope scaling is a `rope_freqs` tensor, Gemma 1 to 3's norms have 1 added (Gemma 4's are stored as they are), a tied output head is not written beside the embedding, and norm weights and biases are f32 whatever `--method` is. The tokenizer comes with the file: byte-level BPE for Qwen and Llama 3, SentencePiece pieces and scores (from `tokenizer.model`) for Gemma, with the special tokens, `add_bos_token`, the pre-tokenizer and the chat template.

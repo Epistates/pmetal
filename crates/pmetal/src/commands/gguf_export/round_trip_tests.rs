@@ -67,8 +67,9 @@ fn bf16_bytes(values: Vec<f32>) -> Vec<u8> {
         .collect()
 }
 
-/// Write a tiny Gemma 3 checkpoint (bf16, one file) and its config.
-fn write_gemma3(dir: &Path) {
+/// The tensors of a tiny Gemma 3 language model, by their names in a
+/// text-only checkpoint.
+fn gemma3_tensors() -> Vec<(String, Vec<usize>, Vec<u8>)> {
     let mut rng = Rng(0x2545_F491_4F6C_DD1D);
     let mut tensors: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
     let mut add = |name: String, shape: &[usize], scale: f32| {
@@ -113,19 +114,66 @@ fn write_gemma3(dir: &Path) {
         add(format!("{p}.mlp.up_proj.weight"), &[FFN, HIDDEN], 0.4);
         add(format!("{p}.mlp.down_proj.weight"), &[HIDDEN, FFN], 0.4);
     }
+    tensors
+}
+
+/// The config of the tiny Gemma 3 language model.
+fn gemma3_text_config() -> serde_json::Value {
+    serde_json::json!({
+        "model_type": "gemma3_text",
+        "vocab_size": VOCAB, "hidden_size": HIDDEN, "intermediate_size": FFN,
+        "num_hidden_layers": LAYERS, "num_attention_heads": HEADS,
+        "num_key_value_heads": KV_HEADS, "head_dim": HEAD_DIM,
+        "max_position_embeddings": 128, "rms_norm_eps": 1e-6,
+        "hidden_activation": "gelu_pytorch_tanh", "tie_word_embeddings": true,
+        "rope_theta": 1_000_000.0, "rope_local_base_freq": 10000.0,
+        "sliding_window": 4, "query_pre_attn_scalar": HEAD_DIM,
+        "rope_scaling": {"rope_type": "linear", "factor": 8.0},
+    })
+}
+
+/// Write a tiny Gemma 3 checkpoint (bf16, one file) and its config.
+fn write_gemma3(dir: &Path) {
+    write_bf16(dir, &gemma3_tensors());
+    let mut config = gemma3_text_config();
+    config["architectures"] = serde_json::json!(["Gemma3ForCausalLM"]);
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+}
+
+/// A tiny Gemma 3 in the multimodal wrapper the 4B, 12B and 27B models ship
+/// in: the language model's tensors under `language_model.model.` (or, as
+/// transformers 5 saves them, `model.language_model.`), a stub of the vision
+/// tower and the projector beside them, the text config nested.
+fn write_gemma3_multimodal(dir: &Path, transformers_5_names: bool) {
+    let mut tensors: Vec<(String, Vec<usize>, Vec<u8>)> = gemma3_tensors()
+        .into_iter()
+        .map(|(name, shape, data)| {
+            let name = match name.strip_prefix("model.") {
+                Some(rest) if transformers_5_names => format!("model.language_model.{rest}"),
+                Some(rest) => format!("language_model.model.{rest}"),
+                None => name,
+            };
+            (name, shape, data)
+        })
+        .collect();
+    tensors.push((
+        "vision_tower.vision_model.embeddings.patch_embedding.weight".into(),
+        vec![4, 4],
+        bf16_bytes(vec![0.5; 16]),
+    ));
+    tensors.push((
+        "multi_modal_projector.mm_input_projection_weight".into(),
+        vec![4, 4],
+        bf16_bytes(vec![0.25; 16]),
+    ));
     write_bf16(dir, &tensors);
     std::fs::write(
         dir.join("config.json"),
         serde_json::json!({
-            "architectures": ["Gemma3ForCausalLM"], "model_type": "gemma3_text",
-            "vocab_size": VOCAB, "hidden_size": HIDDEN, "intermediate_size": FFN,
-            "num_hidden_layers": LAYERS, "num_attention_heads": HEADS,
-            "num_key_value_heads": KV_HEADS, "head_dim": HEAD_DIM,
-            "max_position_embeddings": 128, "rms_norm_eps": 1e-6,
-            "hidden_activation": "gelu_pytorch_tanh", "tie_word_embeddings": true,
-            "rope_theta": 1_000_000.0, "rope_local_base_freq": 10000.0,
-            "sliding_window": 4, "query_pre_attn_scalar": HEAD_DIM,
-            "rope_scaling": {"rope_type": "linear", "factor": 8.0},
+            "architectures": ["Gemma3ForConditionalGeneration"], "model_type": "gemma3",
+            "mm_tokens_per_image": 256,
+            "text_config": gemma3_text_config(),
+            "vision_config": {"model_type": "siglip_vision_model", "hidden_size": 4},
         })
         .to_string(),
     )
@@ -172,14 +220,40 @@ fn worst(a: &[f32], b: &[f32]) -> f32 {
 async fn a_gemma_3_checkpoint_survives_its_own_export() {
     let dir = tempfile::tempdir().unwrap();
     write_gemma3(dir.path());
-    let mut reference = DynamicModel::load(dir.path()).expect("the checkpoint loads");
+    let want = survives_its_export(dir.path()).await;
+    assert!(want.iter().all(|v| v.is_finite()));
+}
+
+/// The multimodal Gemma 3 (4B, 12B, 27B) exports its language model: the file
+/// computes the checkpoint's logits, and the same logits as the text-only
+/// checkpoint of the same weights, whichever of the two layouts the wrapper's
+/// tensors are saved in.
+#[tokio::test]
+async fn a_multimodal_gemma_3_exports_its_language_model() {
+    let text_only = tempfile::tempdir().unwrap();
+    write_gemma3(text_only.path());
+    let want = logits(&mut DynamicModel::load(text_only.path()).expect("the checkpoint loads"));
+
+    for transformers_5_names in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        write_gemma3_multimodal(dir.path(), transformers_5_names);
+        let got = survives_its_export(dir.path()).await;
+        // The wrapped checkpoint is the text model's weights: the same logits.
+        assert_eq!(got, want, "transformers 5 names: {transformers_5_names}");
+    }
+}
+
+/// Export the checkpoint in `dir` at bf16 and q8_0, load both back, and check
+/// their logits against the checkpoint's own. Returns the checkpoint's.
+async fn survives_its_export(dir: &Path) -> Vec<f32> {
+    let mut reference = DynamicModel::load(dir).expect("the checkpoint loads");
     let want = logits(&mut reference);
     let spread = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     assert!(spread > 1e-2 && want.iter().all(|v| v.is_finite()));
 
-    let mut bf16 = export(dir.path(), crate::cli::quantize::QuantizeMethod::Bf16).await;
+    let mut bf16 = export(dir, crate::cli::quantize::QuantizeMethod::Bf16).await;
     let bf16 = logits(&mut bf16);
-    let mut q8 = export(dir.path(), crate::cli::quantize::QuantizeMethod::Q8_0).await;
+    let mut q8 = export(dir, crate::cli::quantize::QuantizeMethod::Q8_0).await;
     let q8 = logits(&mut q8);
 
     // bf16 keeps every weight; what differs is the arithmetic the two models
@@ -190,6 +264,7 @@ async fn a_gemma_3_checkpoint_survives_its_own_export() {
     println!("bf16: {bf16_error:e}, q8_0: {q8_error:e} (of {spread})");
     assert!(bf16_error < 1.5e-2, "bf16 export: {bf16_error:e}");
     assert!(q8_error < 3.5e-2, "q8_0 export: {q8_error:e}");
+    want
 }
 
 /// A tiny Gemma 4 in the multimodal wrapper the released models ship in: the
