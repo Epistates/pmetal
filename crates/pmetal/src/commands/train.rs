@@ -27,9 +27,11 @@ pub(crate) async fn run_train(
     job.explicit = Explicit::Only(given);
     let job_id = job.model_id.clone();
     super::with_run_context(events, &job_id, |ctx| async move {
-        orchestrator::run_training(job, None, ctx.callbacks)
-            .await
-            .map(|_| ())
+        let result = orchestrator::run_training(job, None, ctx.callbacks).await?;
+        if ctx.emit_console_output {
+            println!("{}", result.console_summary());
+        }
+        Ok(())
     })
     .await
 }

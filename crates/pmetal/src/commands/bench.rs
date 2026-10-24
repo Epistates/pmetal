@@ -130,8 +130,7 @@ pub(crate) async fn run_benchmark(
         no_sequence_packing: true,
         ..Default::default()
     };
-    let mut config = TrainingJobConfig::from_spec(&spec).map_err(anyhow::Error::msg)?;
-    config.emit_console_output = false;
+    let config = TrainingJobConfig::from_spec(&spec).map_err(anyhow::Error::msg)?;
 
     println!("\nTraining...");
     let collector = StepMetricsCollector::new();
@@ -2626,7 +2625,6 @@ async fn benchmark_real_training(
             log_metrics: None,
             resume: false,
             seed: 42,
-            emit_console_output: false,
         },
         None,
         vec![Box::new(callback)],

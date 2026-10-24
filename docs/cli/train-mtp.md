@@ -9,7 +9,7 @@ Train MTP checkpoints for exact speculative decoding.
 
 The target model stays frozen; only the predictor is trained, on token shards from [`pmetal tokenize`](/cli/tokenize/).
 
-Ctrl-C (SIGINT) or SIGTERM finishes the step in flight, saves the checkpoint and exits with status 130.
+Ctrl-C (SIGINT) or SIGTERM finishes the step in flight, saves the checkpoint and exits with status 130. `--log-events` (a global option) writes the run's events as JSONL.
 
 ## Usage
 

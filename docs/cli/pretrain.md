@@ -4,7 +4,7 @@ Pretrain a model from scratch: full-parameter training with no LoRA, on tokenize
 
 The model is built from an architecture name (and an optional config JSON) with fresh weights, then trained with AdamW on packed batches streamed from the shards. Build the shards with [`pmetal tokenize`](/cli/tokenize/).
 
-Ctrl-C (SIGINT) or SIGTERM finishes the step in flight, writes the final checkpoint and exits with status 130. `--resume` continues from a checkpoint, including the optimizer state and the position in the shard stream.
+Ctrl-C (SIGINT) or SIGTERM finishes the step in flight, writes the final checkpoint and exits with status 130. `--resume` continues from a checkpoint, including the optimizer state and the position in the shard stream. `--log-events` (a global option) writes the run's events as JSONL.
 
 ## Usage
 

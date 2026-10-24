@@ -176,7 +176,18 @@ fn every_surface_agrees_which_commands_write_an_event_log() {
         .collect();
     assert_eq!(
         writers,
-        ["train", "distill", "grpo", "rlkd", "preference"],
+        [
+            "train",
+            "distill",
+            "grpo",
+            "rlkd",
+            "preference",
+            "embed-train",
+            "pretrain",
+            "train-mtp",
+            "train-draft",
+            "train-diffusion"
+        ],
         "{rows:?}"
     );
 }

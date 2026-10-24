@@ -6,7 +6,7 @@ The current DFlash training objective uses a frozen Qwen3 target and trains the
 draft to reconstruct masked blocks from captured target hidden states. Input is
 token shards from [`pmetal tokenize`](/cli/tokenize/).
 
-Ctrl-C (SIGINT) or SIGTERM finishes the step in flight, writes the final checkpoint and exits with status 130.
+Ctrl-C (SIGINT) or SIGTERM finishes the step in flight, writes the final checkpoint and exits with status 130. `--log-events` (a global option) writes the run's events as JSONL.
 
 ## Usage
 

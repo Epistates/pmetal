@@ -306,8 +306,6 @@ impl PyGrpoTrainer {
             rt.block_on(run_grpo_job(
                 spec,
                 GrpoJobOptions {
-                    // A library call prints nothing the caller did not ask for.
-                    emit_console_output: false,
                     callbacks,
                     extra_rewards,
                 },

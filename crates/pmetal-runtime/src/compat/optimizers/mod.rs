@@ -2,7 +2,7 @@
 //! [`Sgd`], [`MomentumSgd`], [`Lion`], [`Adafactor`] and [`Muon`].
 
 use super::{Array, Exception, FlattenedModuleParam, ModuleParameters, ModuleParametersExt};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 mod adamw_8bit;
@@ -213,7 +213,7 @@ impl StatefulOptimizer for AdamW {
     fn import_state(&mut self, state: &OptimizerState) -> Result<(), Exception> {
         state.expect_kind("adamw")?;
         let step = state.scalar("step")? as u64;
-        let mut restored = HashMap::new();
+        let mut restored = BTreeMap::new();
         for (key, m) in state.slot("m") {
             let v = state.tensor("v", key).ok_or_else(|| {
                 Exception::custom(format!(
@@ -314,5 +314,34 @@ impl<M, O: Updatable> Updatable for (M, O) {
     }
     fn updatable_states_mut(&mut self) -> Vec<&mut Array> {
         self.1.updatable_states_mut()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The f32 master copies come out in parameter-name order, the same on
+    /// every run: a checkpoint writes them in that order.
+    #[test]
+    fn master_weights_are_in_name_order() {
+        let bf16 = super::super::Dtype::Bfloat16.as_i32();
+        // Inserted out of order, and enough of them that a hash map would not
+        // happen to walk them sorted.
+        let names: Vec<Rc<str>> = (0..40)
+            .rev()
+            .map(|i| Rc::from(format!("layers.{i}.w")))
+            .collect();
+        let mut opt = AdamW::new(1e-3, 0.0);
+        opt.advance_step();
+        for name in &names {
+            let mut param = Array::from_f32_slice(&[1.0, 2.0], &[2]).as_dtype(bf16);
+            let grad = Array::from_f32_slice(&[0.5, 0.5], &[2]).as_dtype(bf16);
+            opt.update_single(name, &grad, &mut param).unwrap();
+        }
+        let mut sorted: Vec<&str> = names.iter().map(|n| &**n).collect();
+        sorted.sort_unstable();
+        let masters: Vec<&str> = opt.master_weights().map(|(name, _)| name).collect();
+        assert_eq!(masters, sorted);
     }
 }

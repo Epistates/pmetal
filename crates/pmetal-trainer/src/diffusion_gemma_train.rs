@@ -399,17 +399,20 @@ impl DiffusionGemmaTrainer {
         if let Some(e) = failure {
             return Err(e);
         }
-        loss.eval();
-        let loss_val = crate::step_check::check_step(self.step as usize + 1, loss.item_f32())?;
-
-        // Global-norm gradient clipping.
-        let (grads, grad_norm) = if self.config.max_grad_norm > 0.0 {
+        // The gradient norm is read on the host to decide the clipping, so the
+        // loss and the norm are evaluated together.
+        let norm = (self.config.max_grad_norm > 0.0).then(|| {
             let mut norm_sq = Array::from_f32(0.0);
             for g in &grads {
                 norm_sq = norm_sq.add(&g.multiply(g).sum(None));
             }
-            let norm = ops::sqrt(&norm_sq);
-            norm.eval();
+            ops::sqrt(&norm_sq)
+        });
+        eval(std::iter::once(&loss).chain(norm.iter()))?;
+        let loss_val = crate::step_check::check_step(self.step as usize + 1, loss.item_f32())?;
+
+        // Global-norm gradient clipping.
+        let (grads, grad_norm) = if let Some(norm) = norm {
             let total = norm.item_f32();
             let max_norm = self.config.max_grad_norm;
             if total > max_norm {

@@ -51,10 +51,11 @@ pub mod vocode;
 pub struct Cli {
     /// Write every JobEvent of a training run as a JSONL line to this file.
     ///
-    /// Works with train, distill, grpo, rlkd and preference; any other command
-    /// refuses it, rather than leave an empty file. The TUI, the desktop app
-    /// and the Python bindings follow a run through it. A write that fails is
-    /// reported when the run ends.
+    /// Works with train, distill, grpo, rlkd, preference, pretrain, embed-train,
+    /// train-mtp, train-draft and train-diffusion; any other command refuses
+    /// it, rather than leave an empty file. The TUI, the desktop app and the
+    /// Python bindings follow a run through it. A write that fails is reported
+    /// when the run ends.
     #[cfg(feature = "trainer")]
     #[arg(long, global = true, value_name = "PATH")]
     pub log_events: Option<PathBuf>,
@@ -442,13 +443,21 @@ impl Commands {
     #[cfg(feature = "trainer")]
     pub fn writes_event_log(&self) -> bool {
         use pmetal_core::JobFields;
-        use pmetal_core::jobs::{DistillSpec, GrpoSpec, PreferenceSpec, RlkdSpec, TrainSpec};
+        use pmetal_core::jobs::{
+            DistillSpec, EmbedTrainSpec, GrpoSpec, PreferenceSpec, PretrainSpec, RlkdSpec,
+            TrainDiffusionSpec, TrainDraftSpec, TrainMtpSpec, TrainSpec,
+        };
         match self {
             Commands::Train(_) => TrainSpec::REPORTS_EVENTS,
             Commands::Distill(_) => DistillSpec::REPORTS_EVENTS,
             Commands::Grpo(_) => GrpoSpec::REPORTS_EVENTS,
             Commands::Rlkd(_) => RlkdSpec::REPORTS_EVENTS,
             Commands::Preference(_) => PreferenceSpec::REPORTS_EVENTS,
+            Commands::TrainMtp(_) => TrainMtpSpec::REPORTS_EVENTS,
+            Commands::TrainDraft(_) => TrainDraftSpec::REPORTS_EVENTS,
+            Commands::TrainDiffusion(_) => TrainDiffusionSpec::REPORTS_EVENTS,
+            Commands::EmbedTrain(_) => EmbedTrainSpec::REPORTS_EVENTS,
+            Commands::Pretrain(_) => PretrainSpec::REPORTS_EVENTS,
             _ => false,
         }
     }
@@ -458,13 +467,24 @@ impl Commands {
     #[cfg(feature = "trainer")]
     pub fn event_log_commands() -> Vec<&'static str> {
         use pmetal_core::JobFields;
-        use pmetal_core::jobs::{DistillSpec, GrpoSpec, PreferenceSpec, RlkdSpec, TrainSpec};
+        use pmetal_core::jobs::{
+            DistillSpec, EmbedTrainSpec, GrpoSpec, PreferenceSpec, PretrainSpec, RlkdSpec,
+            TrainDiffusionSpec, TrainDraftSpec, TrainMtpSpec, TrainSpec,
+        };
         [
             (TrainSpec::subcommand(), TrainSpec::REPORTS_EVENTS),
             (DistillSpec::subcommand(), DistillSpec::REPORTS_EVENTS),
             (GrpoSpec::subcommand(), GrpoSpec::REPORTS_EVENTS),
             (RlkdSpec::subcommand(), RlkdSpec::REPORTS_EVENTS),
             (PreferenceSpec::subcommand(), PreferenceSpec::REPORTS_EVENTS),
+            (TrainMtpSpec::subcommand(), TrainMtpSpec::REPORTS_EVENTS),
+            (TrainDraftSpec::subcommand(), TrainDraftSpec::REPORTS_EVENTS),
+            (
+                TrainDiffusionSpec::subcommand(),
+                TrainDiffusionSpec::REPORTS_EVENTS,
+            ),
+            (EmbedTrainSpec::subcommand(), EmbedTrainSpec::REPORTS_EVENTS),
+            (PretrainSpec::subcommand(), PretrainSpec::REPORTS_EVENTS),
         ]
         .into_iter()
         .filter_map(|(name, writes)| writes.then_some(name))
@@ -564,19 +584,16 @@ mod event_log_tests {
             &["grpo", "-m", "m", "-d", "d"],
             &["rlkd", "-m", "m", "--teacher-model", "t", "-d", "d"],
             &["preference", "-m", "m", "-d", "d"],
-        ] {
-            assert!(writes_event_log(argv), "{argv:?}");
-        }
-        for argv in [
-            &["pretrain", "-a", "llama", "-s", "a.bin"][..],
+            &["pretrain", "-a", "llama", "-s", "a.bin"],
             &["embed-train", "-m", "m", "-d", "d"],
             &["train-mtp", "-m", "m", "-s", "a.bin"],
             &["train-draft", "--target", "t", "-s", "a.bin"],
             &["train-diffusion", "--model", "m", "--dataset", "d"],
-            &["info"],
         ] {
-            assert!(!writes_event_log(argv), "{argv:?}");
+            assert!(writes_event_log(argv), "{argv:?}");
         }
+        // Anything that is not a training run refuses it.
+        assert!(!writes_event_log(&["info"]));
     }
 
     #[test]

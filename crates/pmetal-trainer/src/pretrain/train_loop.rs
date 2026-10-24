@@ -11,7 +11,7 @@ use super::init::{apply_depth_scaled_init, zero_biases};
 use super::loss::causal_lm_loss;
 use super::{CausalLm, PretrainBatch, PretrainConfig, PretrainError, document_mask};
 
-use pmetal_core::LearningRateScheduler;
+use pmetal_core::{LearningRateScheduler, TrainingCallback};
 use pmetal_data::streaming::StreamPosition;
 use pmetal_runtime::compat::{
     Array, Exception, ModuleParametersExt,
@@ -185,6 +185,7 @@ where
         optimizer,
         0,
         Option::<std::iter::Empty<Array>>::None,
+        &mut crate::callbacks::CompositeCallback::new(),
     )
 }
 
@@ -204,6 +205,10 @@ fn build_optimizer(config: &PretrainConfig) -> Result<AdamW, PretrainError> {
 /// which is written into checkpoints so resume can restart at the exact
 /// corpus boundary, and the documents its rows are made of, which attention
 /// is then masked to.
+///
+/// `callbacks` follows the run (start, each step's metrics, each checkpoint
+/// written, the end) and can stop it after the step in flight, like
+/// `config.stop`.
 pub fn run_pretrain_with_state<M, I, E>(
     model: &mut M,
     config: &PretrainConfig,
@@ -211,6 +216,7 @@ pub fn run_pretrain_with_state<M, I, E>(
     mut optimizer: AdamW,
     start_step: usize,
     mut eval_batches: Option<E>,
+    callbacks: &mut dyn TrainingCallback,
 ) -> Result<Vec<f32>, PretrainError>
 where
     M: CausalLm,
@@ -238,7 +244,10 @@ where
     let start = std::time::Instant::now();
     let mut last_stream_position: Option<StreamPosition> = None;
 
+    callbacks.on_train_start();
     for step in start_step..config.num_steps {
+        let step_start = std::time::Instant::now();
+        callbacks.on_step_start(step + 1);
         let lr = scheduler.get_lr(step) as f32;
         optimizer.set_lr(lr);
 
@@ -265,6 +274,18 @@ where
         crate::step_check::check_step(step + 1, loss)
             .map_err(|e| PretrainError::Autograd(e.to_string()))?;
         losses.push(loss);
+        let step_tokens: usize = micro
+            .iter()
+            .map(|b| (b.tokens.dim(0) * b.tokens.dim(1)) as usize)
+            .sum();
+        callbacks.on_step_end_with_metrics(&crate::callbacks::plain_step_metrics(
+            step + 1,
+            config.num_steps,
+            f64::from(loss),
+            f64::from(lr),
+            step_tokens,
+            step_start.elapsed(),
+        ));
 
         // Logging
         if config.log_every > 0 && (step + 1) % config.log_every == 0 {
@@ -309,13 +330,15 @@ where
                     },
                 )?;
                 tracing::info!("checkpoint saved: {}", step_dir.display());
+                callbacks.on_save(&step_dir);
             }
         }
 
-        if config
-            .stop
-            .as_ref()
-            .is_some_and(|stop| stop.load(std::sync::atomic::Ordering::SeqCst))
+        if callbacks.should_stop()
+            || config
+                .stop
+                .as_ref()
+                .is_some_and(|stop| stop.load(std::sync::atomic::Ordering::SeqCst))
         {
             tracing::info!(
                 "stop requested: ending after step {} of {}",
@@ -349,7 +372,9 @@ where
                 },
             )?;
             tracing::info!("final checkpoint saved: {}", final_dir.display());
+            callbacks.on_save(&final_dir);
         }
     }
+    callbacks.on_train_end();
     Ok(losses)
 }

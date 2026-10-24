@@ -4,7 +4,7 @@ Train a sentence-embedding model (BERT / encoder-only) with contrastive losses.
 
 Fine-tunes the whole encoder, or LoRA adapters with `--lora`, on pairs or triplets of texts. `--model` is a local model directory (a plain encoder checkpoint or a sentence-transformers one); `pmetal download` prints the snapshot directory of a Hub model. A sentence-transformers model keeps its pipeline in the output (`modules.json`, the pooling and normalize modules), so `sentence-transformers` and `pmetal` both load what is written.
 
-Ctrl-C (SIGINT) or SIGTERM finishes the step in flight, saves what is trained so far and exits with status 130.
+Ctrl-C (SIGINT) or SIGTERM finishes the step in flight, saves what is trained so far and exits with status 130. `--log-events` (a global option) writes the run's events as JSONL.
 
 ## Usage
 

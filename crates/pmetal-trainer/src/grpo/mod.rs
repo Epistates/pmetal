@@ -950,32 +950,32 @@ impl GrpoTrainer {
             let (parts, detached, distill) = stash
                 .into_inner()
                 .expect("value_and_grad calls the loss closure once");
-            // Materialize before the update: these are values of the policy
-            // that is about to change.
-            rl_losses.push({
-                parts.total.eval();
-                parts.total.item_f32()
-            });
-            transforms::eval([
+            if max_grad_norm > 0.0 {
+                pmetal_runtime::training::clip_grad_norm_map(&mut grads, max_grad_norm);
+            }
+            optimizer.update(policy_model, grads)?;
+            // One evaluation for the iteration: the statistics (values of the
+            // policy before this update, which the graph holds on to) and the
+            // updated parameters.
+            let params = policy_model.lora_parameters();
+            let mut to_eval = vec![
                 &loss,
                 &detached,
+                &parts.total,
                 &parts.policy,
                 &parts.kl,
                 &parts.clip_fraction,
-            ])?;
+            ];
+            to_eval.extend(distill.iter());
+            to_eval.extend(params.values());
+            transforms::eval(to_eval)?;
+            rl_losses.push(parts.total.item_f32());
             if let Some(distill) = &distill {
-                distill.eval();
                 distill_losses.push(distill.item_f32());
             }
             if old_per_token_logps.is_none() {
                 old_per_token_logps = Some(detached);
             }
-            if max_grad_norm > 0.0 {
-                pmetal_runtime::training::clip_grad_norm_map(&mut grads, max_grad_norm);
-            }
-            optimizer.update(policy_model, grads)?;
-            let params = policy_model.lora_parameters();
-            transforms::eval(params.values())?;
             losses.push(crate::step_check::check_step(
                 self.step + 1,
                 loss.item_f32(),

@@ -35,7 +35,7 @@ use pmetal_lora::AdaptedModel;
 use pmetal_models::architectures::encoder::EncoderModel;
 use pmetal_models::pooling::{PoolingMode, normalize_embeddings, pool};
 use pmetal_runtime::compat::{
-    Array, Dtype, Exception, ModuleParameters, eval_params, nn, optimizers::Optimizer,
+    Array, Dtype, Exception, ModuleParameters, ModuleParametersExt, eval, nn, optimizers::Optimizer,
 };
 
 use crate::contrastive_loss;
@@ -483,17 +483,20 @@ impl EmbeddingTrainer {
                 let lr = scheduler.get_lr(self.step) as f32;
                 optimizer.set_lr(lr);
                 optimizer.update(model, grads)?;
-                eval_params(model.trainable_parameters())?;
+                // One evaluation: the updated parameters, the loss and the norm.
+                let trainable = model.flatten_trainable_params();
+                let mut to_eval: Vec<&Array> = trainable.values().collect();
+                to_eval.push(&loss);
+                to_eval.extend(grad_norm.iter());
+                eval(to_eval)?;
+                drop(trainable);
 
                 let loss_val = crate::step_check::check_step(self.step + 1, loss.item_f32())?;
                 let grad_norm = match grad_norm {
-                    Some(norm) => {
-                        norm.eval();
-                        Some(crate::step_check::check_grad_norm(
-                            self.step + 1,
-                            norm.item_f32(),
-                        )?)
-                    }
+                    Some(norm) => Some(crate::step_check::check_grad_norm(
+                        self.step + 1,
+                        norm.item_f32(),
+                    )?),
                     None => None,
                 };
                 losses.push(loss_val);

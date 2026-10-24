@@ -7,7 +7,7 @@ use pmetal_core_derive::JobSpec;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JobSpec)]
-#[spec(kind = "TrainDraft", subcommand = "train-draft")]
+#[spec(kind = "TrainDraft", subcommand = "train-draft", events)]
 #[serde(rename_all = "snake_case")]
 pub struct TrainDraftSpec {
     #[job(

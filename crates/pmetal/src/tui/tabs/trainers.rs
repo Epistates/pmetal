@@ -354,13 +354,14 @@ mod tests {
     }
 
     #[test]
-    fn pretraining_has_no_event_stream_to_follow() {
+    fn pretraining_writes_its_events_where_the_monitor_reads_them() {
         let mut tab = TrainerTab::pretrain();
         tab.panel.form.set_value("Architecture", "llama");
         let plan = tab.plan();
         let plan = plan.unwrap_or_else(|e| panic!("{e:?}"));
-        assert!(plan.events_file.is_none());
-        assert!(!plan.argv.iter().any(|a| a == "--log-events"));
+        let events = plan.events_file.expect("pretraining reports events");
+        let at = plan.argv.iter().position(|a| a == "--log-events").unwrap();
+        assert_eq!(plan.argv[at + 1], events.display().to_string());
     }
 
     #[test]

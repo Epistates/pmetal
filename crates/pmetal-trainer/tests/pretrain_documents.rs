@@ -147,9 +147,97 @@ fn a_data_error_stops_the_run() {
         AdamW::new(1e-3, 0.0),
         0,
         Option::<std::iter::Empty<Array>>::None,
+        &mut pmetal_trainer::CompositeCallback::new(),
     )
     .expect_err("the data error must surface");
     assert!(err.to_string().contains("truncated"), "{err}");
+}
+
+/// What a callback sees of a pretraining run: it starts, each step reports its
+/// metrics (tokens included), each checkpoint written is announced, it ends;
+/// and a callback that asks to stop ends the run after the step in flight.
+#[test]
+#[serial]
+fn callbacks_follow_pretraining_and_can_stop_it() {
+    use pmetal_core::{StepMetrics, TrainingCallback};
+    use std::sync::{Arc, Mutex};
+
+    struct Recorder {
+        log: Arc<Mutex<Vec<String>>>,
+        stop_after: usize,
+    }
+    impl TrainingCallback for Recorder {
+        fn on_train_start(&mut self) {
+            self.log.lock().unwrap().push("start".into());
+        }
+        fn on_step_end_with_metrics(&mut self, m: &StepMetrics) {
+            assert!(m.loss.is_finite() && m.lr > 0.0 && m.total_steps == 20);
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("step {} tokens {}", m.step, m.tokens));
+        }
+        fn on_save(&mut self, _path: &std::path::Path) {
+            self.log.lock().unwrap().push("save".into());
+        }
+        fn on_train_end(&mut self) {
+            self.log.lock().unwrap().push("end".into());
+        }
+        fn should_stop(&self) -> bool {
+            self.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|l| l.starts_with("step"))
+                .count()
+                >= self.stop_after
+        }
+    }
+
+    random::seed(5);
+    let mut model = tiny_llama();
+    let tokens = random::randint(0, 64, &[2, 8], Dtype::Int32, None).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let config = PretrainConfig {
+        num_steps: 20,
+        learning_rate: 1e-3,
+        warmup_steps: 0,
+        max_grad_norm: None,
+        checkpoint_dir: Some(dir.path().to_path_buf()),
+        checkpoint_every: Some(100),
+        log_every: 0,
+        ..PretrainConfig::default()
+    };
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut recorder = Recorder {
+        log: Arc::clone(&log),
+        stop_after: 3,
+    };
+
+    let losses = run_pretrain_with_state(
+        &mut model,
+        &config,
+        std::iter::repeat_with(move || Ok(PretrainBatch::new(tokens.clone()))),
+        AdamW::new(1e-3, 0.0),
+        0,
+        Option::<std::iter::Empty<Array>>::None,
+        &mut recorder,
+    )
+    .unwrap();
+
+    assert_eq!(losses.len(), 3, "the callback stopped the run");
+    assert_eq!(
+        *log.lock().unwrap(),
+        [
+            "start",
+            "step 1 tokens 16",
+            "step 2 tokens 16",
+            "step 3 tokens 16",
+            "save",
+            "end"
+        ]
+    );
+    assert!(dir.path().join("final").join("model.safetensors").exists());
 }
 
 #[test]
@@ -206,6 +294,7 @@ fn a_pretrain_config_that_cannot_work_is_refused_before_the_run() {
         AdamW::new(1e-3, 0.0),
         0,
         Option::<std::iter::Empty<Array>>::None,
+        &mut pmetal_trainer::CompositeCallback::new(),
     );
     assert!(matches!(result, Err(PretrainError::Config(_))));
 }

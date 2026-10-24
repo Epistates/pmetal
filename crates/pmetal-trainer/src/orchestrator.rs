@@ -165,8 +165,6 @@ pub struct TrainingJobConfig {
     pub resume: bool,
     /// Random seed.
     pub seed: u64,
-    /// Whether to print the final summary to stdout.
-    pub emit_console_output: bool,
 }
 
 impl Default for TrainingJobConfig {
@@ -187,7 +185,6 @@ impl Default for TrainingJobConfig {
             log_metrics: None,
             resume: false,
             seed: 42,
-            emit_console_output: true,
         }
     }
 }
@@ -273,7 +270,6 @@ impl TrainingJobConfig {
             log_metrics: spec.log_metrics.clone(),
             resume: spec.resume,
             seed: spec.seed,
-            emit_console_output: true,
         })
     }
 }
@@ -428,6 +424,34 @@ pub struct TrainingResult {
     /// The trained weights: a LoRA adapter, or for full-parameter ANE
     /// training the model's own weights (`model.safetensors`).
     pub lora_weights_path: PathBuf,
+    /// What to do with the result, as commands to run: the lines the command
+    /// line prints under "Next steps". The library prints nothing itself.
+    pub next_steps: Vec<String>,
+}
+
+impl TrainingResult {
+    /// The command line's closing summary: the run's totals, then
+    /// [`next_steps`](Self::next_steps).
+    pub fn console_summary(&self) -> String {
+        let mut text = format!(
+            "\n========================================\n  Training Complete!\n\
+             ========================================\n\
+             Final Loss:   {:.4}\n\
+             Total Steps:  {}\n\
+             Total Tokens: {}\n\
+             Output:       {}\n\
+             ========================================\n\nNext steps:",
+            self.final_loss,
+            self.total_steps,
+            self.total_tokens,
+            self.output_dir.display()
+        );
+        for step in &self.next_steps {
+            text.push_str("\n  ");
+            text.push_str(step);
+        }
+        text
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -965,35 +989,26 @@ pub async fn run_training(
         }
     }
 
-    if config.emit_console_output {
-        println!("\n========================================");
-        println!("  Training Complete!");
-        println!("========================================");
-        println!("Final Loss:   {:.4}", final_loss);
-        println!("Total Steps:  {}", final_step);
-        println!("Total Tokens: {}", total_tokens);
-        println!("Output:       {}", output_dir);
-        println!("========================================");
-
-        println!("\nNext steps:");
-        if config.full.is_some() {
-            println!("  Inference:  pmetal infer -m {output_dir} -p \"Your prompt\"");
-            println!("  Serve:      pmetal serve -m {output_dir}");
-        } else {
-            println!(
-                "  Inference:  pmetal infer -m {} --lora {}/{} -p \"Your prompt\"",
-                full_config.model.model_id,
-                output_dir,
-                pmetal_lora::peft::ADAPTER_WEIGHTS
-            );
-            println!(
-                "  Quantize:   pmetal quantize -m {} --lora {}/{} -o model.gguf",
-                full_config.model.model_id,
-                output_dir,
-                pmetal_lora::peft::ADAPTER_WEIGHTS
-            );
-        }
-    }
+    tracing::info!(
+        final_loss,
+        steps = final_step,
+        tokens = total_tokens,
+        output = output_dir,
+        "Training complete"
+    );
+    let next_steps = if config.full.is_some() {
+        vec![
+            format!("Inference:  pmetal infer -m {output_dir} -p \"Your prompt\""),
+            format!("Serve:      pmetal serve -m {output_dir}"),
+        ]
+    } else {
+        let adapter = format!("{output_dir}/{}", pmetal_lora::peft::ADAPTER_WEIGHTS);
+        let model = &full_config.model.model_id;
+        vec![
+            format!("Inference:  pmetal infer -m {model} --lora {adapter} -p \"Your prompt\""),
+            format!("Quantize:   pmetal quantize -m {model} --lora {adapter} -o model.gguf"),
+        ]
+    };
 
     // The trained weights: an adapter, or for a full fine-tune the model itself
     // (a single file, or the index of its shards).
@@ -1016,6 +1031,7 @@ pub async fn run_training(
         total_tokens,
         output_dir: PathBuf::from(&output_dir),
         lora_weights_path,
+        next_steps,
     })
 }
 
@@ -1576,21 +1592,13 @@ async fn attempt_ane_training(
     training_loop.save_model(&weights_path)?;
     tracing::info!(path = %weights_path.display(), "Saved ANE-trained model");
 
-    if config.emit_console_output {
-        println!("\n========================================");
-        println!("  Training Complete!");
-        println!("========================================");
-        println!("Final Loss:   {:.4}", final_loss);
-        println!("Total Steps:  {}", total_batches);
-        println!("Total Tokens: {}", total_tokens_processed);
-        println!("Output:       {}", output_dir);
-        println!("========================================");
-        println!("\nNext steps:");
-        println!(
-            "  Inference:  pmetal infer -m {} -p \"Your prompt\"",
-            output_dir
-        );
-    }
+    tracing::info!(
+        final_loss,
+        steps = total_batches,
+        tokens = total_tokens_processed,
+        output = output_dir,
+        "Training complete"
+    );
 
     Ok(TrainingResult {
         final_loss,
@@ -1598,6 +1606,9 @@ async fn attempt_ane_training(
         total_tokens: total_tokens_processed,
         output_dir: output,
         lora_weights_path: weights_path,
+        next_steps: vec![format!(
+            "Inference:  pmetal infer -m {output_dir} -p \"Your prompt\""
+        )],
     })
 }
 
@@ -1742,6 +1753,35 @@ pub fn format_param_count(count: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_console_summary_is_the_banner_the_command_line_always_printed() {
+        let result = TrainingResult {
+            final_loss: 1.23456,
+            total_steps: 40,
+            total_tokens: 63876,
+            output_dir: PathBuf::from("out"),
+            lora_weights_path: PathBuf::from("out/adapter_model.safetensors"),
+            next_steps: vec![
+                "Inference:  pmetal infer -m m -p \"Your prompt\"".to_string(),
+                "Serve:      pmetal serve -m out".to_string(),
+            ],
+        };
+        assert_eq!(
+            result.console_summary(),
+            "\n========================================\n\
+             \x20 Training Complete!\n\
+             ========================================\n\
+             Final Loss:   1.2346\n\
+             Total Steps:  40\n\
+             Total Tokens: 63876\n\
+             Output:       out\n\
+             ========================================\n\
+             \nNext steps:\n\
+             \x20 Inference:  pmetal infer -m m -p \"Your prompt\"\n\
+             \x20 Serve:      pmetal serve -m out"
+        );
+    }
 
     #[test]
     fn the_loop_gets_the_lora_plus_ratio_and_embedding_rate_the_config_sets() {
