@@ -15,7 +15,6 @@ categories = ["web-programming::http-server", "science"]
 default = []
 
 [dependencies]
-pmetal-metal = { workspace = true }
 pmetal-models = { workspace = true }
 pmetal-data = { workspace = true }
 pmetal-cache = { workspace = true }

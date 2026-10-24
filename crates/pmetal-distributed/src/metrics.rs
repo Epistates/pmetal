@@ -8,11 +8,11 @@
 //!
 //! Metrics can be exposed via callbacks or collected for monitoring systems.
 
-use parking_lot::RwLock;
+use pmetal_core::sync::{read_locked, write_locked};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 /// Maximum number of samples to keep in rolling windows.
@@ -133,7 +133,7 @@ impl Histogram {
         // AtomicU64 bit manipulation which was semantically wrong.
         self.count.fetch_add(1, Ordering::Relaxed);
 
-        let mut samples = self.samples.write();
+        let mut samples = write_locked(&self.samples);
         if samples.len() >= self.max_samples {
             samples.pop_front();
         }
@@ -142,7 +142,7 @@ impl Histogram {
 
     /// Get the mean of recent samples.
     pub fn mean(&self) -> f64 {
-        let samples = self.samples.read();
+        let samples = read_locked(&self.samples);
         if samples.is_empty() {
             return 0.0;
         }
@@ -166,7 +166,7 @@ impl Histogram {
 
     /// Get a percentile of recent samples.
     pub fn percentile(&self, p: f64) -> f64 {
-        let samples = self.samples.read();
+        let samples = read_locked(&self.samples);
         if samples.is_empty() {
             return 0.0;
         }
@@ -293,14 +293,13 @@ impl DistributedMetrics {
     /// Create a new metrics instance.
     pub fn new() -> Self {
         let metrics = Self::default();
-        *metrics.start_time.write() = Some(Instant::now());
+        *write_locked(&metrics.start_time) = Some(Instant::now());
         metrics
     }
 
     /// Get uptime in seconds.
     pub fn uptime_secs(&self) -> u64 {
-        self.start_time
-            .read()
+        read_locked(&self.start_time)
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(0)
     }

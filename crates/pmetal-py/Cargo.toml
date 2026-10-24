@@ -28,8 +28,6 @@ anyhow = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tracing = { workspace = true }
-tempfile = { workspace = true }
 
 [features]
 # Hooks that make the extension misbehave on purpose, for the tests that check

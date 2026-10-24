@@ -14,7 +14,7 @@
 //! gracefully if the framework is missing.
 
 use std::ffi::{CStr, c_char, c_int, c_void};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use objc2::runtime::{AnyClass, AnyObject, Bool};
 use objc2::{
@@ -22,7 +22,7 @@ use objc2::{
     msg_send,
 };
 use objc2_foundation::{NSArray, NSData, NSDictionary, NSError, NSFileManager, NSNumber, NSString};
-use parking_lot::Mutex;
+use pmetal_core::sync::locked;
 
 use crate::error::{MetalError, Result};
 
@@ -340,7 +340,7 @@ impl AneModel {
         outputs: &[*mut c_void],
         collect_stats: bool,
     ) -> Result<AnePerformanceStats> {
-        let mut staging = self.staging.lock();
+        let mut staging = locked(&self.staging);
         let ins = stage(inputs, &self.input_layouts, &mut staging.inputs)?;
         let outs = stage(outputs, &self.output_layouts, &mut staging.outputs)?;
         for (i, layout, surface) in &ins.restrided {

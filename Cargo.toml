@@ -130,7 +130,10 @@ parquet = "60"
 
 # HuggingFace integration
 hf-hub = "1.0"
-tokenizers = "0.23"
+# Oniguruma regexes (the pre-tokenizer patterns the reference implementation
+# runs), without the defaults that only training a tokenizer uses: a progress
+# bar and the C++ suffix array of the Unigram trainer.
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 reqwest = { version = "0.13", features = ["json", "multipart", "stream", "rustls"] }
 sha2 = "0.11"
 base64 = "0.23"
@@ -187,7 +190,6 @@ libc = "0.2.191"
 rustix = { version = "1.1", features = ["process"] }
 # Strips terminal escape sequences from a child's output (pmetal-supervisor)
 anstream = "1.0"
-parking_lot = "0.13"
 regex = "1.13"
 uuid = "1.28"
 # Splits a user's command line into arguments without a shell (pmetal-trainer rewards)

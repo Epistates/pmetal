@@ -32,10 +32,10 @@ use crate::{DistributedBackend, ReduceOp};
 use anyhow::Result;
 use async_trait::async_trait;
 use libp2p::PeerId;
-use parking_lot::RwLock;
+use pmetal_core::sync::{read_locked, write_locked};
 use std::net::SocketAddr;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{Mutex, OnceCell, mpsc};
 use tracing::{debug, error, info, warn};
@@ -131,7 +131,7 @@ impl AutoDiscoveryBackend {
         // Seed the local node's advertised addresses from the fabric probe so
         // that peer-side ring formation can prefer Thunderbolt right away.
         {
-            let mut t = topology.write();
+            let mut t = write_locked(&topology);
             let local_addrs: Vec<_> = fabric
                 .advertised_addrs()
                 .into_iter()
@@ -209,7 +209,7 @@ impl AutoDiscoveryBackend {
 
     /// Get the number of discovered peers.
     pub fn peer_count(&self) -> usize {
-        self.discovery_state.read().connected_count()
+        read_locked(&self.discovery_state).connected_count()
     }
 
     /// Wait for a minimum number of peers to be discovered.
@@ -278,21 +278,19 @@ impl AutoDiscoveryBackend {
                 // on). Classify each against our local fabric so the topology
                 // has the full set of fallback addresses, not just the one
                 // libp2p happened to dial first.
-                let extra = self
-                    .discovery_state
-                    .read()
+                let extra = read_locked(&self.discovery_state)
                     .get_peer(&peer_id)
                     .map(|p| p.all_socket_addrs())
                     .unwrap_or_default();
                 let all_addrs = compose_peer_addrs(&self.fabric, address, kind, &extra);
 
-                let mut topology = self.topology.write();
+                let mut topology = write_locked(&self.topology);
                 topology.add_node(peer_id, all_addrs);
             }
             DiscoveryEvent::PeerDisconnected { peer_id } => {
                 warn!("Disconnected from peer: {}", peer_id);
 
-                let mut topology = self.topology.write();
+                let mut topology = write_locked(&self.topology);
                 topology.remove_node(&peer_id);
 
                 // Note: ring_init is a OnceCell and cannot be reset.  A peer
@@ -314,7 +312,7 @@ impl AutoDiscoveryBackend {
     async fn establish_ring_inner(&self) -> Result<RingCollective> {
         // Collect all needed data from topology while holding the lock
         let (local_rank, world_size, endpoints, peer_ids, peer_id_bytes) = {
-            let topology = self.topology.read();
+            let topology = read_locked(&self.topology);
 
             if !topology.can_form_ring() {
                 return Err(DistributedError::Protocol(
@@ -431,14 +429,14 @@ impl DistributedBackend for AutoDiscoveryBackend {
     fn rank(&self) -> usize {
         match self.ring.get() {
             Some(ring) => ring.rank(),
-            None => self.topology.read().local_rank(),
+            None => read_locked(&self.topology).local_rank(),
         }
     }
 
     fn world_size(&self) -> usize {
         match self.ring.get() {
             Some(ring) => ring.world_size(),
-            None => self.topology.read().node_count(),
+            None => read_locked(&self.topology).node_count(),
         }
     }
 

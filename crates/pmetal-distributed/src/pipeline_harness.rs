@@ -34,6 +34,7 @@ use crate::topology::NodeProfile;
 use crate::transport::{
     Channel, LinkParams, LinkSecurity, RingMembership, TcpTransport, accept_authenticated,
 };
+use pmetal_core::sync::read_locked;
 use std::net::SocketAddr;
 use std::ops::Range;
 use std::sync::Arc;
@@ -129,7 +130,7 @@ impl PipelineHarness {
     ) -> DistributedResult<Self> {
         let (peer_addrs, profiles, local_rank, membership) = {
             let topo = backend.topology();
-            let topo = topo.read();
+            let topo = read_locked(&topo);
             let order = topo.ring_order();
             let world_size = order.len();
             if world_size < 2 {

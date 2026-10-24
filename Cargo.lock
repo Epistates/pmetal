@@ -1605,7 +1605,7 @@ dependencies = [
  "document-features",
  "futures-core",
  "mio",
- "parking_lot 0.12.5",
+ "parking_lot",
  "rustix",
  "signal-hook",
  "signal-hook-mio",
@@ -1839,9 +1839,9 @@ dependencies = [
  "cfg-if",
  "crossbeam-utils",
  "hashbrown 0.14.5",
- "lock_api 0.4.14",
+ "lock_api",
  "once_cell",
- "parking_lot_core 0.9.12",
+ "parking_lot_core",
 ]
 
 [[package]]
@@ -2205,9 +2205,6 @@ name = "esaxx-rs"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
-dependencies = [
- "cc",
-]
 
 [[package]]
 name = "euclid"
@@ -2952,7 +2949,7 @@ dependencies = [
  "moka",
  "ndk-context",
  "once_cell",
- "parking_lot 0.12.5",
+ "parking_lot",
  "rand 0.10.3",
  "resolv-conf",
  "smallvec",
@@ -3837,7 +3834,7 @@ dependencies = [
  "multiaddr",
  "multihash",
  "multistream-select",
- "parking_lot 0.12.5",
+ "parking_lot",
  "pin-project",
  "prost",
  "rand 0.10.3",
@@ -3858,7 +3855,7 @@ dependencies = [
  "hickory-resolver",
  "libp2p-core",
  "libp2p-identity",
- "parking_lot 0.12.5",
+ "parking_lot",
  "smallvec",
  "tracing",
 ]
@@ -4234,15 +4231,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lock_api"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65d91b22da179613dcf4d6ec8349563f52a363f6849e03b00dd0a185ec4a59af"
-dependencies = [
- "scopeguard",
-]
-
-[[package]]
 name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4482,7 +4470,7 @@ dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
  "equivalent",
- "parking_lot 0.12.5",
+ "parking_lot",
  "portable-atomic",
  "smallvec",
  "tagptr",
@@ -5137,18 +5125,8 @@ version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
 dependencies = [
- "lock_api 0.4.14",
- "parking_lot_core 0.9.12",
-]
-
-[[package]]
-name = "parking_lot"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9cf937ca4e1d0b7578784559063422fc39ae7c5a00f02471f2614d5486fd226"
-dependencies = [
- "lock_api 0.5.0",
- "parking_lot_core 0.10.0",
+ "lock_api",
+ "parking_lot_core",
 ]
 
 [[package]]
@@ -5159,19 +5137,7 @@ checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
 dependencies = [
  "cfg-if",
  "libc",
- "redox_syscall 0.5.18",
- "smallvec",
- "windows-link",
-]
-
-[[package]]
-name = "parking_lot_core"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9cfff060068cc18aa7815010fcaf80c68c7fb9e85fc7f5c0f9bf142c21d19826"
-dependencies = [
- "libc",
- "redox_syscall 0.9.5",
+ "redox_syscall",
  "smallvec",
  "windows-link",
 ]
@@ -5422,7 +5388,6 @@ dependencies = [
  "anyhow",
  "arrow",
  "base64 0.23.1",
- "chrono",
  "clap",
  "clap_complete",
  "crossterm",
@@ -5559,7 +5524,6 @@ dependencies = [
  "half",
  "if-addrs",
  "libp2p",
- "parking_lot 0.13.0",
  "petgraph",
  "pmetal-core",
  "pmetal-runtime",
@@ -5688,7 +5652,6 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "objc2-metal",
- "parking_lot 0.13.0",
  "pmetal-core",
  "pmetal-runtime",
  "rand 0.10.3",
@@ -5756,9 +5719,7 @@ dependencies = [
  "pyo3-build-config",
  "serde",
  "serde_json",
- "tempfile",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -5795,7 +5756,6 @@ dependencies = [
  "llguidance",
  "pmetal-cache",
  "pmetal-data",
- "pmetal-metal",
  "pmetal-models",
  "pmetal-runtime",
  "prometheus-client",
@@ -6037,7 +5997,7 @@ checksum = "1784dc11a05f5a8f57c4a62915686be140f24f70301290b997e317241fa9ffc2"
 dependencies = [
  "dtoa",
  "itoa",
- "parking_lot 0.12.5",
+ "parking_lot",
  "prometheus-client-derive-encode",
 ]
 
@@ -6657,15 +6617,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "redox_syscall"
-version = "0.9.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "580c875845b41ecb1564ad1ae4703044cef774145e3d7a94dc2b3fa7c97868fd"
-dependencies = [
- "bitflags 2.13.2",
-]
-
-[[package]]
 name = "redox_users"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6704,7 +6655,7 @@ dependencies = [
  "ahash",
  "fluent-uri 0.3.2",
  "once_cell",
- "parking_lot 0.12.5",
+ "parking_lot",
  "percent-encoding",
  "serde_json",
 ]
@@ -6721,7 +6672,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "itoa",
  "micromap",
- "parking_lot 0.12.5",
+ "parking_lot",
  "percent-encoding",
  "serde_json",
 ]
@@ -7292,7 +7243,7 @@ dependencies = [
  "futures-util",
  "log",
  "once_cell",
- "parking_lot 0.12.5",
+ "parking_lot",
  "serial_test_derive",
 ]
 
@@ -7763,7 +7714,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9048a889effe34a5cddee0af7f53285198b16dca3be510858d38dfdb3e62a04e"
 dependencies = [
  "bitflags 2.13.2",
- "parking_lot 0.12.5",
+ "parking_lot",
  "rustix",
  "signal-hook",
  "windows-sys 0.61.2",
@@ -7975,7 +7926,6 @@ dependencies = [
  "derive_builder",
  "esaxx-rs",
  "getrandom 0.3.4",
- "indicatif",
  "itertools 0.14.0",
  "log",
  "macro_rules_attribute",
@@ -8005,7 +7955,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot 0.12.5",
+ "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
@@ -8385,7 +8335,7 @@ dependencies = [
  "fastrand",
  "flate2",
  "futures",
- "parking_lot 0.12.5",
+ "parking_lot",
  "percent-encoding",
  "pin-project-lite",
  "regex",
@@ -8411,7 +8361,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "futures",
- "parking_lot 0.12.5",
+ "parking_lot",
  "schemars",
  "serde",
  "serde_json",
@@ -8434,7 +8384,7 @@ checksum = "a987f6275664d7f8a9fb802a06911971735ef39d8164f262c594f708bf0e988d"
 dependencies = [
  "bytes",
  "futures",
- "parking_lot 0.12.5",
+ "parking_lot",
  "serde_json",
  "tokio",
  "tokio-util",
@@ -8457,7 +8407,7 @@ dependencies = [
  "futures",
  "getrandom 0.4.3",
  "nix 0.31.3",
- "parking_lot 0.12.5",
+ "parking_lot",
  "serde",
  "serde_json",
  "subtle",
@@ -9429,7 +9379,7 @@ dependencies = [
  "futures",
  "log",
  "nohash-hasher",
- "parking_lot 0.12.5",
+ "parking_lot",
  "pin-project",
  "static_assertions",
  "web-time",

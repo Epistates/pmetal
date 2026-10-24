@@ -26,10 +26,10 @@ use libp2p::{
     Multiaddr, PeerId, Swarm, SwarmBuilder, gossipsub, identify, mdns, noise, ping,
     swarm::NetworkBehaviour, swarm::SwarmEvent, tcp, yamux,
 };
-use parking_lot::RwLock;
+use pmetal_core::sync::{read_locked, write_locked};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
@@ -261,7 +261,7 @@ impl DiscoveryService {
                     }
 
                     {
-                        let mut state = self.state.write();
+                        let mut state = write_locked(&self.state);
                         if let Some(peer) = state.peers.get_mut(&peer_id) {
                             peer.connected = false;
                         }
@@ -357,7 +357,7 @@ impl DiscoveryService {
 
                     // Add to state
                     {
-                        let mut state = self.state.write();
+                        let mut state = write_locked(&self.state);
                         let peer = state.peers.entry(peer_id).or_insert_with(|| PeerInfo {
                             peer_id,
                             addresses: Vec::new(),
@@ -376,7 +376,7 @@ impl DiscoveryService {
                     }
 
                     let addresses = {
-                        let state = self.state.read();
+                        let state = read_locked(&self.state);
                         state
                             .peers
                             .get(&peer_id)
@@ -429,7 +429,7 @@ impl DiscoveryService {
     /// Record a peer as connected and tell the backend.
     async fn mark_connected(&self, peer_id: PeerId, socket_addr: Option<SocketAddr>) {
         {
-            let mut state = self.state.write();
+            let mut state = write_locked(&self.state);
             if let Some(peer) = state.peers.get_mut(&peer_id) {
                 peer.connected = true;
                 peer.socket_addr = socket_addr;

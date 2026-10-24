@@ -9,9 +9,10 @@ use crate::fabric::InterfaceKind;
 use crate::topology::ClusterTopology;
 use anyhow::Result;
 use libp2p::PeerId;
+use pmetal_core::sync::read_locked;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLockReadGuard};
 use std::time::Duration;
 
 /// One row of `pmetal cluster status`: a peer, its primary fabric, and
@@ -101,7 +102,7 @@ fn truncate(s: &str, max: usize) -> String {
 pub fn snapshot_status(backend: &AutoDiscoveryBackend) -> ClusterStatus {
     let topology = backend.topology();
     let fabric = backend.fabric();
-    let topo: parking_lot::RwLockReadGuard<'_, ClusterTopology> = topology.read();
+    let topo: RwLockReadGuard<'_, ClusterTopology> = read_locked(&topology);
 
     let local_peer_id = topo
         .nodes()

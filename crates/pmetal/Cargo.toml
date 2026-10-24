@@ -57,7 +57,7 @@ cli = [
     "core", "gguf", "metal", "hub", "runtime", "cache", "models", "data",
     "dep:clap", "dep:clap_complete", "dep:tokio",
     "dep:serde", "dep:serde-saphyr", "dep:indicatif", "dep:anyhow",
-    "dep:safetensors", "dep:dirs", "dep:chrono",
+    "dep:safetensors", "dep:dirs",
     "dep:rand", "dep:regex", "dep:tempfile", "dep:tokenizers",
     "dep:walkdir", "dep:flate2", "dep:libc", "dep:sha2",
 ]
@@ -107,7 +107,6 @@ indicatif = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
 safetensors = { workspace = true, optional = true }
 dirs = { workspace = true, optional = true }
-chrono = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 regex = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }

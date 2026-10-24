@@ -16,10 +16,10 @@
 //! `beta == 0` it never reads `C`, so a fresh buffer is fine as the output.
 
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
-use parking_lot::Mutex;
+use pmetal_core::sync::locked;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::buffer::{BufferUsage, MetalBuffer};
@@ -226,7 +226,7 @@ impl ScratchPool {
     /// The buffer holds at least `data.len()` elements (a reused one may hold
     /// more) and stays untouched until the next `reset`.
     pub fn stage(&self, data: &[f32]) -> Result<MetalBuffer<f32>> {
-        let mut state = self.state.lock();
+        let mut state = locked(&self.state);
         let slot = state.next;
         if slot == state.buffers.len() {
             let buffer = MetalBuffer::new(&self.ctx, data.len(), BufferUsage::Shared)?;
@@ -246,7 +246,7 @@ impl ScratchPool {
     ///
     /// Call this once the batches that use the staged operands have executed.
     pub fn reset(&self) {
-        self.state.lock().next = 0;
+        locked(&self.state).next = 0;
     }
 }
 

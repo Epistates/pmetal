@@ -48,7 +48,6 @@ tracing = "0.1"
 
 # Utilities
 dirs = "7"
-reqwest = { version = "0.13", features = ["json", "rustls"], default-features = false }
 pmetal = { path = "../../pmetal", features = ["full"] }
 pmetal-runtime = { path = "../../pmetal-runtime" }
 pmetal-supervisor = { path = "../../pmetal-supervisor" }

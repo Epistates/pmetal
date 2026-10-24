@@ -19,13 +19,13 @@ use objc2_metal::{
     MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily, MTLLibrary,
     MTLResourceOptions, MTLSize,
 };
-use parking_lot::RwLock;
+use pmetal_core::sync::{read_locked, write_locked};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tracing::{debug, info};
 
 use crate::chip;
@@ -689,14 +689,14 @@ impl MetalContext {
 
     /// Get read access to the pipeline cache.
     #[inline]
-    pub fn pipeline_cache(&self) -> parking_lot::RwLockReadGuard<'_, PipelineCache> {
-        self.pipeline_cache.read()
+    pub fn pipeline_cache(&self) -> RwLockReadGuard<'_, PipelineCache> {
+        read_locked(&self.pipeline_cache)
     }
 
     /// Get write access to the pipeline cache.
     #[inline]
-    pub fn pipeline_cache_mut(&self) -> parking_lot::RwLockWriteGuard<'_, PipelineCache> {
-        self.pipeline_cache.write()
+    pub fn pipeline_cache_mut(&self) -> RwLockWriteGuard<'_, PipelineCache> {
+        write_locked(&self.pipeline_cache)
     }
 
     /// Whether the Metal 4 / MPP kernels can run on this device: the build

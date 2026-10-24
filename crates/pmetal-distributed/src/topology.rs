@@ -18,12 +18,11 @@ use crate::error::DistributedError;
 use crate::fabric::InterfaceKind;
 use anyhow::Result;
 use libp2p::PeerId;
-use parking_lot::RwLock;
 use petgraph::graph::{DiGraph, NodeIndex};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
