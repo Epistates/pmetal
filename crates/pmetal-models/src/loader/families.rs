@@ -28,7 +28,7 @@ pub struct Qwen3NextLoadOptions {
     /// of a dense copy must not have).
     pub unpack_quantized_experts: bool,
     /// Keep an MLX-quantized checkpoint's projections, embedding table and
-    /// routed experts packed (see [`LoadPolicy::keep_quantized`]), where they
+    /// routed experts packed (see [`LoadPolicy::keep_quantized`](crate::loader::LoadPolicy::keep_quantized)), where they
     /// are unpacked to dense by default. Routed experts that are offloaded are
     /// read from their own files and take no part.
     pub keep_quantized: bool,

@@ -98,7 +98,8 @@ impl ExternalRewardConfig {
     }
 }
 
-/// A reward scored by a long-lived process: see the [module docs](self).
+/// A reward scored by a long-lived process that reads one JSON line per batch
+/// and answers with the rewards (the protocol is in this module's docs).
 pub struct ExternalCommandReward {
     name: String,
     timeout: Duration,

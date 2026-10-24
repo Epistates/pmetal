@@ -818,7 +818,7 @@ impl Gemma4Experts {
     /// (the gate and up projections already fused along the output axis, which
     /// packing allows since every row is quantized on its own), all at one
     /// width and group size. The words stand in the parameters, as a packed
-    /// `Linear`'s do, and the forward runs [`Self::forward_quantized`].
+    /// `Linear`'s do, and the forward runs the packed path (`forward_quantized`).
     pub fn install_packed(
         &mut self,
         gate_up: (Array, Array, Array),

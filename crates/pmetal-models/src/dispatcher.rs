@@ -2145,7 +2145,7 @@ impl DynamicModel {
     }
 
     /// Where the projection onto the vocabulary sits in the walk
-    /// [`VisitLinears`](pmetal_runtime::compat::VisitLinears) makes, when it is
+    /// [`VisitLinears`] makes, when it is
     /// a layer of its own; `None` when the model ties it to the token
     /// embedding or has none.
     ///

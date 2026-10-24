@@ -2,7 +2,7 @@
 //!
 //! `pmetal train --full` trains every weight of the model through the same
 //! loop, optimizers, gradient checkpointing and packing LoRA runs through: the
-//! model is [`DynamicLoraModel::from_pretrained_full`], the inference path's own
+//! model is [`DynamicLoraModel::from_pretrained_full`](pmetal_lora::DynamicLoraModel::from_pretrained_full), the inference path's own
 //! model with every parameter trainable, so there is no second forward pass to
 //! drift from the one `pmetal infer` and `serve` run. What is specific to a
 //! full fine-tune lives here:

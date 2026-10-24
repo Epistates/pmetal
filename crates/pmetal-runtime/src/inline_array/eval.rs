@@ -39,9 +39,10 @@ impl InlineArray {
 
     /// Materialize every array of a set in ONE evaluation: one submission and
     /// one wait for the lot, where `eval` on each would wait once apiece. The
-    /// arrays stay attached to their graphs (unlike [`eval_and_detach_many`]
-    /// (crate::inline_array::eval_and_detach_many)) and the values are the
-    /// ones `eval` would give. An empty set does nothing.
+    /// arrays stay attached to their graphs (unlike
+    /// [`eval_and_detach_many`](crate::inline_array::eval_and_detach_many))
+    /// and the values are the ones `eval` would give. An empty set does
+    /// nothing.
     pub fn eval_many<'a>(arrays: impl IntoIterator<Item = &'a InlineArray>) -> EvalToken {
         let prior = crate::error::peek_last_error();
         let mut ptrs: Vec<*mut RawBuf> = arrays

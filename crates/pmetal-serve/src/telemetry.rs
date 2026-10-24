@@ -4,7 +4,7 @@
 //! process-wide recorder), so two servers in one process, and the tests, keep
 //! separate numbers. Three kinds of series live in it:
 //!
-//! * HTTP, from [`track_http`]: requests by route, method and status, a
+//! * HTTP, from the `track_http` middleware: requests by route, method and status, a
 //!   latency histogram per route (for a streamed reply, the time to its
 //!   headers), and the requests in flight. Routes are the router's patterns,
 //!   never the raw path, so a client cannot mint series.
