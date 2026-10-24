@@ -233,6 +233,38 @@ mod tests {
     }
 
     #[test]
+    fn a_model_whose_template_writes_the_bos_gets_one_at_the_start_of_every_chunk() {
+        use crate::tokenizer::testing::byte_level_bpe;
+        // The Gemma 4 layout: the tokenizer's post-processor adds no BOS and
+        // the chat template does.
+        let bare = byte_level_bpe(&[], &["<bos>"], None);
+        let model = tempfile::tempdir().unwrap();
+        bare.inner()
+            .save(model.path().join("tokenizer.json"), false)
+            .unwrap();
+        std::fs::write(
+            model.path().join("tokenizer_config.json"),
+            r#"{"bos_token": "<bos>"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            model.path().join("chat_template.jinja"),
+            "{{- bos_token -}}{%- for m in messages -%}{{ m['content'] }}{%- endfor -%}",
+        )
+        .unwrap();
+        let tokenizer = Tokenizer::from_model_dir(model.path()).unwrap();
+        let bos = tokenizer.bos_token_id().expect("a bos");
+
+        let (_d, txt) = dir_with("c.txt", "abcdefghijklmnopqrstuvwxyz");
+        let set = load_calibration_chunks(&txt, &tokenizer, &options(8)).unwrap();
+        assert!(set.chunks.len() >= 3);
+        for chunk in &set.chunks {
+            assert_eq!(chunk[0], bos);
+        }
+        assert_eq!(set.chunks[0][1], u32::from(b'a'));
+    }
+
+    #[test]
     fn empty_data_and_tiny_chunks_are_errors() {
         let tokenizer = word_level(&["<unk>", "a"], &[]);
         let (_d, empty) = dir_with("c.txt", "");

@@ -72,16 +72,16 @@ pub fn can_quantize(dtype: GgmlType) -> bool {
 ///
 /// A block never straddles a row, so a type whose block size does not divide
 /// the row cannot hold the tensor. The reference falls back to a 32-element
-/// type of similar size (Q2_K, Q3_K, IQ4_XS and the IQ1/2/3 types to IQ4_NL,
-/// Q4_K to Q5_0, Q5_K to Q5_1, Q6_K and Q8_K to Q8_0, the ternary types to
-/// Q4_0), and to F16 when even 32 does not divide the row. Returns `dtype`
-/// itself when it fits.
+/// type of similar size (Q2_K and Q3_K to Q4_0, IQ4_XS and the IQ1/2/3 types
+/// to IQ4_NL, Q4_K to Q5_0, Q5_K to Q5_1, Q6_K and Q8_K to Q8_0, the ternary
+/// types to Q4_0), and to F16 when even 32 does not divide the row. Returns
+/// `dtype` itself when it fits.
 pub fn fit_to_row_length(dtype: GgmlType, n_per_row: usize) -> GgmlType {
     if n_per_row % dtype.block_size() == 0 {
         return dtype;
     }
     let fallback = match dtype {
-        GgmlType::Tq1_0 | GgmlType::Tq2_0 => GgmlType::Q4_0,
+        GgmlType::Tq1_0 | GgmlType::Tq2_0 | GgmlType::Q2K | GgmlType::Q3K => GgmlType::Q4_0,
         GgmlType::Iq2Xxs
         | GgmlType::Iq2Xs
         | GgmlType::Iq2S
@@ -89,8 +89,6 @@ pub fn fit_to_row_length(dtype: GgmlType, n_per_row: usize) -> GgmlType {
         | GgmlType::Iq3S
         | GgmlType::Iq1S
         | GgmlType::Iq1M
-        | GgmlType::Q2K
-        | GgmlType::Q3K
         | GgmlType::Iq4Xs => GgmlType::Iq4Nl,
         GgmlType::Q4K => GgmlType::Q5_0,
         GgmlType::Q5K => GgmlType::Q5_1,
@@ -1079,6 +1077,77 @@ mod tests {
         }
     }
 
+    /// A weight matrix as trained ones look: rows of groups of 16 whose scales
+    /// vary by a factor of a few, and about one value in 200 an outlier. The
+    /// scale search of a K-quant has something to do on this and none of it
+    /// is a cosine.
+    fn heavy_tailed(rows: usize, cols: usize) -> Vec<f32> {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut uniform = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            ((state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+        };
+        let mut gauss = move || {
+            let (u, v) = (uniform(), uniform());
+            (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()
+        };
+        let mut out = Vec::with_capacity(rows * cols);
+        for _ in 0..rows {
+            let mut group_scale = 0.0;
+            for c in 0..cols {
+                if c % 16 == 0 {
+                    group_scale = (0.7 * gauss()).exp();
+                }
+                let mut x = 0.02 * group_scale * gauss();
+                if gauss().abs() > 2.8 {
+                    x *= 6.0;
+                }
+                out.push(x as f32);
+            }
+        }
+        out
+    }
+
+    /// The K-quants find as small an error as the reference quantizer does.
+    ///
+    /// The reference values are the relative RMS error (`|x - x'| / |x|`) of
+    /// this exact tensor quantized by the reference quantizer without an
+    /// importance matrix. They agree to about a thousandth because the scale
+    /// searches are the same computation; a weaker search (one that settles for
+    /// the first scale it tries, say) is worse by percents, and a file made
+    /// with it is worse under the same name.
+    #[test]
+    fn k_quants_lose_no_more_than_the_reference_quantizer_on_a_heavy_tailed_matrix() {
+        let (rows, cols) = (256, 1024);
+        let data = heavy_tailed(rows, cols);
+        let energy: f64 = data.iter().map(|v| f64::from(*v).powi(2)).sum();
+        for (dtype, reference) in [
+            (GgmlType::Q2K, 0.325_816),
+            (GgmlType::Q3K, 0.172_322),
+            (GgmlType::Q4K, 0.085_718),
+            (GgmlType::Q5K, 0.043_839),
+            (GgmlType::Q6K, 0.021_481),
+        ] {
+            let bytes = quantize_tensor(&data, dtype, cols, None).unwrap();
+            let back = dequantize(&bytes, dtype, &[rows as i32, cols as i32]).unwrap();
+            let error: f64 = data
+                .iter()
+                .zip(&back)
+                .map(|(a, b)| f64::from(a - b).powi(2))
+                .sum();
+            let relative = (error / energy).sqrt();
+            // Not worse (a rounding that falls the other way in a handful of
+            // blocks can make it a hair better), and not so different that the
+            // search is another one.
+            assert!(
+                relative <= reference * 1.001 && relative >= reference * 0.99,
+                "{dtype:?}: relative error {relative:.6} against the reference's {reference}"
+            );
+        }
+    }
+
     #[test]
     fn bits_buy_accuracy() {
         // Within a family, more bits must not be worse.
@@ -1112,7 +1181,14 @@ mod tests {
         assert_eq!(fit_to_row_length(GgmlType::Q4K, 4160), GgmlType::Q5_0);
         assert_eq!(fit_to_row_length(GgmlType::Q5K, 4160), GgmlType::Q5_1);
         assert_eq!(fit_to_row_length(GgmlType::Q6K, 4160), GgmlType::Q8_0);
-        assert_eq!(fit_to_row_length(GgmlType::Q3K, 4160), GgmlType::Iq4Nl);
+        // Gemma 3 1B's rows (1,152 = 4.5 x 256) are the case that showed these:
+        // the reference writes Q4_0 for its Q2_K and Q3_K tensors, IQ4_NL for
+        // IQ4_XS and for the IQ3 types.
+        assert_eq!(fit_to_row_length(GgmlType::Q3K, 1152), GgmlType::Q4_0);
+        assert_eq!(fit_to_row_length(GgmlType::Q2K, 1152), GgmlType::Q4_0);
+        assert_eq!(fit_to_row_length(GgmlType::Iq4Xs, 1152), GgmlType::Iq4Nl);
+        assert_eq!(fit_to_row_length(GgmlType::Iq3S, 1152), GgmlType::Iq4Nl);
+        assert_eq!(fit_to_row_length(GgmlType::Q3K, 4160), GgmlType::Q4_0);
         assert_eq!(fit_to_row_length(GgmlType::Iq2Xxs, 4160), GgmlType::Iq4Nl);
         assert_eq!(fit_to_row_length(GgmlType::Tq2_0, 4160), GgmlType::Q4_0);
         // Not even 32 divides it.

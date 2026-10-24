@@ -127,8 +127,9 @@ pub(crate) async fn run_serve(spec: ServeSpec, api_keys: Vec<String>) -> anyhow:
 
     // Load tokenizer — use pmetal_data::Tokenizer for config-aware special token
     // resolution (needed by collect_all_stop_tokens inside InferenceEngine::new).
+    // A GGUF file carries its tokenizer in its metadata.
     tracing::info!("Loading tokenizer...");
-    let tokenizer = pmetal_data::Tokenizer::from_model_dir(&model_path)
+    let tokenizer = pmetal_data::Tokenizer::from_model_path(&model_path)
         .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?;
 
     let kv_turboquant_preset = kv_turboquant_preset

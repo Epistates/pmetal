@@ -770,6 +770,39 @@ mod tests {
         assert!(encode_pair(&tokenizer, "so the", " ").is_err());
     }
 
+    /// Gemma 4's tokenizer adds no BOS and its chat template writes one: a
+    /// benchmark's prompts must start with it all the same, once, in the
+    /// context and not in the continuation.
+    #[test]
+    fn a_model_that_gets_its_bos_from_its_template_scores_prompts_after_one() {
+        let bare =
+            pmetal_data::tokenizer::testing::byte_level_bpe(&["a b"], &["<bos>", "<|turn>"], None);
+        let dir = tempfile::tempdir().unwrap();
+        bare.inner()
+            .save(dir.path().join("tokenizer.json"), false)
+            .unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"bos_token": "<bos>"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "{{- bos_token -}}{%- for m in messages -%}{{ m['content'] }}{%- endfor -%}",
+        )
+        .unwrap();
+        let tokenizer = Tokenizer::from_model_dir(dir.path()).unwrap();
+        let bos = tokenizer.inner().token_to_id("<bos>").unwrap();
+
+        let (context, continuation) = encode_pair(&tokenizer, "ab ab:", " ab").unwrap();
+        assert_eq!(context.iter().filter(|&&t| t == bos).count(), 1);
+        assert_eq!(context[0], bos);
+        assert!(!continuation.contains(&bos));
+        // A prompt that is generated from starts the same way.
+        let prompt = tokenizer.encode_with_special_tokens("ab ab:").unwrap();
+        assert_eq!(prompt, context);
+    }
+
     #[test]
     fn an_empty_task_is_an_error() {
         let mut model = Scripted::new(|_| 0.0);

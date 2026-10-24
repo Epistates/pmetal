@@ -709,7 +709,14 @@ pub(crate) fn add_tokenizer_metadata(
             },
         )
     };
-    if let Some(value) = add_special("bos", true) {
+    if tokenizer_model == "gemma4" {
+        // Gemma 4's tokenizer config does not say, its chat template carries a
+        // beginning of text of its own, and a raw prompt has none: the reference
+        // converter states that the engine adds one, and that it does not
+        // prefix a space.
+        builder.add_bool(pmetal_gguf::keys::TOKENIZER_ADD_BOS, true);
+        builder.add_bool(pmetal_gguf::keys::TOKENIZER_ADD_SPACE_PREFIX, false);
+    } else if let Some(value) = add_special("bos", true) {
         builder.add_bool(pmetal_gguf::keys::TOKENIZER_ADD_BOS, value);
     }
     if let Some(value) = add_special("eos", false) {

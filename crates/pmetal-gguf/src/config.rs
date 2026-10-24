@@ -96,6 +96,35 @@ pub struct GgufArchConfig {
     /// The context the scaled frequencies are defined against
     /// (`rope.scaling.original_context_length`).
     pub original_context_length: Option<u32>,
+    /// Sliding-window width of the local-attention layers
+    /// (`attention.sliding_window`): Gemma 2 and 3.
+    pub sliding_window: Option<u32>,
+    /// RoPE base frequency of the sliding-window layers
+    /// (`rope.freq_base_swa`): Gemma 3.
+    pub rope_theta_swa: Option<f64>,
+    /// `tanh` cap on the attention scores (`attn_logit_softcapping`): Gemma 2.
+    pub attn_logit_softcapping: Option<f64>,
+    /// `tanh` cap on the output logits (`final_logit_softcapping`): Gemma 2.
+    pub final_logit_softcapping: Option<f64>,
+    /// Width of the heads of the sliding-window layers
+    /// (`attention.key_length_swa`), where they differ from the full-attention
+    /// layers': Gemma 4.
+    pub head_dim_swa: Option<u32>,
+    /// Key/value heads of every layer, when the file states one count per
+    /// layer (`attention.head_count_kv` as an array): Gemma 4.
+    pub num_key_value_heads_per_layer: Option<Vec<u32>>,
+    /// Feed-forward width of every layer, when the file states one per layer
+    /// (`feed_forward_length` as an array).
+    pub intermediate_size_per_layer: Option<Vec<u32>>,
+    /// Whether each layer is a sliding-window one
+    /// (`attention.sliding_window_pattern`): Gemma 4.
+    pub sliding_window_pattern: Option<Vec<bool>>,
+    /// Width of the per-layer input embedding (`embedding_length_per_layer_input`);
+    /// zero for a model without one.
+    pub embedding_length_per_layer_input: Option<u32>,
+    /// Trailing layers that read an earlier layer's keys and values
+    /// (`attention.shared_kv_layers`).
+    pub shared_kv_layers: Option<u32>,
     /// Experts per MoE layer (`expert_count`).
     pub num_experts: Option<u32>,
     /// Experts routed per token (`expert_used_count`).
@@ -186,6 +215,43 @@ impl GgufArchConfig {
                 .or(rope_dimension_count),
             rope_dimension_count,
             original_context_length,
+            head_dim_swa: u32_of("attention.key_length_swa"),
+            num_key_value_heads_per_layer: array_of(
+                content,
+                &format!("{arch}.attention.head_count_kv"),
+            )
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|v| v.as_u64().and_then(|v| u32::try_from(v).ok()))
+                    .collect::<Option<Vec<u32>>>()
+            })
+            .unwrap_or(None),
+            intermediate_size_per_layer: array_of(content, &format!("{arch}.feed_forward_length"))
+                .map(|values| {
+                    values
+                        .iter()
+                        .map(|v| v.as_u64().and_then(|v| u32::try_from(v).ok()))
+                        .collect::<Option<Vec<u32>>>()
+                })
+                .unwrap_or(None),
+            sliding_window_pattern: array_of(
+                content,
+                &format!("{arch}.attention.sliding_window_pattern"),
+            )
+            .map(|values| {
+                values
+                    .iter()
+                    .map(MetadataValue::as_bool)
+                    .collect::<Option<Vec<bool>>>()
+            })
+            .unwrap_or(None),
+            embedding_length_per_layer_input: u32_of("embedding_length_per_layer_input"),
+            shared_kv_layers: u32_of("attention.shared_kv_layers"),
+            sliding_window: u32_of("attention.sliding_window"),
+            rope_theta_swa: f64_of("rope.freq_base_swa"),
+            attn_logit_softcapping: f64_of("attn_logit_softcapping"),
+            final_logit_softcapping: f64_of("final_logit_softcapping"),
             num_experts: u32_of("expert_count"),
             num_experts_per_tok: u32_of("expert_used_count"),
             file_type: content
@@ -256,7 +322,7 @@ impl GgufArchConfig {
             "architectures",
             json!([map_architecture_class(&self.architecture)]),
         );
-        let optional: [(&str, Option<Value>); 15] = [
+        let optional: [(&str, Option<Value>); 19] = [
             ("_name_or_path", self.name.as_ref().map(|v| json!(v))),
             ("hidden_size", self.hidden_size.map(|v| json!(v))),
             (
@@ -283,6 +349,19 @@ impl GgufArchConfig {
             ("rope_theta", self.rope_theta.map(|v| json!(v))),
             ("head_dim", self.head_dim.map(|v| json!(v))),
             ("rms_norm_eps", self.rms_norm_eps.map(|v| json!(v))),
+            ("sliding_window", self.sliding_window.map(|v| json!(v))),
+            (
+                "rope_local_base_freq",
+                self.rope_theta_swa.map(|v| json!(v)),
+            ),
+            (
+                "attn_logit_softcapping",
+                self.attn_logit_softcapping.map(|v| json!(v)),
+            ),
+            (
+                "final_logit_softcapping",
+                self.final_logit_softcapping.map(|v| json!(v)),
+            ),
             ("num_local_experts", self.num_experts.map(|v| json!(v))),
             (
                 "num_experts_per_tok",
@@ -297,6 +376,14 @@ impl GgufArchConfig {
             }
         }
         Value::Object(config)
+    }
+}
+
+/// A metadata value that is an array.
+fn array_of<'a>(content: &'a GgufContent, key: &str) -> Option<&'a [MetadataValue]> {
+    match content.get_metadata(key)? {
+        MetadataValue::Array(values) => Some(values),
+        _ => None,
     }
 }
 
@@ -542,6 +629,98 @@ mod tests {
         assert_eq!(config["max_position_embeddings"], 8192);
         assert_eq!(config["intermediate_size"], 11008);
         assert_eq!(config["architectures"][0], "LlamaForCausalLM");
+    }
+
+    /// Gemma 3's window, local rope base and soft caps are read as the
+    /// converter names them, and written under the Hugging Face names.
+    #[test]
+    fn gemma_window_rope_base_and_softcaps_are_read() {
+        let content = make_content(
+            "gemma3",
+            vec![
+                (
+                    "gemma3.attention.sliding_window",
+                    MetadataValue::Uint32(512),
+                ),
+                ("gemma3.rope.freq_base_swa", MetadataValue::Float32(10000.0)),
+                ("gemma3.rope.freq_base", MetadataValue::Float32(1_000_000.0)),
+                (
+                    "gemma3.final_logit_softcapping",
+                    MetadataValue::Float32(30.0),
+                ),
+                (
+                    "gemma3.attn_logit_softcapping",
+                    MetadataValue::Float32(50.0),
+                ),
+            ],
+        );
+        let arch = GgufArchConfig::from_gguf(&content).unwrap();
+        assert_eq!(arch.sliding_window, Some(512));
+        assert_eq!(arch.rope_theta_swa, Some(10000.0));
+        assert_eq!(arch.final_logit_softcapping, Some(30.0));
+        let config = arch.to_config_json();
+        assert_eq!(config["sliding_window"], 512);
+        assert_eq!(config["rope_local_base_freq"], 10000.0);
+        assert_eq!(config["attn_logit_softcapping"], 50.0);
+        assert_eq!(config["final_logit_softcapping"], 30.0);
+        // Absent stays absent.
+        let plain = make_content("llama", vec![]);
+        assert!(
+            config_from_gguf(&plain)
+                .unwrap()
+                .get("sliding_window")
+                .is_none()
+        );
+    }
+
+    /// Gemma 4 states per-layer facts as arrays; they are read as arrays, and
+    /// the scalar fields stay empty rather than take the first element.
+    #[test]
+    fn gemma_4_per_layer_arrays_are_read() {
+        let array = |values: Vec<MetadataValue>| MetadataValue::Array(values);
+        let content = make_content(
+            "gemma4",
+            vec![
+                (
+                    "gemma4.attention.head_count_kv",
+                    array(vec![MetadataValue::Uint32(8), MetadataValue::Uint32(1)]),
+                ),
+                (
+                    "gemma4.attention.sliding_window_pattern",
+                    array(vec![MetadataValue::Bool(true), MetadataValue::Bool(false)]),
+                ),
+                (
+                    "gemma4.feed_forward_length",
+                    array(vec![MetadataValue::Uint32(64), MetadataValue::Uint32(128)]),
+                ),
+                (
+                    "gemma4.attention.key_length_swa",
+                    MetadataValue::Uint32(256),
+                ),
+                ("gemma4.attention.key_length", MetadataValue::Uint32(512)),
+                (
+                    "gemma4.embedding_length_per_layer_input",
+                    MetadataValue::Uint32(0),
+                ),
+            ],
+        );
+        let arch = GgufArchConfig::from_gguf(&content).unwrap();
+        assert_eq!(arch.num_key_value_heads, None);
+        assert_eq!(arch.num_key_value_heads_per_layer, Some(vec![8, 1]));
+        assert_eq!(arch.sliding_window_pattern, Some(vec![true, false]));
+        assert_eq!(arch.intermediate_size, None);
+        assert_eq!(arch.intermediate_size_per_layer, Some(vec![64, 128]));
+        assert_eq!(arch.head_dim_swa, Some(256));
+        assert_eq!(arch.head_dim, Some(512));
+        assert_eq!(arch.embedding_length_per_layer_input, Some(0));
+        // A scalar head count is not an array.
+        let scalar = make_content(
+            "llama",
+            vec![("llama.attention.head_count_kv", MetadataValue::Uint32(8))],
+        );
+        let arch = GgufArchConfig::from_gguf(&scalar).unwrap();
+        assert_eq!(arch.num_key_value_heads, Some(8));
+        assert_eq!(arch.num_key_value_heads_per_layer, None);
     }
 
     #[test]

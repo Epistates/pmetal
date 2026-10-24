@@ -1,5 +1,5 @@
 use crate::commands::gguf_export::{
-    ExportArch, add_hf_config_metadata, add_tokenizer_metadata, json_usize, model_name,
+    ExportArch, Recipe, add_hf_config_metadata, add_tokenizer_metadata, model_name,
 };
 use crate::commands::quantize_source::TensorMeta;
 use std::collections::{HashMap, HashSet};
@@ -137,206 +137,6 @@ fn expert_stack_layout(
     shape.push(sorted.len() as u64);
     shape.extend(base_shape.iter().map(|&dim| dim as u64));
     Ok((sorted, shape))
-}
-
-fn is_quantizable_gguf_tensor(gguf_name: &str, shape: &[u64]) -> bool {
-    if !(shape.len() == 2 || shape.len() == 3) || !gguf_name.ends_with(".weight") {
-        return false;
-    }
-    let name = gguf_name.to_ascii_lowercase();
-    if name.contains("_norm.weight")
-        || name.contains("norm.weight")
-        || name.contains("ffn_gate_inp.weight")
-        || name.contains("router")
-        || name.contains("altup")
-        || name.contains("laurel")
-        || name.contains("per_layer_model_proj")
-        || name.contains("pos_embd")
-        || name.contains("token_types")
-        || name.contains("ssm_conv1d")
-        || name.contains("shortconv.conv.weight")
-        || name.contains("attn_rel_b.weight")
-        || name.contains(".position_embd")
-        || name.contains(".rel_pos")
-        || name.contains(".patch_embd")
-        || name.contains(".patch_merger")
-    {
-        return false;
-    }
-    true
-}
-
-fn parse_layer_from_gguf_name(gguf_name: &str) -> Option<usize> {
-    let rest = gguf_name.strip_prefix("blk.")?;
-    let (layer, _) = rest.split_once('.')?;
-    layer.parse::<usize>().ok()
-}
-
-fn use_more_bits(layer: usize, n_layers: usize) -> bool {
-    if n_layers == 0 {
-        return false;
-    }
-    layer < n_layers / 8 || layer >= 7 * n_layers / 8 || layer.saturating_sub(n_layers / 8) % 3 == 2
-}
-
-fn llama_default_type(method: crate::cli::quantize::QuantizeMethod) -> pmetal_gguf::GgmlType {
-    method.to_ggml_type().unwrap_or(pmetal_gguf::GgmlType::Q4K)
-}
-
-fn llama_style_tensor_type(
-    method: crate::cli::quantize::QuantizeMethod,
-    gguf_name: &str,
-    shape: &[u64],
-    config_json: Option<&serde_json::Value>,
-    proposed: pmetal_gguf::GgmlType,
-) -> pmetal_gguf::GgmlType {
-    use pmetal_gguf::GgmlType;
-
-    // A vector (a norm weight, a bias) is kept in f32 whatever the type of the
-    // file. An engine multiplies activations by it element-wise, and the ops
-    // that do so take it as f32 (the reference engine aborts on a bf16 one),
-    // so a half-precision norm is a file no engine will run. A vector is a
-    // negligible share of the bytes.
-    if shape.len() <= 1 {
-        return GgmlType::F32;
-    }
-
-    if matches!(
-        method,
-        crate::cli::quantize::QuantizeMethod::F32
-            | crate::cli::quantize::QuantizeMethod::F16
-            | crate::cli::quantize::QuantizeMethod::Bf16
-    ) {
-        return llama_default_type(method);
-    }
-
-    if !is_quantizable_gguf_tensor(gguf_name, shape) {
-        return GgmlType::F16;
-    }
-
-    let mut dtype = if matches!(method, crate::cli::quantize::QuantizeMethod::Dynamic) {
-        proposed
-    } else {
-        llama_default_type(method)
-    };
-    let n_layers = config_json
-        .and_then(|json| json_usize(json, "num_hidden_layers"))
-        .unwrap_or(0);
-    let n_heads = config_json
-        .and_then(|json| json_usize(json, "num_attention_heads"))
-        .unwrap_or(0);
-    let n_kv_heads = config_json
-        .and_then(|json| json_usize(json, "num_key_value_heads"))
-        .unwrap_or(n_heads.max(1));
-    let n_gqa = n_heads.checked_div(n_kv_heads).unwrap_or(1);
-    let layer = parse_layer_from_gguf_name(gguf_name).unwrap_or(0);
-
-    if gguf_name == "output.weight" || gguf_name == "token_embd.weight" {
-        return match method {
-            crate::cli::quantize::QuantizeMethod::Q1_0
-            | crate::cli::quantize::QuantizeMethod::Tq1_0
-            | crate::cli::quantize::QuantizeMethod::Tq2_0
-            | crate::cli::quantize::QuantizeMethod::Mxfp4
-            | crate::cli::quantize::QuantizeMethod::Nvfp4 => GgmlType::F16,
-            _ if dtype == GgmlType::Q8_0 => GgmlType::Q8_0,
-            crate::cli::quantize::QuantizeMethod::Dynamic
-            | crate::cli::quantize::QuantizeMethod::Q2K
-            | crate::cli::quantize::QuantizeMethod::Q3KM
-            | crate::cli::quantize::QuantizeMethod::Q3KS
-            | crate::cli::quantize::QuantizeMethod::Q3KL
-            | crate::cli::quantize::QuantizeMethod::Q4KM
-            | crate::cli::quantize::QuantizeMethod::Q4KS
-            | crate::cli::quantize::QuantizeMethod::Q5KM
-            | crate::cli::quantize::QuantizeMethod::Q5KS
-            | crate::cli::quantize::QuantizeMethod::Iq4Nl
-            | crate::cli::quantize::QuantizeMethod::Iq4Xs
-            | crate::cli::quantize::QuantizeMethod::Q6K => GgmlType::Q6K,
-            _ => dtype,
-        };
-    }
-
-    if gguf_name.contains("attn_v.weight") {
-        dtype = match method {
-            crate::cli::quantize::QuantizeMethod::Q2K => {
-                if n_gqa >= 4 {
-                    GgmlType::Q4K
-                } else {
-                    GgmlType::Q3K
-                }
-            }
-            crate::cli::quantize::QuantizeMethod::Q3KM => {
-                if layer < 2 {
-                    GgmlType::Q5K
-                } else {
-                    GgmlType::Q4K
-                }
-            }
-            crate::cli::quantize::QuantizeMethod::Q3KL => GgmlType::Q5K,
-            crate::cli::quantize::QuantizeMethod::Q4KM
-            | crate::cli::quantize::QuantizeMethod::Q5KM => {
-                if use_more_bits(layer, n_layers) {
-                    GgmlType::Q6K
-                } else {
-                    dtype
-                }
-            }
-            crate::cli::quantize::QuantizeMethod::Q4KS => {
-                if layer < 4 {
-                    GgmlType::Q5K
-                } else {
-                    dtype
-                }
-            }
-            _ => dtype,
-        };
-    } else if gguf_name.contains("ffn_down.weight") || gguf_name.contains("ffn_down_exps.weight") {
-        dtype = match method {
-            crate::cli::quantize::QuantizeMethod::Q2K => GgmlType::Q3K,
-            crate::cli::quantize::QuantizeMethod::Q3KM => {
-                if layer < n_layers / 16 {
-                    GgmlType::Q5K
-                } else if use_more_bits(layer, n_layers) {
-                    GgmlType::Q4K
-                } else {
-                    GgmlType::Q3K
-                }
-            }
-            crate::cli::quantize::QuantizeMethod::Q3KL => GgmlType::Q5K,
-            crate::cli::quantize::QuantizeMethod::Q4KM
-            | crate::cli::quantize::QuantizeMethod::Q5KM => {
-                if use_more_bits(layer, n_layers) {
-                    GgmlType::Q6K
-                } else {
-                    dtype
-                }
-            }
-            crate::cli::quantize::QuantizeMethod::Q4KS => {
-                if layer < n_layers / 8 {
-                    GgmlType::Q5K
-                } else {
-                    dtype
-                }
-            }
-            _ => dtype,
-        };
-    } else if gguf_name.contains("attn_output.weight") {
-        dtype = match method {
-            crate::cli::quantize::QuantizeMethod::Q2K => GgmlType::Q3K,
-            crate::cli::quantize::QuantizeMethod::Q3KM => GgmlType::Q4K,
-            crate::cli::quantize::QuantizeMethod::Q3KL => GgmlType::Q5K,
-            _ => dtype,
-        };
-    } else if gguf_name.contains("attn_qkv.weight") {
-        dtype = match method {
-            crate::cli::quantize::QuantizeMethod::Q3KM
-            | crate::cli::quantize::QuantizeMethod::Q3KL => GgmlType::Q4K,
-            crate::cli::quantize::QuantizeMethod::Q4KM => GgmlType::Q5K,
-            crate::cli::quantize::QuantizeMethod::Q5KM => GgmlType::Q6K,
-            _ => dtype,
-        };
-    }
-
-    dtype
 }
 
 /// Run `pmetal quantize`: GGUF (the default) or MLX safetensors, from the base
@@ -542,6 +342,7 @@ pub(crate) async fn run_quantization(
     };
 
     // 2. Initialize quantizer
+    let has_imatrix = imatrix.is_some();
     let quantizer = if let Some(base_type) = method.to_ggml_type() {
         let config = DynamicQuantizationConfig {
             base_type,
@@ -664,19 +465,32 @@ pub(crate) async fn run_quantization(
         arch.name,
         model_name(model_path, &resolved_model_path).as_str(),
     );
-    add_hf_config_metadata(&mut builder, &arch, config_json.as_ref(), method);
-    add_tokenizer_metadata(&mut builder, &resolved_model_path, config_json.as_ref())?;
+    // The model's own configuration: the language model's, in a multimodal
+    // checkpoint. The tokenizer is found from the checkpoint's.
+    let model_config = arch.model_config(config_json.as_ref());
+    add_hf_config_metadata(&mut builder, &arch, model_config.as_ref(), method);
+    add_tokenizer_metadata(
+        &mut builder,
+        &resolved_model_path,
+        arch.tokenizer_config(config_json.as_ref()).as_ref(),
+    )?;
 
     // Each tensor's type. The header of a GGUF file comes first and names every
     // tensor's type and size, which depend on the shapes alone.
+    let recipe = Recipe::new(
+        method,
+        &arch,
+        model_config.as_ref(),
+        has_imatrix,
+        entries.iter().map(|e| e.gguf_name.as_str()),
+    );
     let choose_type = |gguf_name: &str, shape_u64: &[u64]| {
         let proposed = if calibration_map.is_empty() {
             quantizer.get_tensor_type(gguf_name, shape_u64)
         } else {
             quantizer.get_tensor_type_calibrated(gguf_name, shape_u64, &calibration_map)
         };
-        let chosen =
-            llama_style_tensor_type(method, gguf_name, shape_u64, config_json.as_ref(), proposed);
+        let chosen = recipe.tensor_type(gguf_name, shape_u64, proposed);
         // A block never straddles a row: fall back to a type whose block
         // divides the row, as the reference does.
         let n_per_row = shape_u64.last().copied().unwrap_or(1) as usize;
@@ -978,56 +792,6 @@ pub(crate) async fn run_quantization_mlx(
 mod tests {
     use super::*;
     use pmetal_gguf::GgmlType;
-
-    #[test]
-    fn llama_style_recipe_keeps_norms_dense_and_bumps_q4km_sensitive_tensors() {
-        let config = serde_json::json!({
-            "num_hidden_layers": 32,
-            "num_attention_heads": 32,
-            "num_key_value_heads": 8
-        });
-
-        assert_eq!(
-            llama_style_tensor_type(
-                crate::cli::quantize::QuantizeMethod::Q4KM,
-                "blk.0.ffn_down.weight",
-                &[4096, 14336],
-                Some(&config),
-                GgmlType::Q4K,
-            ),
-            GgmlType::Q6K
-        );
-        assert_eq!(
-            llama_style_tensor_type(
-                crate::cli::quantize::QuantizeMethod::Q4KM,
-                "blk.0.attn_norm.weight",
-                &[4096],
-                Some(&config),
-                GgmlType::Q4K,
-            ),
-            GgmlType::F32
-        );
-        assert_eq!(
-            llama_style_tensor_type(
-                crate::cli::quantize::QuantizeMethod::Q4KM,
-                "output.weight",
-                &[32000, 4096],
-                Some(&config),
-                GgmlType::Q4K,
-            ),
-            GgmlType::Q6K
-        );
-        assert_eq!(
-            llama_style_tensor_type(
-                crate::cli::quantize::QuantizeMethod::Tq1_0,
-                "token_embd.weight",
-                &[32000, 4096],
-                Some(&config),
-                GgmlType::Tq1_0,
-            ),
-            GgmlType::F16
-        );
-    }
 
     #[test]
     fn expert_tensor_names_are_grouped_by_layer_and_projection() {

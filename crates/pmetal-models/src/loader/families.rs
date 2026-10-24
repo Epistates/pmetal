@@ -499,6 +499,54 @@ pub fn load_gemma_weights(
     Ok(())
 }
 
+/// The tensors of `weights` that [`load_gemma_weights`] does not read: a
+/// checkpoint of another model, or a layout of this one the loader does not
+/// know, either of which would otherwise load without a word and run without
+/// the weight.
+///
+/// Sorted, for a stable message.
+pub fn unread_gemma_weights(weights: &HashMap<String, Array>) -> Vec<String> {
+    const LAYER_TENSORS: &[&str] = &[
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "self_attn.o_proj.weight",
+        "self_attn.q_proj.bias",
+        "self_attn.k_proj.bias",
+        "self_attn.v_proj.bias",
+        "self_attn.o_proj.bias",
+        "self_attn.q_norm.weight",
+        "self_attn.k_norm.weight",
+        "mlp.gate_proj.weight",
+        "mlp.up_proj.weight",
+        "mlp.down_proj.weight",
+        "input_layernorm.weight",
+        "post_attention_layernorm.weight",
+        "pre_feedforward_layernorm.weight",
+        "post_feedforward_layernorm.weight",
+    ];
+    let mut unread: Vec<String> = weights
+        .keys()
+        .filter(|key| {
+            if matches!(
+                key.as_str(),
+                "model.embed_tokens.weight" | "model.norm.weight"
+            ) {
+                return false;
+            }
+            let layer_tensor = key
+                .strip_prefix("model.layers.")
+                .and_then(|rest| rest.split_once('.'))
+                .filter(|(layer, _)| layer.parse::<usize>().is_ok())
+                .map(|(_, tensor)| tensor);
+            !layer_tensor.is_some_and(|tensor| LAYER_TENSORS.contains(&tensor))
+        })
+        .cloned()
+        .collect();
+    unread.sort();
+    unread
+}
+
 /// Split Phi-3's fused `self_attn.qkv_proj` into `q_proj` / `k_proj` /
 /// `v_proj`, in place.
 ///

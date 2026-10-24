@@ -1394,13 +1394,8 @@ pub fn detect_chat_template(model_path: &std::path::Path, model_name: &str) -> C
     //    transformers writes since v4.43 and reads ahead of the config (the
     //    gpt-oss release ships its template only there), else the
     //    `chat_template` in tokenizer_config.json.
-    let config_path = model_path.join("tokenizer_config.json");
-    let json = std::fs::read_to_string(&config_path)
-        .ok()
-        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-        .unwrap_or(serde_json::Value::Null);
-    let standalone = std::fs::read_to_string(model_path.join("chat_template.jinja")).ok();
-    if let Some(jinja) = standalone.or_else(|| extract_jinja_template(&json)) {
+    let json = read_tokenizer_config(model_path);
+    if let Some(jinja) = read_jinja_template(model_path, &json) {
         // Pull bos / eos token strings from the tokenizer config (else the
         // special-tokens map) so the Jinja renderer can substitute
         // `{{ bos_token }}` and `{{ eos_token }}` exactly like HF does.
@@ -1448,6 +1443,49 @@ pub fn detect_chat_template(model_path: &std::path::Path, model_name: &str) -> C
         template.template_type
     );
     template
+}
+
+/// A model directory's `tokenizer_config.json`, or `null` without one.
+pub(crate) fn read_tokenizer_config(model_dir: &std::path::Path) -> serde_json::Value {
+    std::fs::read_to_string(model_dir.join("tokenizer_config.json"))
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// The Jinja chat template a model directory ships: a standalone
+/// `chat_template.jinja`, which transformers writes since v4.43 and reads
+/// ahead of the config (the gpt-oss release ships its template only there),
+/// else the `chat_template` in `tokenizer_config.json` (`config`).
+fn read_jinja_template(model_dir: &std::path::Path, config: &serde_json::Value) -> Option<String> {
+    std::fs::read_to_string(model_dir.join("chat_template.jinja"))
+        .ok()
+        .or_else(|| extract_jinja_template(config))
+}
+
+/// Whether the model's own chat template opens a conversation with the BOS
+/// token, `bos`: the way a model that gets its BOS from its template and not
+/// from its tokenizer's post-processor (Gemma 4) says it starts every
+/// sequence with one. Rendered with a one-message conversation; a model
+/// without a template, or one that fails to render, does not say so.
+pub(crate) fn template_opens_with_bos(
+    model_dir: &std::path::Path,
+    bos: &str,
+    eos: Option<&str>,
+) -> bool {
+    let config = read_tokenizer_config(model_dir);
+    let Some(src) = read_jinja_template(model_dir, &config) else {
+        return false;
+    };
+    let options = crate::jinja_chat::JinjaRenderOptions {
+        add_generation_prompt: true,
+        bos_token: Some(bos.to_owned()),
+        eos_token: eos.map(str::to_owned),
+        ..Default::default()
+    };
+    let messages = [crate::jinja_chat::JinjaMessage::user("hello")];
+    crate::jinja_chat::render_chat_template(&src, &messages, &options)
+        .is_ok_and(|rendered| rendered.starts_with(bos))
 }
 
 /// Extract the string form of a special token field (`bos_token`,
