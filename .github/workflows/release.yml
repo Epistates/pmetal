@@ -175,8 +175,10 @@ jobs:
           tar -czf "artifacts/${BINARY_NAME}.tar.gz" "$BINARY_NAME" mlx.metallib
           cp mlx.metallib artifacts/mlx.metallib
 
-          shasum -a 256 "artifacts/${BINARY_NAME}.tar.gz" > "artifacts/${BINARY_NAME}.tar.gz.sha256"
-          shasum -a 256 "artifacts/mlx.metallib" > "artifacts/mlx.metallib.sha256"
+          # Hashed from inside artifacts/, so each line names the file as it is
+          # downloaded and `shasum -c` works beside it.
+          (cd artifacts && shasum -a 256 "${BINARY_NAME}.tar.gz" > "${BINARY_NAME}.tar.gz.sha256")
+          (cd artifacts && shasum -a 256 mlx.metallib > mlx.metallib.sha256)
 
           echo "CLI artifacts:"
           ls -lh artifacts/
@@ -423,7 +425,7 @@ jobs:
               APP_NAME=$(basename "$APP_PATH")
               DEST_NAME="PMetal-${VERSION}-aarch64-apple-darwin.tar.gz"
               tar -czf "artifacts/$DEST_NAME" -C "$(dirname "$APP_PATH")" "$APP_NAME"
-              shasum -a 256 "artifacts/$DEST_NAME" > "artifacts/$DEST_NAME.sha256"
+              (cd artifacts && shasum -a 256 "$DEST_NAME" > "$DEST_NAME.sha256")
               echo "Packaged: $DEST_NAME"
             fi
           fi
