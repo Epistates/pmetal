@@ -434,8 +434,10 @@ fn gemma4_native_prefill_memory_is_bounded_by_the_pass() {
 
     let (_dir, config, weights) =
         native_checkpoint(synthetic_config_json(), "gemma4_synth_weights.safetensors");
-    // 16384 tokens, 8 passes: its logits alone are 16384 x 512 x 4 bytes.
-    let prompt: Vec<u32> = (0..16384).map(|i| (i * 7 % 512) as u32).collect();
+    // 8192 tokens, 4 passes: its logits alone are 8192 x 512 x 4 bytes. The
+    // whole-prompt forward's attention scores are one 1 GiB buffer; at 16384
+    // tokens they were 4 GiB, past the buffer limit of a small machine.
+    let prompt: Vec<u32> = (0..8192).map(|i| (i * 7 % 512) as u32).collect();
     let peak = |prefill: &dyn Fn(&mut gemma4_native::NativeCache) -> u32| {
         let mut cache = gemma4_native::build_cache(&weights, &config);
         clear_cache();
