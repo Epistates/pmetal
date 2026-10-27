@@ -77,7 +77,9 @@ jobs:
 
       # Single-threaded to avoid Metal/GPU conflicts.
       - name: Run tests
-        run: cargo test --workspace --exclude pmetal-py --profile ci -- --test-threads=1
+        # --no-fail-fast: a run costs two hours of building, so one failing
+        # test binary must not hide what the rest would report.
+        run: cargo test --workspace --exclude pmetal-py --profile ci --no-fail-fast -- --test-threads=1
 
   # License, advisory, ban and source policy from deny.toml (`just deny`).
   # It reads manifests and lockfiles, never builds, so it runs on Linux.
