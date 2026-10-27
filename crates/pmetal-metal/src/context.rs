@@ -845,10 +845,17 @@ mod tests {
             AppleGPUFamily::Apple9
         } else if device.supportsFamily(MTLGPUFamily::Apple8) {
             AppleGPUFamily::Apple8
-        } else {
+        } else if device.supportsFamily(MTLGPUFamily::Apple7) {
             AppleGPUFamily::Apple7
+        } else {
+            AppleGPUFamily::Unknown
         };
         assert_eq!(props.gpu_family, expected);
+        // A virtual GPU (a hosted CI runner's) supports no Apple family and
+        // has no architecture generation to check against one.
+        if expected == AppleGPUFamily::Unknown {
+            return;
+        }
 
         // The generation is the architecture name's, and fits the family.
         let architecture = device.architecture().name().to_string();

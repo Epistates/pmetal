@@ -342,9 +342,17 @@ mod tests {
         assert_eq!(full_bin_gpu_cores(0, Base), 0);
     }
 
-    /// The registry reports a plausible core count for the GPU in this machine.
+    /// The registry reports a plausible core count for the GPU in this machine,
+    /// and none for a virtual GPU (a hosted CI runner's), which has no
+    /// `AGXAccelerator`.
     #[test]
     fn the_io_registry_reports_this_machines_gpu_cores() {
+        use crate::context::{AppleGPUFamily, MetalContext};
+        let ctx = MetalContext::new().unwrap();
+        if ctx.properties().gpu_family == AppleGPUFamily::Unknown {
+            assert_eq!(registry_gpu_core_count(), None);
+            return;
+        }
         let cores = registry_gpu_core_count().expect("an AGXAccelerator with a core count");
         assert!((7..=80).contains(&cores), "{cores} GPU cores");
     }

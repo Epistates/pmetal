@@ -23,7 +23,8 @@ fn the_metal_layer_and_the_runtime_agree_on_the_device() {
     );
     assert_eq!(props.max_buffer_length, info.max_buffer_length);
 
-    // The generation is the number in the architecture name both read.
+    // The generation is the number in the architecture name both read, and 0
+    // for a virtual GPU (a hosted CI runner's `air64_v27`), which has none.
     let generation: u32 = info
         .architecture
         .strip_prefix("applegpu_g")
@@ -31,7 +32,7 @@ fn the_metal_layer_and_the_runtime_agree_on_the_device() {
             let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
             digits.parse().ok()
         })
-        .expect("an applegpu architecture name");
+        .unwrap_or(0);
     assert_eq!(props.architecture_gen, generation, "{}", info.architecture);
 
     check_unobserved_error().expect("runtime error");

@@ -47,16 +47,22 @@ fn the_cache_limit_returns_the_previous_one() {
 fn device_info_describes_the_gpu() {
     let info = device_info().expect("a Metal device");
     assert!(!info.device_name.is_empty());
+    // A hosted CI runner's virtual GPU names its architecture after the
+    // shader ABI (`air64_v27`), not a GPU generation, and the runner has
+    // less RAM than any Apple Silicon Mac.
+    let real_gpu = info.architecture.starts_with("applegpu");
     assert!(
-        info.architecture.starts_with("applegpu"),
+        real_gpu || info.architecture.starts_with("air64"),
         "{}",
         info.architecture
     );
-    assert!(
-        info.memory_size >= 8 << 30,
-        "{} bytes of RAM",
-        info.memory_size
-    );
+    if real_gpu {
+        assert!(
+            info.memory_size >= 8 << 30,
+            "{} bytes of RAM",
+            info.memory_size
+        );
+    }
     assert!(info.max_recommended_working_set_size <= info.memory_size);
     assert_eq!(
         info.max_recommended_working_set_size,
