@@ -344,11 +344,16 @@ fn a_long_prompt_is_quantized_in_bounded_memory() {
     crate::inline_array::synchronize();
     let stored = cache.nbytes();
     let extra = get_peak_memory().saturating_sub(before + stored);
+    // Less than one f32 copy of the prompt, where at once it takes two. In
+    // pieces it is about 130 MB on Apple Silicon and up to 200 MB on a hosted
+    // CI runner's virtual GPU.
+    let one_copy = (heads * tokens * dim) as usize * 4;
     assert!(
-        extra < 160 << 20,
-        "quantizing the prompt needed {} MB beyond the {} MB cache",
+        extra < one_copy,
+        "quantizing the prompt needed {} MB beyond the {} MB cache, against {} MB for one copy of it",
         extra >> 20,
-        stored >> 20
+        stored >> 20,
+        one_copy >> 20
     );
     assert_eq!(cache.len(), tokens as usize);
     crate::check_unobserved_error().unwrap();
