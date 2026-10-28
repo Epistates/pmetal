@@ -181,11 +181,13 @@ fn mlx_fingerprint() -> String {
     let metal = cfg!(feature = "metal") as u8;
     let accelerate = cfg!(feature = "accelerate") as u8;
     let target = env::var("TARGET").unwrap_or_else(|_| "unknown-target".to_string());
-    let deployment = if cfg!(target_os = "macos") {
-        resolve_deployment_target()
-    } else {
-        "n/a".to_string()
-    };
+    // An attribute, not `cfg!`: both arms of a `cfg!` must compile, and
+    // `resolve_deployment_target` exists only on macOS (docs.rs runs this
+    // script on Linux).
+    #[cfg(target_os = "macos")]
+    let deployment = resolve_deployment_target();
+    #[cfg(not(target_os = "macos"))]
+    let deployment = "n/a".to_string();
     let os = if cfg!(target_os = "macos") {
         "macos"
     } else {

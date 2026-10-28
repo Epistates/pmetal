@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`pmetal-runtime`'s build script compiles on a machine that is not a Mac,** so docs.rs (which builds on Linux) can document it and the crates that need only it. A `cfg!` branch called a function that exists only on macOS; 0.7.0's documentation failed to build for `pmetal-runtime`, `pmetal-cache` and `pmetal-distill`.
 - **A release's `.sha256` files name the file as it is downloaded,** so `shasum -c` works beside it; they named it under the build's `artifacts/` directory.
 
 ## [0.7.0] - 2026-10-25
