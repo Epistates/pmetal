@@ -100,6 +100,12 @@ jobs:
       - name: Publish order
         run: scripts/check-publish-order.sh
 
+      # Every published crate is one crates.io accepts (`just
+      # check-crates-io`): manifests, crates.io's category list, and the
+      # packages cargo builds for upload, which needs no compiling.
+      - name: crates.io limits
+        run: scripts/check-crates-io.sh
+
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
 
       # The GUI is a separate workspace; same deny.toml, found by walking up.

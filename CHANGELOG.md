@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`just check-crates-io` (a preflight step, a CI check and the first thing `scripts/publish.sh` runs) fails on a crate crates.io would refuse.** `cargo publish --dry-run` packages and builds every crate without asking the registry, so 0.7.0's upload stopped twice: after five crates at a 22-character keyword, and after fifteen at a 54 MB `pmetal-models`, whose test fixtures were in the package. Every published crate needs a description and a license, at most five keywords of at most 20 letters, digits, `_`, `-` or `+`, at most five categories from crates.io's list, and a package of at most 10 MiB. `pmetal-models` no longer packages its integration tests, which cannot run without the fixtures; it is 0.6 MB.
+
+### Fixed
+
+- **A release's `.sha256` files name the file as it is downloaded,** so `shasum -c` works beside it; they named it under the build's `artifacts/` directory.
+
 ## [0.7.0] - 2026-10-25
 
 ### Added

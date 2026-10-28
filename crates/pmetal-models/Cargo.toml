@@ -10,6 +10,9 @@ homepage.workspace = true
 readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
+# The integration tests read 57 MB of weight fixtures, five times what
+# crates.io takes for a whole crate, and cannot run without them.
+exclude = ["tests/"]
 
 [dependencies]
 pmetal-runtime = { workspace = true }

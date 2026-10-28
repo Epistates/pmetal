@@ -45,8 +45,10 @@ fi
 # The order is derived from the manifests (scripts/publish-order.sh), so it
 # follows the workspace instead of a list that can go stale. Check it first:
 # a crate missing from it, or one published before a crate it needs, would
-# only show up halfway through a release.
+# only show up halfway through a release. So would a crate crates.io refuses,
+# which a dry run never asks it about.
 scripts/check-publish-order.sh
+scripts/check-crates-io.sh
 
 CRATES=()
 while IFS= read -r crate; do

@@ -14,7 +14,7 @@ default:
 # Runs every check that CI performs. If this passes, publish is safe.
 
 # Full pre-publish validation (mirrors CI + release pipelines)
-preflight: fmt-check check-workspace-deps check-publish-order lint lint-all-features lint-min-features doc-check test test-release check-gui lint-gui test-gui check-version check-lockfile deny
+preflight: fmt-check check-workspace-deps check-publish-order check-crates-io lint lint-all-features lint-min-features doc-check test test-release check-gui lint-gui test-gui check-version check-lockfile deny
     @echo ""
     @echo "All preflight checks passed -- safe to publish {{ version }}"
 
@@ -285,6 +285,12 @@ check-workspace-deps:
 # is derived from the manifests and checked against them (CI: deny job).
 check-publish-order:
     scripts/check-publish-order.sh
+
+# Every published crate is one crates.io accepts (description, license,
+# keywords, categories, size), which `cargo publish --dry-run` never asks it
+# about (CI: deny job).
+check-crates-io:
+    scripts/check-crates-io.sh
 
 # ─── Utilities ──────────────────────────────────────────────────────
 
