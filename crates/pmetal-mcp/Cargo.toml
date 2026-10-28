@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
-keywords = ["mcp", "model-context-protocol", "llm", "fine-tuning", "apple-silicon"]
+keywords = ["mcp", "mcp-server", "llm", "fine-tuning", "apple-silicon"]
 categories = ["development-tools", "science"]
 
 [[bin]]

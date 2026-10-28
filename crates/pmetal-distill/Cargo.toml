@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
-keywords = ["distillation", "knowledge-distillation", "llm", "machine-learning", "apple-silicon"]
+keywords = ["distillation", "teacher-student", "llm", "machine-learning", "apple-silicon"]
 categories = ["science", "algorithms"]
 
 [dependencies]
