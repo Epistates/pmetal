@@ -13,8 +13,8 @@ Reads the three Cargo lockfiles and the GUI's bun.lock and reports:
   scripts     npm packages that declare install scripts (bun runs none of them,
               as package.json trusts no dependency, but a new one is worth a look)
 
-Exits non-zero on malware or an npm advisory, and on young versions too with
---fail-on-young. Needs only the standard library and network access to
+Exits non-zero on malware or an npm advisory not in REVIEWED_NPM_ADVISORIES,
+and on young versions too with --fail-on-young. Needs only the standard library and network access to
 api.osv.dev and api.deps.dev.
 """
 
@@ -34,6 +34,17 @@ ROOT = Path(__file__).resolve().parent.parent
 CARGO_LOCKS = ["Cargo.lock", "crates/pmetal-gui/src-tauri/Cargo.lock", "fuzz/Cargo.lock"]
 BUN_LOCK = "crates/pmetal-gui/bun.lock"
 HEADERS = {"User-Agent": "pmetal-audit-lockfiles", "Content-Type": "application/json"}
+
+# npm advisories reviewed and found not to apply, with the reason, as
+# deny.toml's [advisories] ignore does for crates. Still listed in the report.
+REVIEWED_NPM_ADVISORIES = {
+    "GHSA-gcqx-w48m-w2h4": (
+        "deepmerge, prototype poisoning from a merged source object. No release "
+        "fixes it. Only @sveltejs/vite-plugin-svelte uses it, at build time, to "
+        "merge this project's own Vite and Svelte config, and it is not in the "
+        "built app."
+    ),
+}
 
 
 def fetch(url, body=None):
@@ -112,9 +123,15 @@ def main():
     print(f"\nmalware records: {len(malware)}")
     for f in malware:
         print("   ", *f)
+    reviewed = [f for f in npm_advisories if f[3] in REVIEWED_NPM_ADVISORIES]
+    npm_advisories = [f for f in npm_advisories if f[3] not in REVIEWED_NPM_ADVISORIES]
     print(f"npm advisories: {len(npm_advisories)}")
     for f in npm_advisories:
         print("   ", *f)
+    if reviewed:
+        print(f"npm advisories reviewed as not applying: {len(reviewed)}")
+        for f in reviewed:
+            print("   ", *f, "-", REVIEWED_NPM_ADVISORIES[f[3]])
     print(f"crate advisories (any platform; `just deny` decides): {len(crate_advisories)}")
     for f in crate_advisories:
         print("   ", *f)
