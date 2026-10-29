@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+documentation = "https://epistates.github.io/pmetal/pmetal_mcp/"
 homepage.workspace = true
 readme = "README.md"
 keywords = ["mcp", "mcp-server", "llm", "fine-tuning", "apple-silicon"]

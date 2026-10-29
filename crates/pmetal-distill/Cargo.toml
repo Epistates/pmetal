@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+documentation = "https://epistates.github.io/pmetal/pmetal_distill/"
 homepage.workspace = true
 readme = "README.md"
 keywords = ["distillation", "teacher-student", "llm", "machine-learning", "apple-silicon"]

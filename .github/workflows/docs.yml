@@ -1,0 +1,80 @@
+# API documentation for every published crate, built on macOS and served
+# from GitHub Pages; each crate's `documentation` link points here.
+#
+# docs.rs builds on Linux, where the C libraries most of the crates reach
+# (TLS, tokenizers' regular expressions, zstd, BLAKE3) cannot be compiled for
+# an Apple target, so it documents only the crates that need none of them.
+name: Docs
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deployment at a time. A newer run waits for the one deploying.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # As on docs.rs, the build scripts skip MLX and the Metal kernels, which
+  # rustdoc needs neither of.
+  DOCS_RS: "1"
+
+jobs:
+  build:
+    name: Build
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: docs
+
+      # What `just doc-check` documents, failing on a broken link.
+      - name: Document the workspace
+        run: cargo doc --workspace --exclude pmetal-py --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # rustdoc writes a directory per crate and no page at the root.
+      - name: Root page
+        run: |
+          cat > target/doc/index.html <<'EOF'
+          <!doctype html>
+          <meta charset="utf-8">
+          <title>PMetal API documentation</title>
+          <meta http-equiv="refresh" content="0; url=pmetal/index.html">
+          <link rel="canonical" href="pmetal/index.html">
+          <a href="pmetal/index.html">PMetal API documentation</a>
+          EOF
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: target/doc
+
+  deploy:
+    name: Deploy
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

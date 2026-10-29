@@ -6,6 +6,7 @@ rust-version.workspace = true
 description = "Manifold-Constrained Hyper-Connections (mHC) for stable deep network training"
 license.workspace = true
 repository.workspace = true
+documentation = "https://epistates.github.io/pmetal/pmetal_mhc/"
 homepage.workspace = true
 readme = "README.md"
 keywords = ["deep-learning", "transformer", "residual-connections", "training"]

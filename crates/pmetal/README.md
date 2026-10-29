@@ -3,7 +3,7 @@
 **Powdered Metal** — High-performance LLM fine-tuning framework for Apple Silicon, written in Rust.
 
 [![Crates.io](https://img.shields.io/crates/v/pmetal.svg)](https://crates.io/crates/pmetal)
-[![docs.rs](https://docs.rs/pmetal/badge.svg)](https://docs.rs/pmetal)
+[![Docs](https://img.shields.io/badge/docs-API-blue.svg)](https://epistates.github.io/pmetal/pmetal/)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](../../LICENSE-MIT)
 
 This is the umbrella crate that re-exports all PMetal sub-crates behind feature flags. Add a single dependency to access the full framework:

@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+documentation = "https://epistates.github.io/pmetal/pmetal_supervisor/"
 homepage.workspace = true
 readme = "README.md"
 keywords = ["process", "supervisor", "jobs", "subprocess", "pmetal"]

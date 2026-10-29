@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+documentation = "https://epistates.github.io/pmetal/pmetal_metal/"
 homepage.workspace = true
 readme = "README.md"
 keywords = ["metal", "gpu", "neural-engine", "apple-silicon", "machine-learning"]

@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+documentation = "https://epistates.github.io/pmetal/pmetal_core_derive/"
 homepage.workspace = true
 readme = "README.md"
 keywords = ["derive", "proc-macro", "job-spec", "cli", "pmetal"]

@@ -6,6 +6,7 @@ rust-version.workspace = true
 description = "Distributed training and inference backend for PMetal (Home Clusters)"
 license.workspace = true
 repository.workspace = true
+documentation = "https://epistates.github.io/pmetal/pmetal_distributed/"
 homepage.workspace = true
 readme = "README.md"
 keywords = ["distributed", "all-reduce", "cluster", "apple-silicon", "mlx"]
