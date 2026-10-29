@@ -51,9 +51,10 @@ The formula builds the command line from source against the MLX revision PMetal 
 Each [release](https://github.com/Epistates/pmetal/releases) carries a code-signed `pmetal-<version>-aarch64-apple-darwin.tar.gz` with the binary and the `mlx.metallib` it was built with (the binary embeds a copy as well), a checksum file, and the desktop app as a DMG. The binary includes `pmetal serve` and `pmetal mcp`.
 
 ```bash
-gh release download v0.7.0 --repo Epistates/pmetal --pattern 'pmetal-*-aarch64-apple-darwin.tar.gz'
-tar xzf pmetal-v0.7.0-aarch64-apple-darwin.tar.gz
-sudo install -m 755 pmetal-v0.7.0-aarch64-apple-darwin /usr/local/bin/pmetal
+gh release download v0.7.1 --repo Epistates/pmetal --pattern 'pmetal-*-aarch64-apple-darwin.tar.gz*'
+shasum -a 256 -c pmetal-v0.7.1-aarch64-apple-darwin.tar.gz.sha256
+tar xzf pmetal-v0.7.1-aarch64-apple-darwin.tar.gz
+sudo install -m 755 pmetal-v0.7.1-aarch64-apple-darwin /usr/local/bin/pmetal
 pmetal --version
 ```
 

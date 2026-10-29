@@ -1,6 +1,6 @@
 {
   "name": "pmetal-gui",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "PMetal - Apple Silicon ML Training Suite",
   "type": "module",
   "scripts": {

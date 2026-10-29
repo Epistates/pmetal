@@ -6073,7 +6073,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -6119,7 +6119,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-cache"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "pmetal-runtime",
  "tracing",
@@ -6127,7 +6127,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-core"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "chrono",
  "dirs 7.0.0",
@@ -6144,7 +6144,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-core-derive"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6153,7 +6153,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-data"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "arrow",
  "base64 0.23.1",
@@ -6177,7 +6177,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-distill"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "bitcode",
  "pmetal-runtime",
@@ -6191,7 +6191,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-distributed"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6218,7 +6218,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-gguf"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "byteorder",
  "half",
@@ -6233,7 +6233,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-gui"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "apple-native-keyring-store",
  "chrono",
@@ -6255,7 +6255,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-hub"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "dirs 7.0.0",
  "futures",
@@ -6275,7 +6275,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-lora"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "pmetal-cache",
  "pmetal-core",
@@ -6288,7 +6288,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-merge"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "half",
  "memmap2",
@@ -6306,7 +6306,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-metal"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "cc",
  "dirs 7.0.0",
@@ -6326,7 +6326,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-mhc"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "ndarray",
  "rand 0.10.3",
@@ -6337,7 +6337,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-models"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "json5",
  "objc2",
@@ -6358,7 +6358,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-runtime"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "cc",
  "cmake",
@@ -6375,7 +6375,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-supervisor"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anstream",
  "chrono",
@@ -6391,7 +6391,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-trainer"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6425,7 +6425,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-vocoder"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "half",
  "pmetal-hub",

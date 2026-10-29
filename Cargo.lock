@@ -5383,7 +5383,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "arrow",
@@ -5436,7 +5436,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-cache"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "pmetal-runtime",
  "tracing",
@@ -5444,7 +5444,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-core"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "chrono",
  "dirs 7.0.0",
@@ -5463,7 +5463,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-core-derive"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5472,7 +5472,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-data"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "arrow",
  "base64 0.23.1",
@@ -5498,7 +5498,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-distill"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "bitcode",
  "pmetal-runtime",
@@ -5514,7 +5514,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-distributed"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5544,7 +5544,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-gguf"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "byteorder",
  "half",
@@ -5560,7 +5560,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-hub"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "base64 0.23.1",
  "dirs 7.0.0",
@@ -5584,7 +5584,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-lora"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "criterion",
  "pmetal-cache",
@@ -5599,7 +5599,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-mcp"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "pmetal-core",
  "pmetal-hub",
@@ -5620,7 +5620,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-merge"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "criterion",
  "half",
@@ -5641,7 +5641,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-metal"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "cc",
  "criterion",
@@ -5665,7 +5665,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-mhc"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "criterion",
  "ndarray",
@@ -5678,7 +5678,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-models"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "base64 0.23.1",
  "image",
@@ -5703,7 +5703,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-py"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "pmetal",
@@ -5724,7 +5724,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-runtime"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "cc",
  "cmake",
@@ -5744,7 +5744,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-serve"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -5774,7 +5774,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-supervisor"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anstream",
  "chrono",
@@ -5792,7 +5792,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-trainer"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5828,7 +5828,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-vocoder"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "criterion",
  "half",

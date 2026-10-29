@@ -336,8 +336,8 @@ brew install epistates/tap/pmetal
 **Prebuilt binary.** Download the `pmetal-<version>-aarch64-apple-darwin.tar.gz` asset from the [Releases](https://github.com/Epistates/pmetal/releases) page. It holds the `pmetal` binary and the `mlx.metallib` it was built with:
 
 ```bash
-tar xzf pmetal-v0.7.0-aarch64-apple-darwin.tar.gz
-sudo install -m 755 pmetal-v0.7.0-aarch64-apple-darwin /usr/local/bin/pmetal
+tar xzf pmetal-v0.7.1-aarch64-apple-darwin.tar.gz
+sudo install -m 755 pmetal-v0.7.1-aarch64-apple-darwin /usr/local/bin/pmetal
 pmetal --version
 ```
 

@@ -26,7 +26,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
@@ -37,27 +37,27 @@ categories = ["science", "algorithms"]
 
 [workspace.dependencies]
 # Internal crates
-pmetal-runtime = { path = "crates/pmetal-runtime", version = "0.7.0" }
-pmetal-core = { path = "crates/pmetal-core", version = "0.7.0", default-features = false }
-pmetal-core-derive = { path = "crates/pmetal-core-derive", version = "0.7.0" }
-pmetal-metal = { path = "crates/pmetal-metal", version = "0.7.0", default-features = false }
-pmetal-cache = { path = "crates/pmetal-cache", version = "0.7.0" }
-pmetal-models = { path = "crates/pmetal-models", version = "0.7.0" }
-pmetal-lora = { path = "crates/pmetal-lora", version = "0.7.0" }
-pmetal-data = { path = "crates/pmetal-data", version = "0.7.0" }
-pmetal-trainer = { path = "crates/pmetal-trainer", version = "0.7.0" }
-pmetal-hub = { path = "crates/pmetal-hub", version = "0.7.0" }
-pmetal-gguf = { path = "crates/pmetal-gguf", version = "0.7.0" }
-pmetal-vocoder = { path = "crates/pmetal-vocoder", version = "0.7.0" }
-pmetal-merge = { path = "crates/pmetal-merge", version = "0.7.0" }
-pmetal-distill = { path = "crates/pmetal-distill", version = "0.7.0" }
-pmetal-mhc = { path = "crates/pmetal-mhc", version = "0.7.0" }
-pmetal-distributed = { path = "crates/pmetal-distributed", version = "0.7.0" }
-pmetal-serve = { path = "crates/pmetal-serve", version = "0.7.0" }
-pmetal-mcp = { path = "crates/pmetal-mcp", version = "0.7.0" }
-pmetal-supervisor = { path = "crates/pmetal-supervisor", version = "0.7.0" }
+pmetal-runtime = { path = "crates/pmetal-runtime", version = "0.7.1" }
+pmetal-core = { path = "crates/pmetal-core", version = "0.7.1", default-features = false }
+pmetal-core-derive = { path = "crates/pmetal-core-derive", version = "0.7.1" }
+pmetal-metal = { path = "crates/pmetal-metal", version = "0.7.1", default-features = false }
+pmetal-cache = { path = "crates/pmetal-cache", version = "0.7.1" }
+pmetal-models = { path = "crates/pmetal-models", version = "0.7.1" }
+pmetal-lora = { path = "crates/pmetal-lora", version = "0.7.1" }
+pmetal-data = { path = "crates/pmetal-data", version = "0.7.1" }
+pmetal-trainer = { path = "crates/pmetal-trainer", version = "0.7.1" }
+pmetal-hub = { path = "crates/pmetal-hub", version = "0.7.1" }
+pmetal-gguf = { path = "crates/pmetal-gguf", version = "0.7.1" }
+pmetal-vocoder = { path = "crates/pmetal-vocoder", version = "0.7.1" }
+pmetal-merge = { path = "crates/pmetal-merge", version = "0.7.1" }
+pmetal-distill = { path = "crates/pmetal-distill", version = "0.7.1" }
+pmetal-mhc = { path = "crates/pmetal-mhc", version = "0.7.1" }
+pmetal-distributed = { path = "crates/pmetal-distributed", version = "0.7.1" }
+pmetal-serve = { path = "crates/pmetal-serve", version = "0.7.1" }
+pmetal-mcp = { path = "crates/pmetal-mcp", version = "0.7.1" }
+pmetal-supervisor = { path = "crates/pmetal-supervisor", version = "0.7.1" }
 # The CLI crate, as a library. Renamed because pmetal-py's own lib is `pmetal`.
-pmetal-lib = { package = "pmetal", path = "crates/pmetal", version = "0.7.0", default-features = false }
+pmetal-lib = { package = "pmetal", path = "crates/pmetal", version = "0.7.1", default-features = false }
 
 # Every external dependency of every member is declared here, once, and
 # members take it with `dep = { workspace = true }` (adding features locally
