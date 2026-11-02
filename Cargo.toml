@@ -106,7 +106,7 @@ serde_json = "1.0"
 serde-saphyr = "2.0"
 # Names the key a deserialization error came from.
 serde_path_to_error = "0.1"
-json5 = "1.3.3"
+json5 = "1.3.4"
 # TensorBoard event files
 prost = "0.14"
 crc = "3.4"
@@ -191,7 +191,7 @@ rustix = { version = "1.1", features = ["process"] }
 # Strips terminal escape sequences from a child's output (pmetal-supervisor)
 anstream = "1.0"
 regex = "1.13"
-uuid = "1.28"
+uuid = "1.29"
 # Splits a user's command line into arguments without a shell (pmetal-trainer rewards)
 shlex = "2.0"
 # JSON Schema validation (pmetal-trainer's schema reward); no HTTP: a schema never fetches
@@ -203,7 +203,7 @@ quote = "1.0"
 syn = "3.0"
 
 # Native build helpers
-cc = "1.9"
+cc = "1.10"
 cmake = "0.1"
 
 # Python bindings
