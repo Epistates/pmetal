@@ -17,7 +17,9 @@ all-features = true
 
 [advisories]
 ignore = [
-    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained, not vulnerable. It is a build-time proc macro reached only through libp2p (netlink) and image (exr/pulp); the fix has to come from those crates." },
+    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained, not vulnerable. It is a build-time proc macro reached only through tokenizers; the fix has to come from that crate." },
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, not vulnerable. pmetal-core, pmetal-supervisor, pmetal-trainer, pmetal-serve and the GUI use it for timestamps, and it is also reached through arrow and parquet, hf-hub (the xet crates) and turbomcp (with schemars); it stays until those crates move off it." },
+    { id = "RUSTSEC-2026-0542", reason = "humantime is unmaintained (it wraps chrono), not vulnerable. It is reached only through hf-hub (xet-runtime); the fix has to come from that crate." },
 ]
 
 [licenses]
