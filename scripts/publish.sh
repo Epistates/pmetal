@@ -28,6 +28,11 @@ command -v jq >/dev/null 2>&1 || { echo "jq not found in PATH" >&2; exit 1; }
 
 DRY_RUN=false
 USER_AGENT="pmetal-publish (https://github.com/Epistates/pmetal)"
+# crates.io's longest wait is ten minutes, for a brand-new crate, so a crate
+# that is still refused after three waits, or a wait of over half an hour,
+# means something else is wrong.
+MAX_RATE_LIMIT_RETRIES=3
+MAX_RATE_LIMIT_WAIT=1800
 
 for arg in "$@"; do
     case "$arg" in
@@ -100,6 +105,10 @@ wait_until() {
         return 1
     fi
     now=$(date -u +%s)
+    if ((target - now > MAX_RATE_LIMIT_WAIT)); then
+        echo "  crates.io asks to wait until $1, more than ${MAX_RATE_LIMIT_WAIT}s; giving up." >&2
+        return 1
+    fi
     if ((target > now)); then
         echo "  crates.io asks to wait until $1; waiting $((target - now + 5))s..."
         sleep $((target - now + 5))
@@ -108,7 +117,7 @@ wait_until() {
 
 # Publish one crate, waiting out crates.io's rate limit as often as it asks.
 publish() {
-    local log retry_after
+    local log retry_after attempt=0
     log=$(mktemp)
     while true; do
         if cargo publish -p "$1" 2>&1 | tee "$log"; then
@@ -116,10 +125,17 @@ publish() {
             return 0
         fi
         retry_after=$(sed -n 's/.*Please try again after \([^.]* GMT\).*/\1/p' "$log" | head -n 1)
-        if [[ -z $retry_after ]] || ! wait_until "$retry_after"; then
-            rm -f "$log"
+        rm -f "$log"
+        if [[ -z $retry_after ]]; then
             return 1
         fi
+        attempt=$((attempt + 1))
+        if ((attempt > MAX_RATE_LIMIT_RETRIES)); then
+            echo "  crates.io refused $1 under its rate limit $attempt times; giving up." >&2
+            return 1
+        fi
+        wait_until "$retry_after" || return 1
+        log=$(mktemp)
     done
 }
 

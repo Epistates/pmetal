@@ -7,10 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **`scripts/publish.sh` waits only when crates.io asks it to, and running it again resumes a release that stopped.** It waited ten minutes between crates after the fifth, which is crates.io's limit for brand-new crates, so a release of the 20 existing crates spent two and a half hours waiting. It now publishes each crate as soon as the one before it is in the index, waits until the time crates.io gives when it refuses an upload under its rate limit, and skips any crate whose version is already on crates.io.
-
 ## [0.7.1] - 2026-10-29
 
 ### Added
