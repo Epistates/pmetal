@@ -2934,16 +2934,9 @@ mod tests {
         );
     }
 
+    /// `len` tokens that the length limit ended.
     fn token_output(len: usize) -> GenerationOutput {
-        GenerationOutput {
-            token_ids: vec![0; len],
-            num_generated: len,
-            stopped_by_token: false,
-            stopped_by_length: true,
-            decode_metrics: None,
-            speculative_metrics: None,
-            load_time: std::time::Duration::ZERO,
-        }
+        GenerationOutput::new(vec![0; len], len, false, true)
     }
 
     /// An ANE generation that fails after some tokens ends in an error: the

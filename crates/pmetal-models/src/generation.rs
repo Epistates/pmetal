@@ -522,6 +522,25 @@ enum Ended {
 }
 
 impl GenerationOutput {
+    /// The output of a generation an engine outside this module ran: its
+    /// tokens (the prompt, then those generated), how many it generated, and
+    /// whether a stop token or the length limit ended it. It has no decode or
+    /// speculative metrics and no load time; set the fields the engine has.
+    pub fn new(
+        token_ids: Vec<u32>,
+        num_generated: usize,
+        stopped_by_token: bool,
+        stopped_by_length: bool,
+    ) -> Self {
+        Self {
+            token_ids,
+            num_generated,
+            stopped_by_token,
+            stopped_by_length,
+            ..Self::default()
+        }
+    }
+
     fn ended(
         token_ids: Vec<u32>,
         prompt_len: usize,
@@ -1187,6 +1206,17 @@ mod tests {
     }
 
     const PROMPT: [u32; 4] = [3, 9, 1, 20];
+
+    /// An engine's output is what it reports, with nothing it did not.
+    #[test]
+    fn an_outside_engines_output_holds_what_it_reported() {
+        let output = GenerationOutput::new(vec![3, 9, 1, 20, 7, 8], 2, false, true);
+        assert_eq!(output.token_ids, [3, 9, 1, 20, 7, 8]);
+        assert_eq!(output.num_generated, 2);
+        assert!(!output.stopped_by_token && output.stopped_by_length);
+        assert!(output.decode_metrics.is_none() && output.speculative_metrics.is_none());
+        assert_eq!(output.load_time, Duration::ZERO);
+    }
 
     /// `row_logprobs` over many rows is `token_logprobs` row by row, and agrees
     /// with a direct log-softmax on the host.

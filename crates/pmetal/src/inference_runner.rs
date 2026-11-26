@@ -1200,15 +1200,15 @@ impl InferenceGenState {
             .map_err(Exception::custom)?;
 
             self.last_decode_metrics = output.decode_metrics;
-            return Ok(GenerationOutput {
-                token_ids: output.token_ids,
-                num_generated: output.num_generated,
-                stopped_by_token: output.stopped_by_token,
-                stopped_by_length: output.stopped_by_length,
-                decode_metrics: output.decode_metrics,
-                speculative_metrics: None,
-                load_time: output.load_time,
-            });
+            let mut generated = GenerationOutput::new(
+                output.token_ids,
+                output.num_generated,
+                output.stopped_by_token,
+                output.stopped_by_length,
+            );
+            generated.decode_metrics = output.decode_metrics;
+            generated.load_time = output.load_time;
+            return Ok(generated);
         }
 
         let output = generate_on_shared_model(
