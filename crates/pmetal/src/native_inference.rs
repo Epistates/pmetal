@@ -976,35 +976,46 @@ fn run_qwen3(
                 },
             )
         },
-        |path, config| {
-            let mut weights = qwen3_native::load_model(path, config)?;
-            // Apply Hadamard preconditioning when affine KV cache quantization is enabled.
-            // Absorbs random rotation into Q/K/V/O weights for better quantization quality.
-            if quant_config.is_some() {
-                qwen3_native::apply_kv_preconditioning(&mut weights);
-            }
-            // Apply outlier channel permutation for mixed-bit presets (TurboQuant v2).
-            // This absorbs the permutation into Q/K/V/O projection weights at load time,
-            // moving high-magnitude channels to the front of each head with zero runtime cost.
-            if let Some(qcfg) = quant_config {
-                if let Some(mb) = qcfg.mixed_bit {
-                    let outlier_fraction = mb.outlier_count as f32 / config.get_head_dim() as f32;
-                    qwen3_native::apply_outlier_permutation(&mut weights, outlier_fraction);
-                }
-                // Generate QJL projection matrix when QJL residual correction is enabled.
-                // Must be called after apply_kv_preconditioning so S is in the same space as R.
-                if qcfg.qjl {
-                    qwen3_native::apply_qjl_matrix(&mut weights);
-                }
-            }
-            Ok(weights)
-        },
+        |path, config| load_qwen3_weights(path, config, quant_config),
         |weights, _| build_qwen3_cache_with_quant(weights, turboquant, quant_config),
         prefill_first_token,
         |weights, _config, cache, first_tok, remaining, sampler, on_token| {
             qwen3_native::generate(weights, cache, first_tok, remaining, sampler, on_token)
         },
     )
+}
+
+/// The Qwen weights for a cache quantized as `quant_config` asks: the
+/// Hadamard preconditioning, the outlier permutation of a mixed-bit preset
+/// and the QJL matrix are absorbed into them at load.
+fn load_qwen3_weights(
+    path: &Path,
+    config: &pmetal_runtime::qwen3_native::Qwen3Config,
+    quant_config: Option<pmetal_runtime::qwen3_native::QuantCacheConfig>,
+) -> Result<pmetal_runtime::qwen3_native::NativeWeights, pmetal_runtime::RuntimeError> {
+    use pmetal_runtime::qwen3_native;
+
+    let mut weights = qwen3_native::load_model(path, config)?;
+    // Apply Hadamard preconditioning when affine KV cache quantization is enabled.
+    // Absorbs random rotation into Q/K/V/O weights for better quantization quality.
+    if quant_config.is_some() {
+        qwen3_native::apply_kv_preconditioning(&mut weights);
+    }
+    // Apply outlier channel permutation for mixed-bit presets (TurboQuant v2).
+    // This absorbs the permutation into Q/K/V/O projection weights at load time,
+    // moving high-magnitude channels to the front of each head with zero runtime cost.
+    if let Some(qcfg) = quant_config {
+        if let Some(mb) = qcfg.mixed_bit {
+            let outlier_fraction = mb.outlier_count as f32 / config.get_head_dim() as f32;
+            qwen3_native::apply_outlier_permutation(&mut weights, outlier_fraction);
+        }
+        // Generate QJL projection matrix when QJL residual correction is enabled.
+        // Must be called after apply_kv_preconditioning so S is in the same space as R.
+        if qcfg.qjl {
+            qwen3_native::apply_qjl_matrix(&mut weights);
+        }
+    }
+    Ok(weights)
 }
 
 fn build_qwen3_cache_with_quant(
@@ -1068,13 +1079,16 @@ fn run_gemma4(
 }
 
 /// Benchmark full prompt + generation throughput with a fixed workload shape:
-/// fixed prompt token ids, one warmup, EOS disabled, and
-/// repeated generations from a fresh cache.
+/// fixed prompt token ids, one warmup, EOS disabled, and repeated
+/// generations from a fresh cache. The weights and every trial's cache are
+/// built as generation builds them, so `turboquant` and `quant_config` (the
+/// affine cache, a mixed-bit preset, QJL) are what is timed.
 pub fn benchmark_native(
     model_path: &Path,
     prompt_ids: &[u32],
     generation_tokens: usize,
     turboquant: Option<TurboQuantConfig>,
+    quant_config: Option<pmetal_runtime::qwen3_native::QuantCacheConfig>,
     num_trials: usize,
 ) -> Result<Vec<BenchmarkTrialMetrics>, String> {
     use pmetal_runtime::qwen3_native;
@@ -1086,7 +1100,7 @@ pub fn benchmark_native(
         .ok_or_else(|| "unsupported architecture for native inference".to_string())?;
     if turboquant.is_some() && !arch.supports_turboquant() {
         return Err(format!(
-            "TurboQuant native benchmark is only supported for Qwen3/Qwen3.5, not {}",
+            "TurboQuant native cache is not yet supported for {}",
             arch.label()
         ));
     }
@@ -1099,13 +1113,13 @@ pub fn benchmark_native(
         NativeArch::Qwen3 | NativeArch::Qwen3_5 => {
             let config = qwen3_native::load_config(model_path).map_err(|e| e.to_string())?;
             let weights =
-                qwen3_native::load_model(model_path, &config).map_err(|e| e.to_string())?;
+                load_qwen3_weights(model_path, &config, quant_config).map_err(|e| e.to_string())?;
             run_benchmark_trials(prompt_ids.len(), generation_tokens, num_trials, || {
                 Ok(qwen3_native::benchmark_trial(
                     &weights,
+                    &mut build_qwen3_cache_with_quant(&weights, turboquant, quant_config),
                     prompt_ids,
                     generation_tokens,
-                    turboquant,
                 ))
             })
         }
@@ -1117,6 +1131,7 @@ pub fn benchmark_native(
             run_benchmark_trials(prompt_ids.len(), generation_tokens, num_trials, || {
                 Ok(llama4_native::benchmark_trial(
                     &weights,
+                    &mut build_llama4_cache(&weights, turboquant, quant_config),
                     prompt_ids,
                     generation_tokens,
                 ))
@@ -1130,6 +1145,7 @@ pub fn benchmark_native(
             run_benchmark_trials(prompt_ids.len(), generation_tokens, num_trials, || {
                 Ok(deepseek_native::benchmark_trial(
                     &weights,
+                    &mut deepseek_native::NativeCache::new_with_quant(&weights, quant_config),
                     prompt_ids,
                     generation_tokens,
                 ))
@@ -1143,6 +1159,7 @@ pub fn benchmark_native(
             run_benchmark_trials(prompt_ids.len(), generation_tokens, num_trials, || {
                 Ok(gpt_oss_native::benchmark_trial(
                     &weights,
+                    &mut gpt_oss_native::NativeCache::new_with_quant(&weights, quant_config),
                     prompt_ids,
                     generation_tokens,
                 ))

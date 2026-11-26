@@ -1020,6 +1020,7 @@ impl InferenceRunner {
                 &prompt_ids,
                 generation_tokens,
                 self.state.native_turboquant,
+                self.state.native_quant_config,
                 num_trials,
             )
             .map_err(Exception::custom);
