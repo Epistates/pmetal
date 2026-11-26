@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`InferResult.generation_seconds` in the Python bindings is the time from the first token to the last, as its documentation says** (#44). It was timed from the call into the engine, so it also held the prompt's prefill and, on the architectures' own engines, which load their weights as generation starts, the model's load. `pmetal.infer_with_metrics` with one token now reports 0.0 seconds of generation, as it should
+
 ## [0.7.1] - 2026-10-29
 
 ### Added

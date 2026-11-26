@@ -211,15 +211,22 @@ fn run(py: Python<'_>, spec: &InferSpec) -> PyResult<PyInferResult> {
         let mut runner = InferenceRunner::prepare(config).map_err(|e| e.to_string())?;
         let mut generated = Vec::new();
         let mut last_check = Instant::now();
-        let started = Instant::now();
+        // The generation runs from the first token to the last: what comes
+        // before the first (a native engine's load, the prompt) is not part
+        // of it.
+        let mut first_token_at: Option<Instant> = None;
+        let mut last_token_at: Option<Instant> = None;
         let output = runner
             .state
             .generate_streaming(|token| {
+                let now = Instant::now();
+                first_token_at.get_or_insert(now);
+                last_token_at = Some(now);
                 generated.push(token);
-                if last_check.elapsed() < SIGNAL_POLL {
+                if now.duration_since(last_check) < SIGNAL_POLL {
                     return true;
                 }
-                last_check = Instant::now();
+                last_check = now;
                 // Only the main thread sees Ctrl-C; elsewhere this is Ok.
                 match Python::attach(|py| py.check_signals()) {
                     Ok(()) => true,
@@ -234,13 +241,16 @@ fn run(py: Python<'_>, spec: &InferSpec) -> PyResult<PyInferResult> {
             .tokenizer
             .decode(&generated)
             .map_err(|e| e.to_string())?;
-        Ok((text, output, started.elapsed()))
+        let generating = first_token_at
+            .zip(last_token_at)
+            .map_or(Duration::ZERO, |(first, last)| last - first);
+        Ok((text, output, generating))
     });
 
     if let Some(e) = interrupt.lock().unwrap_or_else(|p| p.into_inner()).take() {
         return Err(e);
     }
-    let (text, output, elapsed) = outcome.map_err(backend_err)?;
+    let (text, output, generating) = outcome.map_err(backend_err)?;
     let speculative = output
         .speculative_metrics
         .map(|m| -> PyResult<Py<PyDict>> {
@@ -265,7 +275,7 @@ fn run(py: Python<'_>, spec: &InferSpec) -> PyResult<PyInferResult> {
         num_generated: output.num_generated,
         stopped_by_token: output.stopped_by_token,
         stopped_by_length: output.stopped_by_length,
-        generation_seconds: elapsed.as_secs_f64(),
+        generation_seconds: generating.as_secs_f64(),
         speculative,
     })
 }
