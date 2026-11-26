@@ -456,6 +456,26 @@ pub(crate) async fn run_inference(spec: InferSpec) -> anyhow::Result<()> {
             anyhow::bail!("{media} cannot be combined with {flag}");
         }
     }
+    // A benchmark times plain generation on the GPU, on whichever engine runs
+    // the model; what it would ignore, or cannot run without, is refused
+    // before anything loads.
+    let benchmark_prompt_tokens = if benchmark {
+        let other = [
+            (ane, "--ane / --backend ane"),
+            (mtp, "--mtp"),
+            (draft_model.is_some(), "--draft-model"),
+            (profile_layers, "--profile-layers"),
+        ];
+        if let Some((_, flag)) = other.iter().find(|(set, _)| *set) {
+            anyhow::bail!("--benchmark cannot be combined with {flag}");
+        }
+        Some(
+            benchmark_prompt_tokens
+                .ok_or_else(|| anyhow::anyhow!("--benchmark requires --benchmark-prompt-tokens"))?,
+        )
+    } else {
+        None
+    };
 
     tracing::info!(model = %model_id, "Loading model for inference");
     if mtp && draft_model.is_some() {
@@ -528,20 +548,13 @@ pub(crate) async fn run_inference(spec: InferSpec) -> anyhow::Result<()> {
     let gen_config = runner.state.gen_config();
 
     if profile_layers {
-        if benchmark {
-            anyhow::bail!(
-                "--profile-layers and --benchmark are separate modes; run them separately"
-            );
-        }
         if lora_path.is_some() {
             anyhow::bail!("--profile-layers is only supported for standard models right now");
         }
         return run_qwen3_next_layer_profile(&mut runner, model_id, profile_output);
     }
 
-    if benchmark {
-        let prompt_tokens = benchmark_prompt_tokens
-            .ok_or_else(|| anyhow::anyhow!("--benchmark requires --benchmark-prompt-tokens"))?;
+    if let Some(prompt_tokens) = benchmark_prompt_tokens {
         // A benchmark times a fixed generation length, not the model's budget.
         let max_tokens = max_tokens.unwrap_or(pmetal_data::inference_config::FALLBACK_MAX_TOKENS);
         println!("Running warmup..");

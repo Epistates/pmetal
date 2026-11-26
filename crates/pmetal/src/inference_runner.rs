@@ -5,6 +5,7 @@
 //! consumers get identical behavior from a single code path.
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use pmetal_cache::kv_cache::{
     CacheMode, KVCache, KVCacheConfig, MambaCache, TurboQuantConfig, sanitize_cache_mode_for_config,
@@ -343,10 +344,65 @@ pub struct InferenceGenState {
     videos: Vec<ProcessedMedia>,
 }
 
+impl LoadedModel {
+    /// An empty recurrent-state cache for the shared model's hybrid layers;
+    /// `None` for an attention-only model and for the native engines, which
+    /// keep their own.
+    fn create_mamba_cache(&self) -> Option<MambaCache> {
+        match self {
+            Self::Standard(model) => model.create_mamba_cache(),
+            #[cfg(feature = "lora")]
+            Self::Lora(model) => model.create_mamba_cache(),
+            Self::NativeOnly => None,
+        }
+    }
+}
+
 impl InferenceGenState {
     /// True when using the native bridge path (model loads inside generate).
     pub fn is_native_only(&self) -> bool {
         matches!(self.model, LoadedModel::NativeOnly)
+    }
+
+    /// One benchmark run on the shared model, from empty caches, timed as the
+    /// native engines' benchmark trials are: greedy and without stop tokens,
+    /// so exactly `generation_tokens` come out; the prompt time runs to the
+    /// first token (the prefill, its sample, and the next step queued behind
+    /// it) and the generation time from there to the last token.
+    fn shared_benchmark_trial(
+        &mut self,
+        prompt_ids: &[u32],
+        generation_tokens: usize,
+    ) -> Result<pmetal_runtime::decode::BenchmarkTrial, Exception> {
+        pmetal_runtime::inline_array::reset_peak_memory();
+        let mut cache = KVCache::new(KVCacheConfig {
+            max_seq_len: kv_capacity(prompt_ids.len(), generation_tokens),
+            ..self.cache.config().clone()
+        });
+        let mut mamba_cache = self.model.create_mamba_cache();
+        let started = Instant::now();
+        let mut first_token_at = None;
+        generate_on_shared_model(
+            &mut self.model,
+            prompt_ids,
+            GenerationConfig::greedy(generation_tokens),
+            &mut cache,
+            mamba_cache.as_mut(),
+            |_| {
+                first_token_at.get_or_insert_with(Instant::now);
+                true
+            },
+        )?;
+        let finished = Instant::now();
+        let first_token_at = first_token_at.unwrap_or(finished);
+        let trial = pmetal_runtime::decode::BenchmarkTrial {
+            prompt_secs: (first_token_at - started).as_secs_f64(),
+            generation_secs: (finished - first_token_at).as_secs_f64(),
+            peak_memory_bytes: pmetal_runtime::inline_array::get_peak_memory(),
+        };
+        pmetal_runtime::inline_array::synchronize();
+        pmetal_runtime::inline_array::clear_cache();
+        Ok(trial)
     }
 }
 
@@ -613,7 +669,7 @@ impl InferenceRunner {
         };
 
         // 9. Load model (standard or LoRA-merged)
-        let max_seq_len = input_ids.len() + max_tokens + 64;
+        let max_seq_len = kv_capacity(input_ids.len(), max_tokens);
 
         let mut cache_request = cache_mode_request_from_config(&config);
         if mtp_requested {
@@ -922,7 +978,7 @@ impl InferenceRunner {
 
     /// Benchmark the active model with a fixed workload shape:
     /// fixed random prompt ids, one warmup, EOS disabled,
-    /// and repeated full prompt+decode runs.
+    /// and repeated full prompt+decode runs, on whichever engine runs it.
     pub fn benchmark(
         &mut self,
         prompt_tokens: usize,
@@ -936,19 +992,27 @@ impl InferenceRunner {
         }
 
         let prompt_ids = build_benchmark_prompt(prompt_tokens, vocab_size, seed);
-        match &mut self.state.model {
-            LoadedModel::NativeOnly => crate::native_inference::benchmark_native(
+        if self.state.is_native_only() {
+            return crate::native_inference::benchmark_native(
                 &self.state.model_path,
                 &prompt_ids,
                 generation_tokens,
                 self.state.native_turboquant,
                 num_trials,
             )
-            .map_err(Exception::custom),
-            _ => Err(Exception::custom(
-                "The inference benchmark is currently only implemented for the native bridge path",
-            )),
+            .map_err(Exception::custom);
         }
+        crate::native_inference::check_benchmark_workload(prompt_ids.len(), generation_tokens)
+            .map_err(Exception::custom)?;
+        crate::native_inference::run_benchmark_trials(
+            prompt_ids.len(),
+            generation_tokens,
+            num_trials,
+            || {
+                self.state
+                    .shared_benchmark_trial(&prompt_ids, generation_tokens)
+            },
+        )
     }
 }
 
@@ -1346,6 +1410,11 @@ fn cache_mode_request_from_config(config: &InferenceRunnerConfig) -> CacheModeRe
         no_kv_quant: config.no_kv_quant || config.mtp_assistant_path.is_some() || config.qwen_mtp,
         fp8: config.fp8,
     }
+}
+
+/// KV cache slots for a prompt and the tokens generated after it.
+fn kv_capacity(prompt_tokens: usize, max_new_tokens: usize) -> usize {
+    prompt_tokens + max_new_tokens + 64
 }
 
 fn build_benchmark_prompt(prompt_tokens: usize, vocab_size: usize, seed: u64) -> Vec<u32> {

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`pmetal infer --benchmark` runs on the shared model** (#38). It loaded the model and then stopped with "only implemented for the native bridge path" on every architecture without an engine of its own (Nemotron 3.5 among them) and on every run the shared model takes (`--lora`, `--fp8`, `--experts-dir`). The shared model is now timed as the native engines are, as `mlx_lm.benchmark` does: a random prompt, greedy generation with the stop tokens off, one warm-up run, then the timed runs from an empty cache, each giving the prompt rate, the generation rate and the peak memory. Gemma 4's own engine still has no benchmark, and says so before it loads. What a benchmark cannot time is refused before anything loads: a run without `--benchmark-prompt-tokens` or with `--profile-layers` (both refused only after the load before), and one with `--ane`, `--mtp` or `--draft-model`, which a benchmark does not use (it times plain generation on the GPU, and used to do that without saying so). Reported by [@texchi2](https://github.com/texchi2)
+
 ## [0.7.1] - 2026-10-29
 
 ### Added

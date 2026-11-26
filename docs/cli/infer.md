@@ -65,7 +65,7 @@ pmetal infer \
 | `--kv-qjl` | `false` | QJL residual correction for 2- and 3-bit key quantization |
 | `--no-kv-quant` | `false` | Use an fp16 KV cache |
 | `--detect-repetition` | `false` | Stop on n-gram repetition loops |
-| `--benchmark` | `false` | Time prompt processing and generation instead of answering (needs `--benchmark-prompt-tokens`) |
+| `--benchmark` | `false` | Time prompt processing and generation instead of answering, on whichever engine runs the model (see [Benchmark](#benchmark)); needs `--benchmark-prompt-tokens` |
 | `--benchmark-iters` | `5` | Measured trials for `--benchmark` |
 | `--benchmark-prompt-tokens` | none | Synthetic prompt length for `--benchmark` |
 | `--profile-layers` | `false` | Per-layer forward profile for supported hybrid models |
@@ -135,8 +135,7 @@ pmetal infer \
   --prompt "Summarize monotonic queues."
 
 # Throughput benchmark with a 512-token synthetic prompt
-pmetal infer --model Qwen/Qwen3-0.6B --benchmark --benchmark-prompt-tokens 512 \
-  --prompt "unused by --benchmark"
+pmetal infer --model Qwen/Qwen3-0.6B --benchmark --benchmark-prompt-tokens 512
 
 # Profile Qwen 3.5 hybrid prefill + cached decode layers and write JSON
 pmetal infer \
@@ -159,6 +158,10 @@ An architecture's engine is used only while it is no slower than the shared mode
 Setting `PMETAL_DISABLE_NATIVE_BRIDGE` runs the shared model whatever the checkpoint, to compare the two on the same files.
 
 Decode speed on a laptop is not steady: on the M4 Max this was measured on, a GPU that has just been busy for a couple of seconds decodes at about half the speed of one that has rested, with either engine. Compare engines, or two builds, by running each from rest, one after the other, in both orders.
+
+## Benchmark
+
+`--benchmark` times the model the way `mlx_lm.benchmark` does: a prompt of `--benchmark-prompt-tokens` random token ids, `--max-tokens` tokens (default 256) generated greedily with the stop tokens ignored, one warm-up run and then `--benchmark-iters` timed runs, each from an empty cache. Each run reports the prompt rate (prompt tokens over the time to the first token), the generation rate (tokens over the time after the first) and the peak memory, and the averages follow. It runs on the architecture's own engine or on the shared model, whichever decodes the model, except Gemma 4's own engine, which has no benchmark yet. It times plain generation, so it is refused, before the model loads, with `--ane`, `--mtp`, `--draft-model` or `--profile-layers`, and with images or videos.
 
 ## Quantized Checkpoints
 
