@@ -1124,50 +1124,14 @@ impl InferenceGenState {
             });
         }
 
-        let output = match self.model {
-            LoadedModel::Standard(ref mut model) => {
-                let mamba = &mut self.mamba_cache;
-                generate_cached_async_streaming(
-                    // Sampling reads the last position's logits alone.
-                    |input, cache| {
-                        model.forward_with_hybrid_cache_last(
-                            input,
-                            None,
-                            Some(cache),
-                            mamba.as_mut(),
-                        )
-                    },
-                    &self.input_ids,
-                    self.gen_config.clone(),
-                    &mut self.cache,
-                    on_token_guarded,
-                )
-            }
-            #[cfg(feature = "lora")]
-            LoadedModel::Lora(ref mut model) => {
-                let mamba = &mut self.mamba_cache;
-                generate_cached_async_streaming(
-                    |input, cache| {
-                        model
-                            .forward_with_hybrid_cache_last(
-                                input,
-                                None,
-                                Some(cache),
-                                mamba.as_mut(),
-                            )
-                            .map_err(|e| Exception::custom(e.to_string()))
-                    },
-                    &self.input_ids,
-                    self.gen_config.clone(),
-                    &mut self.cache,
-                    on_token_guarded,
-                )
-            }
-            LoadedModel::NativeOnly => {
-                // native path returns before reaching this fallback code
-                unreachable!("NativeOnly model should have returned before the shared fallback")
-            }
-        }?;
+        let output = generate_on_shared_model(
+            &mut self.model,
+            &self.input_ids,
+            self.gen_config.clone(),
+            &mut self.cache,
+            self.mamba_cache.as_mut(),
+            on_token_guarded,
+        )?;
         // Forward the streaming generator's per-step decode metrics into
         // the runner state so the CLI summary print ingests them the same
         // way it does for the bridge-native path.
@@ -1261,6 +1225,58 @@ impl InferenceGenState {
     /// Mutable access to the Mamba cache.
     pub fn mamba_cache_mut(&mut self) -> Option<&mut MambaCache> {
         self.mamba_cache.as_mut()
+    }
+}
+
+/// Generate on the shared model, standard or LoRA-merged, from `input_ids`
+/// into `cache` and `mamba_cache`.
+fn generate_on_shared_model<F>(
+    model: &mut LoadedModel,
+    input_ids: &[u32],
+    config: GenerationConfig,
+    cache: &mut KVCache,
+    mut mamba_cache: Option<&mut MambaCache>,
+    on_token: F,
+) -> Result<GenerationOutput, Exception>
+where
+    F: FnMut(u32) -> bool,
+{
+    match model {
+        LoadedModel::Standard(model) => generate_cached_async_streaming(
+            // Sampling reads the last position's logits alone.
+            |input, cache| {
+                model.forward_with_hybrid_cache_last(
+                    input,
+                    None,
+                    Some(cache),
+                    mamba_cache.as_deref_mut(),
+                )
+            },
+            input_ids,
+            config,
+            cache,
+            on_token,
+        ),
+        #[cfg(feature = "lora")]
+        LoadedModel::Lora(model) => generate_cached_async_streaming(
+            |input, cache| {
+                model
+                    .forward_with_hybrid_cache_last(
+                        input,
+                        None,
+                        Some(cache),
+                        mamba_cache.as_deref_mut(),
+                    )
+                    .map_err(|e| Exception::custom(e.to_string()))
+            },
+            input_ids,
+            config,
+            cache,
+            on_token,
+        ),
+        LoadedModel::NativeOnly => Err(Exception::custom(
+            "a native engine has no shared model to generate with",
+        )),
     }
 }
 
