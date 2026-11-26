@@ -581,7 +581,8 @@ mod tests {
 // Output type
 // ============================================================================
 
-/// Output produced by a native generation run.
+/// Output produced by a native generation run. Fields may be added.
+#[non_exhaustive]
 pub struct NativeGenerationOutput {
     /// All token IDs: prompt + generated.
     pub token_ids: Vec<u32>,

@@ -485,7 +485,11 @@ impl GenerationConfig {
 }
 
 /// Output from text generation.
+///
+/// Fields may be added; outside this crate, build one with
+/// [`GenerationOutput::new`].
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct GenerationOutput {
     /// The prompt, then the generated token IDs. A stop token ends the
     /// generation and is not part of the output.
