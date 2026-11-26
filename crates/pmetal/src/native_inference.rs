@@ -6,6 +6,7 @@
 //! `pmetal_runtime` and `serde_json`.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use pmetal_runtime::turboquant::TurboQuantConfig;
 
@@ -594,6 +595,9 @@ pub struct NativeGenerationOutput {
     /// Decode throughput metrics from the bridge generate loop.
     /// `None` when fewer than 20 decode steps were measured.
     pub decode_metrics: Option<pmetal_runtime::decode::DecodeMetrics>,
+    /// Time spent loading the model (its config and weights, and a vision
+    /// tower's) before the prompt.
+    pub load_time: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -721,8 +725,9 @@ pub fn run_native_multimodal_inference_ext(
         return Err("images need a Qwen3.5-family model".into());
     }
     ensure_native_runtime_metal_available()?;
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let vision = Qwen3_5Vision::load(model_path).map_err(|e| e.to_string())?;
+    let vision_load_time = started.elapsed();
     let encoded = vision
         .encode(input_ids, images, videos)
         .map_err(|e| e.to_string())?;
@@ -737,7 +742,7 @@ pub fn run_native_multimodal_inference_ext(
     let config = qwen3_native::load_config(model_path).map_err(|e| e.to_string())?;
     let tables = config.mrope_tables(&encoded.positions.array());
     let prompt_ids = input_ids.to_vec();
-    run_qwen3(
+    let output = run_qwen3(
         model_path,
         input_ids,
         max_tokens,
@@ -769,7 +774,11 @@ pub fn run_native_multimodal_inference_ext(
                 },
             )
         },
-    )
+    )?;
+    Ok(NativeGenerationOutput {
+        load_time: output.load_time + vision_load_time,
+        ..output
+    })
 }
 
 // ============================================================================
@@ -780,6 +789,7 @@ fn finish_with_bridge_generate(
     prompt: &[u32],
     first_tok: u32,
     max_tokens: usize,
+    load_time: Duration,
     on_token: &mut dyn FnMut(u32) -> bool,
     generate_tail: impl FnOnce(
         &mut dyn FnMut(u32) -> bool,
@@ -796,6 +806,7 @@ fn finish_with_bridge_generate(
             stopped_by_token: true,
             stopped_by_length: false,
             decode_metrics: None,
+            load_time,
         };
     }
 
@@ -811,6 +822,7 @@ fn finish_with_bridge_generate(
         stopped_by_token,
         stopped_by_length: !stopped_by_token && num_generated >= max_tokens,
         decode_metrics,
+        load_time,
     }
 }
 
@@ -841,13 +853,13 @@ fn run_bridge_inference<Config, Weights, Cache>(
         &mut dyn FnMut(u32) -> bool,
     ) -> (Vec<u32>, Option<pmetal_runtime::decode::DecodeMetrics>),
 ) -> Result<NativeGenerationOutput, String> {
+    let started = Instant::now();
     let config = load_config(model_path).map_err(|e| e.to_string())?;
     tracing::debug!("{}", describe_config(&config));
-
-    let t0 = std::time::Instant::now();
     let weights = load_model(model_path, &config).map_err(|e| e.to_string())?;
+    let load_time = started.elapsed();
     tracing::info!(
-        elapsed_s = format!("{:.1}", t0.elapsed().as_secs_f64()),
+        elapsed_s = format!("{:.1}", load_time.as_secs_f64()),
         active_mb = format!(
             "{:.0}",
             pmetal_runtime::inline_array::get_active_memory() as f64 / 1e6
@@ -862,6 +874,7 @@ fn run_bridge_inference<Config, Weights, Cache>(
         input_ids,
         first_tok,
         max_tokens,
+        load_time,
         on_token,
         |on_token| {
             generate(

@@ -2942,6 +2942,7 @@ mod tests {
             stopped_by_length: true,
             decode_metrics: None,
             speculative_metrics: None,
+            load_time: std::time::Duration::ZERO,
         }
     }
 

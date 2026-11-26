@@ -11,6 +11,8 @@
 //! Sampling stays on the GPU, the penalties' token history included, and the
 //! pipelined generators queue each step's forward before the previous token
 //! is read back, so the host never stalls the GPU.
+use std::time::Duration;
+
 use pmetal_cache::kv_cache::KVCache;
 use pmetal_runtime::compat::ops::{async_eval, logsumexp_axis_keepdims, select_axis};
 use pmetal_runtime::compat::{Array, Dtype, Exception};
@@ -502,6 +504,10 @@ pub struct GenerationOutput {
     pub decode_metrics: Option<pmetal_runtime::decode::DecodeMetrics>,
     /// Speculative decoding acceptance/accounting metrics.
     pub speculative_metrics: Option<SpeculativeDecodeMetrics>,
+    /// Time the call spent loading the model before it began on the prompt.
+    /// The native engines and the ANE load inside the call; a model loaded
+    /// beforehand, as the shared model is, takes none here.
+    pub load_time: Duration,
 }
 
 /// Why a generation ended.
@@ -529,6 +535,7 @@ impl GenerationOutput {
             stopped_by_length: ended == Ended::Length,
             decode_metrics,
             speculative_metrics: None,
+            load_time: Duration::ZERO,
         }
     }
 }
@@ -1055,6 +1062,7 @@ fn build_cached_generation_output(
             && num_generated >= gen_config.max_new_tokens,
         decode_metrics: None,
         speculative_metrics: None,
+        load_time: Duration::ZERO,
     }
 }
 
@@ -1102,7 +1110,11 @@ where
         sampling: gen_config.clone(),
     };
     let mut cancelled = false;
-    let (generated, stats) = crate::ane_worker::generate(request, |token| {
+    let crate::ane_worker::AneOutput {
+        tokens: generated,
+        stats,
+        load_time,
+    } = crate::ane_worker::generate(request, |token| {
         cancelled = !on_token(token);
         !cancelled
     })?;
@@ -1119,13 +1131,16 @@ where
         .is_some_and(|t| gen_config.stop_tokens.contains(t));
     let mut token_ids = input_ids.to_vec();
     token_ids.extend(&generated[..generated.len() - usize::from(saw_stop_token)]);
-    Ok(build_cached_generation_output(
-        prompt_len,
-        token_ids,
-        gen_config,
-        cancelled,
-        saw_stop_token,
-    ))
+    Ok(GenerationOutput {
+        load_time,
+        ..build_cached_generation_output(
+            prompt_len,
+            token_ids,
+            gen_config,
+            cancelled,
+            saw_stop_token,
+        )
+    })
 }
 
 /// Check if a model config is compatible with ANE inference.

@@ -8,7 +8,11 @@ mod tiny_model;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::Duration;
 
+use pmetal::data::infer_stream::InferStream;
+use pmetal::inference_runner::{InferenceRunner, InferenceRunnerConfig};
+use serde_json::Value;
 use tempfile::TempDir;
 
 /// The engines a checkpoint can run on.
@@ -148,4 +152,75 @@ fn benchmark_refuses_what_it_cannot_time_before_the_model_loads() {
             "{args:?} loaded the model before refusing:\n{stderr}"
         );
     }
+}
+
+#[test]
+fn the_model_load_is_reported_apart_from_the_time_to_the_first_token() {
+    let (_dir, model) = workspace();
+    let ask = [
+        "--prompt",
+        "the cat",
+        "--max-tokens",
+        "6",
+        "--temperature",
+        "0",
+    ];
+    for engine in [Engine::Native, Engine::Shared] {
+        // The JSON object has the load as its own figure.
+        let output = infer(&model, engine, &[&ask[..], &["--json"]].concat());
+        let (stdout, stderr) = succeeded(engine, &output);
+        let report: Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("{engine:?} engine: {e}:\n{stdout}\n{stderr}"));
+        let load = report["model_load_seconds"].as_f64();
+        assert!(
+            load.is_some_and(|load| load > 0.0),
+            "{engine:?} engine: model_load_seconds is {}",
+            report["model_load_seconds"]
+        );
+        assert!(
+            report["time_to_first_token_seconds"].as_f64().is_some(),
+            "{engine:?} engine: {report}"
+        );
+
+        // The footer gives it on its own line, and its readers still find
+        // the time to the first token.
+        let output = infer(&model, engine, &ask);
+        let (stdout, _) = succeeded(engine, &output);
+        let mut stream = InferStream::new();
+        stream.push(&stdout);
+        let stats = stream.finish();
+        assert!(stream.is_complete(), "{engine:?} engine:\n{stdout}");
+        assert!(stats.tokens > 0, "{engine:?} engine:\n{stdout}");
+        assert!(
+            stats.first_token_seconds.is_some(),
+            "{engine:?} engine:\n{stdout}"
+        );
+        assert!(
+            stdout.lines().any(|l| l.starts_with("Model load: ")),
+            "{engine:?} engine:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("model load included"),
+            "{engine:?} engine:\n{stdout}"
+        );
+    }
+}
+
+/// The native engines load their weights inside the generation call, so the
+/// call says how long that took; the time to the first token leaves it out.
+#[test]
+fn the_native_engine_reports_the_load_it_does_while_generating() {
+    let (_dir, model) = workspace();
+    let mut runner = InferenceRunner::prepare(InferenceRunnerConfig {
+        model_path: model,
+        prompt: "the cat".into(),
+        temperature: Some(0.0),
+        max_tokens: Some(4),
+        ..Default::default()
+    })
+    .expect("prepare");
+    assert!(runner.state.is_native_only());
+    let output = runner.state.generate_streaming(|_| true).expect("generate");
+    assert!(output.load_time > Duration::ZERO);
+    assert!(runner.load_time() > Duration::ZERO);
 }

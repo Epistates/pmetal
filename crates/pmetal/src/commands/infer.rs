@@ -678,9 +678,9 @@ pub(crate) async fn run_inference(spec: InferSpec) -> anyhow::Result<()> {
             let _ = std::io::stdout().flush();
         }
     };
-    // ⚠️ The native engines load their weights inside the dispatch below, so
-    // `start` measures load + prefill + decode. Reporting that as generation
-    // time made a 1 s generation read as 30 s.
+    // The native engines and the ANE load their weights inside the dispatch
+    // below and say how long that took (`GenerationOutput::load_time`), which
+    // `RunTimes` takes out of the time to the first token.
     let mut first_token_at: Option<std::time::Instant> = None;
 
     let output = {
@@ -755,7 +755,13 @@ pub(crate) async fn run_inference(spec: InferSpec) -> anyhow::Result<()> {
             })?
         }
     };
-    let elapsed = start.elapsed();
+    let times = RunTimes::measure(
+        runner.load_time(),
+        output.load_time,
+        start,
+        first_token_at,
+        std::time::Instant::now(),
+    );
 
     // The streamed text ends without a newline, and the statistics follow.
     if !json {
@@ -763,17 +769,18 @@ pub(crate) async fn run_inference(spec: InferSpec) -> anyhow::Result<()> {
     }
     say!();
     say!("---");
-    match first_token_at {
-        Some(first) => say!(
-            "Generated {} tokens in {:.2}s ({:.2}s to the first token, model load included)",
+    say!("Model load: {:.2}s", times.model_load.as_secs_f64());
+    match times.first_token {
+        Some(first_token) => say!(
+            "Generated {} tokens in {:.2}s ({:.2}s to the first token)",
             output.num_generated,
-            (elapsed - (first - start)).as_secs_f64(),
-            (first - start).as_secs_f64(),
+            times.generating.as_secs_f64(),
+            first_token.as_secs_f64(),
         ),
         None => say!(
             "Generated {} tokens in {:.2}s",
             output.num_generated,
-            elapsed.as_secs_f64(),
+            times.generating.as_secs_f64(),
         ),
     }
     if output.stopped_by_token {
@@ -826,8 +833,7 @@ pub(crate) async fn run_inference(spec: InferSpec) -> anyhow::Result<()> {
             prompt_tokens: input_ids.len(),
             generated_tokens: output.num_generated,
             stopped_by_token: output.stopped_by_token,
-            elapsed_seconds: elapsed.as_secs_f64(),
-            first_token_seconds: first_token_at.map(|first| (first - start).as_secs_f64()),
+            times: &times,
             decode_tokens_per_second: runner.state.last_decode_metrics.map(|m| m.tok_per_sec),
             speculative_acceptance: output
                 .speculative_metrics
@@ -860,6 +866,44 @@ pub(crate) async fn run_inference(spec: InferSpec) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How long a run took, part by part.
+#[derive(Debug, PartialEq)]
+struct RunTimes {
+    /// Loading the model: the runner's preparation, the prompt aside, and
+    /// the load an engine does as generation starts.
+    model_load: std::time::Duration,
+    /// From the start of generation to the first token, without the load an
+    /// engine does in that time; `None` when no token came.
+    first_token: Option<std::time::Duration>,
+    /// From the first token to the last (with no token, the generation's
+    /// whole time, the load aside).
+    generating: std::time::Duration,
+}
+
+impl RunTimes {
+    /// The times of a generation that started at `start`, produced its first
+    /// token at `first_token_at` and ended at `end`, of a model whose
+    /// preparation spent `prepared_load` loading it and whose engine then
+    /// spent `generation_load` of the generation loading its weights.
+    fn measure(
+        prepared_load: std::time::Duration,
+        generation_load: std::time::Duration,
+        start: std::time::Instant,
+        first_token_at: Option<std::time::Instant>,
+        end: std::time::Instant,
+    ) -> Self {
+        Self {
+            model_load: prepared_load + generation_load,
+            first_token: first_token_at
+                .map(|first| first.duration_since(start).saturating_sub(generation_load)),
+            generating: match first_token_at {
+                Some(first) => end.duration_since(first),
+                None => end.duration_since(start).saturating_sub(generation_load),
+            },
+        }
+    }
+}
+
 /// What a finished generation reports in `--json`.
 struct InferenceFacts<'a> {
     model: &'a str,
@@ -867,16 +911,15 @@ struct InferenceFacts<'a> {
     prompt_tokens: usize,
     generated_tokens: usize,
     stopped_by_token: bool,
-    elapsed_seconds: f64,
-    first_token_seconds: Option<f64>,
+    times: &'a RunTimes,
     decode_tokens_per_second: Option<f64>,
     speculative_acceptance: Option<f64>,
     interrupted: bool,
 }
 
-/// The `--json` object. `seconds` is the generation time (the model's load
-/// is in `time_to_first_token_seconds` for the engines that load inside the
-/// run).
+/// The `--json` object: `seconds` is the time from the first token to the
+/// last, `time_to_first_token_seconds` the time to the first token and
+/// `model_load_seconds` the model's load, which neither includes.
 fn inference_report(facts: &InferenceFacts<'_>) -> serde_json::Value {
     let stopped_by = if facts.interrupted {
         "interrupted"
@@ -885,15 +928,15 @@ fn inference_report(facts: &InferenceFacts<'_>) -> serde_json::Value {
     } else {
         "length"
     };
-    let seconds = facts.elapsed_seconds - facts.first_token_seconds.unwrap_or(0.0);
     serde_json::json!({
         "model": facts.model,
         "text": facts.text,
         "prompt_tokens": facts.prompt_tokens,
         "generated_tokens": facts.generated_tokens,
         "stopped_by": stopped_by,
-        "seconds": seconds.max(0.0),
-        "time_to_first_token_seconds": facts.first_token_seconds,
+        "seconds": facts.times.generating.as_secs_f64(),
+        "time_to_first_token_seconds": facts.times.first_token.map(|t| t.as_secs_f64()),
+        "model_load_seconds": facts.times.model_load.as_secs_f64(),
         "decode_tokens_per_second": facts.decode_tokens_per_second,
         "speculative_acceptance": facts.speculative_acceptance,
     })
@@ -904,19 +947,25 @@ fn inference_report(facts: &InferenceFacts<'_>) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
     use pmetal_models::architectures::Qwen3NextProfileSection;
 
     #[test]
     fn the_json_report_says_why_generation_stopped_and_what_it_cost() {
+        let times = RunTimes {
+            model_load: Duration::from_millis(20_250),
+            first_token: Some(Duration::from_secs(1)),
+            generating: Duration::from_millis(1_500),
+        };
         let mut facts = InferenceFacts {
             model: "m",
             text: "hello",
             prompt_tokens: 5,
             generated_tokens: 3,
             stopped_by_token: true,
-            elapsed_seconds: 2.5,
-            first_token_seconds: Some(1.0),
+            times: &times,
             decode_tokens_per_second: Some(42.0),
             speculative_acceptance: None,
             interrupted: false,
@@ -926,11 +975,45 @@ mod tests {
         assert_eq!(report["stopped_by"], "eos");
         assert_eq!(report["seconds"], 1.5);
         assert_eq!(report["time_to_first_token_seconds"], 1.0);
+        assert_eq!(report["model_load_seconds"], 20.25);
         assert!(report["speculative_acceptance"].is_null());
         facts.stopped_by_token = false;
         assert_eq!(inference_report(&facts)["stopped_by"], "length");
         facts.interrupted = true;
         assert_eq!(inference_report(&facts)["stopped_by"], "interrupted");
+    }
+
+    /// The native engines and the ANE load their weights after generation
+    /// starts, the shared model before it; the time to the first token is
+    /// the same thing on both, and the load is counted once wherever it was.
+    #[test]
+    fn the_first_token_is_timed_without_the_model_load_on_every_engine() {
+        let ms = Duration::from_millis;
+        let start = Instant::now();
+        let at = |millis| start + ms(millis);
+
+        // A native engine: 0.3 s of preparation, 20 s of loading its weights
+        // inside generation, the first token 0.8 s after that.
+        let native = RunTimes::measure(ms(300), ms(20_000), start, Some(at(20_800)), at(23_000));
+        assert_eq!(
+            native,
+            RunTimes {
+                model_load: ms(20_300),
+                first_token: Some(ms(800)),
+                generating: ms(2_200),
+            }
+        );
+
+        // The shared model: loaded during the 20.3 s preparation, the first
+        // token 0.8 s into generation.
+        let shared = RunTimes::measure(ms(20_300), Duration::ZERO, start, Some(at(800)), at(3_000));
+        assert_eq!(shared, native);
+
+        // No token at all: no time to the first, and the load is still apart.
+        let none = RunTimes::measure(ms(300), ms(20_000), start, None, at(20_500));
+        assert_eq!(none.first_token, None);
+        assert_eq!(none.generating, ms(500));
+        assert_eq!(none.model_load, ms(20_300));
     }
 
     #[test]

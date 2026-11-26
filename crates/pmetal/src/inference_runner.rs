@@ -5,7 +5,7 @@
 //! consumers get identical behavior from a single code path.
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use pmetal_cache::kv_cache::{
     CacheMode, KVCache, KVCacheConfig, MambaCache, TurboQuantConfig, sanitize_cache_mode_for_config,
@@ -311,6 +311,8 @@ pub struct InferenceRunner {
     chat_template_type: Option<ChatTemplateType>,
     is_chat: bool,
     thinks: bool,
+    /// See [`InferenceRunner::load_time`].
+    load_time: Duration,
 }
 
 /// Mutable generation state (model, caches, config).
@@ -421,7 +423,11 @@ impl InferenceRunner {
     /// 9. Enable expert offloading
     /// 10. Create KV cache (with quantization mode)
     /// 11. Create Mamba cache (for hybrid models)
+    ///
+    /// Everything but the prompt's own preparation is timed as the model's
+    /// load ([`load_time`](Self::load_time)).
     pub fn prepare(mut config: InferenceRunnerConfig) -> Result<Self, Exception> {
+        let started = Instant::now();
         let images = std::mem::take(&mut config.images);
         let videos = std::mem::take(&mut config.videos);
         let has_media = !images.is_empty() || !videos.is_empty();
@@ -492,10 +498,12 @@ impl InferenceRunner {
         // The media are preprocessed before the prompt is tokenized: a
         // video's placeholder expands to text as well as tokens (each frame's
         // timestamp), so placeholders are expanded in the prompt text.
+        let prompt_started = Instant::now();
         let (image_media, video_media) = match &multimodal {
             None => (Vec::new(), Vec::new()),
             Some(multimodal) => preprocess_media(model_path, multimodal, &images, &videos)?,
         };
+        let mut prompt_time = prompt_started.elapsed();
         let expand_media = |text: String| -> Result<String, Exception> {
             match &multimodal {
                 None => Ok(text),
@@ -536,6 +544,7 @@ impl InferenceRunner {
         };
 
         // 6. Apply chat template + tokenize
+        let prompt_started = Instant::now();
         let (input_ids, template_type, thinks) = if use_chat {
             let detected = pmetal_data::chat_templates::detect_chat_template(
                 model_path,
@@ -610,6 +619,7 @@ impl InferenceRunner {
             (ids, None, false)
         };
 
+        prompt_time += prompt_started.elapsed();
         tracing::info!(tokens = input_ids.len(), "Prompt tokenized");
 
         // 6a. Output budget: the caller's, else the model's recommendation
@@ -956,7 +966,19 @@ impl InferenceRunner {
             chat_template_type: template_type,
             is_chat: use_chat,
             thinks,
+            load_time: started.elapsed().saturating_sub(prompt_time),
         })
+    }
+
+    /// Time [`prepare`](Self::prepare) spent loading the model: the
+    /// tokenizer, the weights the shared model runs from (and an adapter, a
+    /// draft model or an MTP head), and the caches. The prompt's own
+    /// preparation (rendering, tokenizing, preprocessing its images and
+    /// videos) is left out. The native engines load their weights when
+    /// generation starts, and report that load in the output's
+    /// [`load_time`](GenerationOutput::load_time).
+    pub fn load_time(&self) -> Duration {
+        self.load_time
     }
 
     /// Whether chat mode is active.
@@ -1185,6 +1207,7 @@ impl InferenceGenState {
                 stopped_by_length: output.stopped_by_length,
                 decode_metrics: output.decode_metrics,
                 speculative_metrics: None,
+                load_time: output.load_time,
             });
         }
 
