@@ -1,0 +1,62 @@
+name: Code changed
+description: >-
+  Whether a change touches anything beyond documentation and licences: `**.md`,
+  `docs/**` and `LICENSE*` at the repository root. Run it after a checkout with
+  `fetch-depth: 2`.
+
+outputs:
+  code:
+    description: >-
+      `false` when every changed file is documentation or a licence, otherwise
+      `true`. It is `true` whenever the change cannot be worked out.
+    value: ${{ steps.detect.outputs.code }}
+
+runs:
+  using: composite
+  steps:
+    - id: detect
+      shell: bash
+      env:
+        EVENT: ${{ github.event_name }}
+        BEFORE: ${{ github.event.before }}
+      run: |
+        # A wrong skip is the only dangerous answer, so every path that cannot
+        # tell says `true`.
+        code=true
+        changed="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/changed-files"
+        base=""
+        case "$EVENT" in
+          # The checkout is the merge of the pull request into its base; the
+          # first parent is the base, so the diff is the change as it merges.
+          pull_request) base='HEAD^1' ;;
+          push)
+            if [[ "$BEFORE" =~ ^0+$ || -z "$BEFORE" ]]; then
+              echo "No previous commit to compare with."
+            elif git cat-file -e "$BEFORE^{commit}" 2>/dev/null \
+              || git fetch --no-tags --depth=1 origin "$BEFORE" 2>/dev/null; then
+              base="$BEFORE"
+            else
+              echo "Could not fetch $BEFORE."
+            fi
+            ;;
+          *) echo "No change to compare with for $EVENT." ;;
+        esac
+
+        # No renames: a file moved out of `docs/` is a change to code, so both
+        # its old and its new path are listed.
+        if [[ -n "$base" ]] && git diff -z --name-only --no-renames "$base" HEAD >"$changed" 2>/dev/null \
+          && [[ -s "$changed" ]]; then
+          code=false
+          while IFS= read -r -d '' file; do
+            case "$file" in
+              *.md | docs/*) ;;          # `**.md` and `docs/**`
+              LICENSE*/*) code=true ;;   # `*` in a path filter does not cross a slash
+              LICENSE*) ;;
+              *) code=true ;;
+            esac
+            echo "$file"
+            [[ "$code" == true ]] && break
+          done <"$changed"
+        fi
+        echo "code=$code"
+        echo "code=$code" >>"$GITHUB_OUTPUT"
