@@ -12,6 +12,7 @@ import shlex
 import sys
 import textwrap
 import threading
+import time
 from pathlib import Path
 
 import pmetal
@@ -184,26 +185,65 @@ def test_a_run_with_nothing_to_score_by_says_so(tiny_model, tmp_path):
 # -- threads and the GIL --------------------------------------------------------------------------
 
 
+#: A reward command that answers its first request only once the file `argv[1]` exists, and says so
+#: if that takes a minute. The run waits on it, with the GIL released, for another Python thread.
+GATED_REWARD_COMMAND = """\
+import json, os, sys, time
+gate = sys.argv[1]
+deadline = time.monotonic() + 60
+for line in sys.stdin:
+    request = json.loads(line)
+    while not os.path.exists(gate):
+        if time.monotonic() > deadline:
+            print("the gate never opened: no other Python thread ran while the run waited", file=sys.stderr)
+            sys.exit(3)
+        time.sleep(0.01)
+    print(json.dumps({"rewards": [0.0] * len(request["completions"])}), flush=True)
+"""
+
+
 def test_the_gil_is_free_while_the_run_trains_and_taken_for_each_call(tiny_model, prompts, tmp_path):
+    """The run waits for another Python thread, so it can only finish if the GIL is free.
+
+    A reward command holds the run until a file exists. A ticker thread, started once
+    the run has begun, takes the GIL ``wanted`` times and then makes the file: that
+    takes no time the run can lose by being short. A run that kept the GIL while it
+    waited would never let the ticker run, and the command would give up on the gate.
+    """
+    wanted = 100
+    gate = tmp_path / "gate"
+    script = tmp_path / "gated_reward.py"
+    script.write_text(GATED_REWARD_COMMAND)
+    begun = threading.Event()
     ticks = 0
-    stop = threading.Event()
 
     def tick() -> None:
         nonlocal ticks
-        while not stop.is_set():
+        if not begun.wait(60):
+            return
+        while ticks < wanted:
             ticks += 1
-            stop.wait(0.001)
+            time.sleep(0)  # let go of the GIL and take it back
+        gate.write_text("open")
+
+    class Begins:
+        def on_train_start(self) -> None:
+            begun.set()
 
     reward = Recorder()
+    spec = spec_for(
+        tiny_model, prompts, tmp_path / "out", reward_cmd=[shlex.join([sys.executable, str(script), str(gate)])]
+    )
     thread = threading.Thread(target=tick)
     thread.start()
     try:
-        pmetal.GrpoTrainer(spec_for(tiny_model, prompts, tmp_path / "out"), [reward]).train()
+        result = pmetal.GrpoTrainer(spec, [reward], callbacks=[Begins()]).train()
     finally:
-        stop.set()
+        begun.set()
         thread.join()
+    assert result.total_steps == 3 and ticks == wanted and gate.exists(), "another Python thread ran during the run"
+    # Taken for each call: every batch reached the function, on the thread that trains.
     assert len(reward.calls) == 3
-    assert ticks > 5, "another Python thread made progress during the run"
 
 
 def test_with_async_rewards_a_function_runs_on_the_scorer_thread(tiny_model, prompts, tmp_path):
