@@ -136,7 +136,7 @@ build-wheel:
     mkdir -p "$PKG/_bin"
     cargo build --release -p pmetal --features serve,mcp
     cp target/release/pmetal "$PKG/_bin/pmetal"
-    meta=$(
+    META=$(
       cargo build --profile wheel -p pmetal-py --message-format=json \
         | jq -r 'select(.reason == "build-script-executed")
             | select(.package_id | test("pmetal-runtime"))
@@ -144,13 +144,15 @@ build-wheel:
             | "\(.PMETAL_RUNTIME_MLX_METALLIB) \(.PMETAL_RUNTIME_MLX_METALLIB_SHA256)"' \
         | tail -n 1
     )
-    read -r path sha <<< "$meta"
-    if [[ ! -f "$path" ]]; then
-        echo "FAIL: the bridge's build published no metallib ($meta)"
+    # Not `path`: in zsh that is the array tied to PATH, and reading into it
+    # leaves the next command with no search path.
+    read -r METALLIB SHA256 <<< "$META"
+    if [[ ! -f "$METALLIB" ]]; then
+        echo "FAIL: the bridge's build published no metallib ($META)"
         exit 1
     fi
-    cp "$path" "$PKG/mlx.metallib"
-    echo "$sha  $PKG/mlx.metallib" | shasum -a 256 -c -
+    cp "$METALLIB" "$PKG/mlx.metallib"
+    echo "$SHA256  $PKG/mlx.metallib" | shasum -a 256 -c -
     cd crates/pmetal-py && maturin build --strip --out ../../target/wheels
 
 # Python bindings: lint, then the pytest suite (stubs included) against the
