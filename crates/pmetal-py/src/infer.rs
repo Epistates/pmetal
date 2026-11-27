@@ -99,7 +99,11 @@ pub struct PyInferResult {
     /// The token limit ended the generation.
     #[pyo3(get)]
     stopped_by_length: bool,
-    /// Seconds from the first token to the last.
+    /// Seconds from the first token to the last. A run of n tokens spans
+    /// n - 1 intervals, so its decode rate is
+    /// `(num_generated - 1) / generation_seconds` tokens per second (the
+    /// inverse of the time per output token vLLM and llama.cpp report), and a
+    /// single token has none.
     #[pyo3(get)]
     generation_seconds: f64,
     /// Speculative-decoding statistics (drafted, accepted, acceptance rate, ...), or None for plain decoding.
