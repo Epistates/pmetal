@@ -2527,7 +2527,6 @@ class InferCallOptions(TypedDict, total=False):
     """The fields of ``InferSpec`` that ``infer`` takes as keyword arguments."""
 
     lora: str | None
-    messages_file: str | None
     max_tokens: int | None
     temperature: float | None
     top_k: int | None
