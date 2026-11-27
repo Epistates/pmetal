@@ -1,9 +1,20 @@
 name: Python Bindings
 
 # Builds the wheel the way a release ships it and runs the test suite against
-# the installed wheel (not an editable install). Manual until the bindings are
-# published.
+# the installed wheel (not an editable install).
 on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE*'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE*'
   workflow_dispatch:
 
 permissions:
@@ -15,24 +26,53 @@ env:
   # releases are caught and pulled within days. pip reads a duration here from
   # 26.1, which each job installs first with this unset.
   PIP_UPLOADED_PRIOR_TO: P7D
+  # Persistent MLX prefix, as in ci.yml: build.rs reuses a matching pre-built
+  # MLX here and skips cmake, and a fresh build is copied back in.
+  PMETAL_MLX_PREFIX: ${{ github.workspace }}/.mlx-cache
 
 jobs:
+  # The abi3 wheel is built once, on the oldest Python it supports, and tested
+  # on the oldest and the newest (`test`).
   wheel:
-    name: Wheel and tests (macOS aarch64, Python ${{ matrix.python }})
+    name: Wheel (macOS aarch64)
     runs-on: macos-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # The abi3 wheel is built once, on the oldest Python it supports, and
-        # tested on the oldest and the newest.
-        python: ["3.11", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      # rust-toolchain.toml pins the compiler for everything under the
+      # checkout, so that is the toolchain to install; a `stable` would never
+      # be used. Cargo's own auto-install of it is deprecated, and when a
+      # runner already has an empty directory for the toolchain it installs
+      # only the file's components: no cargo, no rustc. `component add` fills
+      # that in and changes nothing on a complete install.
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install --no-self-update
+          rustup component add cargo rustc
+
+      # The MLX revision (tag or commit) comes from build.rs, so the key
+      # tracks it, and the files that drive MLX's cmake configure. The key is
+      # apart from ci.yml's: the wheel links MLX statically, a different
+      # build, in its own slot of the prefix.
+      - name: Resolve the MLX cache key
+        id: mlx
+        env:
+          MLX_SOURCES: ${{ hashFiles('crates/pmetal-runtime/build.rs', 'crates/pmetal-runtime/cmake/**', 'crates/pmetal-runtime/patches/**') }}
+        run: |
+          tag=$(grep -E '^const BUNDLED_MLX_GIT_TAG' \
+            crates/pmetal-runtime/build.rs | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "Resolved MLX tag: $tag"
+          prefix="mlx-static-$RUNNER_OS-$RUNNER_ARCH-$tag-"
+          echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+          echo "key=$prefix$MLX_SOURCES" >> "$GITHUB_OUTPUT"
+
+      - name: Restore MLX
+        id: mlx-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          toolchain: stable
+          path: ${{ env.PMETAL_MLX_PREFIX }}
+          key: ${{ steps.mlx.outputs.key }}
+          restore-keys: ${{ steps.mlx.outputs.prefix }}
 
       - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
@@ -41,7 +81,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: ${{ matrix.python }}
+          python-version: "3.11"
 
       - name: Upgrade pip
         run: env -u PIP_UPLOADED_PRIOR_TO python -m pip install --upgrade "pip>=26.1"
@@ -53,11 +93,17 @@ jobs:
       # with that MLX inside the package, and the unwinding `wheel` profile
       # (see `just build-wheel`).
       - name: Build the wheel
-        if: matrix.python == '3.11'
         run: just build-wheel
 
+      # Saved right after the build, so a failing test does not throw it away.
+      - name: Save MLX
+        if: steps.mlx-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.PMETAL_MLX_PREFIX }}
+          key: ${{ steps.mlx.outputs.key }}
+
       - name: Check the wheel carries the metallib and the command line
-        if: matrix.python == '3.11'
         run: |
           set -euo pipefail
           ls target/wheels
@@ -67,14 +113,31 @@ jobs:
           unzip -l target/wheels/*.whl | grep -q 'pmetal/pmetal.pyi$'
 
       - name: Upload the wheel
-        if: matrix.python == '3.11'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pmetal-wheel-macos-aarch64
           path: target/wheels/*.whl
 
-      - name: Fetch the wheel built on 3.11
-        if: matrix.python != '3.11'
+  test:
+    name: Tests (macOS aarch64, Python ${{ matrix.python }})
+    needs: wheel
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Upgrade pip
+        run: env -u PIP_UPLOADED_PRIOR_TO python -m pip install --upgrade "pip>=26.1"
+
+      - name: Fetch the wheel
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: pmetal-wheel-macos-aarch64
@@ -106,10 +169,32 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      # See the `wheel` job for this and the MLX cache: the MLX is the same
+      # one, it does not depend on the Python.
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install --no-self-update
+          rustup component add cargo rustc
+
+      - name: Resolve the MLX cache key
+        id: mlx
+        env:
+          MLX_SOURCES: ${{ hashFiles('crates/pmetal-runtime/build.rs', 'crates/pmetal-runtime/cmake/**', 'crates/pmetal-runtime/patches/**') }}
+        run: |
+          tag=$(grep -E '^const BUNDLED_MLX_GIT_TAG' \
+            crates/pmetal-runtime/build.rs | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "Resolved MLX tag: $tag"
+          prefix="mlx-static-$RUNNER_OS-$RUNNER_ARCH-$tag-"
+          echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+          echo "key=$prefix$MLX_SOURCES" >> "$GITHUB_OUTPUT"
+
+      - name: Restore MLX
+        id: mlx-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          toolchain: stable
+          path: ${{ env.PMETAL_MLX_PREFIX }}
+          key: ${{ steps.mlx.outputs.key }}
+          restore-keys: ${{ steps.mlx.outputs.prefix }}
 
       - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
@@ -129,8 +214,15 @@ jobs:
       - name: Build the wheel
         run: just build-wheel
 
+      - name: Save MLX
+        if: steps.mlx-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.PMETAL_MLX_PREFIX }}
+          key: ${{ steps.mlx.outputs.key }}
+
       - name: Check it is the free-threaded wheel
-        run: ls target/wheels | grep -q 'cp314-cp314t-macosx_14_0_arm64.whl$'
+        run: ls target/wheels/*-cp314-cp314t-macosx_14_0_arm64.whl
 
       - name: Install the wheel and the test tools
         run: |
