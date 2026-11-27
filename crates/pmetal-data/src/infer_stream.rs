@@ -27,7 +27,8 @@ pub struct GenerationStats {
     /// Seconds spent generating after the first token. With
     /// [`first_token_seconds`](Self::first_token_seconds), the whole run.
     pub generating_seconds: f64,
-    /// Seconds to the first token, model load included, when the footer says.
+    /// Seconds from the start of generation to the first token, the model's
+    /// load left out, when the footer says.
     pub first_token_seconds: Option<f64>,
 }
 
@@ -169,7 +170,7 @@ impl InferStream {
                     .and_then(|s| s.trim().parse::<f64>().ok())
                     .unwrap_or(0.0);
                 stats.generating_seconds = seconds;
-                // `(0.20s to the first token, model load included)`
+                // `(0.20s to the first token)`
                 stats.first_token_seconds = rest
                     .split_once('(')
                     .and_then(|(_, r)| r.split_once("s to the first token"))
@@ -255,7 +256,7 @@ mod tests {
         )
     }
 
-    const FOOTER_TEXT: &str = "Generated 42 tokens in 1.50s (0.20s to the first token, model load included)\nStopped by: EOS token\nDecode: 310 tok/s (avg=3.20ms p50=3.10ms over 41 steps)\n";
+    const FOOTER_TEXT: &str = "Model load: 2.40s\nGenerated 42 tokens in 1.50s (0.20s to the first token)\nStopped by: EOS token\nDecode: 310 tok/s (avg=3.20ms p50=3.10ms over 41 steps)\n";
 
     fn read_in_pieces(out: &str, piece: usize) -> InferStream {
         let mut stream = InferStream::new();

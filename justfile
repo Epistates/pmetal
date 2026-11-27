@@ -128,15 +128,22 @@ stage-gui-sidecar: build-cli
 # command line (which `pmetal.run` runs) and the metallib built with the
 # extension's MLX inside the package, and the unwinding `wheel` profile
 # (pyproject.toml), so a Rust panic is a Python exception. Output: target/wheels.
-build-wheel:
+#
+# With no `interpreter` the wheel is the abi3 one, for CPython 3.11 and later.
+# A free-threaded CPython cannot load that, and maturin builds a version-specific
+# wheel for an interpreter that cannot use the stable ABI only when it is named:
+# `just build-wheel python3.14t`.
+build-wheel interpreter="":
     #!/usr/bin/env zsh
     set -euo pipefail
+    MATURIN_ARGS=(--strip --out ../../target/wheels)
+    if [[ -n "{{ interpreter }}" ]]; then MATURIN_ARGS+=(--interpreter "{{ interpreter }}"); fi
     export PMETAL_MLX_STATIC=1 MACOSX_DEPLOYMENT_TARGET=14.0
     PKG=crates/pmetal-py/py_src/pmetal
     mkdir -p "$PKG/_bin"
     cargo build --release -p pmetal --features serve,mcp
     cp target/release/pmetal "$PKG/_bin/pmetal"
-    meta=$(
+    META=$(
       cargo build --profile wheel -p pmetal-py --message-format=json \
         | jq -r 'select(.reason == "build-script-executed")
             | select(.package_id | test("pmetal-runtime"))
@@ -144,14 +151,16 @@ build-wheel:
             | "\(.PMETAL_RUNTIME_MLX_METALLIB) \(.PMETAL_RUNTIME_MLX_METALLIB_SHA256)"' \
         | tail -n 1
     )
-    read -r path sha <<< "$meta"
-    if [[ ! -f "$path" ]]; then
-        echo "FAIL: the bridge's build published no metallib ($meta)"
+    # Not `path`: in zsh that is the array tied to PATH, and reading into it
+    # leaves the next command with no search path.
+    read -r METALLIB SHA256 <<< "$META"
+    if [[ ! -f "$METALLIB" ]]; then
+        echo "FAIL: the bridge's build published no metallib ($META)"
         exit 1
     fi
-    cp "$path" "$PKG/mlx.metallib"
-    echo "$sha  $PKG/mlx.metallib" | shasum -a 256 -c -
-    cd crates/pmetal-py && maturin build --strip --out ../../target/wheels
+    cp "$METALLIB" "$PKG/mlx.metallib"
+    echo "$SHA256  $PKG/mlx.metallib" | shasum -a 256 -c -
+    cd crates/pmetal-py && maturin build "${MATURIN_ARGS[@]}"
 
 # Python bindings: lint, then the pytest suite (stubs included) against the
 # extension installed by `maturin develop`.

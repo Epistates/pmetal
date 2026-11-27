@@ -11,6 +11,8 @@
 //! Sampling stays on the GPU, the penalties' token history included, and the
 //! pipelined generators queue each step's forward before the previous token
 //! is read back, so the host never stalls the GPU.
+use std::time::Duration;
+
 use pmetal_cache::kv_cache::KVCache;
 use pmetal_runtime::compat::ops::{async_eval, logsumexp_axis_keepdims, select_axis};
 use pmetal_runtime::compat::{Array, Dtype, Exception};
@@ -483,7 +485,11 @@ impl GenerationConfig {
 }
 
 /// Output from text generation.
+///
+/// Fields may be added; outside this crate, build one with
+/// [`GenerationOutput::new`].
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct GenerationOutput {
     /// The prompt, then the generated token IDs. A stop token ends the
     /// generation and is not part of the output.
@@ -502,6 +508,10 @@ pub struct GenerationOutput {
     pub decode_metrics: Option<pmetal_runtime::decode::DecodeMetrics>,
     /// Speculative decoding acceptance/accounting metrics.
     pub speculative_metrics: Option<SpeculativeDecodeMetrics>,
+    /// Time the call spent loading the model before it began on the prompt.
+    /// The native engines and the ANE load inside the call; a model loaded
+    /// beforehand, as the shared model is, takes none here.
+    pub load_time: Duration,
 }
 
 /// Why a generation ended.
@@ -516,6 +526,25 @@ enum Ended {
 }
 
 impl GenerationOutput {
+    /// The output of a generation an engine outside this module ran: its
+    /// tokens (the prompt, then those generated), how many it generated, and
+    /// whether a stop token or the length limit ended it. It has no decode or
+    /// speculative metrics and no load time; set the fields the engine has.
+    pub fn new(
+        token_ids: Vec<u32>,
+        num_generated: usize,
+        stopped_by_token: bool,
+        stopped_by_length: bool,
+    ) -> Self {
+        Self {
+            token_ids,
+            num_generated,
+            stopped_by_token,
+            stopped_by_length,
+            ..Self::default()
+        }
+    }
+
     fn ended(
         token_ids: Vec<u32>,
         prompt_len: usize,
@@ -529,6 +558,7 @@ impl GenerationOutput {
             stopped_by_length: ended == Ended::Length,
             decode_metrics,
             speculative_metrics: None,
+            load_time: Duration::ZERO,
         }
     }
 }
@@ -1055,6 +1085,7 @@ fn build_cached_generation_output(
             && num_generated >= gen_config.max_new_tokens,
         decode_metrics: None,
         speculative_metrics: None,
+        load_time: Duration::ZERO,
     }
 }
 
@@ -1102,7 +1133,11 @@ where
         sampling: gen_config.clone(),
     };
     let mut cancelled = false;
-    let (generated, stats) = crate::ane_worker::generate(request, |token| {
+    let crate::ane_worker::AneOutput {
+        tokens: generated,
+        stats,
+        load_time,
+    } = crate::ane_worker::generate(request, |token| {
         cancelled = !on_token(token);
         !cancelled
     })?;
@@ -1119,13 +1154,16 @@ where
         .is_some_and(|t| gen_config.stop_tokens.contains(t));
     let mut token_ids = input_ids.to_vec();
     token_ids.extend(&generated[..generated.len() - usize::from(saw_stop_token)]);
-    Ok(build_cached_generation_output(
-        prompt_len,
-        token_ids,
-        gen_config,
-        cancelled,
-        saw_stop_token,
-    ))
+    Ok(GenerationOutput {
+        load_time,
+        ..build_cached_generation_output(
+            prompt_len,
+            token_ids,
+            gen_config,
+            cancelled,
+            saw_stop_token,
+        )
+    })
 }
 
 /// Check if a model config is compatible with ANE inference.
@@ -1172,6 +1210,17 @@ mod tests {
     }
 
     const PROMPT: [u32; 4] = [3, 9, 1, 20];
+
+    /// An engine's output is what it reports, with nothing it did not.
+    #[test]
+    fn an_outside_engines_output_holds_what_it_reported() {
+        let output = GenerationOutput::new(vec![3, 9, 1, 20, 7, 8], 2, false, true);
+        assert_eq!(output.token_ids, [3, 9, 1, 20, 7, 8]);
+        assert_eq!(output.num_generated, 2);
+        assert!(!output.stopped_by_token && output.stopped_by_length);
+        assert!(output.decode_metrics.is_none() && output.speculative_metrics.is_none());
+        assert_eq!(output.load_time, Duration::ZERO);
+    }
 
     /// `row_logprobs` over many rows is `token_logprobs` row by row, and agrees
     /// with a direct log-softmax on the host.

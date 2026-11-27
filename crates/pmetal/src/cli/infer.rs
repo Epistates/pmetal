@@ -182,7 +182,12 @@ pub struct InferArgs {
     #[arg(long = "ane-max-seq-len", default_value_t = 4096)]
     pub ane_max_seq_len: usize,
 
-    /// Run a prompt and generation throughput benchmark.
+    /// Time prompt processing and generation instead of answering, as
+    /// mlx_lm.benchmark does: a random prompt of --benchmark-prompt-tokens
+    /// tokens, then --max-tokens tokens generated greedily, one warm-up run
+    /// and --benchmark-iters timed ones. Runs on whichever engine decodes
+    /// the model (not yet Gemma 4's own); not with --ane, --mtp or
+    /// --draft-model.
     #[arg(long = "benchmark")]
     pub benchmark: bool,
 

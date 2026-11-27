@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -48,15 +49,43 @@ def test_training_commands_get_an_event_log_and_others_do_not(fake_cli):
         assert "--log-events" not in pmetal.run(spec, cli=cli).json()
 
 
-def test_the_specs_that_stream_events_are_the_trainers_the_command_line_accepts_the_flag_for():
-    # The specs state it themselves (`#[spec(events)]`); the command line refuses
-    # `--log-events` for every other command (Commands::writes_event_log).
-    names = {
+def streaming_subcommands() -> set[str]:
+    """The subcommands of the specs that state they write an event log (`#[spec(events)]`)."""
+    return {
         cls.subcommand
         for cls in vars(pmetal).values()
         if isinstance(cls, type) and hasattr(cls, "reports_events") and cls.reports_events
     }
-    assert names == {"train", "distill", "grpo", "rlkd", "preference"}
+
+
+def test_the_specs_that_stream_events_are_the_trainers():
+    assert streaming_subcommands() == {
+        "train",
+        "distill",
+        "grpo",
+        "rlkd",
+        "preference",
+        "train-mtp",
+        "train-draft",
+        "train-diffusion",
+        "embed-train",
+        "pretrain",
+    }
+
+
+def test_the_command_line_accepts_the_event_log_flag_for_the_specs_that_stream_events(tmp_path):
+    """The command line refuses `--log-events` for a command that writes no log, and names the ones that do."""
+    try:
+        cli = pmetal.find_cli()
+    except pmetal.CliNotFoundError:
+        pytest.skip("no pmetal command line to ask")
+    refused = subprocess.run(
+        [str(cli), "info", "--log-events", str(tmp_path / "events.jsonl")], capture_output=True, text=True, check=False
+    )
+    assert refused.returncode != 0
+    named = re.search(r"--log-events is written by (.+) only", refused.stderr)
+    assert named, refused.stderr
+    assert set(named.group(1).split(", ")) == streaming_subcommands()
 
 
 def test_events_reach_on_event_in_order_and_the_result(fake_cli):
@@ -121,7 +150,7 @@ def test_an_interrupted_command_is_cancelled_not_failed(fake_cli):
         pmetal.run(SPEC, cli=cli)
 
 
-def test_a_missing_command_line_says_where_it_looked(tmp_path, monkeypatch):
+def test_a_missing_command_line_says_where_it_looked(no_bundled_cli, tmp_path, monkeypatch):
     monkeypatch.delenv("PMETAL_BIN", raising=False)
     monkeypatch.setenv("PATH", str(tmp_path))
     monkeypatch.setattr(_jobs, "_fallback_directories", list)
@@ -132,7 +161,7 @@ def test_a_missing_command_line_says_where_it_looked(tmp_path, monkeypatch):
         pmetal.find_cli()
 
 
-def test_the_cli_is_found_through_the_environment_and_the_path(fake_cli, monkeypatch):
+def test_the_cli_is_found_through_the_environment_and_the_path(no_bundled_cli, fake_cli, monkeypatch):
     cli = fake_cli(ECHO)
     monkeypatch.setenv("PMETAL_BIN", str(cli))
     assert pmetal.find_cli() == cli
@@ -140,6 +169,30 @@ def test_the_cli_is_found_through_the_environment_and_the_path(fake_cli, monkeyp
     monkeypatch.delenv("PMETAL_BIN")
     monkeypatch.setenv("PATH", f"{cli.parent}{os.pathsep}{os.environ['PATH']}")
     assert pmetal.find_cli() == cli
+
+
+def test_the_cli_shipped_in_the_package_comes_before_the_path(fake_cli, tmp_path, monkeypatch):
+    bundled = fake_cli(ECHO, name="bundled")
+    on_path = tmp_path / "bin"
+    on_path.mkdir()
+    (on_path / "pmetal").write_bytes(fake_cli(ECHO, name="on_path").read_bytes())
+    (on_path / "pmetal").chmod(0o755)
+    monkeypatch.delenv("PMETAL_BIN", raising=False)
+    monkeypatch.setenv("PATH", f"{on_path}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(_jobs, "_bundled_cli", lambda: bundled)
+    assert pmetal.find_cli() == bundled
+
+
+def test_pmetal_bin_comes_before_the_cli_shipped_in_the_package(fake_cli, tmp_path, monkeypatch):
+    bundled = fake_cli(ECHO, name="bundled")
+    chosen = fake_cli(ECHO, name="chosen")
+    monkeypatch.setattr(_jobs, "_bundled_cli", lambda: bundled)
+    monkeypatch.setenv("PMETAL_BIN", str(chosen))
+    assert pmetal.find_cli() == chosen
+    # Set, it is the only one tried: a missing file is an error, not a fall-through.
+    monkeypatch.setenv("PMETAL_BIN", str(tmp_path / "nope"))
+    with pytest.raises(pmetal.CliNotFoundError):
+        pmetal.find_cli()
 
 
 def test_an_invalid_spec_never_starts_a_process(fake_cli, tmp_path):
@@ -356,7 +409,7 @@ def test_python_dash_m_pmetal_runs_the_command_line(fake_cli, monkeypatch):
     assert missing.returncode != 0 and "no pmetal command line" in missing.stderr
 
 
-def test_the_places_a_gui_launched_program_would_miss_are_searched(tmp_path, monkeypatch):
+def test_the_places_a_gui_launched_program_would_miss_are_searched(no_bundled_cli, tmp_path, monkeypatch):
     monkeypatch.delenv("PMETAL_BIN", raising=False)
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
     cargo_bin = tmp_path / ".cargo" / "bin"

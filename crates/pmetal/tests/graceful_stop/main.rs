@@ -7,6 +7,8 @@
 //! run is training, sends SIGTERM and checks the exit status and the artifact.
 
 mod fixtures;
+#[path = "../tiny_model/mod.rs"]
+mod tiny_model;
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -171,7 +173,7 @@ fn stops_gracefully(mut run: Run, progress: impl Fn(&str) -> bool, artifact: &Pa
 fn workspace() -> (TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let model = dir.path().join("model");
-    fixtures::write_tiny_model(&model, 1);
+    tiny_model::write_tiny_model(&model, 1);
     (dir, model)
 }
 

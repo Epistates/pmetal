@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use pmetal_metal::ane::lm::{
     AneLm, AneLmOptions, Drafter, GenerateOptions, GenerationStats, PromptLookup,
@@ -60,9 +61,19 @@ pub(crate) struct AneRequest {
     pub sampling: GenerationConfig,
 }
 
+/// What one request on the ANE produced.
+pub(crate) struct AneOutput {
+    /// The tokens generated.
+    pub tokens: Vec<u32>,
+    pub stats: GenerationStats,
+    /// Time spent loading the model for the request: compiling it for the
+    /// ANE, and its drafter; next to nothing when it was loaded already.
+    pub load_time: Duration,
+}
+
 enum Event {
     Token(u32),
-    Done(Result<(Vec<u32>, GenerationStats)>),
+    Done(Result<AneOutput>),
 }
 
 /// Run `request` on the ANE thread, calling `on_token` on this thread for
@@ -71,7 +82,7 @@ enum Event {
 pub(crate) fn generate(
     request: AneRequest,
     mut on_token: impl FnMut(u32) -> bool,
-) -> Result<(Vec<u32>, GenerationStats)> {
+) -> Result<AneOutput> {
     let (events, from_worker) = mpsc::channel::<Event>();
     let (answers, from_caller) = mpsc::channel::<bool>();
     ane_thread()?
@@ -128,26 +139,33 @@ fn run(
     engines: &mut Engines,
     request: &AneRequest,
     on_token: impl FnMut(u32) -> bool,
-) -> Result<(Vec<u32>, GenerationStats)> {
+) -> Result<AneOutput> {
+    let started = Instant::now();
     let engine = engine_for(
         engines,
         &request.model_path,
         request.draft_path.as_deref(),
         request.context,
     )?;
+    let load_time = started.elapsed();
     let mut lookup = PromptLookup::default();
     let drafter: &mut dyn Drafter = match &mut engine.drafter {
         Some((_, dflash)) => dflash,
         None => &mut lookup,
     };
     let mut sampler = HostLogitsSampler::new(&request.sampling, &request.input_ids);
-    engine.lm.generate(
+    let (tokens, stats) = engine.lm.generate(
         &request.input_ids,
         &request.opts,
         &mut sampler,
         drafter,
         on_token,
-    )
+    )?;
+    Ok(AneOutput {
+        tokens,
+        stats,
+        load_time,
+    })
 }
 
 fn engine_for<'a>(

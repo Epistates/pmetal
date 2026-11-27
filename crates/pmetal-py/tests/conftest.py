@@ -254,6 +254,19 @@ def tiny_dataset(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def no_bundled_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hide the command line an installed wheel carries in ``pmetal/_bin``.
+
+    ``find_cli`` tries it before ``PATH`` and the fallback directories, so a test
+    of those needs it out of the way, as it is in an editable install.
+    """
+
+    from pmetal import _jobs
+
+    monkeypatch.setattr(_jobs, "_bundled_cli", lambda: tmp_path / "no_bundled_cli" / "pmetal")
+
+
+@pytest.fixture
 def fake_cli(tmp_path: Path):
     """Write an executable stand-in for the ``pmetal`` command and return its path.
 
