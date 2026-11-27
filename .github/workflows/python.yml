@@ -4,22 +4,37 @@ on:
 permissions:
   contents: read
 jobs:
-  dbg:
+  a-dtolnay-then-cargo:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: before
-        run: |
-          which -a rustup cargo; rustup --version; echo RUSTUP_HOME=${RUSTUP_HOME:-unset}; ls -la ~/.rustup/toolchains || true
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable
-      - name: after dtolnay
-        run: |
-          ls -la ~/.rustup/toolchains; for d in ~/.rustup/toolchains/*; do echo "== $d"; ls "$d" "$d/lib/rustlib" 2>&1 | head -20; done
-      - name: cargo version (auto-install)
-        run: cargo --version || true
-      - name: after cargo
-        run: |
-          ls -la ~/.rustup/toolchains; for d in ~/.rustup/toolchains/1.99*; do echo "== $d"; ls "$d" "$d/bin" "$d/lib/rustlib" 2>&1 | head -20; done
-          rustup toolchain list
+      - run: cargo --version
+      - run: ls ~/.rustup/toolchains/1.99.1-aarch64-apple-darwin/bin
+  b-cargo-first:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: cargo --version
+      - run: ls ~/.rustup/toolchains/1.99.1-aarch64-apple-darwin/bin
+  c-explicit-install:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install --no-self-update
+      - run: cargo --version
+      - run: ls ~/.rustup/toolchains/1.99.1-aarch64-apple-darwin/bin
+  d-dtolnay-install-action-then-cargo:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: just
+      - run: cargo --version
+      - run: ls ~/.rustup/toolchains/1.99.1-aarch64-apple-darwin/bin
