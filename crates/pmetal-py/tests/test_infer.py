@@ -29,6 +29,15 @@ def test_infer_with_metrics_describes_the_generation(tiny_model):
     assert "InferResult(" in repr(result)
 
 
+def test_generation_seconds_run_from_the_first_token_to_the_last(tiny_model):
+    # One token is the first and the last: no time passes between them, however
+    # long the model took to load and to read the prompt.
+    one = pmetal.infer_with_metrics(tiny_model, "the cat", max_tokens=1, temperature=0.0)
+    assert one.num_generated == 1 and one.generation_seconds == 0.0
+    many = pmetal.infer_with_metrics(tiny_model, "the cat", max_tokens=12, temperature=0.0)
+    assert many.num_generated == 12 and many.generation_seconds > 0
+
+
 def test_a_seed_makes_sampling_repeatable(tiny_model):
     kwargs = {"max_tokens": 24, "temperature": 1.0, "top_k": 0, "top_p": 1.0}
     a = pmetal.infer(tiny_model, "the cat", seed=3, **kwargs)

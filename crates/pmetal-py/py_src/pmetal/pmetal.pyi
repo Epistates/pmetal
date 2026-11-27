@@ -2515,7 +2515,13 @@ class InferResult:
         """The token limit ended the generation."""
     @property
     def generation_seconds(self) -> float:
-        """Seconds from the first token to the last."""
+        """Seconds from the first token to the last.
+
+        A run of n tokens spans n - 1 intervals, so its decode rate is
+        ``(num_generated - 1) / generation_seconds`` tokens per second (the
+        inverse of the time per output token vLLM and llama.cpp report), and a
+        single token has none.
+        """
     @property
     def speculative(self) -> dict[str, Any] | None:
         """Speculative-decoding statistics, or None for plain decoding."""
