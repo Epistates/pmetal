@@ -583,6 +583,50 @@ fn swish_native_quantized_kv_prefill_does_not_depend_on_the_passes() {
     }
 }
 
+/// A benchmark trial runs on the cache it is given, built as generation builds
+/// it, so a benchmark of an affine-quantized cache times that cache: every
+/// attention layer holds the run as packed keys and values.
+#[test]
+#[serial]
+fn swish_native_benchmark_trial_runs_on_the_cache_it_is_given() {
+    use pmetal_cache::test_utils::to_f32_vec_eval;
+    use pmetal_runtime::qwen3_native::{
+        NativeCache, QuantCacheConfig, benchmark_trial, load_config, load_model,
+    };
+
+    let fx = checkpoint("swish");
+    let config = load_config(fx.path()).expect("native config parses");
+    let weights = load_model(fx.path(), &config).expect("native weights load");
+    drain_bridge("native load");
+    let ids: Vec<u32> = to_f32_vec_eval(&fx.input_ids())
+        .into_iter()
+        .map(|v| v as u32)
+        .collect();
+    let mut cache = NativeCache::new_empty(&weights);
+    for kv in &mut cache.kv_caches {
+        kv.quant_config = Some(QuantCacheConfig {
+            bits: 8,
+            group_size: 32,
+            mixed_bit: None,
+            qjl: false,
+        });
+    }
+
+    let trial = benchmark_trial(&weights, &mut cache, &ids, 4);
+    drain_bridge("quantized-cache benchmark trial");
+    assert!(trial.prompt_secs > 0.0 && trial.generation_secs > 0.0);
+    let attention: Vec<_> = cache.kv_caches.iter().filter(|kv| kv.offset > 0).collect();
+    assert!(!attention.is_empty(), "no attention layer saw the run");
+    for kv in attention {
+        assert!(kv.offset as usize >= ids.len(), "offset {}", kv.offset);
+        let (Some(keys), Some(values)) = (&kv.quantized_keys, &kv.quantized_values) else {
+            panic!("the run was not kept quantized");
+        };
+        // The packed time axis holds every token the run wrote.
+        assert!(keys.packed.dim(2) >= kv.offset && values.packed.dim(2) >= kv.offset);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

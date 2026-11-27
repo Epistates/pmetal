@@ -120,26 +120,27 @@ fn generate_from_primed_sample_impl(
     )
 }
 
-/// Run one benchmark trial on the canonical Qwen native path.
+/// Run one benchmark trial on the canonical Qwen native path, from `cache`,
+/// empty and built as generation builds it (its TurboQuant or affine
+/// quantization included), which holds the run afterwards.
 ///
 /// The timing split: prompt timing includes prefill,
 /// first-token sampling, and priming the next decode step; generation timing
 /// covers only the remaining decode loop.
 pub fn benchmark_trial(
     weights: &NativeWeights,
+    cache: &mut NativeCache,
     prompt_ids: &[u32],
     generation_tokens: usize,
-    turboquant: Option<crate::turboquant::TurboQuantConfig>,
 ) -> crate::decode::BenchmarkTrial {
     crate::inline_array::reset_peak_memory();
-    let mut cache = NativeCache::new_with_turboquant(weights, turboquant);
 
     let prompt_tic = std::time::Instant::now();
     let (first_tok, mut sampler) =
-        prefill_first_token(weights, &mut cache, prompt_ids, SamplingParams::new(0.0));
+        prefill_first_token(weights, cache, prompt_ids, SamplingParams::new(0.0));
     let current_y = prime_generation_impl(
         weights,
-        &mut cache,
+        cache,
         first_tok,
         generation_tokens.saturating_sub(1),
         &mut sampler,
@@ -152,7 +153,7 @@ pub fn benchmark_trial(
         let generation_tic = std::time::Instant::now();
         let (generated_tail, _) = generate_from_primed_sample_impl(
             weights,
-            &mut cache,
+            cache,
             current_y,
             generation_tokens - 1,
             sampler,

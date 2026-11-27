@@ -158,31 +158,32 @@ fn generate_from_primed_sample_impl(
     )
 }
 
-/// Run one benchmark trial on the canonical DeepSeek native path.
+/// Run one benchmark trial on the canonical DeepSeek native path, from
+/// `cache`, empty and built as generation builds it (its quantization
+/// included), which holds the run afterwards.
 pub fn benchmark_trial(
     weights: &NativeWeights,
+    cache: &mut NativeCache,
     prompt_ids: &[u32],
     generation_tokens: usize,
 ) -> crate::decode::BenchmarkTrial {
     crate::inline_array::reset_peak_memory();
-    let mut cache = NativeCache::new_empty(weights);
 
     let prompt_tic = std::time::Instant::now();
     let (first_tok, mut sampler) = prefill_first_token(
         weights,
-        &mut cache,
+        cache,
         prompt_ids,
         crate::decode::SamplingParams::new(0.0),
     );
-    let current_y =
-        prime_generation_impl(weights, &mut cache, first_tok, &mut sampler, false, false);
+    let current_y = prime_generation_impl(weights, cache, first_tok, &mut sampler, false, false);
     let prompt_secs = prompt_tic.elapsed().as_secs_f64();
 
     let generation_secs = if generation_tokens > 1 {
         let generation_tic = std::time::Instant::now();
         let (generated_tail, _) = generate_from_primed_sample_impl(
             weights,
-            &mut cache,
+            cache,
             current_y,
             generation_tokens - 1,
             sampler,
