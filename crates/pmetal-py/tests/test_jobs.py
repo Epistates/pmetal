@@ -121,7 +121,7 @@ def test_an_interrupted_command_is_cancelled_not_failed(fake_cli):
         pmetal.run(SPEC, cli=cli)
 
 
-def test_a_missing_command_line_says_where_it_looked(tmp_path, monkeypatch):
+def test_a_missing_command_line_says_where_it_looked(no_bundled_cli, tmp_path, monkeypatch):
     monkeypatch.delenv("PMETAL_BIN", raising=False)
     monkeypatch.setenv("PATH", str(tmp_path))
     monkeypatch.setattr(_jobs, "_fallback_directories", list)
@@ -132,7 +132,7 @@ def test_a_missing_command_line_says_where_it_looked(tmp_path, monkeypatch):
         pmetal.find_cli()
 
 
-def test_the_cli_is_found_through_the_environment_and_the_path(fake_cli, monkeypatch):
+def test_the_cli_is_found_through_the_environment_and_the_path(no_bundled_cli, fake_cli, monkeypatch):
     cli = fake_cli(ECHO)
     monkeypatch.setenv("PMETAL_BIN", str(cli))
     assert pmetal.find_cli() == cli
@@ -140,6 +140,30 @@ def test_the_cli_is_found_through_the_environment_and_the_path(fake_cli, monkeyp
     monkeypatch.delenv("PMETAL_BIN")
     monkeypatch.setenv("PATH", f"{cli.parent}{os.pathsep}{os.environ['PATH']}")
     assert pmetal.find_cli() == cli
+
+
+def test_the_cli_shipped_in_the_package_comes_before_the_path(fake_cli, tmp_path, monkeypatch):
+    bundled = fake_cli(ECHO, name="bundled")
+    on_path = tmp_path / "bin"
+    on_path.mkdir()
+    (on_path / "pmetal").write_bytes(fake_cli(ECHO, name="on_path").read_bytes())
+    (on_path / "pmetal").chmod(0o755)
+    monkeypatch.delenv("PMETAL_BIN", raising=False)
+    monkeypatch.setenv("PATH", f"{on_path}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(_jobs, "_bundled_cli", lambda: bundled)
+    assert pmetal.find_cli() == bundled
+
+
+def test_pmetal_bin_comes_before_the_cli_shipped_in_the_package(fake_cli, tmp_path, monkeypatch):
+    bundled = fake_cli(ECHO, name="bundled")
+    chosen = fake_cli(ECHO, name="chosen")
+    monkeypatch.setattr(_jobs, "_bundled_cli", lambda: bundled)
+    monkeypatch.setenv("PMETAL_BIN", str(chosen))
+    assert pmetal.find_cli() == chosen
+    # Set, it is the only one tried: a missing file is an error, not a fall-through.
+    monkeypatch.setenv("PMETAL_BIN", str(tmp_path / "nope"))
+    with pytest.raises(pmetal.CliNotFoundError):
+        pmetal.find_cli()
 
 
 def test_an_invalid_spec_never_starts_a_process(fake_cli, tmp_path):
@@ -356,7 +380,7 @@ def test_python_dash_m_pmetal_runs_the_command_line(fake_cli, monkeypatch):
     assert missing.returncode != 0 and "no pmetal command line" in missing.stderr
 
 
-def test_the_places_a_gui_launched_program_would_miss_are_searched(tmp_path, monkeypatch):
+def test_the_places_a_gui_launched_program_would_miss_are_searched(no_bundled_cli, tmp_path, monkeypatch):
     monkeypatch.delenv("PMETAL_BIN", raising=False)
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
     cargo_bin = tmp_path / ".cargo" / "bin"
