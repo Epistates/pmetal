@@ -5,16 +5,8 @@ name: Python Bindings
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE*'
   pull_request:
     branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE*'
   workflow_dispatch:
 
 # A new push to a pull request cancels its older run; every other run has a group of its own, since a shared one would cancel the pending ones.
@@ -36,10 +28,31 @@ env:
   PMETAL_MLX_PREFIX: ${{ github.workspace }}/.mlx-cache
 
 jobs:
+  # A workflow skipped by a path filter leaves its required checks pending,
+  # while a job skipped by `if` reports success, so the jobs decide. They run
+  # unless `changes` says `false`: if it failed, there is no answer, and no answer
+  # must not skip them.
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      code: ${{ steps.code.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+
+      - id: code
+        uses: ./.github/actions/code-changed
+
   # The abi3 wheel is built once, on the oldest Python it supports, and tested
   # on the oldest, the newest and the one before it (`test`).
   wheel:
     name: Wheel (macOS aarch64)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -173,6 +186,8 @@ jobs:
   # abi3 wheel when none is named) and tested with the GIL off.
   wheel-free-threaded:
     name: Wheel and tests (macOS aarch64, Python 3.14t)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -244,3 +259,20 @@ jobs:
         env:
           PYTHON_GIL: "0"
         run: python -m pytest tests -v
+
+  # The one check main requires, so a new Python version does not touch the
+  # ruleset. A job skipped for a documentation-only change counts as passed; one
+  # that failed or was cancelled does not. The free-threaded job is left out, so
+  # it stays optional.
+  python:
+    name: Python
+    needs: [changes, wheel, test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job passed or was skipped
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          echo "$NEEDS" | jq -e 'all(.[]; .result == "success" or .result == "skipped")' >/dev/null
