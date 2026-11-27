@@ -25,6 +25,16 @@ jobs:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
 
+    # The pinned toolchain runs `cargo install` below (`cargo +nightly` runs the
+    # fuzzer). Cargo's own auto-install of it is deprecated, and when a runner
+    # already has an empty directory for the toolchain it installs only the file's
+    # components: no cargo, no rustc. `component add` fills that in and changes
+    # nothing on a complete install.
+    - name: Install the pinned Rust toolchain
+      run: |
+        rustup toolchain install --no-self-update
+        rustup component add cargo rustc
+
     - name: Install nightly Rust
       uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
       with:

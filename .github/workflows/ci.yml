@@ -35,10 +35,16 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          toolchain: stable
-          components: clippy, rustfmt
+      # rust-toolchain.toml pins the compiler for everything under the checkout,
+      # so that is the toolchain to install; a `stable` would never be used.
+      # Cargo's own auto-install of it is deprecated, and when a runner already
+      # has an empty directory for the toolchain it installs only the file's
+      # components: no cargo, no rustc. `component add` fills that in and changes
+      # nothing on a complete install.
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install --no-self-update
+          rustup component add cargo rustc
 
       # Extract the pinned MLX revision (tag or commit) from build.rs so the
       # cache key tracks it.
