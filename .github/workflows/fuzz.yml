@@ -30,6 +30,8 @@ jobs:
     # already has an empty directory for the toolchain it installs only the file's
     # components: no cargo, no rustc. `component add` fills that in and changes
     # nothing on a complete install.
+    # Drop `component add` once rustup stops counting a toolchain directory
+    # with no manifest as installed (https://github.com/rust-lang/goals/issues/736).
     - name: Install the pinned Rust toolchain
       run: |
         rustup toolchain install --no-self-update
