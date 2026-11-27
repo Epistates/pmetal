@@ -5,6 +5,7 @@
 //! consumers get identical behavior from a single code path.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use pmetal_cache::kv_cache::{
     CacheMode, KVCache, KVCacheConfig, MambaCache, TurboQuantConfig, sanitize_cache_mode_for_config,
@@ -310,6 +311,8 @@ pub struct InferenceRunner {
     chat_template_type: Option<ChatTemplateType>,
     is_chat: bool,
     thinks: bool,
+    /// See [`InferenceRunner::load_time`].
+    load_time: Duration,
 }
 
 /// Mutable generation state (model, caches, config).
@@ -343,10 +346,65 @@ pub struct InferenceGenState {
     videos: Vec<ProcessedMedia>,
 }
 
+impl LoadedModel {
+    /// An empty recurrent-state cache for the shared model's hybrid layers;
+    /// `None` for an attention-only model and for the native engines, which
+    /// keep their own.
+    fn create_mamba_cache(&self) -> Option<MambaCache> {
+        match self {
+            Self::Standard(model) => model.create_mamba_cache(),
+            #[cfg(feature = "lora")]
+            Self::Lora(model) => model.create_mamba_cache(),
+            Self::NativeOnly => None,
+        }
+    }
+}
+
 impl InferenceGenState {
     /// True when using the native bridge path (model loads inside generate).
     pub fn is_native_only(&self) -> bool {
         matches!(self.model, LoadedModel::NativeOnly)
+    }
+
+    /// One benchmark run on the shared model, from empty caches, timed as the
+    /// native engines' benchmark trials are: greedy and without stop tokens,
+    /// so exactly `generation_tokens` come out; the prompt time runs to the
+    /// first token (the prefill, its sample, and the next step queued behind
+    /// it) and the generation time from there to the last token.
+    fn shared_benchmark_trial(
+        &mut self,
+        prompt_ids: &[u32],
+        generation_tokens: usize,
+    ) -> Result<pmetal_runtime::decode::BenchmarkTrial, Exception> {
+        pmetal_runtime::inline_array::reset_peak_memory();
+        let mut cache = KVCache::new(KVCacheConfig {
+            max_seq_len: kv_capacity(prompt_ids.len(), generation_tokens),
+            ..self.cache.config().clone()
+        });
+        let mut mamba_cache = self.model.create_mamba_cache();
+        let started = Instant::now();
+        let mut first_token_at = None;
+        generate_on_shared_model(
+            &mut self.model,
+            prompt_ids,
+            GenerationConfig::greedy(generation_tokens),
+            &mut cache,
+            mamba_cache.as_mut(),
+            |_| {
+                first_token_at.get_or_insert_with(Instant::now);
+                true
+            },
+        )?;
+        let finished = Instant::now();
+        let first_token_at = first_token_at.unwrap_or(finished);
+        let trial = pmetal_runtime::decode::BenchmarkTrial {
+            prompt_secs: (first_token_at - started).as_secs_f64(),
+            generation_secs: (finished - first_token_at).as_secs_f64(),
+            peak_memory_bytes: pmetal_runtime::inline_array::get_peak_memory(),
+        };
+        pmetal_runtime::inline_array::synchronize();
+        pmetal_runtime::inline_array::clear_cache();
+        Ok(trial)
     }
 }
 
@@ -365,7 +423,11 @@ impl InferenceRunner {
     /// 9. Enable expert offloading
     /// 10. Create KV cache (with quantization mode)
     /// 11. Create Mamba cache (for hybrid models)
+    ///
+    /// Everything but the prompt's own preparation is timed as the model's
+    /// load ([`load_time`](Self::load_time)).
     pub fn prepare(mut config: InferenceRunnerConfig) -> Result<Self, Exception> {
+        let started = Instant::now();
         let images = std::mem::take(&mut config.images);
         let videos = std::mem::take(&mut config.videos);
         let has_media = !images.is_empty() || !videos.is_empty();
@@ -436,10 +498,12 @@ impl InferenceRunner {
         // The media are preprocessed before the prompt is tokenized: a
         // video's placeholder expands to text as well as tokens (each frame's
         // timestamp), so placeholders are expanded in the prompt text.
+        let prompt_started = Instant::now();
         let (image_media, video_media) = match &multimodal {
             None => (Vec::new(), Vec::new()),
             Some(multimodal) => preprocess_media(model_path, multimodal, &images, &videos)?,
         };
+        let mut prompt_time = prompt_started.elapsed();
         let expand_media = |text: String| -> Result<String, Exception> {
             match &multimodal {
                 None => Ok(text),
@@ -480,6 +544,7 @@ impl InferenceRunner {
         };
 
         // 6. Apply chat template + tokenize
+        let prompt_started = Instant::now();
         let (input_ids, template_type, thinks) = if use_chat {
             let detected = pmetal_data::chat_templates::detect_chat_template(
                 model_path,
@@ -554,6 +619,7 @@ impl InferenceRunner {
             (ids, None, false)
         };
 
+        prompt_time += prompt_started.elapsed();
         tracing::info!(tokens = input_ids.len(), "Prompt tokenized");
 
         // 6a. Output budget: the caller's, else the model's recommendation
@@ -613,7 +679,7 @@ impl InferenceRunner {
         };
 
         // 9. Load model (standard or LoRA-merged)
-        let max_seq_len = input_ids.len() + max_tokens + 64;
+        let max_seq_len = kv_capacity(input_ids.len(), max_tokens);
 
         let mut cache_request = cache_mode_request_from_config(&config);
         if mtp_requested {
@@ -900,7 +966,19 @@ impl InferenceRunner {
             chat_template_type: template_type,
             is_chat: use_chat,
             thinks,
+            load_time: started.elapsed().saturating_sub(prompt_time),
         })
+    }
+
+    /// Time [`prepare`](Self::prepare) spent loading the model: the
+    /// tokenizer, the weights the shared model runs from (and an adapter, a
+    /// draft model or an MTP head), and the caches. The prompt's own
+    /// preparation (rendering, tokenizing, preprocessing its images and
+    /// videos) is left out. The native engines load their weights when
+    /// generation starts, and report that load in the output's
+    /// [`load_time`](GenerationOutput::load_time).
+    pub fn load_time(&self) -> Duration {
+        self.load_time
     }
 
     /// Whether chat mode is active.
@@ -922,7 +1000,7 @@ impl InferenceRunner {
 
     /// Benchmark the active model with a fixed workload shape:
     /// fixed random prompt ids, one warmup, EOS disabled,
-    /// and repeated full prompt+decode runs.
+    /// and repeated full prompt+decode runs, on whichever engine runs it.
     pub fn benchmark(
         &mut self,
         prompt_tokens: usize,
@@ -936,19 +1014,27 @@ impl InferenceRunner {
         }
 
         let prompt_ids = build_benchmark_prompt(prompt_tokens, vocab_size, seed);
-        match &mut self.state.model {
-            LoadedModel::NativeOnly => crate::native_inference::benchmark_native(
+        if self.state.is_native_only() {
+            return crate::native_inference::benchmark_native(
                 &self.state.model_path,
                 &prompt_ids,
                 generation_tokens,
                 self.state.native_turboquant,
                 num_trials,
             )
-            .map_err(Exception::custom),
-            _ => Err(Exception::custom(
-                "The inference benchmark is currently only implemented for the native bridge path",
-            )),
+            .map_err(Exception::custom);
         }
+        crate::native_inference::check_benchmark_workload(prompt_ids.len(), generation_tokens)
+            .map_err(Exception::custom)?;
+        crate::native_inference::run_benchmark_trials(
+            prompt_ids.len(),
+            generation_tokens,
+            num_trials,
+            || {
+                self.state
+                    .shared_benchmark_trial(&prompt_ids, generation_tokens)
+            },
+        )
     }
 }
 
@@ -1114,60 +1200,25 @@ impl InferenceGenState {
             .map_err(Exception::custom)?;
 
             self.last_decode_metrics = output.decode_metrics;
-            return Ok(GenerationOutput {
-                token_ids: output.token_ids,
-                num_generated: output.num_generated,
-                stopped_by_token: output.stopped_by_token,
-                stopped_by_length: output.stopped_by_length,
-                decode_metrics: output.decode_metrics,
-                speculative_metrics: None,
-            });
+            let mut generated = GenerationOutput::new(
+                output.token_ids,
+                output.num_generated,
+                output.stopped_by_token,
+                output.stopped_by_length,
+            );
+            generated.decode_metrics = output.decode_metrics;
+            generated.load_time = output.load_time;
+            return Ok(generated);
         }
 
-        let output = match self.model {
-            LoadedModel::Standard(ref mut model) => {
-                let mamba = &mut self.mamba_cache;
-                generate_cached_async_streaming(
-                    // Sampling reads the last position's logits alone.
-                    |input, cache| {
-                        model.forward_with_hybrid_cache_last(
-                            input,
-                            None,
-                            Some(cache),
-                            mamba.as_mut(),
-                        )
-                    },
-                    &self.input_ids,
-                    self.gen_config.clone(),
-                    &mut self.cache,
-                    on_token_guarded,
-                )
-            }
-            #[cfg(feature = "lora")]
-            LoadedModel::Lora(ref mut model) => {
-                let mamba = &mut self.mamba_cache;
-                generate_cached_async_streaming(
-                    |input, cache| {
-                        model
-                            .forward_with_hybrid_cache_last(
-                                input,
-                                None,
-                                Some(cache),
-                                mamba.as_mut(),
-                            )
-                            .map_err(|e| Exception::custom(e.to_string()))
-                    },
-                    &self.input_ids,
-                    self.gen_config.clone(),
-                    &mut self.cache,
-                    on_token_guarded,
-                )
-            }
-            LoadedModel::NativeOnly => {
-                // native path returns before reaching this fallback code
-                unreachable!("NativeOnly model should have returned before the shared fallback")
-            }
-        }?;
+        let output = generate_on_shared_model(
+            &mut self.model,
+            &self.input_ids,
+            self.gen_config.clone(),
+            &mut self.cache,
+            self.mamba_cache.as_mut(),
+            on_token_guarded,
+        )?;
         // Forward the streaming generator's per-step decode metrics into
         // the runner state so the CLI summary print ingests them the same
         // way it does for the bridge-native path.
@@ -1264,6 +1315,58 @@ impl InferenceGenState {
     }
 }
 
+/// Generate on the shared model, standard or LoRA-merged, from `input_ids`
+/// into `cache` and `mamba_cache`.
+fn generate_on_shared_model<F>(
+    model: &mut LoadedModel,
+    input_ids: &[u32],
+    config: GenerationConfig,
+    cache: &mut KVCache,
+    mut mamba_cache: Option<&mut MambaCache>,
+    on_token: F,
+) -> Result<GenerationOutput, Exception>
+where
+    F: FnMut(u32) -> bool,
+{
+    match model {
+        LoadedModel::Standard(model) => generate_cached_async_streaming(
+            // Sampling reads the last position's logits alone.
+            |input, cache| {
+                model.forward_with_hybrid_cache_last(
+                    input,
+                    None,
+                    Some(cache),
+                    mamba_cache.as_deref_mut(),
+                )
+            },
+            input_ids,
+            config,
+            cache,
+            on_token,
+        ),
+        #[cfg(feature = "lora")]
+        LoadedModel::Lora(model) => generate_cached_async_streaming(
+            |input, cache| {
+                model
+                    .forward_with_hybrid_cache_last(
+                        input,
+                        None,
+                        Some(cache),
+                        mamba_cache.as_deref_mut(),
+                    )
+                    .map_err(|e| Exception::custom(e.to_string()))
+            },
+            input_ids,
+            config,
+            cache,
+            on_token,
+        ),
+        LoadedModel::NativeOnly => Err(Exception::custom(
+            "a native engine has no shared model to generate with",
+        )),
+    }
+}
+
 fn forward_native_token<F>(stop_tokens: &[u32], on_token: &mut F, token: u32) -> bool
 where
     F: FnMut(u32) -> bool,
@@ -1330,6 +1433,11 @@ fn cache_mode_request_from_config(config: &InferenceRunnerConfig) -> CacheModeRe
         no_kv_quant: config.no_kv_quant || config.mtp_assistant_path.is_some() || config.qwen_mtp,
         fp8: config.fp8,
     }
+}
+
+/// KV cache slots for a prompt and the tokens generated after it.
+fn kv_capacity(prompt_tokens: usize, max_new_tokens: usize) -> usize {
+    prompt_tokens + max_new_tokens + 64
 }
 
 fn build_benchmark_prompt(prompt_tokens: usize, vocab_size: usize, seed: u64) -> Vec<u32> {

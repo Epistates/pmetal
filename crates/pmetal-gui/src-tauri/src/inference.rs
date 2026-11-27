@@ -450,7 +450,7 @@ mod tests {
             .expect("the reply did not end");
     }
 
-    const FOOTER: &str = "printf '\\n\\n---\\nGenerated 6 tokens in 0.50s (0.20s to the first token, model load included)\\nStopped by: EOS token\\nDecode: 200 tok/s (avg=5ms p50=5ms over 5 steps)\\n'";
+    const FOOTER: &str = "printf '\\n\\n---\\nModel load: 2.40s\\nGenerated 6 tokens in 0.50s (0.20s to the first token)\\nStopped by: EOS token\\nDecode: 200 tok/s (avg=5ms p50=5ms over 5 steps)\\n'";
 
     #[tokio::test]
     async fn a_reply_streams_in_and_ends_with_its_statistics() {

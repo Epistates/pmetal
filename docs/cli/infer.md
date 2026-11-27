@@ -46,7 +46,7 @@ pmetal infer \
 | `--no-preserve-thinking` | `false` | Keep only the current turn's thinking in the prompt, for chat templates with a `preserve_thinking` control |
 | `--chat-template-kwargs` | none | Extra chat template keyword arguments as a JSON object; `--no-thinking`, `--reasoning-effort` and `--no-preserve-thinking` win over the same keys |
 | `--tools` | none | JSON file of tool definitions (OpenAI format) |
-| `--json` | `false` | Print one JSON object on stdout instead of streaming the text: `model`, `text`, `prompt_tokens`, `generated_tokens`, `stopped_by` (`eos`, `length` or `interrupted`), `seconds`, `time_to_first_token_seconds`, `decode_tokens_per_second` and `speculative_acceptance`. The banner and statistics go to stderr |
+| `--json` | `false` | Print one JSON object on stdout instead of streaming the text: `model`, `text`, `prompt_tokens`, `generated_tokens`, `stopped_by` (`eos`, `length` or `interrupted`), `seconds`, `time_to_first_token_seconds`, `model_load_seconds`, `decode_tokens_per_second` and `speculative_acceptance` (see [Statistics](#statistics)). The banner and statistics go to stderr |
 | `--fp8` | `false` | FP8 weights (about 2x memory reduction) |
 | `--experts-dir` | none | Packed expert directory for SSD-offloaded MoE inference (see [`pmetal pack-experts`](/cli/pack-experts/)) |
 | `--backend` | `auto` | Generation path: `auto` (the GPU, or the ANE with `--ane`), `standard` (the GPU, whatever `--ane` says) or `ane` (Apple Neural Engine) |
@@ -65,7 +65,7 @@ pmetal infer \
 | `--kv-qjl` | `false` | QJL residual correction for 2- and 3-bit key quantization |
 | `--no-kv-quant` | `false` | Use an fp16 KV cache |
 | `--detect-repetition` | `false` | Stop on n-gram repetition loops |
-| `--benchmark` | `false` | Time prompt processing and generation instead of answering (needs `--benchmark-prompt-tokens`) |
+| `--benchmark` | `false` | Time prompt processing and generation instead of answering, on whichever engine runs the model (see [Benchmark](#benchmark)); needs `--benchmark-prompt-tokens` |
 | `--benchmark-iters` | `5` | Measured trials for `--benchmark` |
 | `--benchmark-prompt-tokens` | none | Synthetic prompt length for `--benchmark` |
 | `--profile-layers` | `false` | Per-layer forward profile for supported hybrid models |
@@ -135,8 +135,7 @@ pmetal infer \
   --prompt "Summarize monotonic queues."
 
 # Throughput benchmark with a 512-token synthetic prompt
-pmetal infer --model Qwen/Qwen3-0.6B --benchmark --benchmark-prompt-tokens 512 \
-  --prompt "unused by --benchmark"
+pmetal infer --model Qwen/Qwen3-0.6B --benchmark --benchmark-prompt-tokens 512
 
 # Profile Qwen 3.5 hybrid prefill + cached decode layers and write JSON
 pmetal infer \
@@ -159,6 +158,28 @@ An architecture's engine is used only while it is no slower than the shared mode
 Setting `PMETAL_DISABLE_NATIVE_BRIDGE` runs the shared model whatever the checkpoint, to compare the two on the same files.
 
 Decode speed on a laptop is not steady: on the M4 Max this was measured on, a GPU that has just been busy for a couple of seconds decodes at about half the speed of one that has rested, with either engine. Compare engines, or two builds, by running each from rest, one after the other, in both orders.
+
+## Statistics
+
+After the text, `pmetal infer` prints how the run went:
+
+```text
+---
+Model load: 19.84s
+Generated 96 tokens in 1.53s (0.77s to the first token)
+Stopped by: EOS token
+Decode: 63 tok/s (avg=15.90ms p50=15.80ms over 94 steps) [M4 Max]
+```
+
+- **Model load** is the time spent loading the model: its tokenizer, weights and caches. The architectures' own engines load their weights as generation starts and the shared model loads them beforehand; the figure is the same thing on both.
+- **The time to the first token** runs from the start of generation, the prompt already tokenized, to the first generated token, without the model load on any engine, as mlx-lm, llama.cpp and vLLM measure it: their model is loaded before the clock starts.
+- **Generated N tokens in** is the time from the first token to the last.
+
+`--json` gives the same figures as `model_load_seconds`, `time_to_first_token_seconds` and `seconds`.
+
+## Benchmark
+
+`--benchmark` times the model the way `mlx_lm.benchmark` does: a prompt of `--benchmark-prompt-tokens` random token ids, `--max-tokens` tokens (default 256) generated greedily with the stop tokens ignored, one warm-up run and then `--benchmark-iters` timed runs, each from an empty cache. Each run reports the prompt rate (prompt tokens over the time to the first token), the generation rate (tokens over the time after the first) and the peak memory, and the averages follow. It runs on the architecture's own engine or on the shared model, whichever decodes the model, except Gemma 4's own engine, which has no benchmark yet. It times plain generation, so it is refused, before the model loads, with `--ane`, `--mtp`, `--draft-model` or `--profile-layers`, and with images or videos.
 
 ## Quantized Checkpoints
 

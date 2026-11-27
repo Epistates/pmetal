@@ -288,6 +288,7 @@ impl Emitter<'_> {
             stopped_by_token: self.stopped_by_token,
             decode_metrics: None,
             speculative_metrics: metrics,
+            load_time: std::time::Duration::ZERO,
         }
     }
 }

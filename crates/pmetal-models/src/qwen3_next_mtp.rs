@@ -5,6 +5,7 @@
 //! (adapted or not), and the native bridge engine `pmetal infer` uses.
 
 use std::path::Path;
+use std::time::Instant;
 
 use pmetal_cache::{
     kv_cache::{GdnVerifyInputs, KVCache, MambaCache, MambaSnapshot},
@@ -246,7 +247,8 @@ impl MtpTarget for Qwen3NextMtpVerifier<'_> {
     }
 }
 
-/// MTP decode of the native bridge Qwen engine, loaded from `model_dir`.
+/// MTP decode of the native bridge Qwen engine, loaded from `model_dir`; the
+/// output's `load_time` is that load.
 pub fn generate_qwen3_native_mtp_streaming<F>(
     model_dir: &Path,
     mtp: &mut Qwen3NextMtpForCausalLM,
@@ -259,7 +261,9 @@ pub fn generate_qwen3_native_mtp_streaming<F>(
 where
     F: FnMut(u32) -> bool,
 {
+    let started = Instant::now();
     let mut target = NativeQwen3MtpVerifier::load(model_dir)?;
+    let load_time = started.elapsed();
     if mtp.config.hidden_size != target.hidden_size {
         return Err(Exception::custom(format!(
             "Qwen MTP hidden_size ({}) must match target hidden_size ({})",
@@ -267,14 +271,18 @@ where
         )));
     }
     let mut drafter = Qwen3NextMtpDrafter::new(mtp, mtp_cache);
-    generate_mtp_streaming(
+    let output = generate_mtp_streaming(
         &mut target,
         &mut drafter,
         input_ids,
         &gen_config,
         mtp_config.num_draft_tokens,
         on_token,
-    )
+    )?;
+    Ok(GenerationOutput {
+        load_time,
+        ..output
+    })
 }
 
 /// The native bridge Qwen engine as an [`MtpTarget`]. Its attention layers

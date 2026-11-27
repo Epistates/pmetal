@@ -6,6 +6,7 @@
 //! `pmetal_runtime` and `serde_json`.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use pmetal_runtime::turboquant::TurboQuantConfig;
 
@@ -580,7 +581,8 @@ mod tests {
 // Output type
 // ============================================================================
 
-/// Output produced by a native generation run.
+/// Output produced by a native generation run. Fields may be added.
+#[non_exhaustive]
 pub struct NativeGenerationOutput {
     /// All token IDs: prompt + generated.
     pub token_ids: Vec<u32>,
@@ -594,6 +596,9 @@ pub struct NativeGenerationOutput {
     /// Decode throughput metrics from the bridge generate loop.
     /// `None` when fewer than 20 decode steps were measured.
     pub decode_metrics: Option<pmetal_runtime::decode::DecodeMetrics>,
+    /// Time spent loading the model (its config and weights, and a vision
+    /// tower's) before the prompt.
+    pub load_time: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -721,8 +726,9 @@ pub fn run_native_multimodal_inference_ext(
         return Err("images need a Qwen3.5-family model".into());
     }
     ensure_native_runtime_metal_available()?;
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let vision = Qwen3_5Vision::load(model_path).map_err(|e| e.to_string())?;
+    let vision_load_time = started.elapsed();
     let encoded = vision
         .encode(input_ids, images, videos)
         .map_err(|e| e.to_string())?;
@@ -737,7 +743,7 @@ pub fn run_native_multimodal_inference_ext(
     let config = qwen3_native::load_config(model_path).map_err(|e| e.to_string())?;
     let tables = config.mrope_tables(&encoded.positions.array());
     let prompt_ids = input_ids.to_vec();
-    run_qwen3(
+    let output = run_qwen3(
         model_path,
         input_ids,
         max_tokens,
@@ -769,7 +775,11 @@ pub fn run_native_multimodal_inference_ext(
                 },
             )
         },
-    )
+    )?;
+    Ok(NativeGenerationOutput {
+        load_time: output.load_time + vision_load_time,
+        ..output
+    })
 }
 
 // ============================================================================
@@ -780,6 +790,7 @@ fn finish_with_bridge_generate(
     prompt: &[u32],
     first_tok: u32,
     max_tokens: usize,
+    load_time: Duration,
     on_token: &mut dyn FnMut(u32) -> bool,
     generate_tail: impl FnOnce(
         &mut dyn FnMut(u32) -> bool,
@@ -796,6 +807,7 @@ fn finish_with_bridge_generate(
             stopped_by_token: true,
             stopped_by_length: false,
             decode_metrics: None,
+            load_time,
         };
     }
 
@@ -811,6 +823,7 @@ fn finish_with_bridge_generate(
         stopped_by_token,
         stopped_by_length: !stopped_by_token && num_generated >= max_tokens,
         decode_metrics,
+        load_time,
     }
 }
 
@@ -841,13 +854,13 @@ fn run_bridge_inference<Config, Weights, Cache>(
         &mut dyn FnMut(u32) -> bool,
     ) -> (Vec<u32>, Option<pmetal_runtime::decode::DecodeMetrics>),
 ) -> Result<NativeGenerationOutput, String> {
+    let started = Instant::now();
     let config = load_config(model_path).map_err(|e| e.to_string())?;
     tracing::debug!("{}", describe_config(&config));
-
-    let t0 = std::time::Instant::now();
     let weights = load_model(model_path, &config).map_err(|e| e.to_string())?;
+    let load_time = started.elapsed();
     tracing::info!(
-        elapsed_s = format!("{:.1}", t0.elapsed().as_secs_f64()),
+        elapsed_s = format!("{:.1}", load_time.as_secs_f64()),
         active_mb = format!(
             "{:.0}",
             pmetal_runtime::inline_array::get_active_memory() as f64 / 1e6
@@ -862,6 +875,7 @@ fn run_bridge_inference<Config, Weights, Cache>(
         input_ids,
         first_tok,
         max_tokens,
+        load_time,
         on_token,
         |on_token| {
             generate(
@@ -889,19 +903,35 @@ fn trial_metrics(
     }
 }
 
-fn run_benchmark_trials(
+/// Check a benchmark's workload: a prompt to process and tokens to generate.
+pub(crate) fn check_benchmark_workload(
+    prompt_tokens: usize,
+    generation_tokens: usize,
+) -> Result<(), String> {
+    if prompt_tokens == 0 {
+        return Err("Inference benchmark requires prompt_tokens > 0".to_string());
+    }
+    if generation_tokens == 0 {
+        return Err("Inference benchmark requires generation_tokens > 0".to_string());
+    }
+    Ok(())
+}
+
+/// One warm-up run of `run_once`, then `num_trials` timed ones; nothing runs
+/// when no trial is asked for. Every engine's benchmark goes through here.
+pub(crate) fn run_benchmark_trials<E>(
     prompt_tokens: usize,
     generation_tokens: usize,
     num_trials: usize,
-    mut run_once: impl FnMut() -> pmetal_runtime::decode::BenchmarkTrial,
-) -> Vec<BenchmarkTrialMetrics> {
-    let _warmup = run_once();
-
-    let mut trials = Vec::with_capacity(num_trials);
-    for _ in 0..num_trials {
-        trials.push(trial_metrics(run_once(), prompt_tokens, generation_tokens));
+    mut run_once: impl FnMut() -> Result<pmetal_runtime::decode::BenchmarkTrial, E>,
+) -> Result<Vec<BenchmarkTrialMetrics>, E> {
+    if num_trials == 0 {
+        return Ok(Vec::new());
     }
-    trials
+    run_once()?;
+    (0..num_trials)
+        .map(|_| run_once().map(|trial| trial_metrics(trial, prompt_tokens, generation_tokens)))
+        .collect()
 }
 
 // ============================================================================
@@ -1049,13 +1079,7 @@ pub fn benchmark_native(
 ) -> Result<Vec<BenchmarkTrialMetrics>, String> {
     use pmetal_runtime::qwen3_native;
 
-    if prompt_ids.is_empty() {
-        return Err("Inference benchmark requires prompt_tokens > 0".to_string());
-    }
-    if generation_tokens == 0 {
-        return Err("Inference benchmark requires generation_tokens > 0".to_string());
-    }
-
+    check_benchmark_workload(prompt_ids.len(), generation_tokens)?;
     ensure_native_runtime_metal_available()?;
 
     let arch = detect_arch(model_path)
@@ -1071,58 +1095,68 @@ pub fn benchmark_native(
         return Ok(Vec::new());
     }
 
-    let trials = {
-        match arch {
-            NativeArch::Qwen3 | NativeArch::Qwen3_5 => {
-                let config = qwen3_native::load_config(model_path).map_err(|e| e.to_string())?;
-                let weights =
-                    qwen3_native::load_model(model_path, &config).map_err(|e| e.to_string())?;
-                run_benchmark_trials(prompt_ids.len(), generation_tokens, num_trials, || {
-                    qwen3_native::benchmark_trial(
-                        &weights,
-                        prompt_ids,
-                        generation_tokens,
-                        turboquant,
-                    )
-                })
-            }
-            NativeArch::Llama4 => {
-                use pmetal_runtime::llama4_native;
-                let config = llama4_native::load_config(model_path).map_err(|e| e.to_string())?;
-                let weights =
-                    llama4_native::load_model(model_path, &config).map_err(|e| e.to_string())?;
-                run_benchmark_trials(prompt_ids.len(), generation_tokens, num_trials, || {
-                    llama4_native::benchmark_trial(&weights, prompt_ids, generation_tokens)
-                })
-            }
-            NativeArch::DeepSeek => {
-                use pmetal_runtime::deepseek_native;
-                let config = deepseek_native::load_config(model_path).map_err(|e| e.to_string())?;
-                let weights =
-                    deepseek_native::load_model(model_path, &config).map_err(|e| e.to_string())?;
-                run_benchmark_trials(prompt_ids.len(), generation_tokens, num_trials, || {
-                    deepseek_native::benchmark_trial(&weights, prompt_ids, generation_tokens)
-                })
-            }
-            NativeArch::GptOss => {
-                use pmetal_runtime::gpt_oss_native;
-                let config = gpt_oss_native::load_config(model_path).map_err(|e| e.to_string())?;
-                let weights =
-                    gpt_oss_native::load_model(model_path, &config).map_err(|e| e.to_string())?;
-                run_benchmark_trials(prompt_ids.len(), generation_tokens, num_trials, || {
-                    gpt_oss_native::benchmark_trial(&weights, prompt_ids, generation_tokens)
-                })
-            }
-            NativeArch::Gemma4 => {
-                return Err("Gemma 4 native benchmark mode is not implemented yet".to_string());
-            }
+    let trials = match arch {
+        NativeArch::Qwen3 | NativeArch::Qwen3_5 => {
+            let config = qwen3_native::load_config(model_path).map_err(|e| e.to_string())?;
+            let weights =
+                qwen3_native::load_model(model_path, &config).map_err(|e| e.to_string())?;
+            run_benchmark_trials(prompt_ids.len(), generation_tokens, num_trials, || {
+                Ok(qwen3_native::benchmark_trial(
+                    &weights,
+                    prompt_ids,
+                    generation_tokens,
+                    turboquant,
+                ))
+            })
+        }
+        NativeArch::Llama4 => {
+            use pmetal_runtime::llama4_native;
+            let config = llama4_native::load_config(model_path).map_err(|e| e.to_string())?;
+            let weights =
+                llama4_native::load_model(model_path, &config).map_err(|e| e.to_string())?;
+            run_benchmark_trials(prompt_ids.len(), generation_tokens, num_trials, || {
+                Ok(llama4_native::benchmark_trial(
+                    &weights,
+                    prompt_ids,
+                    generation_tokens,
+                ))
+            })
+        }
+        NativeArch::DeepSeek => {
+            use pmetal_runtime::deepseek_native;
+            let config = deepseek_native::load_config(model_path).map_err(|e| e.to_string())?;
+            let weights =
+                deepseek_native::load_model(model_path, &config).map_err(|e| e.to_string())?;
+            run_benchmark_trials(prompt_ids.len(), generation_tokens, num_trials, || {
+                Ok(deepseek_native::benchmark_trial(
+                    &weights,
+                    prompt_ids,
+                    generation_tokens,
+                ))
+            })
+        }
+        NativeArch::GptOss => {
+            use pmetal_runtime::gpt_oss_native;
+            let config = gpt_oss_native::load_config(model_path).map_err(|e| e.to_string())?;
+            let weights =
+                gpt_oss_native::load_model(model_path, &config).map_err(|e| e.to_string())?;
+            run_benchmark_trials(prompt_ids.len(), generation_tokens, num_trials, || {
+                Ok(gpt_oss_native::benchmark_trial(
+                    &weights,
+                    prompt_ids,
+                    generation_tokens,
+                ))
+            })
+        }
+        NativeArch::Gemma4 => {
+            return Err("Gemma 4 native benchmark mode is not implemented yet".to_string());
         }
     };
 
     pmetal_runtime::inline_array::synchronize();
     pmetal_runtime::inline_array::clear_cache();
 
-    Ok(trials)
+    trials
 }
 
 // ============================================================================
