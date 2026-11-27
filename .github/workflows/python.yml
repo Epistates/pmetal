@@ -4,22 +4,30 @@ on:
 permissions:
   contents: read
 jobs:
-  a-empty-dir-then-autoinstall:
+  a-force:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: mkdir -p ~/.rustup/toolchains/1.99.1-aarch64-apple-darwin
-      - run: cargo --version || true
-  b-empty-dir-then-explicit-install:
+      - run: rustup toolchain install --no-self-update --force
+      - run: cargo --version && cargo clippy --version && cargo fmt --version && rustc --version
+  b-component-add:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: mkdir -p ~/.rustup/toolchains/1.99.1-aarch64-apple-darwin
+      - run: rustup toolchain install --no-self-update && rustup component add cargo rustc
+      - run: cargo --version && cargo clippy --version && cargo fmt --version && rustc --version
+  c-uninstall-first:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: mkdir -p ~/.rustup/toolchains/1.99.1-aarch64-apple-darwin
+      - run: RUSTUP_AUTO_INSTALL=0 rustup toolchain uninstall 1.99.1-aarch64-apple-darwin; rustup toolchain install --no-self-update
+      - run: cargo --version && cargo clippy --version && cargo fmt --version && rustc --version
+  d-clean-noarg:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install --no-self-update
-      - run: cargo --version && cargo clippy --version && cargo fmt --version
-  c-no-file-components:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: rustup show active-toolchain
-      - run: cargo --version
+      - run: cargo --version && cargo clippy --version && cargo fmt --version && rustc --version && rustup target list --installed && rustup show active-toolchain
