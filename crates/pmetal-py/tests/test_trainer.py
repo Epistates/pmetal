@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import os
 import signal
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -190,26 +192,64 @@ def test_ctrl_c_ends_the_run_after_the_step_and_keeps_the_weights(tiny_model, ti
     assert any(out.rglob("adapter_model.safetensors")) or any(out.rglob("*.safetensors")), "weights are saved"
 
 
+#: Serves a dataset through a named pipe, and only once `gate` exists. Argv: the pipe, the files `seen`
+#: (made when the run is reading the pipe), `gate` and `stop`, and the dataset to serve. After a
+#: minute, or with no gate, it closes the pipe unwritten, so the run reads an empty dataset and fails.
+PIPE_SERVER = """\
+import os, sys, time
+pipe, seen, gate, stop, data = sys.argv[1:6]
+deadline = time.monotonic() + 60
+while not os.path.exists(stop) and time.monotonic() < deadline:
+    try:
+        fd = os.open(pipe, os.O_WRONLY | os.O_NONBLOCK)  # fails until something is reading the pipe
+    except OSError:
+        time.sleep(0.005)
+        continue
+    open(seen, "w").close()
+    while not os.path.exists(gate) and time.monotonic() < deadline:
+        time.sleep(0.005)
+    os.set_blocking(fd, True)
+    if os.path.exists(gate):
+        try:
+            os.write(fd, open(data, "rb").read())
+        except BrokenPipeError:  # the reader looked at the start and closed the pipe
+            pass
+    os.close(fd)
+"""
+
+
 def test_the_gil_is_released_during_training(tiny_model, tiny_dataset, tmp_path):
+    """The run waits for another Python thread, so it can only finish if the GIL is free.
+
+    The dataset is a named pipe that a helper process fills only once a file exists. A ticker
+    thread takes the GIL ``wanted`` times after the run is reading the pipe, and then makes the
+    file. That takes no time the run can lose by being short. A run that kept the GIL while it
+    waited would never let the ticker run, and the helper would give up and close the pipe empty.
+    """
+    wanted = 100
+    pipe, seen, gate, stop = (tmp_path / name for name in ("pipe.jsonl", "seen", "gate", "stop"))
+    os.mkfifo(pipe)
+    server = subprocess.Popen([sys.executable, "-c", PIPE_SERVER, *map(str, (pipe, seen, gate, stop, tiny_dataset))])
     ticks = 0
-    stop = threading.Event()
 
     def tick() -> None:
         nonlocal ticks
-        while not stop.is_set():
-            ticks += 1
+        while not seen.exists() and not stop.exists():
             time.sleep(0.001)
+        while ticks < wanted and not stop.exists():
+            ticks += 1
+            time.sleep(0)  # let go of the GIL and take it back
+        gate.write_text("open")
 
     thread = threading.Thread(target=tick)
     thread.start()
     try:
-        started = time.perf_counter()
-        pmetal.Trainer(spec_for(tiny_model, tiny_dataset, tmp_path / "out", max_steps=6)).train()
-        elapsed = time.perf_counter() - started
+        result = pmetal.Trainer(spec_for(tiny_model, pipe, tmp_path / "out", max_steps=3)).train()
     finally:
-        stop.set()
+        stop.write_text("stop")
         thread.join()
-    assert ticks >= elapsed * 100 * 0.2, f"{ticks} ticks in {elapsed:.2f}s"
+        server.wait(timeout=60)
+    assert result.total_steps == 3 and ticks == wanted, "another Python thread ran while the run read its dataset"
 
 
 def test_callbacks_may_be_called_from_the_training_thread_only_with_the_gil(tiny_model, tiny_dataset, tmp_path):
