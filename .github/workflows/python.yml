@@ -3,38 +3,40 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  PIP_UPLOADED_PRIOR_TO: P7D
 jobs:
-  a-dtolnay-then-cargo:
+  wheel:
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable
-      - run: cargo --version
-      - run: ls ~/.rustup/toolchains/1.99.1-aarch64-apple-darwin/bin
-  b-cargo-first:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: cargo --version
-      - run: ls ~/.rustup/toolchains/1.99.1-aarch64-apple-darwin/bin
-  c-explicit-install:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: rustup toolchain install --no-self-update
-      - run: cargo --version
-      - run: ls ~/.rustup/toolchains/1.99.1-aarch64-apple-darwin/bin
-  d-dtolnay-install-action-then-cargo:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          toolchain: stable
+      - run: echo T1; ls -la ~/.rustup/toolchains
       - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: just
-      - run: cargo --version
-      - run: ls ~/.rustup/toolchains/1.99.1-aarch64-apple-darwin/bin
+      - run: echo T2; ls -la ~/.rustup/toolchains
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+      - run: echo T3; ls -la ~/.rustup/toolchains
+      - run: env -u PIP_UPLOADED_PRIOR_TO python -m pip install --upgrade "pip>=26.1"
+      - run: pip install "maturin>=1.15,<2.0"
+      - run: echo T4; ls -la ~/.rustup/toolchains
+      - run: |
+          cat > $RUNNER_TEMP/justfile <<'J'
+          t:
+              #!/usr/bin/env zsh
+              set -euo pipefail
+              cargo --version
+          J
+          just --justfile $RUNNER_TEMP/justfile --working-directory . t
+      - run: echo T5; ls -la ~/.rustup/toolchains; ls ~/.rustup/toolchains/1.99*/bin
