@@ -3,16 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE*'
   pull_request:
     branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE*'
 
 # A new push to a pull request cancels its older run; every other run has a group of its own, since a shared one would cancel the pending ones.
 concurrency:
@@ -28,8 +20,29 @@ env:
   PMETAL_MLX_PREFIX: ${{ github.workspace }}/.mlx-cache
 
 jobs:
+  # A workflow skipped by a path filter leaves its required checks pending,
+  # while a job skipped by `if` reports success, so the jobs decide. They run
+  # unless `changes` says `false`: if it failed, there is no answer, and no answer
+  # must not skip them.
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      code: ${{ steps.code.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+
+      - id: code
+        uses: ./.github/actions/code-changed
+
   check:
     name: Check
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: macos-latest
 
     steps:
@@ -98,6 +111,8 @@ jobs:
   # It reads manifests and lockfiles, never builds, so it runs on Linux.
   deny:
     name: Deny
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
 
     steps:
