@@ -37,7 +37,7 @@ env:
 
 jobs:
   # The abi3 wheel is built once, on the oldest Python it supports, and tested
-  # on the oldest and the newest (`test`).
+  # on the oldest, the newest and the one before it (`test`).
   wheel:
     name: Wheel (macOS aarch64)
     runs-on: macos-latest
@@ -130,7 +130,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.11", "3.14"]
+        python: ["3.11", "3.14", "3.15"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
