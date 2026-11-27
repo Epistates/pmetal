@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -48,15 +49,43 @@ def test_training_commands_get_an_event_log_and_others_do_not(fake_cli):
         assert "--log-events" not in pmetal.run(spec, cli=cli).json()
 
 
-def test_the_specs_that_stream_events_are_the_trainers_the_command_line_accepts_the_flag_for():
-    # The specs state it themselves (`#[spec(events)]`); the command line refuses
-    # `--log-events` for every other command (Commands::writes_event_log).
-    names = {
+def streaming_subcommands() -> set[str]:
+    """The subcommands of the specs that state they write an event log (`#[spec(events)]`)."""
+    return {
         cls.subcommand
         for cls in vars(pmetal).values()
         if isinstance(cls, type) and hasattr(cls, "reports_events") and cls.reports_events
     }
-    assert names == {"train", "distill", "grpo", "rlkd", "preference"}
+
+
+def test_the_specs_that_stream_events_are_the_trainers():
+    assert streaming_subcommands() == {
+        "train",
+        "distill",
+        "grpo",
+        "rlkd",
+        "preference",
+        "train-mtp",
+        "train-draft",
+        "train-diffusion",
+        "embed-train",
+        "pretrain",
+    }
+
+
+def test_the_command_line_accepts_the_event_log_flag_for_the_specs_that_stream_events(tmp_path):
+    """The command line refuses `--log-events` for a command that writes no log, and names the ones that do."""
+    try:
+        cli = pmetal.find_cli()
+    except pmetal.CliNotFoundError:
+        pytest.skip("no pmetal command line to ask")
+    refused = subprocess.run(
+        [str(cli), "info", "--log-events", str(tmp_path / "events.jsonl")], capture_output=True, text=True, check=False
+    )
+    assert refused.returncode != 0
+    named = re.search(r"--log-events is written by (.+) only", refused.stderr)
+    assert named, refused.stderr
+    assert set(named.group(1).split(", ")) == streaming_subcommands()
 
 
 def test_events_reach_on_event_in_order_and_the_result(fake_cli):
