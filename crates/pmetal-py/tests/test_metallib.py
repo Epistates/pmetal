@@ -27,12 +27,12 @@ def test_a_metallib_is_found_and_is_a_whole_metal_library():
 
 
 def test_the_metallib_in_the_package_is_a_whole_metal_library():
-    packaged = PACKAGE / "mlx.metallib"
     # A wheel carries the command line and the metallib together; a development tree neither.
-    if (PACKAGE / "_bin").exists():
-        assert packaged.exists(), "the wheel carries the metallib built with its MLX"
-    if packaged.exists():
-        assert_a_whole_metal_library(packaged)
+    if not (PACKAGE / "_bin").exists():
+        pytest.skip("not a wheel install: the package carries no command line, so no metallib either")
+    packaged = PACKAGE / "mlx.metallib"
+    assert packaged.exists(), "the wheel carries the metallib built with its MLX"
+    assert_a_whole_metal_library(packaged)
 
 
 def test_an_unusable_override_is_skipped_with_a_warning(tmp_path, monkeypatch):
