@@ -37,7 +37,7 @@ jobs:
 
       # rust-toolchain.toml pins the compiler for everything under the checkout,
       # so that is the toolchain to install; a `stable` would never be used.
-      # Cargo's own auto-install of it is deprecated, and when a runner already
+      # rustup's own auto-install of it is deprecated, and when a runner already
       # has an empty directory for the toolchain it installs only the file's
       # components: no cargo, no rustc. `component add` fills that in and changes
       # nothing on a complete install.

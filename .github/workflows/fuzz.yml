@@ -26,7 +26,7 @@ jobs:
 
 
     # The pinned toolchain runs `cargo install` below (`cargo +nightly` runs the
-    # fuzzer). Cargo's own auto-install of it is deprecated, and when a runner
+    # fuzzer). rustup's own auto-install of it is deprecated, and when a runner
     # already has an empty directory for the toolchain it installs only the file's
     # components: no cargo, no rustc. `component add` fills that in and changes
     # nothing on a complete install.
