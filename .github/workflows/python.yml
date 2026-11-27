@@ -166,8 +166,9 @@ jobs:
         run: python -m pytest tests -v
 
   # A free-threaded CPython cannot load an abi3 wheel (that needs Python 3.15's
-  # abi3t), so 3.14t gets a wheel of its own, built from its interpreter and
-  # tested with the GIL off.
+  # abi3t), so 3.14t gets a wheel of its own, built for its interpreter (maturin
+  # builds one for a named interpreter that cannot use the stable ABI, and the
+  # abi3 wheel when none is named) and tested with the GIL off.
   wheel-free-threaded:
     name: Wheel and tests (macOS aarch64, Python 3.14t)
     runs-on: macos-latest
@@ -217,7 +218,7 @@ jobs:
         run: pip install "maturin>=1.15,<2.0"
 
       - name: Build the wheel
-        run: just build-wheel
+        run: just build-wheel python
 
       - name: Save MLX
         if: steps.mlx-cache.outputs.cache-hit != 'true'
