@@ -8,6 +8,11 @@ on:
   schedule:
     - cron: '0 0 * * *' # Run daily
 
+# A new push to a pull request cancels its older run; every other run has a group of its own, since a shared one would cancel the pending ones.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
